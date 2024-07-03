@@ -1,0 +1,63 @@
+use bitcoincore_rpc::{Auth, Client, RpcApi};
+use std::{env, thread, time::Duration};
+
+use dotenv::dotenv;
+
+fn load_env() -> (String, String, String, String) {
+    dotenv().ok();
+    let rpc_user = env::var("RPC_USER").expect("RPC_USER must be set");
+    let rpc_pass = env::var("RPC_PASS").expect("RPC_PASS must be set");
+    let rpc_url = env::var("RPC_URL").expect("RPC_URL must be set");
+    let wallet_name = env::var("WALLET_NAME").expect("WALLET_NAME must be set");
+
+    (rpc_user, rpc_pass, rpc_url, wallet_name)
+}
+
+pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = load_env();
+
+    let rpc = Client::new(
+        &rpc_url,
+        Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()),
+    )?;
+
+    let _ = rpc.load_wallet(&wallet_name);
+
+    let mut blockchain_info;
+    let mut current_block_height = 0;
+
+    loop {
+        println!("Checking for new blocks...");
+        blockchain_info = rpc.get_blockchain_info().unwrap();
+        let latest_block_height = blockchain_info.blocks;
+
+        // Check for new blocks
+        if latest_block_height > current_block_height {
+            for block_height in (current_block_height + 1)..=latest_block_height {
+                println!("Checking block height: {}", block_height);
+
+                let block_hash = rpc.get_block_hash(block_height).unwrap();
+                let block = rpc.get_block(&block_hash).unwrap();
+
+                for tx in block.txdata {
+                    println!("Checking transaction: {}", tx.compute_txid());
+                    for input in &tx.input {
+                        for witness in input.witness.iter() {
+                            let witness_slice: Vec<u8> = witness.iter().map(|&x| x as u8).collect();
+
+                            if let Ok(witness_str) = std::str::from_utf8(&witness_slice) {
+                                if witness_str.contains("IPC:CREATE") {
+                                    // Try to parse the rest of the command.
+                                    println!("Transaction {} at block height {} contains the keyword 'IPC:CREATE'", tx.compute_txid(), block_height);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            current_block_height = latest_block_height;
+        }
+
+        thread::sleep(Duration::from_secs(10));
+    }
+}
