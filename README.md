@@ -14,6 +14,15 @@ This guide will walk you through the necessary steps needed to setup the environ
 
    Follow the installation instructions for your operating system provided on the [Bitcoin Core download page](https://bitcoin.org/en/download).
 
+   On Linux you can install Bitcoin Core over a shell following the instuctions [here](https://bitcoin.org/en/full-node#linux-instructions).
+   For example, you can install version 27.0 like this:
+   ```sh
+   wget https://bitcoin.org/bin/bitcoin-core-27.0/bitcoin-27.0-x86_64-linux-gnu.tar.gz
+   tar xfz bitcoin-27.0-x86_64-linux-gnu.tar.gz
+   sudo install -m 0755 -o root -g root -t /usr/local/bin bitcoin-27.0/bin/*
+   sudo install -m 0755 -o root -g root -t /usr/local/bin bitcoin-27.0/bin/*
+   ```
+
 2. **Verify Installation**
 
    Open a terminal or command prompt and verify that `bitcoind` and `bitcoin-cli` are installed correctly:
