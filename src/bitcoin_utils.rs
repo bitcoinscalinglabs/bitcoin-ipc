@@ -31,29 +31,34 @@ pub fn init_rpc_client(
 }
 
 pub fn init_wallet(
-    bitcoin_dir: &String,
     rpc: &Client,
     network: Network,
-    wallet: &str,
-    generate_blocks: bool,
-) -> (Address, Option<transaction::Transaction>, u32) {
+    wallet: &String,
+) -> Result<(Address, Option<Transaction>, u32), Box<dyn std::error::Error>> {
     let random_number = rand::random::<usize>().to_string();
     let random_label = random_number.as_str();
 
-    let _ = rpc.create_wallet(&(bitcoin_dir.to_owned() + wallet), None, None, None, None);
-    let _ = rpc.load_wallet(&(bitcoin_dir.to_owned() + wallet));
+    let mut created_wallet = false;
 
-    // $ bitcoin-core.cli -rpcport=18443 -rpcpassword=1234 -regtest getnewaddress
+    match rpc.create_wallet(wallet, None, None, None, None) {
+        Ok(_) => created_wallet = true,
+        Err(_) => {}
+    }
+
+    for _ in 0..100 {
+        println!("Wallet created: {}", created_wallet);
+    }
+
+    let _ = rpc.load_wallet(wallet);
+    let mut coinbase_tx = None;
+
     let address = rpc
         .get_new_address(Some(random_label), None)
         .unwrap()
-        .require_network(network)
-        .unwrap();
+        .require_network(network)?;
 
-    let mut coinbase_tx: Option<transaction::Transaction> = None;
-
-    if generate_blocks {
-        rpc.generate_to_address(101, &address).unwrap();
+    if created_wallet {
+        rpc.generate_to_address(101, &address)?;
 
         let coinbase_txid = rpc
             .list_transactions(Some(random_label), Some(101), Some(100), None)
@@ -64,12 +69,11 @@ pub fn init_wallet(
         coinbase_tx = Some(
             rpc.get_transaction(&coinbase_txid, None)
                 .unwrap()
-                .transaction()
-                .unwrap(),
+                .transaction()?,
         );
     }
 
-    (address, coinbase_tx, 0)
+    Ok((address, coinbase_tx, 0))
 }
 
 pub fn test_and_submit(
