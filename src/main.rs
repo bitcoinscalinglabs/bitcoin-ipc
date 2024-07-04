@@ -1,30 +1,18 @@
-mod bitcoin_utils;
-use bitcoin::blockdata::transaction::{OutPoint, TxOut};
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{amount::Amount, Network};
-use bitcoin_utils::{
+use bitcoin_ipc::bitcoin_utils::{
     collect_amount, commit_arbitrary_data, create_change_txout, create_unspendable_internal_key,
     get_address_from_private_key, get_private_key, init_rpc_client, init_wallet,
     reveal_arbitrary_data, test_and_submit,
 };
+use bitcoin_ipc::utils;
 
-use dotenv::dotenv;
-use std::env;
+use bitcoin::blockdata::transaction::{OutPoint, TxOut};
+use bitcoin::secp256k1::Secp256k1;
+use bitcoin::{amount::Amount, Network};
 
 const NETWORK: Network = Network::Regtest;
 
-fn load_env() -> (String, String, String, String) {
-    dotenv().ok();
-    let rpc_user = env::var("RPC_USER").expect("RPC_USER must be set");
-    let rpc_pass = env::var("RPC_PASS").expect("RPC_PASS must be set");
-    let rpc_url = env::var("RPC_URL").expect("RPC_URL must be set");
-    let wallet_name = env::var("WALLET_NAME").expect("WALLET_NAME must be set");
-
-    (rpc_user, rpc_pass, rpc_url, wallet_name)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = load_env();
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env();
 
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
 
