@@ -81,6 +81,12 @@ This guide will walk you through the necessary steps needed to setup the environ
     WALLET_NAME=default
     ```
 
+    Source the .env, in case you have updated it.
+
+    ```sh
+    . .env
+    ```
+
     3.5 **Setting up a wallet (Optional - this is done in the code)**
     <details>
     <summary> Manual Wallet Setup and Block Generation</summary>
