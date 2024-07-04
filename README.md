@@ -109,7 +109,7 @@ This guide will walk you through the necessary steps needed to setup the environ
     bitcoin-cli -regtest getblockcount
     ```
     The output should be 101.
-    </p>
+    </details>
 
 4. **Running the code**
 
