@@ -8,7 +8,6 @@ use bitcoin_utils::{
     reveal_arbitrary_data, test_and_submit,
 };
 
-use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
 use std::env;
 
@@ -30,8 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
 
     let (miner_address, _, _) = init_wallet(&rpc, NETWORK, &wallet_name)?;
-
-    let _ = rpc.load_wallet(&wallet_name);
 
     let amount_to_send = Amount::from_btc(1.0)?;
     let fee = Amount::from_sat(200);

@@ -45,10 +45,6 @@ pub fn init_wallet(
         Err(_) => {}
     }
 
-    for _ in 0..100 {
-        println!("Wallet created: {}", created_wallet);
-    }
-
     let _ = rpc.load_wallet(wallet);
     let mut coinbase_tx = None;
 
