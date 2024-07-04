@@ -34,21 +34,22 @@ This guide will walk you through the necessary steps needed to setup the environ
 
 3. **Configuration** 
    
-   ### 3.1. Ensure that the Bitcoin data directory exists. The default locations are:
+   3.1. **Ensure that the Bitcoin data directory exists. The default locations are:**
 
     <ul>
     <li>Linux: ~/.bitcoin/ </li> 
     <li> macOS: ~/Library/Application Support/Bitcoin/ </li>
     <li> Windows: %APPDATA%\Bitcoin\ </li>
     </ul>
-   ### 3.2 Create or edit the bitcoin.conf file in the Bitcoin data directory and add the following configuration to enable regtest:
+   
+   3.2 **Create or edit the bitcoin.conf file in the Bitcoin data directory and add the following configuration to enable regtest:**
 
    ```sh
    cd ~/.bitcoin/
    nano bitcoin.conf
    ```
 
-    ### bitcoin.conf
+    bitcoin.conf:
     ```ini
     regtest=1
     server=1
@@ -56,7 +57,7 @@ This guide will walk you through the necessary steps needed to setup the environ
     rpcpassword=yourpassword
     ```
     
-    ### 3.3 Starting Bitcoin Daemon in Regtest Mode 
+   3.3 **Starting Bitcoin Daemon in Regtest Mode**
 
     Start bitcoind in regtest mode:
 
@@ -64,14 +65,14 @@ This guide will walk you through the necessary steps needed to setup the environ
     bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001
     ```
 
-    Verify bitcoind is Running
+    Verify bitcoind is Running:
 
 
     ```sh
     bitcoin-cli getblockchaininfo
     ```
 
-    ### 3.4 Update .env
+    3.4 **Update .env**
 
     ```ini
     RPC_USER=yourusername
@@ -80,33 +81,34 @@ This guide will walk you through the necessary steps needed to setup the environ
     WALLET_NAME=default
     ```
 
-    ### 3.5 Setting up a usable wallet
+    3.5 **Setting up a usable wallet**
     <details>
     <summary> Option 1: Manual Wallet Setup and Block Generation</summary>
     
-    ### 3.5.1 Create a Wallet named default
+      3.5.1 **Create a Wallet named default**
             
     ```sh
     bitcoin-cli createwallet "default"
     ```
 
-    ### 3.5.2 (Optional - if wallet is not already loaded) Load the Wallet
+      3.5.2 **(Optional - if wallet is not already loaded) Load the Wallet**
 
     ```sh
     bitcoin-cli loadwallet "default"
     ```
 
-    ### 3.5.3 Generate 101 blocks
+      3.5.3 **Generate 101 blocks**
 
     ```sh
     bitcoin-cli -regtest generatetoaddress 101 "$(bitcoin-cli -regtest getnewaddress)"
     ```
 
-    Verify block generation - output should be 101
+    3.5.4 **Verify block generation**
 
     ```sh
     bitcoin-cli -regtest getblockcount
     ```
+    The output should be 101.
     </p>
     </details>
 
