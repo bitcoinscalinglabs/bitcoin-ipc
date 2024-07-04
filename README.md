@@ -111,7 +111,7 @@ This guide will walk you through the necessary steps needed to setup the environ
     The output should be 101.
     </details>
 
-4. **Running the code**
+4. **Run the code**
 
 4.1. Run the listener by executing
 
