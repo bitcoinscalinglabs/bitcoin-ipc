@@ -28,7 +28,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = rpc.get_blockchain_info().unwrap();
+        blockchain_info = rpc.get_blockchain_info()?;
         let latest_block_height = blockchain_info.blocks;
 
         // Check for new blocks
@@ -36,8 +36,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
 
-                let block_hash = rpc.get_block_hash(block_height).unwrap();
-                let block = rpc.get_block(&block_hash).unwrap();
+                let block_hash = rpc.get_block_hash(block_height)?;
+                let block = rpc.get_block(&block_hash)?;
 
                 for tx in block.txdata {
                     println!("Checking transaction: {}", tx.compute_txid());
