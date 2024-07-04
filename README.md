@@ -81,9 +81,15 @@ This guide will walk you through the necessary steps needed to setup the environ
     WALLET_NAME=default
     ```
 
-    3.5 **Setting up a usable wallet**
+    Source the .env, in case you have updated it.
+
+    ```sh
+    . .env
+    ```
+
+    3.5 **Setting up a wallet (Optional - this is done in the code)**
     <details>
-    <summary> Option 1: Manual Wallet Setup and Block Generation</summary>
+    <summary> Manual Wallet Setup and Block Generation</summary>
     
       3.5.1 **Create a Wallet named default**
             
@@ -109,14 +115,14 @@ This guide will walk you through the necessary steps needed to setup the environ
     bitcoin-cli -regtest getblockcount
     ```
     The output should be 101.
-    </p>
     </details>
 
-    <details>
-    <summary> Option 2: Using bitcoin_utils.rs</summary>
+4. **Run the code**
 
-    Execute the `init_wallet` function from `bitcoin utils.rs` once.
+4.1. Run the listener by executing
 
-    </details>
+```sh
+cargo run --bin btc_monitor
+```
 
 
