@@ -27,6 +27,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let btc_pubkey = bitcoin::PublicKey::new(pubkey);
     let subnet_address = Address::p2pkh(btc_pubkey, bitcoin_ipc::NETWORK);
 
-    create_child(subnet_address, subnet_data.as_bytes())?;
+    create_child(&subnet_address, subnet_data.as_bytes())?;
     Ok(())
 }
