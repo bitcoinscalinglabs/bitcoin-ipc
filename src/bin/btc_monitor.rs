@@ -5,7 +5,7 @@ use bitcoin_ipc::utils;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env();
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
     let rpc = Client::new(
         &rpc_url,
@@ -40,6 +40,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
                                     // Try to parse the rest of the command.
                                     println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
+                                }
+                                if witness_str.contains(bitcoin_ipc::IPC_JOIN_SUBNET_TAG) {
+                                    // Try to parse the rest of the command.
+                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
                                 }
                             }
                         }
