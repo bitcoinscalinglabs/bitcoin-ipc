@@ -117,12 +117,40 @@ This guide will walk you through the necessary steps needed to setup the environ
     The output should be 101.
     </details>
 
-4. **Run the code**
 
-4.1. Run the listener by executing
+## Running the code
+
+1. Run the listener by executing
 
 ```sh
 cargo run --bin btc_monitor
 ```
 
+You can leave the listener running on the background or separate shell.
 
+2. Generate a bitcoin private/public keypair
+
+```sh
+cargo run --bin generate_keypair
+```
+
+The output will look like this:
+
+```
+private_key:
+tprv8ZgxMBicQKsPeMg7q6BrYrcJBvVcQ6tR6R5PUWGrgx3fyGg9R6N9MEhhHrpeSZ65FzHVL95LCEU8r4nu6nEHAeELd632W3mGHM1ZFsPVGYU
+public_key:
+028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21
+```
+
+3. Create a new IPC subnet
+```sh
+cargo run --bin create_child -- --name <name> --pk <subnetPK>
+```
+where `<name>` is the desired name for the new subnet and `<subnetPK>` is a valid bitcoin public key, such as the one in the output of `generate_keypair`.
+This binary will create the necessary bitcoin transactions and submit them to the local bitcoin node.
+
+When the transactions get finalized on the bitcoin network (the local testnet), the `btc_monitor` binary should detect them as IPC-related. You should see an output such as
+```
+transaction 8fd7027b33cbdaeeefd88b03effe8288a539c376240e167fe572551f785ff07f at block height 117 contains the keyword 'IPC:CREATE'
+```

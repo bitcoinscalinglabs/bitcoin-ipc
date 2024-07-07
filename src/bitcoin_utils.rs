@@ -168,7 +168,6 @@ pub fn commit_arbitrary_data(
     change: TxOut,
     data: &[u8],
     secp: &Secp256k1<All>,
-    x_only_pubkey: XOnlyPublicKey,
 ) -> (Transaction, ScriptBuf, TaprootSpendInfo) {
     let push_bytes: &PushBytes;
     unsafe {
@@ -176,10 +175,13 @@ pub fn commit_arbitrary_data(
     }
     let script = Builder::new().push_slice(push_bytes).into_script();
 
+    // this transaction can only be spent through the script path
+    let unspendable_pubkey = create_unspendable_internal_key(&secp);
+
     let taproot_spend_info = TaprootBuilder::new()
         .add_leaf(0, script.clone())
         .unwrap()
-        .finalize(secp, x_only_pubkey)
+        .finalize(secp, unspendable_pubkey)
         .unwrap();
 
     let script_pubkey = script::ScriptBuf::new_p2tr(

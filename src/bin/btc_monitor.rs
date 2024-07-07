@@ -1,10 +1,11 @@
+use std::{thread, time::Duration};
+
 use bitcoin_ipc::utils;
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use std::{thread, time::Duration};
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env();
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
     let rpc = Client::new(
         &rpc_url,
@@ -36,9 +37,13 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let witness_slice: Vec<u8> = witness.iter().map(|&x| x as u8).collect();
 
                             if let Ok(witness_str) = std::str::from_utf8(&witness_slice) {
-                                if witness_str.contains("IPC:CREATE") {
+                                if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
                                     // Try to parse the rest of the command.
-                                    println!("Transaction {} at block height {} contains the keyword 'IPC:CREATE'", tx.compute_txid(), block_height);
+                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
+                                }
+                                if witness_str.contains(bitcoin_ipc::IPC_JOIN_SUBNET_TAG) {
+                                    // Try to parse the rest of the command.
+                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
                                 }
                             }
                         }
