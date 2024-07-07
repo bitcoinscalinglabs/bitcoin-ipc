@@ -11,6 +11,7 @@ use bitcoin::{
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, XOnlyPublicKey,
 };
+
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 
 pub fn create_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
@@ -266,8 +267,11 @@ pub fn get_address_from_private_key(
     network: Network,
 ) -> Address {
     let receiver_pubkey = private_key.to_keypair(&secp).public_key();
-    let btc_pubkey = bitcoin::PublicKey::new(receiver_pubkey);
+    get_address_from_public_key(receiver_pubkey, network)
+}
 
+pub fn get_address_from_public_key(pk: bitcoin::secp256k1::PublicKey, network: Network) -> Address {
+    let btc_pubkey = bitcoin::PublicKey::new(pk);
     Address::p2pkh(btc_pubkey, network)
 }
 
@@ -300,4 +304,43 @@ pub fn reveal_arbitrary_data(
     }
 
     unsigned_tx
+}
+
+pub fn write_arbitrary_data(
+    rpc: &Client,
+    amount_to_send: Amount,
+    fee: Amount,
+    data: &str,
+    receiver_address: &Address,
+) -> (Transaction, Transaction) {
+    let input_info = collect_amount(&rpc, amount_to_send, fee).unwrap();
+
+    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee).unwrap();
+
+    let secp = Secp256k1::new();
+
+    // Commit the arbitrary data
+    let (commit_tx, script, taproot_spend_info) = commit_arbitrary_data(
+        &rpc,
+        input_info,
+        amount_to_send,
+        change,
+        data.as_bytes(),
+        &secp,
+    );
+
+    let commit_tx_outpoint = OutPoint {
+        txid: commit_tx.compute_txid(),
+        vout: 0,
+    };
+
+    let output = TxOut {
+        value: amount_to_send - fee,
+        script_pubkey: receiver_address.script_pubkey(),
+    };
+
+    // Reveal Transaction : Reveal the Arbitrary Data
+    let reveal_tx = reveal_arbitrary_data(commit_tx_outpoint, output, script, taproot_spend_info);
+
+    (commit_tx, reveal_tx)
 }
