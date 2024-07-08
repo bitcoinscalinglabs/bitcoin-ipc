@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subnet_address =
         get_address_from_private_key(&Secp256k1::new(), &receiver_key, bitcoin_ipc::NETWORK);
 
-    create_child(&subnet_address, subnet_data.as_bytes())?;
+    create_child(&subnet_address, subnet_data)?;
 
     let collateral = Amount::from_btc(1.0)?;
     let validator_data = format!("{} IP:{}", bitcoin_ipc::IPC_JOIN_SUBNET_TAG, "...");

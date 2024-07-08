@@ -1,6 +1,11 @@
 use dotenv::dotenv;
 use std::env;
 
+/// Load environment variables from a .env file
+///
+/// # Returns
+///
+/// A tuple containing the RPC user, RPC password, RPC URL, and wallet name
 pub fn load_env() -> Result<(String, String, String, String), env::VarError> {
     dotenv().ok();
     let rpc_user = env::var("RPC_USER")?;

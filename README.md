@@ -150,7 +150,30 @@ cargo run --bin create_child -- --name <name> --pk <subnetPK>
 where `<name>` is the desired name for the new subnet and `<subnetPK>` is a valid bitcoin public key, such as the one in the output of `generate_keypair`.
 This binary will create the necessary bitcoin transactions and submit them to the local bitcoin node.
 
+<details>
+<summary>Example</summary>
+cargo run --bin create_child -- --name A --pk 028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21
+</details>
+<br/>
+
 When the transactions get finalized on the bitcoin network (the local testnet), the `btc_monitor` binary should detect them as IPC-related. You should see an output such as
 ```
 transaction 8fd7027b33cbdaeeefd88b03effe8288a539c376240e167fe572551f785ff07f at block height 117 contains the keyword 'IPC:CREATE'
+```
+
+4. Join an existing IPC subnet
+```sh
+cargo run --bin join_child -- --ip <ip_address> --pk <subnetPK> --collateral <collateral>
+```
+
+Where `<ip_address>` is the ip address of the validator joining the sunet, `<subnetPK>` is a valid bitcoin public key that represents the subnet and `<collateral>`  is the collateral sent to the subnet address for joining the subnet specified in SATOSHI.
+<details>
+<summary>Example</summary>
+cargo run --bin join_child -- --ip 0.0.0.0 --pk 028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21 --collateral 1000
+</details>
+<br/>
+
+When the transactions get finalized on the bitcoin network (the local testnet), the `btc_monitor` binary should detect them as IPC-related. You should see an output such as
+```
+transaction e84de140c011a77106859026bbf7e5ffd01f644d7922e453556adf54478ae991 at block height 106 contains the keyword 'IPC:JOIN'
 ```
