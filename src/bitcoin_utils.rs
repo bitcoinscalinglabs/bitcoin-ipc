@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
@@ -13,6 +15,8 @@ use bitcoin::{
 };
 
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
+
+use crate::NETWORK;
 
 /// This function creates an unspendable internal key. The internal key is created
 /// by generating a random secret key and deriving the corresponding public key.
@@ -53,10 +57,9 @@ pub fn init_rpc_client(
     let rpc = Client::new(&rpc_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
 }
-
-/// This function initializes a Bitcoin wallet.
-/// If the wallet exists, the function loads the existing wallet.
-/// If the wallet doesn't exist, the function creates a new wallet using the provided wallet name and network
+/// This function loads or initializes a Bitcoin wallet.
+/// /// If a wallet with the provided name and network exists, the function loads it.
+/// If a wallet doesn't exist, the function creates a new wallet
 /// and generates 101 blocks to fund the wallet.
 ///
 /// # Arguments
@@ -66,47 +69,49 @@ pub fn init_rpc_client(
 /// * `wallet` - The name of the wallet to create or load
 ///
 /// # Returns
-/// * `(Address, Option<Transaction>, u32)` - A tuple containing the wallet address, the coinbase transaction, and the vout index
-pub fn init_wallet(
+/// * `(Address, Option<Transaction, u32>)` - A tuple containing the wallet address, and, if a new wallet was created, the coinbase transaction and its vout index.
+pub fn get_or_create_wallet(
     rpc: &Client,
     network: Network,
-    wallet: &String,
-) -> Result<(Address, Option<Transaction>, u32), Box<dyn std::error::Error>> {
+    name: &String,
+) -> Result<(Address, Option<(Transaction, u32)>), LocalNodeError> {
     let random_number = rand::random::<usize>().to_string();
     let random_label = random_number.as_str();
 
+    // create_wallet() returns an error if the wallet already exists. We completely ignore the returned error for now.
     let mut created_wallet = false;
-
-    match rpc.create_wallet(wallet, None, None, None, None) {
+    match rpc.create_wallet(name, None, None, None, None) {
         Ok(_) => created_wallet = true,
         Err(_) => {}
     }
 
-    let _ = rpc.load_wallet(wallet);
-    let mut coinbase_tx = None;
+    //same for load_wallet(), which returns an error if the wallet is already loaded
+    let _ = rpc.load_wallet(name);
 
     let address = rpc
-        .get_new_address(Some(random_label), None)
-        .unwrap()
-        .require_network(network)?;
+        .get_new_address(Some(random_label), None)?
+        .require_network(NETWORK)
+        .map_err(|e| LocalNodeError::InvalidNetwork(network, e))?;
 
     if created_wallet {
         rpc.generate_to_address(101, &address)?;
-
         let coinbase_txid = rpc
-            .list_transactions(Some(random_label), Some(101), Some(100), None)
-            .unwrap()[0]
+            .list_transactions(Some(random_label), Some(101), Some(100), None)?
+            .get(0)
+            .ok_or::<LocalNodeError>(LocalNodeError::Internal(String::from(
+                "list_transactions() should return a transaction",
+            )))?
             .info
             .txid;
 
-        coinbase_tx = Some(
-            rpc.get_transaction(&coinbase_txid, None)
-                .unwrap()
-                .transaction()?,
-        );
+        let coinbase_tx = rpc
+            .get_transaction(&coinbase_txid, None)?
+            .transaction()
+            .map_err(|e| LocalNodeError::EncodeTransaction(String::from("coinbase_tx"), e))?;
+        Ok((address, Some((coinbase_tx, 0))))
+    } else {
+        Ok((address, None))
     }
-
-    Ok((address, coinbase_tx, 0))
 }
 
 /// This function tests and submits a set of transactions to the Bitcoin network.
@@ -515,4 +520,19 @@ pub fn write_arbitrary_data(
     let reveal_tx = reveal_arbitrary_data(commit_tx_outpoint, output, script, taproot_spend_info);
 
     (commit_tx, reveal_tx)
+}
+
+#[derive(Error, Debug)]
+pub enum LocalNodeError {
+    #[error("error while calling an rpc endpoint of the local node")]
+    RpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("the local bitcoin node must be running in the {0} network")]
+    InvalidNetwork(Network, bitcoin::address::ParseError),
+
+    #[error("could not encode transaction: {0}")]
+    EncodeTransaction(String, bitcoin::consensus::encode::Error),
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
