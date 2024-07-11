@@ -70,7 +70,7 @@ pub fn init_rpc_client(
 ///
 /// # Returns
 /// * `(Address, Option<Transaction, u32>)` - A tuple containing the wallet address, and, if a new wallet was created, the coinbase transaction and its vout index.
-pub fn get_or_create_wallet(
+pub fn create_or_load_wallet(
     rpc: &Client,
     network: Network,
     name: &String,

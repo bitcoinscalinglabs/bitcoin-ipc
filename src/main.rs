@@ -8,7 +8,7 @@ use bitcoin_ipc::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
     let rpc = bitcoin_ipc::bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
-    let (_, _) = bitcoin_ipc::bitcoin_utils::get_or_create_wallet(&rpc, NETWORK, &wallet_name)?;
+    let (_, _) = bitcoin_ipc::bitcoin_utils::create_or_load_wallet(&rpc, NETWORK, &wallet_name)?;
 
     let subnet_data = bitcoin_ipc::IPC_CREATE_SUBNET_TAG;
 
