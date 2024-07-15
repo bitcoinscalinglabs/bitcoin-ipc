@@ -1,11 +1,11 @@
 use bitcoin::{key::Secp256k1, Amount};
 use bitcoin_ipc::{
-    bitcoin_utils::{get_address_from_private_key, get_private_key},
+    bitcoin_utils::{get_address_from_private_key, get_private_key, LocalNodeError},
     ipc_lib::{create_child, join_child},
     utils, NETWORK,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), bitcoin_ipc::bitcoin_utils::LocalNodeError> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
     let rpc = bitcoin_ipc::bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (_, _) = bitcoin_ipc::bitcoin_utils::create_or_load_wallet(&rpc, NETWORK, &wallet_name)?;
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     create_child(&subnet_address, subnet_data)?;
 
-    let collateral = Amount::from_btc(1.0)?;
+    let collateral = Amount::from_btc(1.0).map_err(|e| LocalNodeError::InvalidAmount(e))?;
     let validator_data = format!("{} IP:{}", bitcoin_ipc::IPC_JOIN_SUBNET_TAG, "...");
     join_child(&subnet_address, collateral, &validator_data)?;
 

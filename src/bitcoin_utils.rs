@@ -1,8 +1,9 @@
+use bitcoin::amount::ParseAmountError;
 use thiserror::Error;
 
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
-use bitcoin::script::PushBytes;
+use bitcoin::script::{PushBytes, PushBytesError};
 use bitcoin::secp256k1::{All, Keypair, Secp256k1};
 use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{
@@ -239,9 +240,9 @@ pub fn create_change_txout(
 /// # Returns
 ///
 /// * `Transaction` - A signed transaction
-pub fn sign_transaction_safe(rpc: &Client, unsigned_tx: Transaction) -> Transaction {
+pub fn sign_transaction_safe(rpc: &Client, unsigned_tx: &Transaction) -> Transaction {
     let signed_raw_transaction = rpc
-        .sign_raw_transaction_with_wallet(&unsigned_tx, None, None)
+        .sign_raw_transaction_with_wallet(unsigned_tx, None, None)
         .unwrap();
     if !signed_raw_transaction.complete {
         println!("{:#?}", signed_raw_transaction.errors);
@@ -321,10 +322,130 @@ pub fn commit_arbitrary_data(
     };
 
     (
-        sign_transaction_safe(rpc, unsigned_tx),
+        sign_transaction_safe(rpc, &unsigned_tx),
         script,
         taproot_spend_info,
     )
+}
+
+#[derive(Error, Debug)]
+pub enum DataTransactionError {
+    #[error(transparent)]
+    Other(#[from] bitcoin::taproot::TaprootBuilderError),
+
+    #[error("tried to finalize a taproot transaction builder that is not ready")]
+    BuilderNotFinalizable,
+
+    #[error("cannot push data to transaction")]
+    CannotPushDataToTransaction(PushBytesError),
+}
+
+/// This function allows writing arbitrary data to bitcoin
+/// It creates and returns two transactions, `commit_tx` and `reveal_tx`.
+/// The first commits to some arbitrary data by sending a specified amount of Bitcoin to
+/// a script that contains the data, and the second reveals the data by spending the
+/// output of the first transaction.
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client
+/// * `amount_to_send` - The amount of Bitcoin to send
+/// * `receiver_address` - The Bitcoin address of the recipient of the output associated with the reveal transaction
+/// * `fee` - The fee to pay for each of the transactions
+/// * `data` - Arbitrary data
+/// # Returns
+///
+/// * A Result that contains either a `(Transaction, Transaction)` tuple, the commit and the reveal transactions,
+/// or a `DataTransactionError`.
+pub fn create_transactions_with_arbitrary_data(
+    input_utxos: Vec<OutPoint>,
+    change_tx: TxOut,
+    amount_to_send: Amount,
+    fee: Amount,
+    receiver_address: &Address,
+    data: &str,
+) -> Result<(Transaction, Transaction), DataTransactionError> {
+    let secp = Secp256k1::new();
+    // this transaction can only be spent through the script path, we use an unspendable key as the internal key
+    let unspendable_pubkey = create_unspendable_internal_key(&secp);
+
+    // create a script that contains the data
+    let push_bytes: &PushBytes = data
+        .as_bytes()
+        .try_into()
+        .map_err(|e| DataTransactionError::CannotPushDataToTransaction(e))?;
+
+    let data_script = Builder::new().push_slice(push_bytes).into_script();
+    let builder = TaprootBuilder::new().add_leaf(0, data_script.clone())?;
+    let taproot_spend_info = builder
+        .finalize(&secp, unspendable_pubkey)
+        .map_err(|_| DataTransactionError::BuilderNotFinalizable)?;
+
+    let script_pubkey = script::ScriptBuf::new_p2tr(
+        &secp,
+        taproot_spend_info.internal_key(),
+        taproot_spend_info.merkle_root(),
+    );
+
+    // create commit_tx and sign it
+    let commit_tx_inputs: Vec<TxIn> = input_utxos
+        .into_iter()
+        .map(|input_utxo| TxIn {
+            previous_output: input_utxo,
+            script_sig: ScriptBuf::new(),
+            sequence: transaction::Sequence::MAX,
+            witness: Witness::default(),
+        })
+        .collect();
+
+    let commit_tx_outputs: Vec<TxOut> = vec![
+        TxOut {
+            value: amount_to_send,
+            script_pubkey: script_pubkey,
+        },
+        change_tx,
+    ];
+
+    let commit_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: commit_tx_inputs,
+        output: commit_tx_outputs,
+    };
+
+    // create reveal_tx
+    let reveal_tx_inputs = vec![TxIn {
+        previous_output: OutPoint {
+            txid: commit_tx.compute_txid(),
+            vout: 0,
+        },
+        script_sig: script::ScriptBuf::new(),
+        sequence: transaction::Sequence::MAX,
+        witness: Witness::new(),
+    }];
+
+    let reveal_tx_outputs: Vec<TxOut> = vec![TxOut {
+        value: amount_to_send - fee,
+        script_pubkey: receiver_address.script_pubkey(),
+    }];
+
+    let mut reveal_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: reveal_tx_inputs,
+        output: reveal_tx_outputs,
+    };
+
+    let control_block = taproot_spend_info
+        .control_block(&(data_script.clone(), LeafVersion::TapScript))
+        .unwrap();
+
+    for input in &mut reveal_tx.input {
+        input.witness.push(data_script.to_bytes());
+        input.witness.push(control_block.serialize());
+    }
+
+    // return both transactions
+    Ok((commit_tx, reveal_tx))
 }
 
 /// Collects a specified amount of Bitcoin from the wallet.
@@ -527,11 +648,27 @@ pub enum LocalNodeError {
     #[error("error while calling an rpc endpoint of the local node")]
     RpcError(#[from] bitcoincore_rpc::Error),
 
+    #[error(
+        "error when reading environment variable {}: {}",
+        var_name,
+        internal_error
+    )]
+    EnvVarError {
+        var_name: String,
+        internal_error: std::env::VarError,
+    },
+
+    #[error("could not parse amount")]
+    InvalidAmount(#[from] ParseAmountError),
+
     #[error("the local bitcoin node must be running in the {0} network")]
     InvalidNetwork(Network, bitcoin::address::ParseError),
 
     #[error("could not encode transaction: {0}")]
     EncodeTransaction(String, bitcoin::consensus::encode::Error),
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
 
     #[error("internal error: {0}")]
     Internal(String),

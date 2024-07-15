@@ -1,5 +1,3 @@
-use thiserror::Error;
-
 use bitcoin::Amount;
 
 use crate::{
@@ -76,7 +74,7 @@ pub fn join_child(
     subnet_address: &bitcoin::Address,
     collateral: Amount,
     validator_data: &str,
-) -> Result<(), JoinChildError> {
+) -> Result<(), LocalNodeError> {
     let fee: Amount = Amount::from_sat(200);
 
     // Init RPC connection and wallet
@@ -84,27 +82,28 @@ pub fn join_child(
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _) = create_or_load_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
-    let (commit_tx, reveal_tx) =
-        write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address);
+    // let (commit_tx, reveal_tx) =
+    //     write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address);
 
-    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address);
+    // test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address);
+
+    let input_info = crate::bitcoin_utils::collect_amount(&rpc, collateral, fee).unwrap();
+    let change =
+        crate::bitcoin_utils::create_change_txout(&rpc, &input_info, collateral, fee).unwrap();
+
+    match crate::bitcoin_utils::create_transactions_with_arbitrary_data(
+        input_info,
+        change,
+        collateral,
+        fee,
+        subnet_address,
+        validator_data,
+    ) {
+        Ok((commit_tx, reveal_tx)) => {
+            test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)
+        }
+        Err(_) => {}
+    }
+
     Ok(())
-}
-
-#[derive(Error, Debug)]
-pub enum JoinChildError {
-    #[error("no child subnet with address `{0}` was found")]
-    SubnetNotFound(bitcoin::Address),
-
-    #[error("error when reading an environment variable")]
-    EnvVarError(#[from] std::env::VarError),
-
-    #[error(transparent)]
-    LocalNodeError(#[from] LocalNodeError),
-
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error>),
-
-    #[error("internal error")]
-    Internal,
 }
