@@ -1,0 +1,18 @@
+{
+    "name": "B",
+    "subnet_pk": "028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21",
+    "file_path": "BTC/B/B.json",
+    "url": "BTC/B",
+    "validators": [
+        {
+            "ip": "100.100.100.100",
+            "collateral": 1000
+        }
+    ],
+    "accounts": {
+        "dsadada": {
+            "balance": 1000
+        }
+    },
+    "child_subnets": []
+}

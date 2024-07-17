@@ -177,3 +177,36 @@ When the transactions get finalized on the bitcoin network (the local testnet), 
 ```
 transaction e84de140c011a77106859026bbf7e5ffd01f644d7922e453556adf54478ae991 at block height 106 contains the keyword 'IPC:JOIN'
 ```
+
+## Running the demo
+
+1. Make sure you have the bitcoind client and btc_monitor running.
+
+```sh
+bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001
+```
+
+```sh
+cargo run --bin btc_monitor
+```
+
+2. Run the l1_manager binary to interact with L1 IPC
+
+```sh
+cargo run --bin l1_manager
+```
+
+3. Generate a valid keypair for the subnet
+```sh
+cargo run --bin generate_keypair
+```
+
+3. Press 2 to create a child subnet, enter the name and subnet_pk (for now, this has to be a valid bitcoin pk) prompts.
+
+4. You can also press 3 to join a subnet, enter the prompts and watch the btc_monitor.
+
+5. Run the subnet_interactor binary to interact with a child subnet. Usually, the url is in the form of BTC/NAME if it is an L2 subnet.
+```sh
+cargo run --bin subnet_interactor -- --url <subnet_url> 
+```
+6. Interact with the subnet by calling the commands presented on the terminal.

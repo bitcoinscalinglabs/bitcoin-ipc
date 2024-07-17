@@ -1,5 +1,6 @@
 pub mod bitcoin_utils;
 pub mod ipc_lib;
+pub mod ipc_subnet_state;
 pub mod utils;
 
 use bitcoin::Network;

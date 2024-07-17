@@ -18,6 +18,10 @@ struct Args {
     /// Subnet collateral
     #[arg(short, long)]
     collateral: u64,
+
+    /// url
+    #[arg(short, long)]
+    url: String,
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,10 +30,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut validator_data = String::new();
 
     validator_data.push_str(bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
-    validator_data.push_str(&format!("IP:{}", args.ip));
+    validator_data.push_str(&format!("ip={}:", args.ip));
 
     let pubkey = bitcoin::secp256k1::PublicKey::from_str(&args.pk)?;
     let subnet_address = bitcoin_utils::get_address_from_public_key(pubkey, bitcoin_ipc::NETWORK);
+
+    validator_data.push_str(&format!("pk={}:", args.pk));
+    validator_data.push_str(&format!("collateral={}:", args.collateral));
+    validator_data.push_str(&format!("url={}", args.url));
 
     join_child(
         &subnet_address,
