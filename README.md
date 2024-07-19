@@ -118,65 +118,6 @@ This guide will walk you through the necessary steps needed to setup the environ
     </details>
 
 
-## Running the code
-
-1. Run the listener by executing
-
-```sh
-cargo run --bin btc_monitor
-```
-
-You can leave the listener running on the background or separate shell.
-
-2. Generate a bitcoin private/public keypair
-
-```sh
-cargo run --bin generate_keypair
-```
-
-The output will look like this:
-
-```
-private_key:
-tprv8ZgxMBicQKsPeMg7q6BrYrcJBvVcQ6tR6R5PUWGrgx3fyGg9R6N9MEhhHrpeSZ65FzHVL95LCEU8r4nu6nEHAeELd632W3mGHM1ZFsPVGYU
-public_key:
-028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21
-```
-
-3. Create a new IPC subnet
-```sh
-cargo run --bin create_child -- --name <name> --pk <subnetPK>
-```
-where `<name>` is the desired name for the new subnet and `<subnetPK>` is a valid bitcoin public key, such as the one in the output of `generate_keypair`.
-This binary will create the necessary bitcoin transactions and submit them to the local bitcoin node.
-
-<details>
-<summary>Example</summary>
-cargo run --bin create_child -- --name A --pk 028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21
-</details>
-<br/>
-
-When the transactions get finalized on the bitcoin network (the local testnet), the `btc_monitor` binary should detect them as IPC-related. You should see an output such as
-```
-transaction 8fd7027b33cbdaeeefd88b03effe8288a539c376240e167fe572551f785ff07f at block height 117 contains the keyword 'IPC:CREATE'
-```
-
-4. Join an existing IPC subnet
-```sh
-cargo run --bin join_child -- --ip <ip_address> --pk <subnetPK> --collateral <collateral>
-```
-
-Where `<ip_address>` is the ip address of the validator joining the sunet, `<subnetPK>` is a valid bitcoin public key that represents the subnet and `<collateral>`  is the collateral sent to the subnet address for joining the subnet specified in SATOSHI.
-<details>
-<summary>Example</summary>
-cargo run --bin join_child -- --ip 0.0.0.0 --pk 028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21 --collateral 1000
-</details>
-<br/>
-
-When the transactions get finalized on the bitcoin network (the local testnet), the `btc_monitor` binary should detect them as IPC-related. You should see an output such as
-```
-transaction e84de140c011a77106859026bbf7e5ffd01f644d7922e453556adf54478ae991 at block height 106 contains the keyword 'IPC:JOIN'
-```
 
 ## Running the demo
 
