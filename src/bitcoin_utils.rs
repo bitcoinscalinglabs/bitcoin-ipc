@@ -271,10 +271,7 @@ pub fn commit_arbitrary_data(
     data: &[u8],
     secp: &Secp256k1<All>,
 ) -> (Transaction, ScriptBuf, TaprootSpendInfo) {
-    let push_bytes: &PushBytes;
-    unsafe {
-        push_bytes = &*(data as *const [u8] as *const PushBytes);
-    }
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
     let script = Builder::new().push_slice(push_bytes).into_script();
 
     // this transaction can only be spent through the script path
@@ -515,4 +512,61 @@ pub fn write_arbitrary_data(
     let reveal_tx = reveal_arbitrary_data(commit_tx_outpoint, output, script, taproot_spend_info);
 
     (commit_tx, reveal_tx)
+}
+
+pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
+    unsafe { &*(data as *const [u8] as *const PushBytes) }
+}
+
+/// This function creates a checkpoint transaction that commits a checkpoint hash to the blockchain.
+/// The function creates a transaction that sends the checkpoint hash to an OP_RETURN output
+/// and returns the signed transaction.
+///
+/// # Arguments
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `fee` - The fee to pay for the transaction, of type `Amount`
+/// * `checkpoint_hash` - The checkpoint hash to commit, as a string
+///
+/// # Returns
+///
+/// * `Transaction` - A transaction that commits the checkpoint hash to the blockchain
+pub fn create_checkpoint_tx(rpc: &Client, fee: Amount, checkpoint_hash: String) -> Transaction {
+    let input_info = collect_amount(&rpc, Amount::from_sat(0), fee).unwrap();
+
+    let input_vec: Vec<TxIn> = input_info
+        .clone()
+        .into_iter()
+        .map(|input| TxIn {
+            previous_output: input,
+            script_sig: ScriptBuf::new(),
+            sequence: transaction::Sequence::MAX,
+            witness: Witness::default(),
+        })
+        .collect();
+
+    // TODO: All of this will need to be done by the multisig.
+    let change = create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee).unwrap();
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(checkpoint_hash.as_bytes());
+
+    let op_return_out = transaction::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(push_bytes),
+    };
+
+    let unsigned_tx = transaction::Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: input_vec,
+        output: vec![op_return_out, change],
+    };
+
+    let signed_raw_transaction = rpc
+        .sign_raw_transaction_with_wallet(&unsigned_tx, None, None)
+        .unwrap();
+    if !signed_raw_transaction.complete {
+        println!("{:#?}", signed_raw_transaction.errors);
+        panic!("Transaction couldn't be signed.")
+    }
+    signed_raw_transaction.transaction().unwrap()
 }

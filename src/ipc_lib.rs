@@ -3,7 +3,8 @@ use thiserror::Error;
 use bitcoin::Amount;
 
 use crate::{
-    bitcoin_utils::{init_rpc_client, init_wallet, test_and_submit, write_arbitrary_data},
+    bitcoin_utils::{self, init_rpc_client, init_wallet, test_and_submit, write_arbitrary_data},
+    ipc_state::IPCState,
     utils,
 };
 
@@ -88,11 +89,42 @@ pub fn join_child(
     Ok(())
 }
 
+pub fn submit_checkpoint(
+    checkpoint_hash: String,
+    subnet: IPCState,
+) -> Result<(), SubmitCheckpointError> {
+    let fee: Amount = Amount::from_sat(200);
+
+    // Init RPC connection and wallet
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
+    let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
+    let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
+
+    println!("Submitting checkpoint for subnet: {}", subnet.get_url());
+    let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(&rpc, fee, checkpoint_hash);
+
+    test_and_submit(&rpc, vec![checkpoint_tx], miner_address);
+
+    Ok(())
+}
+
 #[derive(Error, Debug)]
 pub enum JoinChildError {
     #[error("no child subnet with address `{0}` was found")]
     SubnetNotFound(bitcoin::Address),
 
+    #[error("error when reading an environment variable")]
+    EnvVarError(#[from] std::env::VarError),
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error("internal error")]
+    Internal,
+}
+
+#[derive(Error, Debug)]
+pub enum SubmitCheckpointError {
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
 

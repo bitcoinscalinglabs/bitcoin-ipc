@@ -1,9 +1,0 @@
-{
-    "name": "C",
-    "subnet_pk": "028cc08dacd6717da80a79f552197b23c61a2348c0aec6651d0150cf1512e53b21",
-    "file_path": "BTC/C/C.json",
-    "url": "BTC/C",
-    "required_number_of_validators": 1,
-    "required_collateral": 100,
-    "validators": []
-}

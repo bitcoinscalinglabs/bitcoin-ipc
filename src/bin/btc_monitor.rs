@@ -1,5 +1,6 @@
 use std::{thread, time::Duration};
 
+use bitcoin::script::Instruction;
 use bitcoin_ipc::{ipc_state::IPCState, utils};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -125,6 +126,25 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         println!("JOIN Command executed successfully");
                                     }
                                     _ => {}
+                                }
+                            }
+                        }
+                    }
+                    // Look for checkpoints
+                    for output in &tx.output {
+                        let script = &output.script_pubkey;
+                        let mut instructions = script.instructions();
+                        if let Some(Ok(Instruction::Op(
+                            bitcoin::blockdata::opcodes::all::OP_RETURN,
+                        ))) = instructions.next()
+                        {
+                            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
+                                if let Ok(data_str) = std::str::from_utf8(data.as_bytes()) {
+                                    if data_str.len() == 64 {
+                                        // TODO: Also look at the pubkey and signature to infer the subnet.
+                                        println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
+                                        println!("Checkpoint: {}", data_str);
+                                    }
                                 }
                             }
                         }
