@@ -71,7 +71,9 @@ impl L1Manager {
         bitcoin_ipc::ipc_lib::create_child(&subnet_address, &subnet_data)
             .expect("Failed to create child");
 
-        println!("Transaction for create child sent successfully, please wait for confirmation");
+        println!(
+            "Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation."
+        );
     }
 
     fn join_child(&self) {
@@ -126,7 +128,7 @@ impl L1Manager {
         )
         .expect("Failed to join child");
 
-        println!("Transaction for join child sent successfully, please wait for confirmation");
+        println!("Transaction to join a child subnet has been submited to bitcoin, please wait for confirmation.");
     }
 
     fn interactive_interface(&mut self) {
