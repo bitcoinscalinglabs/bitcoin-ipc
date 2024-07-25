@@ -1,10 +1,19 @@
 // subnet_interactor.rs
-use bitcoin_ipc::{ipc_state::IPCState, subnet_simulator::SubnetState};
+use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use clap::Parser;
 use std::io::{self};
 
+/// A SubnetInteractor is responsible for interacting with the given subnet,
+/// enabling the user of the subnet to use the functionality provided by the subnet.
+///
+/// This implementation uses a SubnetSimulator, instead of a distributed subnet.
+/// Hence, the SubnetInteractor simply calls the interface of the SubnetSimulator.
+/// It is implemented as a wrapper around a SubnetSimulator object.
+///
+/// In an implementation with a real distributed subnet, the SubnetInteractor
+/// must know how to contact each subnet validator.
 pub struct SubnetInteractor {
-    state: SubnetState,
+    subnet: SubnetSimulator,
 }
 
 #[derive(Parser, Debug)]
@@ -15,8 +24,12 @@ struct Args {
 }
 
 impl SubnetInteractor {
-    pub fn new(state: SubnetState) -> Self {
-        SubnetInteractor { state }
+    pub fn new(subnet_sim: SubnetSimulator) -> Self {
+        print!(
+            "Starting a Subnet Interactor for subnet {}",
+            subnet_sim.subnet_name
+        );
+        SubnetInteractor { subnet: subnet_sim }
     }
 
     pub fn interactive_interface(&mut self) {
@@ -42,7 +55,7 @@ impl SubnetInteractor {
                         .read_line(&mut address)
                         .expect("Failed to read account address");
 
-                    self.state.create_account(address.trim());
+                    self.subnet.create_account(address.trim());
                 }
                 "2" => {
                     let mut address = String::new();
@@ -60,7 +73,7 @@ impl SubnetInteractor {
 
                     let amount: u64 = amount.trim().parse().expect("Invalid balance amount");
 
-                    self.state.fund_account(address.trim(), amount);
+                    self.subnet.fund_account(address.trim(), amount);
                 }
                 "3" => {
                     let mut from = String::new();
@@ -84,16 +97,16 @@ impl SubnetInteractor {
 
                     let amount: u64 = amount.trim().parse().expect("Invalid amount");
 
-                    match self.state.transfer(from.trim(), to.trim(), amount) {
+                    match self.subnet.transfer(from.trim(), to.trim(), amount) {
                         Ok(_) => {}
                         Err(e) => println!("Transfer failed: {}", e),
                     }
                 }
                 "4" => {
-                    let checkpoint = self.state.get_checkpoint();
+                    let checkpoint = self.subnet.get_checkpoint();
                     println!("Checkpoint: {:?}", checkpoint);
                 }
-                "5" => self.state.print_state(),
+                "5" => self.subnet.print_state(),
                 "6" => break,
                 _ => println!("Invalid option. Please try again."),
             }
@@ -103,21 +116,11 @@ impl SubnetInteractor {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-
     let clone = args.url.clone();
-
     let subnet_name = clone.split('/').last().unwrap_or("");
 
-    let ipc_state = IPCState::load_state(args.url + "/" + subnet_name + ".json")?;
-
-    if !ipc_state.has_required_validators() {
-        println!("Not enough validators to interact with subnet");
-        return Ok(());
-    }
-
-    let subnet_state = SubnetState::new();
-
-    let mut interactor = SubnetInteractor::new(subnet_state);
+    let subnet = SubnetSimulator::new(subnet_name);
+    let mut interactor = SubnetInteractor::new(subnet);
 
     interactor.interactive_interface();
     Ok(())
