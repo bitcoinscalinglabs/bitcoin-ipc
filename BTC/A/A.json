@@ -8,7 +8,8 @@
     "validators": [
         {
             "ip": "1.1.1.1",
-            "name": "A1"
+            "name": "A1",
+            "pk": "MyPK"
         }
     ]
 }
