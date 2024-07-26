@@ -147,6 +147,7 @@ cargo run --bin generate_keypair
 5. You can also press 3 to join a subnet, enter the prompts and watch the btc_monitor.
 
 6. Run the subnet_interactor binary to interact with a child subnet.
+
 ```sh
 cargo run --bin subnet_interactor -- --subnet_name <subnet_name> 
 ```
@@ -156,6 +157,7 @@ cargo run --bin subnet_interactor -- --subnet_name <subnet_name>
 ```sh
 cargo run --bin relayer -- --subnet_name <subnet_name>
 ```
+
 ## Running the demo with 1 command
 
 ```sh
