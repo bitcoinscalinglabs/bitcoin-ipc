@@ -101,7 +101,15 @@ pub fn submit_checkpoint(
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
     println!("Submitting checkpoint for subnet: {}", subnet.get_url());
-    let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(&rpc, fee, checkpoint_hash);
+    let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(
+        &rpc,
+        fee,
+        checkpoint_hash,
+        subnet.get_subnet_address(),
+    );
+
+    // Transaction needs to be signed by subnetPK.
+    // Then sent.
 
     test_and_submit(&rpc, vec![checkpoint_tx], miner_address);
 

@@ -94,7 +94,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error:
                 .arg("-c")
                 .arg(format!(
                     "cargo run --bin subnet_interactor -- --url {}; exec bash",
-                    format!("{}/{}", bitcoin_ipc::L1_NAME, subnet_name)
+                    subnet_name
                 ))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())

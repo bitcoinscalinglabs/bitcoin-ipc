@@ -20,7 +20,7 @@ pub struct SubnetInteractor {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    url: String,
+    subnet_name: String,
 }
 
 impl SubnetInteractor {
@@ -116,10 +116,8 @@ impl SubnetInteractor {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let clone = args.url.clone();
-    let subnet_name = clone.split('/').last().unwrap_or("");
 
-    let subnet = SubnetSimulator::new(subnet_name);
+    let subnet = SubnetSimulator::new(&args.subnet_name);
     let mut interactor = SubnetInteractor::new(subnet);
 
     interactor.interactive_interface();

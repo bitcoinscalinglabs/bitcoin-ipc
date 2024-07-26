@@ -146,13 +146,16 @@ cargo run --bin generate_keypair
 
 5. You can also press 3 to join a subnet, enter the prompts and watch the btc_monitor.
 
-6. Run the subnet_interactor binary to interact with a child subnet. Usually, the url is in the form of BTC/NAME if it is an L2 subnet.
+6. Run the subnet_interactor binary to interact with a child subnet.
 ```sh
-cargo run --bin subnet_interactor -- --url <subnet_url> 
+cargo run --bin subnet_interactor -- --subnet_name <subnet_name> 
 ```
 7. Interact with the subnet by calling the commands presented on the terminal.
 
-
+8. Run a relayer that submits checkpoint transactions for a subnet periodically 
+```sh
+cargo run --bin relayer -- --subnet_name <subnet_name>
+```
 ## Running the demo with 1 command
 
 ```sh
@@ -162,3 +165,5 @@ cargo run
 This will run `bitcoind`, `btc_monitor`, the `l1_manager`, generate a key_pair and additionally, it will open a `subnet_interactor` terminal for every existing subnet that has the required number of validators.
 
 Additionally, when interacting with the `l1_manager`, if enough validators join a new subnet, upon transaction confirmation, a `subnet_interactor` for that subnet will be opened.
+
+Launch a relayer manually by following step 8. to checkpoint a certain subnet state on the L1.

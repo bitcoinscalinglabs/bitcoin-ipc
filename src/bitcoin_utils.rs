@@ -200,6 +200,7 @@ pub fn create_change_txout(
     input_info: &Vec<OutPoint>,
     amount_to_send: Amount,
     fee: Amount,
+    change_address: Option<Address>,
 ) -> Result<TxOut, Box<dyn std::error::Error>> {
     let mut input_total_value = 0;
 
@@ -213,8 +214,15 @@ pub fn create_change_txout(
 
     let change_amount = input_total_value - amount_to_send.to_sat() - fee.to_sat();
 
-    let change_address = rpc.get_new_address(None, None)?;
-    let change_script_pubkey = change_address.assume_checked().script_pubkey();
+    let change_address_unwrapped: Address;
+
+    if !change_address.is_some() {
+        change_address_unwrapped = rpc.get_new_address(None, None)?.assume_checked();
+    } else {
+        change_address_unwrapped = change_address.unwrap();
+    }
+
+    let change_script_pubkey = change_address_unwrapped.script_pubkey();
     Ok(TxOut {
         value: Amount::from_sat(change_amount),
         script_pubkey: change_script_pubkey,
@@ -234,15 +242,18 @@ pub fn create_change_txout(
 /// # Returns
 ///
 /// * `Transaction` - A signed transaction
-pub fn sign_transaction_safe(rpc: &Client, unsigned_tx: Transaction) -> Transaction {
+pub fn sign_transaction_safe(
+    rpc: &Client,
+    unsigned_tx: Transaction,
+) -> Result<Transaction, Box<dyn std::error::Error>> {
     let signed_raw_transaction = rpc
         .sign_raw_transaction_with_wallet(&unsigned_tx, None, None)
         .unwrap();
     if !signed_raw_transaction.complete {
         println!("{:#?}", signed_raw_transaction.errors);
-        panic!("Transaction couldn't be signed.")
+        Err("Transaction could not be signed")?
     }
-    signed_raw_transaction.transaction().unwrap()
+    Ok(signed_raw_transaction.transaction().unwrap())
 }
 
 /// Commits arbitrary data to the blockchain.
@@ -313,7 +324,7 @@ pub fn commit_arbitrary_data(
     };
 
     (
-        sign_transaction_safe(rpc, unsigned_tx),
+        sign_transaction_safe(rpc, unsigned_tx).unwrap(),
         script,
         taproot_spend_info,
     )
@@ -484,7 +495,7 @@ pub fn write_arbitrary_data(
 ) -> (Transaction, Transaction) {
     let input_info = collect_amount(&rpc, amount_to_send, fee).unwrap();
 
-    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee).unwrap();
+    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee, None).unwrap();
 
     let secp = Secp256k1::new();
 
@@ -530,7 +541,12 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 /// # Returns
 ///
 /// * `Transaction` - A transaction that commits the checkpoint hash to the blockchain
-pub fn create_checkpoint_tx(rpc: &Client, fee: Amount, checkpoint_hash: String) -> Transaction {
+pub fn create_checkpoint_tx(
+    rpc: &Client,
+    fee: Amount,
+    checkpoint_hash: String,
+    subnet_address: Address,
+) -> Transaction {
     let input_info = collect_amount(&rpc, Amount::from_sat(0), fee).unwrap();
 
     let input_vec: Vec<TxIn> = input_info
@@ -545,7 +561,14 @@ pub fn create_checkpoint_tx(rpc: &Client, fee: Amount, checkpoint_hash: String) 
         .collect();
 
     // TODO: All of this will need to be done by the multisig.
-    let change = create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee).unwrap();
+    let change = create_change_txout(
+        &rpc,
+        &input_info,
+        Amount::from_sat(0),
+        fee,
+        Some(subnet_address),
+    )
+    .unwrap();
 
     let push_bytes: &PushBytes = convert_bytes_to_push_bytes(checkpoint_hash.as_bytes());
 
@@ -561,12 +584,6 @@ pub fn create_checkpoint_tx(rpc: &Client, fee: Amount, checkpoint_hash: String) 
         output: vec![op_return_out, change],
     };
 
-    let signed_raw_transaction = rpc
-        .sign_raw_transaction_with_wallet(&unsigned_tx, None, None)
-        .unwrap();
-    if !signed_raw_transaction.complete {
-        println!("{:#?}", signed_raw_transaction.errors);
-        panic!("Transaction couldn't be signed.")
-    }
-    signed_raw_transaction.transaction().unwrap()
+    // We don't need a signed transaction, the multisig will sign it.
+    sign_transaction_safe(rpc, unsigned_tx).unwrap()
 }

@@ -60,7 +60,6 @@ fn main() {
     subnets.iter().for_each(|subnet| {
         if subnet.has_required_validators() {
             let subnet_name = subnet.get_name().clone();
-            let l1_name = bitcoin_ipc::L1_NAME.to_string();
             let _subnet_interactor_handle = thread::spawn(move || {
                 Command::new("gnome-terminal")
                     .arg(format!("--title=subnet_interactor {}", subnet_name))
@@ -69,7 +68,7 @@ fn main() {
                     .arg("-c")
                     .arg(format!(
                         "cargo run --bin subnet_interactor -- --url {}; exec bash",
-                        format!("{}/{}", l1_name, subnet_name)
+                        subnet_name
                     ))
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
