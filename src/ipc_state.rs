@@ -1,12 +1,18 @@
+use bitcoin::address::NetworkChecked;
+use bitcoin::Address;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::str::FromStr;
+
+use crate::bitcoin_utils;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorData {
     pub name: String,
     pub ip: String,
+    pub pk: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,13 +77,14 @@ impl IPCState {
         return json;
     }
 
-    pub fn add_validator(&mut self, ip: String, name: String) {
+    pub fn add_validator(&mut self, ip: String, name: String, pk: String) {
         self.validators.push(ValidatorData {
             ip: ip.clone(),
-            name,
+            name: name.clone(),
+            pk: pk.clone(),
         });
         self.save_state();
-        println!("Validator {} added", ip);
+        println!("Validator {} {} {} added", ip, name, pk);
     }
 
     pub fn has_required_validators(&self) -> bool {
@@ -86,6 +93,16 @@ impl IPCState {
 
     pub fn get_required_collateral(&self) -> u64 {
         self.required_collateral
+    }
+
+    pub fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    pub fn get_subnet_address(&self) -> Address<NetworkChecked> {
+        let pubkey =
+            bitcoin::secp256k1::PublicKey::from_str(&self.subnet_pk).expect("Invalid public key");
+        bitcoin_utils::get_address_from_public_key(pubkey, crate::NETWORK)
     }
 
     pub fn load_all() -> Result<Vec<Self>, Box<dyn std::error::Error>> {
@@ -120,7 +137,7 @@ impl IPCState {
         // print in a more organized manner:
         println!("Subnet: {}", self.name);
         println!("URL: {}", self.url);
-        println!("Subnet PK: {}", self.subnet_pk);
+        println!("Subnet PK: {}", self.subnet_pk.clone());
         println!(
             "Required number of validators: {}",
             self.required_number_of_validators
@@ -128,7 +145,10 @@ impl IPCState {
         println!("Required collateral: {}", self.required_collateral);
         println!("Validators:");
         for validator in &self.validators {
-            println!("  IP: {}, name: {}", validator.ip, validator.name);
+            println!(
+                "  IP: {}, name: {}, pk: {}",
+                validator.ip, validator.name, validator.pk
+            );
         }
     }
 }

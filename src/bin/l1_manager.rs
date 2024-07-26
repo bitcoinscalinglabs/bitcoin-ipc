@@ -55,16 +55,22 @@ impl L1Manager {
 
         let mut subnet_data = String::new();
         subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
-        subnet_data.push_str(&format!(":name={}:", name));
+        subnet_data.push_str(&format!(
+            "{}name={}{}",
+            bitcoin_ipc::DELIMITER,
+            name,
+            bitcoin_ipc::DELIMITER
+        ));
 
         let pubkey = bitcoin::secp256k1::PublicKey::from_str(pk).expect("Invalid public key");
         let subnet_address =
             bitcoin_utils::get_address_from_public_key(pubkey, bitcoin_ipc::NETWORK);
 
-        subnet_data.push_str(&format!("pk={}:", pk));
+        subnet_data.push_str(&format!("pk={}{}", pk, bitcoin_ipc::DELIMITER));
         subnet_data.push_str(&format!(
-            "required_number_of_validators={}:",
-            required_number_of_validators
+            "required_number_of_validators={}{}",
+            required_number_of_validators,
+            bitcoin_ipc::DELIMITER
         ));
         subnet_data.push_str(&format!("required_collateral={}", required_collateral));
 
@@ -79,50 +85,79 @@ impl L1Manager {
     fn join_child(&self) {
         let mut ip = String::new();
         let mut pk = String::new();
-        let mut name = String::new();
+        let mut username = String::new();
 
-        println!("Enter IP address:");
+        let subnets = IPCState::load_all().expect("Failed to load subnets");
+
+        let available_subnets: Vec<&IPCState> = subnets
+            .iter()
+            .filter(|subnet| !subnet.has_required_validators())
+            .collect();
+
+        if available_subnets.is_empty() {
+            println!("No subnets exist or all subnets have the required number of validators");
+            return;
+        }
+
+        println!("Pick a subnet to join: ");
+
+        available_subnets
+            .iter()
+            .enumerate()
+            .for_each(|(index, subnet)| println!("{}. {}", index + 1, subnet.get_name()));
+
+        println!("Subnets len {}", available_subnets.len());
+        println!("isempty {}", available_subnets.is_empty());
+
+        let mut choice = String::new();
+
+        io::stdin()
+            .read_line(&mut choice)
+            .expect("Failed to read choice");
+
+        let choice: usize = choice.trim().parse().expect("Invalid choice");
+
+        if choice < 1 || choice > subnets.len() {
+            println!("Invalid choice");
+            return;
+        }
+
+        let ipc_state = &subnets[choice - 1];
+
+        println!("Enter your IP address:");
         io::stdin()
             .read_line(&mut ip)
             .expect("Failed to read IP address");
 
-        println!("Enter public key:");
+        println!("Enter your public key:");
         io::stdin()
             .read_line(&mut pk)
             .expect("Failed to read public key");
 
-        println!("Enter subnet name:");
+        println!("Enter your username:");
         io::stdin()
-            .read_line(&mut name)
-            .expect("Failed to read subnet name");
+            .read_line(&mut username)
+            .expect("Failed to read username");
 
         let ip = ip.trim();
         let pk = pk.trim();
-        let name = name.trim();
+        let username = username.trim();
 
         let mut validator_data = String::new();
         validator_data.push_str(bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
-        validator_data.push_str(&format!(":ip={}:", ip));
+        validator_data.push_str(&format!(
+            "{}ip={}{}",
+            bitcoin_ipc::DELIMITER,
+            ip,
+            bitcoin_ipc::DELIMITER
+        ));
 
-        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&pk).expect("Invalid public key");
-        let subnet_address =
-            bitcoin_utils::get_address_from_public_key(pubkey, bitcoin_ipc::NETWORK);
-
-        validator_data.push_str(&format!("pk={}:", pk));
-        validator_data.push_str(&format!("name={}", name));
-
-        let ipc_state = IPCState::load_state(format!(
-            "{}/{}/{}.json",
-            bitcoin_ipc::L1_NAME,
-            name.to_string(),
-            name.to_string()
-        ))
-        .expect("Failed to load state");
-
-        println!("{}", validator_data);
+        validator_data.push_str(&format!("pk={}{}", pk, bitcoin_ipc::DELIMITER));
+        validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
+        validator_data.push_str(&format!("subnet_name={}", ipc_state.get_name()));
 
         bitcoin_ipc::ipc_lib::join_child(
-            &subnet_address,
+            &ipc_state.get_subnet_address(),
             Amount::from_sat(ipc_state.get_required_collateral()),
             &validator_data,
         )

@@ -1,0 +1,3 @@
+This folder contains all the subnet states.
+
+The hierarchy starts from BTC as the root and for every subnet there is a folder with the name of the subnet and a json file with the name of the subnet.
