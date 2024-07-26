@@ -109,10 +109,6 @@ impl IPCState {
         bitcoin_utils::get_address_from_public_key(pubkey, crate::NETWORK)
     }
 
-    pub fn get_url(&self) -> String {
-        self.url.clone()
-    }
-
     pub fn load_all() -> Result<Vec<Self>, Box<dyn std::error::Error>> {
         let mut ipc_states = Vec::new();
         let btc_dir = Path::new("BTC");
