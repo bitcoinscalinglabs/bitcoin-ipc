@@ -8,7 +8,7 @@ fn checkpoint(subnet_name: String) {
     loop {
         let subnet = IPCState::load_state(format!(
             "{}/{}/{}.json",
-            bitcoin_ipc::NETWORK,
+            bitcoin_ipc::L1_NAME,
             subnet_name,
             subnet_name
         ))
@@ -18,7 +18,7 @@ fn checkpoint(subnet_name: String) {
             let mut simulator = SubnetSimulator::new(&subnet_name);
             let hash = simulator.get_checkpoint();
 
-            if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone()) {
+            if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator) {
                 println!("Checkpoint for {} submitted successfully", subnet.get_url());
             }
         } else {

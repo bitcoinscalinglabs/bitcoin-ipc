@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::script::Instruction;
-use bitcoin_ipc::{ipc_state::IPCState, utils};
+use bitcoin::{script::Instruction, PublicKey};
+use bitcoin_ipc::{ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
@@ -17,7 +17,7 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::erro
         Err("Invalid input format")?;
     }
     let name = parts[1].strip_prefix("name=").unwrap_or("");
-    let pk = parts[2].strip_prefix("pk=").unwrap_or("");
+    let subnet_address = parts[2].strip_prefix("subnet_address=").unwrap_or("");
     let required_number_of_validators: u64 = parts[3]
         .strip_prefix("required_number_of_validators=")
         .unwrap_or("")
@@ -32,7 +32,7 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::erro
         .expect("Invalid collateral amount");
 
     if name.is_empty()
-        || pk.is_empty()
+        || subnet_address.is_empty()
         || required_number_of_validators == 0
         || required_collateral == 0
     {
@@ -43,7 +43,7 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::erro
     let ipc_subnet_state = IPCState::new(
         name.to_string(),
         format!("{}/{}", bitcoin_ipc::L1_NAME, name.to_string()),
-        pk.to_string(),
+        subnet_address.to_string(),
         required_number_of_validators,
         required_collateral,
     );
@@ -93,7 +93,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error:
                 .arg("bash")
                 .arg("-c")
                 .arg(format!(
-                    "cargo run --bin subnet_interactor -- --url {}; exec bash",
+                    "cargo run --bin subnet_interactor -- --subnet-name {}; exec bash",
                     subnet_name
                 ))
                 .stdout(Stdio::inherit())
@@ -150,8 +150,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for witness in input.witness.iter() {
                             let witness_str = find_valid_utf8(&witness[..]);
 
-                            println!("Witness: {:?}", witness_str);
-
                             match () {
                                 _ if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) => {
                                     println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
@@ -182,9 +180,27 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
                                 if let Ok(data_str) = std::str::from_utf8(data.as_bytes()) {
                                     if data_str.len() == 64 {
-                                        // TODO: Also look at the pubkey and signature to infer the subnet.
-                                        println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
-                                        println!("Checkpoint: {}", data_str);
+                                        let pubkey = &tx.input[0].witness[1];
+
+                                        let pubkey = PublicKey::from_slice(pubkey)?;
+                                        let subnets = IPCState::load_all()?;
+
+                                        for subnet in subnets {
+                                            let simulator =
+                                                SubnetSimulator::new(&subnet.get_name());
+                                            let compare_pubkey = PublicKey::from_slice(
+                                                &simulator.get_public_key().serialize(),
+                                            )?;
+                                            if compare_pubkey == pubkey {
+                                                println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
+                                                println!(
+                                                    "Checkpoint for subnet: {} {}",
+                                                    subnet.get_name(),
+                                                    subnet.get_subnet_address()
+                                                );
+                                                println!("Checkpoint: {}", data_str);
+                                            }
+                                        }
                                     }
                                 }
                             }

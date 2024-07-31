@@ -1,9 +1,8 @@
 use bitcoin::Amount;
 use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::ipc_state::IPCState;
-
-use std::io::{self};
-use std::str::FromStr;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 
 struct L1Manager {
     subnets: Vec<IPCState>,
@@ -16,9 +15,32 @@ impl L1Manager {
         L1Manager { subnets }
     }
 
+    fn store_keypair(&self, keypair: &bitcoin::secp256k1::Keypair, name: &str) {
+        let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
+            println!("Failed to serialize keypair");
+            "".to_string()
+        });
+
+        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, name);
+        let path = std::path::Path::new(file_path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("Failed to create directories");
+        }
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)
+            .expect("Failed to open state file");
+
+        file.write_all(serialized.as_bytes())
+            .expect("Failed to write state to file");
+    }
+
     fn create_child(&self) {
         let mut name = String::new();
-        let mut pk = String::new();
         let mut required_number_of_validators = String::new();
         let mut required_collateral = String::new();
 
@@ -26,11 +48,6 @@ impl L1Manager {
         io::stdin()
             .read_line(&mut name)
             .expect("Failed to read subnet name");
-
-        println!("Enter public key:");
-        io::stdin()
-            .read_line(&mut pk)
-            .expect("Failed to read public key");
 
         println!("Enter required number of validators:");
         io::stdin()
@@ -43,7 +60,6 @@ impl L1Manager {
             .expect("Failed to read required collateral");
 
         let name = name.trim();
-        let pk = pk.trim();
         let required_number_of_validators: u64 = required_number_of_validators
             .trim()
             .parse()
@@ -62,11 +78,20 @@ impl L1Manager {
             bitcoin_ipc::DELIMITER
         ));
 
-        let pubkey = bitcoin::secp256k1::PublicKey::from_str(pk).expect("Invalid public key");
-        let subnet_address =
-            bitcoin_utils::get_address_from_public_key(pubkey, bitcoin_ipc::NETWORK);
+        let key_pair = bitcoin_utils::generate_keypair(name.to_string());
 
-        subnet_data.push_str(&format!("pk={}{}", pk, bitcoin_ipc::DELIMITER));
+        self.store_keypair(&key_pair, name);
+
+        let subnet_address = bitcoin_utils::get_address_from_private_key(
+            key_pair.secret_key(),
+            bitcoin_ipc::NETWORK,
+        );
+
+        subnet_data.push_str(&format!(
+            "subnet_address={}{}",
+            subnet_address.to_string(),
+            bitcoin_ipc::DELIMITER
+        ));
         subnet_data.push_str(&format!(
             "required_number_of_validators={}{}",
             required_number_of_validators,
@@ -106,9 +131,6 @@ impl L1Manager {
             .enumerate()
             .for_each(|(index, subnet)| println!("{}. {}", index + 1, subnet.get_name()));
 
-        println!("Subnets len {}", available_subnets.len());
-        println!("isempty {}", available_subnets.is_empty());
-
         let mut choice = String::new();
 
         io::stdin()
@@ -117,12 +139,12 @@ impl L1Manager {
 
         let choice: usize = choice.trim().parse().expect("Invalid choice");
 
-        if choice < 1 || choice > subnets.len() {
+        if choice < 1 || choice > available_subnets.len() {
             println!("Invalid choice");
             return;
         }
 
-        let ipc_state = &subnets[choice - 1];
+        let ipc_state = &available_subnets[choice - 1];
 
         println!("Enter your IP address:");
         io::stdin()

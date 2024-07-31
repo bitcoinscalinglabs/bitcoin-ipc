@@ -149,13 +149,13 @@ cargo run --bin generate_keypair
 6. Run the subnet_interactor binary to interact with a child subnet.
 
 ```sh
-cargo run --bin subnet_interactor -- --subnet_name <subnet_name> 
+cargo run --bin subnet_interactor -- --subnet-name <subnet_name> 
 ```
 7. Interact with the subnet by calling the commands presented on the terminal.
 
 8. Run a relayer that submits checkpoint transactions for a subnet periodically 
 ```sh
-cargo run --bin relayer -- --subnet_name <subnet_name>
+cargo run --bin relayer -- --subnet-name <subnet_name>
 ```
 
 ## Running the demo with 1 command

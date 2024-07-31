@@ -5,6 +5,7 @@ use bitcoin::Amount;
 use crate::{
     bitcoin_utils::{self, init_rpc_client, init_wallet, test_and_submit, write_arbitrary_data},
     ipc_state::IPCState,
+    subnet_simulator::SubnetSimulator,
     utils,
 };
 
@@ -89,9 +90,21 @@ pub fn join_child(
     Ok(())
 }
 
+/// Submits a checkpoint of a subnet represented by IPCState and SubnetSimulator to the Bitcoin network.
+///
+/// This function creates a Bitcoin transaction that includes a checkpoint hash in an OP_RETURN output
+/// This transaction gets signed by the subnetPK and the signature is added to the witness of the inputs
+/// The transaction is then submitted to the Bitcoin network.
+///
+/// # Arguments
+///
+/// * `checkpoint_hash` - A string representing the hash of the checkpoint to be submitted.
+/// * `ipc_state` - An instance of IPCState representing the state of the subnet.
+/// * `simulator` - An instance of SubnetSimulator representing the state of the subnet.
 pub fn submit_checkpoint(
     checkpoint_hash: String,
-    subnet: IPCState,
+    ipc_state: IPCState,
+    simulator: SubnetSimulator,
 ) -> Result<(), SubmitCheckpointError> {
     let fee: Amount = Amount::from_sat(200);
 
@@ -100,18 +113,20 @@ pub fn submit_checkpoint(
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
-    println!("Submitting checkpoint for subnet: {}", subnet.get_url());
+    println!("Submitting checkpoint for subnet: {}", ipc_state.get_url());
     let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(
         &rpc,
         fee,
         checkpoint_hash,
-        subnet.get_subnet_address(),
+        simulator.get_public_key().into(),
     );
 
-    // Transaction needs to be signed by subnetPK.
-    // Then sent.
+    let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone());
 
-    test_and_submit(&rpc, vec![checkpoint_tx], miner_address);
+    // sign transaction with the subnetPK - the keypair of the subnet
+    let signed_transaction = simulator.sign_transaction(checkpoint_tx.clone(), prevouts);
+
+    test_and_submit(&rpc, vec![signed_transaction], miner_address);
 
     Ok(())
 }

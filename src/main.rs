@@ -67,7 +67,7 @@ fn main() {
                     .arg("bash")
                     .arg("-c")
                     .arg(format!(
-                        "cargo run --bin subnet_interactor -- --url {}; exec bash",
+                        "cargo run --bin subnet_interactor -- --subnet-name {}; exec bash",
                         subnet_name
                     ))
                     .stdout(Stdio::inherit())
