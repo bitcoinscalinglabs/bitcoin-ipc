@@ -6,10 +6,10 @@ use bitcoin_ipc::ipc_state::IPCState;
 fn main() {
     // Step 1: Run bitcoind in a new terminal
     let _bitcoind_handle = thread::spawn(|| {
-        Command::new("gnome-terminal")
-            .arg("--title=bitcoind")
-            .arg("--")
-            .arg("bash")
+        Command::new("sh")
+            // .arg("--title=bitcoind")
+            // .arg("--")
+            // .arg("bash")
             .arg("-c")
             .arg("bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001; exec bash")
             .stdout(Stdio::inherit())
@@ -23,10 +23,10 @@ fn main() {
 
     // Step 2: Run btc_monitor in a new terminal
     let _btc_monitor_handle = thread::spawn(|| {
-        Command::new("gnome-terminal")
-            .arg("--title=btc_monitor")
-            .arg("--")
-            .arg("bash")
+        Command::new("sh")
+            // .arg("--title=btc_monitor")
+            // .arg("--")
+            // .arg("bash")
             .arg("-c")
             .arg("cargo run --bin btc_monitor; exec bash")
             .stdout(Stdio::inherit())
@@ -40,10 +40,10 @@ fn main() {
 
     // Step 3: Run l1_manager in a new terminal
     let _l1_manager_handle = thread::spawn(|| {
-        Command::new("gnome-terminal")
-            .arg("--title=l1_manager")
-            .arg("--")
-            .arg("bash")
+        Command::new("sh")
+            // .arg("--title=l1_manager")
+            // .arg("--")
+            // .arg("bash")
             .arg("-c")
             .arg("cargo run --bin l1_manager; exec bash")
             .stdout(Stdio::inherit())
@@ -62,10 +62,10 @@ fn main() {
             let subnet_name = subnet.get_name().clone();
             let l1_name = bitcoin_ipc::L1_NAME.to_string();
             let _subnet_interactor_handle = thread::spawn(move || {
-                Command::new("gnome-terminal")
-                    .arg(format!("--title=subnet_interactor {}", subnet_name))
-                    .arg("--")
-                    .arg("bash")
+                Command::new("sh")
+                    // .arg(format!("--title=subnet_interactor {}", subnet_name))
+                    // .arg("--")
+                    // .arg("bash")
                     .arg("-c")
                     .arg(format!(
                         "cargo run --bin subnet_interactor -- --url {}; exec bash",
@@ -84,10 +84,10 @@ fn main() {
 
     // Step 4: Generate a keypair for the subnet
     let _generate_keypair_handle = thread::spawn(|| {
-        Command::new("gnome-terminal")
-            .arg("--title=generate_keypair")
-            .arg("--")
-            .arg("bash")
+        Command::new("sh")
+            // .arg("--title=generate_keypair")
+            // .arg("--")
+            // .arg("bash")
             .arg("-c")
             .arg("cargo run --bin generate_keypair; exec bash")
             .stdout(Stdio::inherit())
