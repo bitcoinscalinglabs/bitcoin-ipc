@@ -22,10 +22,7 @@ impl L1Manager {
         let mut required_number_of_validators = String::new();
         let mut required_collateral = String::new();
 
-        println!("Enter subnet name:");
-        io::stdin()
-            .read_line(&mut name)
-            .expect("Failed to read subnet name");
+        get_user_input(&mut name);
 
         println!("Enter public key:");
         io::stdin()
@@ -192,6 +189,15 @@ impl L1Manager {
                 _ => println!("Invalid option. Please try again."),
             }
         }
+    }
+}
+
+fn get_user_input(prompt: &String) -> Option<String> {
+    println!("{}", prompt);
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => Some(input),
+        Err(_) => None,
     }
 }
 

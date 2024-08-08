@@ -27,10 +27,7 @@ use crate::{
 /// This function returns a `Result`:
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(Box<dyn std::error::Error>)` - If an error occurs during the process.
-pub fn create_child(
-    subnet_address: &bitcoin::Address,
-    subnet_data: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn create_child(subnet_address: &bitcoin::Address, subnet_data: &str) -> Result<(), Error> {
     println!("{:?}", subnet_data);
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
@@ -73,7 +70,7 @@ pub fn join_child(
     subnet_address: &bitcoin::Address,
     collateral: Amount,
     validator_data: &str,
-) -> Result<(), JoinChildError> {
+) -> Result<(), Error> {
     let fee: Amount = Amount::from_sat(200);
 
     // Init RPC connection and wallet
@@ -89,12 +86,21 @@ pub fn join_child(
 }
 
 #[derive(Error, Debug)]
-pub enum JoinChildError {
+pub enum Error {
     #[error("no child subnet with address `{0}` was found")]
     SubnetNotFound(bitcoin::Address),
 
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
+
+    #[error("error when trying to connect to the bitcoin full node over")]
+    RpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("error when trying to init a wallet")]
+    InitiWalletError(#[from] crate::bitcoin_utils::InitWalletError),
+
+    #[error("cannot parse the given amount")]
+    AmountError(#[from] bitcoin::amount::ParseAmountError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),

@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
@@ -49,7 +51,7 @@ pub fn init_rpc_client(
     rpc_user: String,
     rpc_pass: String,
     rpc_url: String,
-) -> Result<Client, Box<dyn std::error::Error>> {
+) -> Result<Client, bitcoincore_rpc::Error> {
     let rpc = Client::new(&rpc_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
 }
@@ -71,7 +73,7 @@ pub fn init_wallet(
     rpc: &Client,
     network: Network,
     wallet: &String,
-) -> Result<(Address, Option<Transaction>, u32), Box<dyn std::error::Error>> {
+) -> Result<(Address, Option<Transaction>, u32), InitWalletError> {
     let random_number = rand::random::<usize>().to_string();
     let random_label = random_number.as_str();
 
@@ -86,27 +88,41 @@ pub fn init_wallet(
     let mut coinbase_tx = None;
 
     let address = rpc
-        .get_new_address(Some(random_label), None)
-        .unwrap()
+        .get_new_address(Some(random_label), None)?
         .require_network(network)?;
 
     if created_wallet {
         rpc.generate_to_address(101, &address)?;
 
         let coinbase_txid = rpc
-            .list_transactions(Some(random_label), Some(101), Some(100), None)
-            .unwrap()[0]
+            .list_transactions(Some(random_label), Some(101), Some(100), None)?
+            .get(0)
+            .ok_or(InitWalletError::Internal)?
             .info
             .txid;
 
-        coinbase_tx = Some(
-            rpc.get_transaction(&coinbase_txid, None)
-                .unwrap()
-                .transaction()?,
-        );
+        coinbase_tx = Some(rpc.get_transaction(&coinbase_txid, None)?.transaction()?);
     }
 
     Ok((address, coinbase_tx, 0))
+}
+
+#[derive(Error, Debug)]
+pub enum InitWalletError {
+    #[error("cannot connect to the bitcoin node")]
+    CannotConnectToBitcoinNode(#[from] bitcoincore_rpc::Error),
+
+    #[error("tried to create a wallet on an invalid or non-existing network")]
+    InvalidNetwork(#[from] bitcoin::address::ParseError),
+
+    #[error("cannot parse a transactin")]
+    CannotDecodeTransaction(#[from] bitcoin::consensus::encode::Error),
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error("internal error")]
+    Internal,
 }
 
 /// This function tests and submits a set of transactions to the Bitcoin network.
