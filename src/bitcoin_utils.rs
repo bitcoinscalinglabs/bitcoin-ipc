@@ -1,3 +1,5 @@
+use std::vec;
+
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
@@ -11,7 +13,8 @@ use bitcoin::{
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, XOnlyPublicKey,
 };
-use bitcoin::{CompressedPublicKey, PrivateKey, PublicKey};
+// use bitcoin::{CompressedPublicKey, PrivateKey, PublicKey};
+use bitcoin::PublicKey;
 use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
 use hex::encode;
 use tiny_keccak::{Hasher, Keccak};
@@ -204,7 +207,7 @@ pub fn create_change_txout(
     input_info: &Vec<OutPoint>,
     amount_to_send: Amount,
     fee: Amount,
-    pubkey: Option<PublicKey>,
+    keypair: Option<Keypair>,
 ) -> Result<TxOut, Box<dyn std::error::Error>> {
     let mut input_total_value = 0;
 
@@ -220,15 +223,21 @@ pub fn create_change_txout(
 
     let script_pub_key: ScriptBuf;
 
-    if !pubkey.is_some() {
+    if !keypair.is_some() {
         script_pub_key = rpc
             .get_new_address(None, None)?
             .assume_checked()
             .script_pubkey();
     } else {
-        let wpkh = pubkey.unwrap().wpubkey_hash().expect("key is compressed");
+        // let wpkh = pubkey.unwrap().wpubkey_hash().expect("key is compressed");
 
-        script_pub_key = ScriptBuf::new_p2wpkh(&wpkh);
+        // script_pub_key = ScriptBuf::new_p2wpkh(&wpkh);
+
+        script_pub_key = ScriptBuf::new_p2tr(
+            &Secp256k1::new(),
+            keypair.unwrap().x_only_public_key().0,
+            None,
+        );
     }
     Ok(TxOut {
         value: Amount::from_sat(change_amount),
@@ -414,7 +423,7 @@ pub fn collect_amount(
     fee: Amount,
     pubkey: PublicKey,
 ) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
-    let desc = format!("wpkh({})", pubkey);
+    let desc = format!("tr({})", pubkey);
 
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
 
@@ -436,14 +445,18 @@ pub fn collect_amount(
 /// # Returns
 /// * `Address` - A P2WPKH Bitcoin address for the specified network.
 pub fn get_address_from_private_key(sk: SecretKey, network: Network) -> Address {
-    Address::p2wpkh(
-        &CompressedPublicKey::from_private_key(
-            &Secp256k1::new(),
-            &PrivateKey::new(sk, crate::NETWORK),
-        )
-        .unwrap(),
-        network,
-    )
+    // Address::p2wpkh(
+    //     &CompressedPublicKey::from_private_key(
+    //         &Secp256k1::new(),
+    //         &PrivateKey::new(sk, crate::NETWORK),
+    //     )
+    //     .unwrap(),
+    //     network,
+    // )
+
+    let secp = Secp256k1::new();
+
+    Address::p2tr(&secp, sk.x_only_public_key(&secp).0, None, network)
 }
 
 /// This function reveals arbitrary data that was previously committed to the blockchain
@@ -568,10 +581,12 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 pub fn create_checkpoint_tx(
     rpc: &Client,
     fee: Amount,
-    checkpoint_hash: String,
-    pubkey: PublicKey,
+    subnet_name: String,
+    checkpoint_hash: [u8; 32],
+    keypair: Keypair,
 ) -> Transaction {
-    let input_info = collect_amount(&rpc, Amount::from_sat(0), fee, pubkey).unwrap();
+    let input_info =
+        collect_amount(&rpc, Amount::from_sat(0), fee, keypair.public_key().into()).unwrap();
 
     let input_vec: Vec<TxIn> = input_info
         .clone()
@@ -585,9 +600,13 @@ pub fn create_checkpoint_tx(
         .collect();
 
     let change =
-        create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(pubkey)).unwrap();
+        create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(keypair)).unwrap();
 
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(checkpoint_hash.as_bytes());
+    let data = format!("n={}{}cp=", subnet_name, crate::DELIMITER);
+
+    let data_bytes = vec![data.as_bytes(), &checkpoint_hash].concat();
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&data_bytes);
 
     let op_return_out = transaction::TxOut {
         value: Amount::ZERO,
@@ -605,21 +624,21 @@ pub fn create_checkpoint_tx(
     unsigned_tx
 }
 
-/// This function hashes a string using the Keccak256 algorithm.
+/// This function hashes  an input string using the Keccak256 algorithm.
 ///
 /// # Arguments
 ///
-/// * `input` - The string to hash
+/// * `input` - The data to hash
 ///
 /// # Returns
 ///
-/// * `String` - The hash of the input string
-pub fn hash(input: String) -> String {
+/// * `[u8; 32]` - The hash of the input as a 32-byte array
+pub fn hash(input: String) -> [u8; 32] {
     let mut keccak = Keccak::v256();
     keccak.update(input.as_bytes());
     let mut hash = [0u8; 32];
     keccak.finalize(&mut hash);
-    encode(hash)
+    hash
 }
 
 /// This function generates a seed from a string input.
@@ -633,7 +652,8 @@ pub fn hash(input: String) -> String {
 /// * `usize` - The seed generated from the input string
 pub fn get_seed(input: String) -> usize {
     let hash = hash(input);
-    usize::from_str_radix(&hash[..8], 16).unwrap()
+    let encoded = encode(hash);
+    usize::from_str_radix(&encoded[..8], 16).unwrap()
 }
 
 /// This function generates a keypair from a string input.

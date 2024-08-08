@@ -114,19 +114,9 @@ impl L1Manager {
 
         let subnets = IPCState::load_all().expect("Failed to load subnets");
 
-        let available_subnets: Vec<&IPCState> = subnets
-            .iter()
-            .filter(|subnet| !subnet.has_required_validators())
-            .collect();
-
-        if available_subnets.is_empty() {
-            println!("No subnets exist or all subnets have the required number of validators");
-            return;
-        }
-
         println!("Pick a subnet to join: ");
 
-        available_subnets
+        subnets
             .iter()
             .enumerate()
             .for_each(|(index, subnet)| println!("{}. {}", index + 1, subnet.get_name()));
@@ -139,12 +129,12 @@ impl L1Manager {
 
         let choice: usize = choice.trim().parse().expect("Invalid choice");
 
-        if choice < 1 || choice > available_subnets.len() {
+        if choice < 1 || choice > subnets.len() {
             println!("Invalid choice");
             return;
         }
 
-        let ipc_state = &available_subnets[choice - 1];
+        let ipc_state = &subnets[choice - 1];
 
         println!("Enter your IP address:");
         io::stdin()

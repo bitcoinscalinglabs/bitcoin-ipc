@@ -1,6 +1,8 @@
 use crate::bitcoin_utils;
-use bitcoin::sighash::SighashCache;
-use bitcoin::{EcdsaSighashType, Transaction, TxOut};
+
+use bitcoin::key::{TapTweak, TweakedKeypair};
+use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::{TapSighashType, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::{collections::HashMap, fs::File};
@@ -105,7 +107,7 @@ impl SubnetSimulator {
         Ok(())
     }
 
-    pub fn get_checkpoint(&mut self) -> String {
+    pub fn get_checkpoint(&mut self) -> [u8; 32] {
         println!("Computing state checkpoint...");
 
         // Disclaimer: this is not secure. It has not checked whether the serialization method and the HashMap
@@ -125,43 +127,37 @@ impl SubnetSimulator {
     ///
     /// * A signed transaction
     pub fn sign_transaction(&self, mut tx: Transaction, prevouts: Vec<TxOut>) -> Transaction {
-        let secp = Secp256k1::new();
-        let mut sighash_cache = SighashCache::new(&tx);
-
         let signatures: Vec<Vec<u8>> = tx
             .input
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let prevout = &prevouts[i];
+                let secp = Secp256k1::new();
+                let mut sighash_cache = SighashCache::new(&tx);
 
-                let sighash = sighash_cache.p2wpkh_signature_hash(
-                    i,
-                    &prevout.script_pubkey,
-                    prevout.value,
-                    EcdsaSighashType::All,
-                );
+                let sighash = sighash_cache
+                    .taproot_key_spend_signature_hash(
+                        i,
+                        &Prevouts::All(&prevouts),
+                        TapSighashType::Default,
+                    )
+                    .expect("failed to construct sighash");
 
-                match sighash {
-                    Ok(sighash) => println!("Sighash: {:?}", sighash),
-                    Err(e) => {
-                        println!("Failed to compute sighash: {}", e);
-                        return vec![];
-                    }
+                // Sign the sighash using the secp256k1 library
+                let tweaked_keypair: TweakedKeypair = self.keypair.tap_tweak(&secp, None);
+                let msg = Message::from_digest_slice(&sighash[..]).expect("32 bytes");
+                let signature = secp.sign_schnorr(&msg, &tweaked_keypair.to_inner());
+
+                bitcoin::taproot::Signature {
+                    signature,
+                    sighash_type: TapSighashType::Default,
                 }
-
-                let message = Message::from_digest_slice(&sighash.unwrap()[..]).unwrap();
-                let sig = secp.sign_ecdsa(&message, &self.keypair.secret_key());
-                let mut sig_vec = sig.serialize_der().to_vec();
-                sig_vec.push(EcdsaSighashType::All as u8);
-
-                sig_vec
+                .to_vec()
             })
             .collect();
 
         for (i, input) in tx.input.iter_mut().enumerate() {
             input.witness.push(signatures[i].clone());
-            input.witness.push(self.keypair.public_key().serialize());
             println!("Signed input {}", i);
         }
 
@@ -170,6 +166,10 @@ impl SubnetSimulator {
 
     pub fn get_public_key(&self) -> bitcoin::secp256k1::PublicKey {
         self.keypair.public_key()
+    }
+
+    pub fn get_keypair(&self) -> bitcoin::secp256k1::Keypair {
+        self.keypair
     }
 
     pub fn print_state(&mut self) {
@@ -182,7 +182,10 @@ impl SubnetSimulator {
             println!("  {}: {}", address, account.balance);
         }
 
-        println!("Checkpoint: {}", self.get_checkpoint());
+        let checkpoint = self.get_checkpoint();
+        let str_cp = hex::encode(checkpoint);
+
+        println!("Checkpoint: {}", str_cp);
         println!();
     }
 }

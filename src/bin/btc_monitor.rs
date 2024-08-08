@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::{script::Instruction, PublicKey};
-use bitcoin_ipc::{ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
+use bitcoin::script::Instruction;
+use bitcoin_ipc::{ipc_state::IPCState, utils};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
@@ -53,6 +53,31 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::erro
     Ok(ipc_subnet_state)
 }
 
+fn run_subnet_interactor(subnet_name: String) {
+    let arg;
+
+    if cfg!(target_os = "linux") {
+        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_UBUNTU;
+    } else if cfg!(target_os = "macos") {
+        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_MACOS;
+    } else {
+        eprintln!("Unsupported operating system.");
+        return;
+    }
+
+    let mut handle = Command::new("bash")
+        .arg(arg)
+        .arg(subnet_name)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to execute script");
+
+    handle
+        .wait()
+        .expect("The script was not completed successfully");
+}
+
 fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error::Error>> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
@@ -86,21 +111,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error:
 
     // start the interactor after enough validators have joined.
     if ipc_subnet_state.has_required_validators() {
-        let _subnet_interactor_handle = thread::spawn(move || {
-            Command::new("gnome-terminal")
-                .arg(format!("--title=subnet_interactor_{}", subnet_name))
-                .arg("--")
-                .arg("bash")
-                .arg("-c")
-                .arg(format!(
-                    "cargo run --bin subnet_interactor -- --subnet-name {}; exec bash",
-                    subnet_name
-                ))
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("Failed to start subnet_interactor");
-        });
+        run_subnet_interactor(ipc_subnet_state.get_name());
     }
 
     Ok(ipc_subnet_state)
@@ -178,28 +189,44 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ))) = instructions.next()
                         {
                             if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
-                                if let Ok(data_str) = std::str::from_utf8(data.as_bytes()) {
-                                    if data_str.len() == 64 {
-                                        let pubkey = &tx.input[0].witness[1];
+                                if data.len() > 32 {
+                                    if let Ok(data_str) =
+                                        std::str::from_utf8(&data.as_bytes()[..data.len() - 32])
+                                    {
+                                        if data_str.contains("n=")
+                                            && data_str.contains("cp=")
+                                            && data_str.contains(bitcoin_ipc::DELIMITER)
+                                        {
+                                            println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
+                                            let parts: Vec<&str> =
+                                                data_str.split(bitcoin_ipc::DELIMITER).collect();
 
-                                        let pubkey = PublicKey::from_slice(pubkey)?;
-                                        let subnets = IPCState::load_all()?;
-
-                                        for subnet in subnets {
-                                            let simulator =
-                                                SubnetSimulator::new(&subnet.get_name());
-                                            let compare_pubkey = PublicKey::from_slice(
-                                                &simulator.get_public_key().serialize(),
-                                            )?;
-                                            if compare_pubkey == pubkey {
-                                                println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
-                                                println!(
-                                                    "Checkpoint for subnet: {} {}",
-                                                    subnet.get_name(),
-                                                    subnet.get_subnet_address()
-                                                );
-                                                println!("Checkpoint: {}", data_str);
+                                            if parts.len() != 2 {
+                                                println!("Invalid checkpoint format");
+                                                continue;
                                             }
+
+                                            let subnets = IPCState::load_all()?;
+
+                                            let name = parts[0].strip_prefix("n=").unwrap_or("");
+                                            let checkpoint = hex::encode(
+                                                data.as_bytes()[data.len() - 32..].to_vec(),
+                                            );
+
+                                            println!("Checkpoint for subnet: {}", name);
+
+                                            subnets.iter().for_each(|subnet| {
+                                                if subnet.get_name() == name {
+                                                    println!(
+                                                        "Subnet address: {}",
+                                                        subnet.get_subnet_address()
+                                                    );
+                                                }
+                                            });
+
+                                            println!("Checkpoint: {}", checkpoint);
+                                        } else {
+                                            println!("Could not determine address for checkpoint");
                                         }
                                     }
                                 }

@@ -25,7 +25,7 @@ struct Args {
 
 impl SubnetInteractor {
     pub fn new(subnet_sim: SubnetSimulator) -> Self {
-        print!(
+        println!(
             "Starting a Subnet Interactor for subnet {}",
             subnet_sim.subnet_name
         );
@@ -104,7 +104,8 @@ impl SubnetInteractor {
                 }
                 "4" => {
                     let checkpoint = self.subnet.get_checkpoint();
-                    println!("Checkpoint: {:?}", checkpoint);
+                    let str_cp = hex::encode(checkpoint);
+                    println!("Checkpoint: {:?}", str_cp);
                 }
                 "5" => self.subnet.print_state(),
                 "6" => break,
@@ -123,4 +124,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     interactor.interactive_interface();
     Ok(())
 }
-

@@ -102,7 +102,7 @@ pub fn join_child(
 /// * `ipc_state` - An instance of IPCState representing the state of the subnet.
 /// * `simulator` - An instance of SubnetSimulator representing the state of the subnet.
 pub fn submit_checkpoint(
-    checkpoint_hash: String,
+    checkpoint_hash: [u8; 32],
     ipc_state: IPCState,
     simulator: SubnetSimulator,
 ) -> Result<(), SubmitCheckpointError> {
@@ -117,8 +117,9 @@ pub fn submit_checkpoint(
     let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(
         &rpc,
         fee,
+        ipc_state.get_name(),
         checkpoint_hash,
-        simulator.get_public_key().into(),
+        simulator.get_keypair(),
     );
 
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone());
