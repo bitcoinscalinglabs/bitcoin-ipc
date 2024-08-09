@@ -115,7 +115,7 @@ pub enum InitWalletError {
     #[error("tried to create a wallet on an invalid or non-existing network")]
     InvalidNetwork(#[from] bitcoin::address::ParseError),
 
-    #[error("cannot parse a transactin")]
+    #[error("cannot parse a transaction")]
     CannotDecodeTransaction(#[from] bitcoin::consensus::encode::Error),
 
     #[error(transparent)]
@@ -138,50 +138,59 @@ pub enum InitWalletError {
 ///
 /// # Returns
 ///
-/// * `()` - The function returns nothing
+/// * `()` - The function returns a SubmitTxError if the transaction was accepted by the mempool.`
 pub fn test_and_submit(
     rpc: &Client,
     txs: Vec<transaction::Transaction>,
     miner_address: Address,
-) -> () {
+) -> Result<(), SubmitTxError> {
     let result =
-        rpc.test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>());
+        rpc.test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())?;
 
-    let mempool_failure = || {
+    let print_mempool_failure_message = || {
         println!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
         for (i, tx) in txs.iter().enumerate() {
             println!("Transaction #{}: {}", i + 1, tx.raw_hex());
         }
     };
 
-    match result {
-        Err(error) => {
-            println!("{:#?}", error);
-            mempool_failure();
-        }
-        Ok(response) => {
-            for r in response.iter() {
-                if !r.allowed {
-                    mempool_failure();
-                    return;
-                }
-            }
-
-            for (i, tx) in txs.iter().enumerate() {
-                println!(
-                    "Transaction #{}: {}",
-                    i + 1,
-                    rpc.send_raw_transaction(tx.raw_hex()).unwrap()
-                );
-
-                println!("Transaction #{}: {:#?}", i + 1, tx)
-            }
-            println!(
-                "Mined new block: {:#?}",
-                rpc.generate_to_address(1, &miner_address).unwrap()
-            );
+    for r in result.iter() {
+        if !r.allowed {
+            print_mempool_failure_message();
+            let reject_reason = match &r.reject_reason {
+                Some(r) => r.clone(),
+                None => String::new(),
+            };
+            return Err(SubmitTxError::MempoolAcceptanceFailed { reject_reason });
         }
     }
+
+    for (i, tx) in txs.iter().enumerate() {
+        println!(
+            "Submitting transaction #{}: {}",
+            i + 1,
+            rpc.send_raw_transaction(tx.raw_hex())?
+        );
+
+        println!("Submitted transaction #{}: {:#?}", i + 1, tx)
+    }
+    println!(
+        "Mined new block: {:#?}",
+        rpc.generate_to_address(1, &miner_address)?
+    );
+
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+pub enum SubmitTxError {
+    #[error("cannot connect to the bitcoin node")]
+    CannotConnectToBitcoinNode(#[from] bitcoincore_rpc::Error),
+
+    #[error(
+        "failed to submit transaction, mempool acceptance test failed. reason: {reject_reason}"
+    )]
+    MempoolAcceptanceFailed { reject_reason: String },
 }
 
 /// This function generates a new private key from a seed and a network.
@@ -194,8 +203,9 @@ pub fn test_and_submit(
 /// # Returns
 ///
 /// * `Xpriv` - A private key of type `Xpriv`
-pub fn get_private_key(seed: usize, network: Network) -> Xpriv {
-    Xpriv::new_master(network, &[seed.try_into().unwrap()]).unwrap()
+pub fn generate_private_key(seed: usize, network: Network) -> Result<Xpriv, bitcoin::bip32::Error> {
+    let seed_bytes = seed.to_be_bytes();
+    Xpriv::new_master(network, &seed_bytes)
 }
 
 /// The function creates a change output for a transaction by calculating the change amount
