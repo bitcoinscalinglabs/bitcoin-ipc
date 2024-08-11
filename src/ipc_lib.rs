@@ -39,7 +39,7 @@ pub fn create_child(subnet_address: &bitcoin::Address, subnet_data: &str) -> Res
     let fee: Amount = Amount::from_sat(200);
 
     let (commit_tx, reveal_tx) =
-        write_arbitrary_data(&rpc, amount_to_send, fee, subnet_data, subnet_address);
+        write_arbitrary_data(&rpc, amount_to_send, fee, subnet_data, subnet_address)?;
 
     test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
 
@@ -79,7 +79,7 @@ pub fn join_child(
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
     let (commit_tx, reveal_tx) =
-        write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address);
+        write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address)?;
 
     test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
     Ok(())
@@ -93,17 +93,8 @@ pub enum Error {
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
 
-    #[error("error when trying to connect to the bitcoin full node over rpc")]
-    RpcError(#[from] bitcoincore_rpc::Error),
-
-    #[error("error when trying to init a wallet")]
-    InitWalletError(#[from] crate::bitcoin_utils::InitWalletError),
-
-    #[error("error when trying to submit a transaction to the bitcoin node")]
-    SubmitTxError(#[from] crate::bitcoin_utils::SubmitTxError),
-
-    #[error("an error related to the BIP32 specification occured")]
-    Bip32Error(#[from] bitcoin::bip32::Error),
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 
     #[error("cannot parse the given amount")]
     AmountError(#[from] bitcoin::amount::ParseAmountError),
