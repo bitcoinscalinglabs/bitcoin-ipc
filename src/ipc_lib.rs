@@ -87,17 +87,14 @@ pub fn join_child(
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("no child subnet with address `{0}` was found")]
-    SubnetNotFound(bitcoin::Address),
-
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
 
-    #[error(transparent)]
-    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
-
     #[error("cannot parse the given amount")]
     AmountError(#[from] bitcoin::amount::ParseAmountError),
+
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
