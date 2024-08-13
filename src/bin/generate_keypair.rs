@@ -1,7 +1,7 @@
 use bitcoin::key::Secp256k1;
 use bitcoin_ipc::{bitcoin_utils::generate_private_key, ipc_lib};
 
-pub fn main() -> Result<(), ipc_lib::Error> {
+pub fn main() -> Result<(), ipc_lib::IpcLibError> {
     let secp = &Secp256k1::new();
 
     let private_key = generate_private_key(1, bitcoin_ipc::NETWORK)?;

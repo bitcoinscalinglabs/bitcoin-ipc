@@ -27,7 +27,10 @@ use crate::{
 /// This function returns a `Result`:
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(Box<dyn std::error::Error>)` - If an error occurs during the process.
-pub fn create_child(subnet_address: &bitcoin::Address, subnet_data: &str) -> Result<(), Error> {
+pub fn create_and_submit_create_child_tx(
+    subnet_address: &bitcoin::Address,
+    subnet_data: &str,
+) -> Result<(), IpcLibError> {
     println!("{:?}", subnet_data);
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
@@ -66,11 +69,11 @@ pub fn create_child(subnet_address: &bitcoin::Address, subnet_data: &str) -> Res
 /// This function returns a `Result`:
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(JoinChildError)` - If an error occurs during the process.
-pub fn join_child(
+pub fn create_and_submit_join_child_tx(
     subnet_address: &bitcoin::Address,
     collateral: Amount,
     validator_data: &str,
-) -> Result<(), Error> {
+) -> Result<(), IpcLibError> {
     let fee: Amount = Amount::from_sat(200);
 
     // Init RPC connection and wallet
@@ -86,7 +89,7 @@ pub fn join_child(
 }
 
 #[derive(Error, Debug)]
-pub enum Error {
+pub enum IpcLibError {
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
 

@@ -62,11 +62,8 @@ impl L1Manager {
         ));
         subnet_data.push_str(&format!("required_collateral={}", required_collateral));
 
-        bitcoin_ipc::ipc_lib::create_child(&subnet_address, &subnet_data)?;
+        bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
 
-        println!(
-            "Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation."
-        );
         Ok(())
     }
 
@@ -120,13 +117,13 @@ impl L1Manager {
         validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
         validator_data.push_str(&format!("subnet_name={}", ipc_state.get_name()));
 
-        bitcoin_ipc::ipc_lib::join_child(
-            &ipc_state.get_subnet_address(),
+        let subnet_address = &ipc_state.get_subnet_address()?;
+        bitcoin_ipc::ipc_lib::create_and_submit_join_child_tx(
+            subnet_address,
             Amount::from_sat(ipc_state.get_required_collateral()),
             &validator_data,
         )?;
 
-        println!("Transaction to join a child subnet has been submited to bitcoin, please wait for confirmation.");
         Ok(())
     }
 
@@ -162,18 +159,28 @@ impl L1Manager {
                                 .for_each(|subnet| subnet.clone().print_state());
                             self.subnets = subnets;
                         }
-                        Err(_) => todo!(),
+                        Err(_) => {
+                            println!("An error occured while reading the state.");
+                        }
                     };
                 }
 
                 2 => match self.create_child() {
-                    Ok(_) => todo!(),
-                    Err(_) => todo!(),
+                    Ok(_) => {
+                        println!("Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation.");
+                    }
+                    Err(e) => {
+                        println!("An error occured, child subnet was not created. Error: {e}");
+                    }
                 },
 
                 3 => match self.join_child() {
-                    Ok(_) => todo!(),
-                    Err(_) => todo!(),
+                    Ok(_) => {
+                        println!("Transaction to join a child subnet has been submited to bitcoin, please wait for confirmation.");
+                    }
+                    Err(e) => {
+                        println!("An error occured, child subnet was not joined. Error: {e}");
+                    }
                 },
 
                 4 => break,
@@ -205,10 +212,11 @@ pub enum L1ManagerError {
     NoSubnetAvailable,
 
     #[error(transparent)]
-    IpcLibError(#[from] bitcoin_ipc::ipc_lib::Error),
+    IpcLibError(#[from] bitcoin_ipc::ipc_lib::IpcLibError),
 
-    // #[error(transparent)]
-    // IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+    #[error(transparent)]
+    IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 }
