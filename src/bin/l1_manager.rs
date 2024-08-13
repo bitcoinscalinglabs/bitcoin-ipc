@@ -17,7 +17,11 @@ impl L1Manager {
         L1Manager { subnets }
     }
 
-    fn store_keypair(&self, keypair: &bitcoin::secp256k1::Keypair, name: &str) {
+    fn store_keypair(
+        &self,
+        keypair: &bitcoin::secp256k1::Keypair,
+        name: &str,
+    ) -> Result<(), L1ManagerError> {
         let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
             println!("Failed to serialize keypair");
             "".to_string()
@@ -39,6 +43,8 @@ impl L1Manager {
 
         file.write_all(serialized.as_bytes())
             .expect("Failed to write state to file");
+
+        Ok(())
     }
 
     fn create_child(&self) -> Result<(), L1ManagerError> {
@@ -68,9 +74,9 @@ impl L1Manager {
             bitcoin_ipc::DELIMITER
         ));
 
-        let key_pair = bitcoin_utils::generate_keypair(name.to_string());
+        let key_pair = bitcoin_utils::generate_keypair(name.to_string())?;
 
-        self.store_keypair(&key_pair, name);
+        self.store_keypair(&key_pair, &name)?;
 
         let subnet_address = bitcoin_utils::get_address_from_private_key(
             key_pair.secret_key(),
@@ -98,13 +104,11 @@ impl L1Manager {
     fn join_child(&self) -> Result<(), L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
-        println!("Pick a subnet to join: ");
-
         let choice = get_user_input(&format!(
-            "Pick a subnet (between 1 and  {}) to join: ",
-            available_subnets.len()
+            "Pick a subnet (between 1 and {}) to join: ",
+            subnets.len()
         ))?;
-      
+
         let choice: usize = choice
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput {
@@ -234,6 +238,9 @@ pub enum L1ManagerError {
 
     #[error(transparent)]
     IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] bitcoin_ipc::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),

@@ -9,6 +9,8 @@ use std::{collections::HashMap, fs::File};
 
 use bitcoin::secp256k1::{Message, Secp256k1};
 
+use thiserror::Error;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Account {
     balance: u64,
@@ -34,7 +36,7 @@ pub struct SubnetSimulator {
 }
 
 impl SubnetSimulator {
-    pub fn new(subnet_name: &str) -> Self {
+    pub fn new(subnet_name: &str) -> Result<Self, SubnetSimulatorError> {
         println!("Starting simulator for subnet {subnet_name}.");
 
         if let Ok(mut file) = File::open(format!("{}/{}/keypair.yaml", crate::L1_NAME, subnet_name))
@@ -43,19 +45,19 @@ impl SubnetSimulator {
             file.read_to_string(&mut json)
                 .expect("Failed to read state file");
             if let Ok(keypair) = serde_json::from_str(&json) {
-                return SubnetSimulator {
+                return Ok(SubnetSimulator {
                     subnet_name: String::from(subnet_name),
                     state: SubnetState::new(),
                     keypair,
-                };
+                });
             }
         }
 
-        return SubnetSimulator {
+        return Ok(SubnetSimulator {
             subnet_name: String::from(subnet_name),
             state: SubnetState::new(),
-            keypair: bitcoin_utils::generate_keypair(subnet_name.to_string()),
-        };
+            keypair: bitcoin_utils::generate_keypair(subnet_name.to_string())?,
+        });
     }
 
     pub fn create_account(&mut self, address: &str) {
@@ -188,4 +190,10 @@ impl SubnetSimulator {
         println!("Checkpoint: {}", str_cp);
         println!();
     }
+}
+
+#[derive(Error, Debug)]
+pub enum SubnetSimulatorError {
+    #[error("account not found")]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 }

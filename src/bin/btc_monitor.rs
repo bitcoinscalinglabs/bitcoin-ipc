@@ -23,8 +23,8 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
         None => return Err(ParseIpcTransactionError::MissingName),
     };
 
-    let pk = match parts[2].strip_prefix("pk=") {
-        Some(pk) => pk,
+    let subnet_address = match parts[2].strip_prefix("subnet_address=") {
+        Some(subnet_address) => subnet_address,
         None => return Err(ParseIpcTransactionError::MissingPk),
     };
 
@@ -98,18 +98,25 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
-    let ip = parts[1].strip_prefix("ip=").unwrap_or("");
-    let pk = parts[2].strip_prefix("pk=").unwrap_or("");
-    let username: String = parts[3].strip_prefix("username=").unwrap_or("").to_string();
-    let subnet_name: String = parts[4]
-        .strip_prefix("subnet_name=")
-        .unwrap_or("")
-        .to_string();
+    let ip = match parts[1].strip_prefix("ip=") {
+        Some(ip) => ip,
+        None => return Err(ParseIpcTransactionError::MissingIP),
+    };
 
-    if ip.is_empty() || pk.is_empty() || username.is_empty() || subnet_name.is_empty() {
-        println!("Invalid input format");
-        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
-    }
+    let pk = match parts[2].strip_prefix("pk=") {
+        Some(pk) => pk,
+        None => return Err(ParseIpcTransactionError::MissingPk),
+    };
+
+    let username = match parts[3].strip_prefix("username=") {
+        Some(subnet_address) => subnet_address.to_string(),
+        None => return Err(ParseIpcTransactionError::MissingUsername),
+    };
+
+    let subnet_name = match parts[4].strip_prefix("subnet_name=") {
+        Some(subnet_name) => subnet_name,
+        None => return Err(ParseIpcTransactionError::MissingName),
+    };
 
     let file_name = format!(
         "{}/{}/{}.json",
@@ -146,7 +153,7 @@ fn find_valid_utf8(data: &[u8]) -> &str {
     ""
 }
 
-pub fn main() {
+pub fn main() -> Result<(), BtcMonitorError> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env().expect("Fatal error.");
 
     let rpc = Client::new(
@@ -244,9 +251,18 @@ pub fn main() {
 
                                             subnets.iter().for_each(|subnet| {
                                                 if subnet.get_name() == name {
+
+                                                    let subnet_address = match subnet.get_subnet_address() {
+                                                        Ok(address) => address,
+                                                        Err(_) => {
+                                                            println!("Could not determine address for subnet");
+                                                            return;
+                                                        }
+                                                    };
+
                                                     println!(
                                                         "Subnet address: {}",
-                                                        subnet.get_subnet_address()
+                                                        subnet_address
                                                     );
                                                 }
                                             });
@@ -267,6 +283,18 @@ pub fn main() {
 
         thread::sleep(Duration::from_secs(10));
     }
+}
+
+#[derive(Error, Debug)]
+pub enum BtcMonitorError {
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error(transparent)]
+    IPCStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error("internal error")]
+    Internal,
 }
 
 #[derive(Error, Debug)]
@@ -291,6 +319,12 @@ pub enum ParseIpcTransactionError {
 
     #[error("missing field pk")]
     MissingPk,
+
+    #[error("missing field ip")]
+    MissingIP,
+
+    #[error("missing field username")]
+    MissingUsername,
 
     #[error("cannot write ipc state")]
     CannotWriteIpcState,

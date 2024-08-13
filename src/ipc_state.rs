@@ -105,12 +105,10 @@ impl IPCState {
     }
 
     pub fn get_subnet_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
-        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&self.subnet_pk)
-            .map_err(|_| IpcStateError::InvalidSubnetPK)?;
-        Ok(bitcoin_utils::get_address_from_public_key(
-            pubkey,
-            crate::NETWORK,
-        ))
+        return match Address::from_str(&self.subnet_address) {
+            Ok(address) => Ok(address.assume_checked()),
+            Err(_) => Err(IpcStateError::InvalidSubnetPK),
+        };
     }
 
     pub fn load_all() -> Result<Vec<Self>, IpcStateError> {

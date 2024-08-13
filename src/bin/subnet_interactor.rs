@@ -118,7 +118,7 @@ impl SubnetInteractor {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let subnet = SubnetSimulator::new(&args.subnet_name);
+    let subnet = SubnetSimulator::new(&args.subnet_name)?;
     let mut interactor = SubnetInteractor::new(subnet);
 
     interactor.interactive_interface();

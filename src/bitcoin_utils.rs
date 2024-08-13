@@ -1,12 +1,12 @@
 use std::vec;
 use thiserror::Error;
 
-
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
 use bitcoin::secp256k1::{All, Keypair, Secp256k1, SecretKey};
 use bitcoin::taproot::TaprootSpendInfo;
+use bitcoin::PublicKey;
 use bitcoin::{
     amount::Amount,
     bip32::Xpriv,
@@ -15,7 +15,6 @@ use bitcoin::{
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, XOnlyPublicKey,
 };
-use bitcoin::PublicKey;
 use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
 use hex::encode;
 use tiny_keccak::{Hasher, Keccak};
@@ -295,12 +294,11 @@ pub fn commit_arbitrary_data(
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
     let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
-    let script = Builder::new().push_slice(push_bytes).into_script();
 
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key(&secp);
-
     let script = Builder::new().push_slice(push_bytes).into_script();
+
     let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
     let taproot_spend_info = builder
         .finalize(&secp, unspendable_pubkey)
@@ -441,15 +439,6 @@ pub fn collect_amount(
 /// # Returns
 /// * `Address` - A P2WPKH Bitcoin address for the specified network.
 pub fn get_address_from_private_key(sk: SecretKey, network: Network) -> Address {
-    // Address::p2wpkh(
-    //     &CompressedPublicKey::from_private_key(
-    //         &Secp256k1::new(),
-    //         &PrivateKey::new(sk, crate::NETWORK),
-    //     )
-    //     .unwrap(),
-    //     network,
-    // )
-
     let secp = Secp256k1::new();
 
     Address::p2tr(&secp, sk.x_only_public_key(&secp).0, None, network)
@@ -524,9 +513,9 @@ pub fn write_arbitrary_data(
     data: &str,
     receiver_address: &Address,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
-    let input_info = collect_amount(&rpc, amount_to_send, fee)?;
+    let input_info = collect_amount_for_wallet(&rpc, amount_to_send, fee)?;
 
-    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee)?;
+    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee, None)?;
 
     let secp = Secp256k1::new();
 
@@ -595,6 +584,9 @@ pub enum BitcoinUtilsError {
         tx: Transaction,
         errors: Vec<bitcoincore_rpc::json::SignRawTransactionResultError>,
     },
+
+    #[error("cannot generate a keypair")]
+    CannotGenerateKeypaair,
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
@@ -706,13 +698,13 @@ pub fn get_seed(input: String) -> usize {
 /// # Returns
 ///
 /// * `Keypair` - A keypair generated from the input string
-pub fn generate_keypair(input: String) -> Keypair {
+pub fn generate_keypair(input: String) -> Result<Keypair, BitcoinUtilsError> {
     let secp = &Secp256k1::new();
 
     let seed = get_seed(input);
 
-    let private_key = get_private_key(seed, crate::NETWORK);
-    private_key.to_keypair(secp)
+    let private_key = generate_private_key(seed, crate::NETWORK)?;
+    Ok(private_key.to_keypair(secp))
 }
 
 /// This function finds the previous output for a given input.

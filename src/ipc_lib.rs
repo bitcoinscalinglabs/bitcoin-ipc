@@ -127,7 +127,7 @@ pub fn submit_checkpoint(
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(checkpoint_tx.clone(), prevouts);
 
-    test_and_submit(&rpc, vec![signed_transaction], miner_address);
+    test_and_submit(&rpc, vec![signed_transaction], miner_address)?;
 
     Ok(())
 }
@@ -154,6 +154,9 @@ pub enum IpcLibError {
 pub enum SubmitCheckpointError {
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
+
+    #[error("init rpc and wallet error")]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
