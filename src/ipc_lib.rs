@@ -29,10 +29,10 @@ use crate::{
 /// This function returns a `Result`:
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(Box<dyn std::error::Error>)` - If an error occurs during the process.
-pub fn create_child(
+pub fn create_and_submit_create_child_tx(
     subnet_address: &bitcoin::Address,
     subnet_data: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), IpcLibError> {
     println!("{:?}", subnet_data);
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
@@ -44,9 +44,9 @@ pub fn create_child(
     let fee: Amount = Amount::from_sat(200);
 
     let (commit_tx, reveal_tx) =
-        write_arbitrary_data(&rpc, amount_to_send, fee, subnet_data, subnet_address);
+        write_arbitrary_data(&rpc, amount_to_send, fee, subnet_data, subnet_address)?;
 
-    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address);
+    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
 
     Ok(())
 }
@@ -71,11 +71,11 @@ pub fn create_child(
 /// This function returns a `Result`:
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(JoinChildError)` - If an error occurs during the process.
-pub fn join_child(
+pub fn create_and_submit_join_child_tx(
     subnet_address: &bitcoin::Address,
     collateral: Amount,
     validator_data: &str,
-) -> Result<(), JoinChildError> {
+) -> Result<(), IpcLibError> {
     let fee: Amount = Amount::from_sat(200);
 
     // Init RPC connection and wallet
@@ -84,9 +84,9 @@ pub fn join_child(
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
     let (commit_tx, reveal_tx) =
-        write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address);
+        write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address)?;
 
-    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address);
+    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
     Ok(())
 }
 
@@ -133,12 +133,15 @@ pub fn submit_checkpoint(
 }
 
 #[derive(Error, Debug)]
-pub enum JoinChildError {
-    #[error("no child subnet with address `{0}` was found")]
-    SubnetNotFound(bitcoin::Address),
-
+pub enum IpcLibError {
     #[error("error when reading an environment variable")]
     EnvVarError(#[from] std::env::VarError),
+
+    #[error("cannot parse the given amount")]
+    AmountError(#[from] bitcoin::amount::ParseAmountError),
+
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),

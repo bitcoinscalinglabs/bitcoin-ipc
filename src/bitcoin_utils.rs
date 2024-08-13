@@ -1,4 +1,6 @@
 use std::vec;
+use thiserror::Error;
+
 
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -13,7 +15,6 @@ use bitcoin::{
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, XOnlyPublicKey,
 };
-// use bitcoin::{CompressedPublicKey, PrivateKey, PublicKey};
 use bitcoin::PublicKey;
 use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
 use hex::encode;
@@ -56,7 +57,7 @@ pub fn init_rpc_client(
     rpc_user: String,
     rpc_pass: String,
     rpc_url: String,
-) -> Result<Client, Box<dyn std::error::Error>> {
+) -> Result<Client, BitcoinUtilsError> {
     let rpc = Client::new(&rpc_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
 }
@@ -78,7 +79,7 @@ pub fn init_wallet(
     rpc: &Client,
     network: Network,
     wallet: &String,
-) -> Result<(Address, Option<Transaction>, u32), Box<dyn std::error::Error>> {
+) -> Result<(Address, Option<Transaction>, u32), BitcoinUtilsError> {
     let random_number = rand::random::<usize>().to_string();
     let random_label = random_number.as_str();
 
@@ -93,24 +94,20 @@ pub fn init_wallet(
     let mut coinbase_tx = None;
 
     let address = rpc
-        .get_new_address(Some(random_label), None)
-        .unwrap()
+        .get_new_address(Some(random_label), None)?
         .require_network(network)?;
 
     if created_wallet {
         rpc.generate_to_address(101, &address)?;
 
         let coinbase_txid = rpc
-            .list_transactions(Some(random_label), Some(101), Some(100), None)
-            .unwrap()[0]
+            .list_transactions(Some(random_label), Some(101), Some(100), None)?
+            .get(0)
+            .ok_or(BitcoinUtilsError::Internal)?
             .info
             .txid;
 
-        coinbase_tx = Some(
-            rpc.get_transaction(&coinbase_txid, None)
-                .unwrap()
-                .transaction()?,
-        );
+        coinbase_tx = Some(rpc.get_transaction(&coinbase_txid, None)?.transaction()?);
     }
 
     Ok((address, coinbase_tx, 0))
@@ -129,50 +126,48 @@ pub fn init_wallet(
 ///
 /// # Returns
 ///
-/// * `()` - The function returns nothing
+/// * `()` - The function returns a BitcoinUtilsError if the transaction was accepted by the mempool.`
 pub fn test_and_submit(
     rpc: &Client,
     txs: Vec<transaction::Transaction>,
     miner_address: Address,
-) -> () {
+) -> Result<(), BitcoinUtilsError> {
     let result =
-        rpc.test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>());
+        rpc.test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())?;
 
-    let mempool_failure = || {
+    let print_mempool_failure_message = || {
         println!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
         for (i, tx) in txs.iter().enumerate() {
             println!("Transaction #{}: {}", i + 1, tx.raw_hex());
         }
     };
 
-    match result {
-        Err(error) => {
-            println!("{:#?}", error);
-            mempool_failure();
-        }
-        Ok(response) => {
-            for r in response.iter() {
-                if !r.allowed {
-                    mempool_failure();
-                    return;
-                }
-            }
-
-            for (i, tx) in txs.iter().enumerate() {
-                println!(
-                    "Transaction #{}: {}",
-                    i + 1,
-                    rpc.send_raw_transaction(tx.raw_hex()).unwrap()
-                );
-
-                println!("Transaction #{}: {:#?}", i + 1, tx)
-            }
-            println!(
-                "Mined new block: {:#?}",
-                rpc.generate_to_address(1, &miner_address).unwrap()
-            );
+    for r in result.iter() {
+        if !r.allowed {
+            print_mempool_failure_message();
+            let reject_reason = match &r.reject_reason {
+                Some(r) => r.clone(),
+                None => String::new(),
+            };
+            return Err(BitcoinUtilsError::MempoolAcceptanceFailed { reject_reason });
         }
     }
+
+    for (i, tx) in txs.iter().enumerate() {
+        println!(
+            "Submitting transaction #{}: {}",
+            i + 1,
+            rpc.send_raw_transaction(tx.raw_hex())?
+        );
+
+        println!("Submitted transaction #{}: {:#?}", i + 1, tx)
+    }
+    println!(
+        "Mined new block: {:#?}",
+        rpc.generate_to_address(1, &miner_address)?
+    );
+
+    Ok(())
 }
 
 /// This function generates a new private key from a seed and a network.
@@ -185,8 +180,9 @@ pub fn test_and_submit(
 /// # Returns
 ///
 /// * `Xpriv` - A private key of type `Xpriv`
-pub fn get_private_key(seed: usize, network: Network) -> Xpriv {
-    Xpriv::new_master(network, &seed.to_le_bytes()).unwrap()
+pub fn generate_private_key(seed: usize, network: Network) -> Result<Xpriv, BitcoinUtilsError> {
+    let seed_bytes = seed.to_be_bytes();
+    Ok(Xpriv::new_master(network, &seed_bytes)?)
 }
 
 /// The function creates a change output for a transaction by calculating the change amount
@@ -208,16 +204,20 @@ pub fn create_change_txout(
     amount_to_send: Amount,
     fee: Amount,
     keypair: Option<Keypair>,
-) -> Result<TxOut, Box<dyn std::error::Error>> {
+) -> Result<TxOut, BitcoinUtilsError> {
     let mut input_total_value = 0;
 
     for input in input_info {
         input_total_value += rpc
             .get_tx_out(&input.txid, input.vout, None)?
-            .unwrap()
+            .ok_or(BitcoinUtilsError::UtxoNotFound)?
             .value
             .to_sat();
     }
+
+    if input_total_value < amount_to_send.to_sat() + fee.to_sat() {
+        return Err(BitcoinUtilsError::InsufficientAmoutForChangeTx);
+    };
 
     let change_amount = input_total_value - amount_to_send.to_sat() - fee.to_sat();
 
@@ -229,10 +229,6 @@ pub fn create_change_txout(
             .assume_checked()
             .script_pubkey();
     } else {
-        // let wpkh = pubkey.unwrap().wpubkey_hash().expect("key is compressed");
-
-        // script_pub_key = ScriptBuf::new_p2wpkh(&wpkh);
-
         script_pub_key = ScriptBuf::new_p2tr(
             &Secp256k1::new(),
             keypair.unwrap().x_only_public_key().0,
@@ -261,15 +257,15 @@ pub fn create_change_txout(
 pub fn sign_transaction_safe(
     rpc: &Client,
     unsigned_tx: Transaction,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
-    let signed_raw_transaction = rpc
-        .sign_raw_transaction_with_wallet(&unsigned_tx, None, None)
-        .unwrap();
+) -> Result<Transaction, BitcoinUtilsError> {
+    let signed_raw_transaction = rpc.sign_raw_transaction_with_wallet(&unsigned_tx, None, None)?;
     if !signed_raw_transaction.complete {
-        println!("{:#?}", signed_raw_transaction.errors);
-        Err("Transaction could not be signed")?
+        return Err(BitcoinUtilsError::CannotSignTransaction {
+            tx: unsigned_tx,
+            errors: signed_raw_transaction.errors.unwrap_or(Vec::new()),
+        });
     }
-    Ok(signed_raw_transaction.transaction().unwrap())
+    Ok(signed_raw_transaction.transaction()?)
 }
 
 /// Commits arbitrary data to the blockchain.
@@ -297,18 +293,18 @@ pub fn commit_arbitrary_data(
     change: TxOut,
     data: &[u8],
     secp: &Secp256k1<All>,
-) -> (Transaction, ScriptBuf, TaprootSpendInfo) {
+) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
     let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
     let script = Builder::new().push_slice(push_bytes).into_script();
 
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key(&secp);
 
-    let taproot_spend_info = TaprootBuilder::new()
-        .add_leaf(0, script.clone())
-        .unwrap()
-        .finalize(secp, unspendable_pubkey)
-        .unwrap();
+    let script = Builder::new().push_slice(push_bytes).into_script();
+    let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
+    let taproot_spend_info = builder
+        .finalize(&secp, unspendable_pubkey)
+        .map_err(|_| BitcoinUtilsError::BuilderNotFinalizable)?;
 
     let script_pubkey = script::ScriptBuf::new_p2tr(
         &secp,
@@ -339,11 +335,11 @@ pub fn commit_arbitrary_data(
         ],
     };
 
-    (
-        sign_transaction_safe(rpc, unsigned_tx).unwrap(),
+    Ok((
+        sign_transaction_safe(rpc, unsigned_tx)?,
         script,
         taproot_spend_info,
-    )
+    ))
 }
 
 fn assemble_outpoints_for_target_amount(
@@ -479,7 +475,7 @@ pub fn reveal_arbitrary_data(
     output: TxOut,
     script: ScriptBuf,
     taproot_spend_info: TaprootSpendInfo,
-) -> Transaction {
+) -> Result<Transaction, BitcoinUtilsError> {
     let mut unsigned_tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -494,14 +490,14 @@ pub fn reveal_arbitrary_data(
 
     let control_block = taproot_spend_info
         .control_block(&(script.clone(), LeafVersion::TapScript))
-        .unwrap();
+        .ok_or(BitcoinUtilsError::CannotConstructControlBlock)?;
 
     for input in &mut unsigned_tx.input {
         input.witness.push(script.to_bytes());
         input.witness.push(control_block.serialize());
     }
 
-    unsigned_tx
+    Ok(unsigned_tx)
 }
 
 /// This function writes arbitrary data to the blockchain by committing the data
@@ -527,12 +523,10 @@ pub fn write_arbitrary_data(
     fee: Amount,
     data: &str,
     receiver_address: &Address,
-) -> (Transaction, Transaction) {
-    let input_info = collect_amount_for_wallet(&rpc, amount_to_send, fee).unwrap();
+) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
+    let input_info = collect_amount(&rpc, amount_to_send, fee)?;
 
-    println!("Input info: {:?}", input_info);
-
-    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee, None).unwrap();
+    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee)?;
 
     let secp = Secp256k1::new();
 
@@ -544,7 +538,7 @@ pub fn write_arbitrary_data(
         change,
         data.as_bytes(),
         &secp,
-    );
+    )?;
 
     let commit_tx_outpoint = OutPoint {
         txid: commit_tx.compute_txid(),
@@ -557,9 +551,56 @@ pub fn write_arbitrary_data(
     };
 
     // Reveal Transaction : Reveal the Arbitrary Data
-    let reveal_tx = reveal_arbitrary_data(commit_tx_outpoint, output, script, taproot_spend_info);
+    let reveal_tx = reveal_arbitrary_data(commit_tx_outpoint, output, script, taproot_spend_info)?;
 
-    (commit_tx, reveal_tx)
+    Ok((commit_tx, reveal_tx))
+}
+
+#[derive(Error, Debug)]
+pub enum BitcoinUtilsError {
+    #[error("cannot connect to the bitcoin node")]
+    CannotConnectToBitcoinNode(#[from] bitcoincore_rpc::Error),
+
+    #[error("tried to create a wallet on an invalid or non-existing network")]
+    InvalidNetwork(#[from] bitcoin::address::ParseError),
+
+    #[error("cannot parse a transaction")]
+    CannotDeserializeTransaction(#[from] bitcoin::consensus::encode::Error),
+
+    #[error(
+        "failed to submit transaction, mempool acceptance test failed. reason: {reject_reason}"
+    )]
+    MempoolAcceptanceFailed { reject_reason: String },
+
+    #[error("an error related to the BIP32 specification occured")]
+    Bip32Error(#[from] bitcoin::bip32::Error),
+
+    #[error("an error occured when building a taproot transaction")]
+    TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
+
+    #[error("tried to finalize a taproot transaction builder that is not ready")]
+    BuilderNotFinalizable,
+
+    #[error("cannot construct control block for the given script")]
+    CannotConstructControlBlock,
+
+    #[error("the utxo was not found")]
+    UtxoNotFound,
+
+    #[error("cannot create change tx for the given arguments")]
+    InsufficientAmoutForChangeTx,
+
+    #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
+    CannotSignTransaction {
+        tx: Transaction,
+        errors: Vec<bitcoincore_rpc::json::SignRawTransactionResultError>,
+    },
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error("internal error")]
+    Internal,
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {

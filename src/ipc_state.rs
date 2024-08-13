@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 use bitcoin::address::NetworkChecked;
 use bitcoin::Address;
 use serde::{Deserialize, Serialize};
@@ -43,47 +45,47 @@ impl IPCState {
         }
     }
 
-    pub fn load_state(file_path: String) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut subnet_state: Option<Self> = None;
-        if let Ok(mut file) = File::open(file_path) {
-            let mut json = String::new();
-
-            file.read_to_string(&mut json)
-                .expect("Failed to read state file");
-            subnet_state = serde_json::from_str(&json).expect("Failed to deserialize state");
-        }
-        Ok(subnet_state.clone().ok_or_else(|| "Failed to load state")?)
+    pub fn load_state(filepath: String) -> Result<Self, IpcStateError> {
+        let mut file = File::open(filepath)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        let subnet_state = serde_json::from_str(&content)?;
+        Ok(subnet_state)
     }
 
-    pub fn save_state(&self) -> String {
-        let json = serde_json::to_string(&self).expect("Failed to serialize state");
+    pub fn save_state(&self) -> Result<String, IpcStateError> {
+        let json = serde_json::to_string(&self)?;
 
         let path = std::path::Path::new(&self.file_path);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create directories");
+            std::fs::create_dir_all(parent)?;
         }
 
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&self.file_path)
-            .expect("Failed to open state file");
+            .open(&self.file_path)?;
 
-        file.write_all(json.as_bytes())
-            .expect("Failed to write state to file");
+        file.write_all(json.as_bytes())?;
 
-        return json;
+        Ok(json)
     }
 
-    pub fn add_validator(&mut self, ip: String, name: String, pk: String) {
+    pub fn add_validator(
+        &mut self,
+        ip: String,
+        name: String,
+        pk: String,
+    ) -> Result<(), IpcStateError> {
         self.validators.push(ValidatorData {
             ip: ip.clone(),
             name: name.clone(),
             pk: pk.clone(),
         });
-        self.save_state();
+        self.save_state()?;
         println!("Validator {} {} {} added", ip, name, pk);
+        Ok(())
     }
 
     pub fn has_required_validators(&self) -> bool {
@@ -102,13 +104,16 @@ impl IPCState {
         self.name.clone()
     }
 
-    pub fn get_subnet_address(&self) -> Address<NetworkChecked> {
-        return Address::from_str(&self.subnet_address)
-            .expect("Failed to parse address")
-            .assume_checked();
+    pub fn get_subnet_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
+        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&self.subnet_pk)
+            .map_err(|_| IpcStateError::InvalidSubnetPK)?;
+        Ok(bitcoin_utils::get_address_from_public_key(
+            pubkey,
+            crate::NETWORK,
+        ))
     }
 
-    pub fn load_all() -> Result<Vec<Self>, Box<dyn std::error::Error>> {
+    pub fn load_all() -> Result<Vec<Self>, IpcStateError> {
         let mut ipc_states = Vec::new();
         let btc_dir = Path::new(crate::L1_NAME);
 
@@ -154,4 +159,16 @@ impl IPCState {
             );
         }
     }
+}
+
+#[derive(Error, Debug)]
+pub enum IpcStateError {
+    #[error("invalid subnet PK")]
+    InvalidSubnetPK,
+
+    #[error("cannot open or read file")]
+    IoError(#[from] std::io::Error),
+
+    #[error("cannot open or read file")]
+    JsonError(#[from] serde_json::Error),
 }

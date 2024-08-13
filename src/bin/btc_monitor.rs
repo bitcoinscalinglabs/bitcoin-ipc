@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 use std::{
     process::{Command, Stdio},
     thread,
@@ -9,35 +11,43 @@ use bitcoin_ipc::{ipc_state::IPCState, utils};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
-fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error::Error>> {
+fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
     if parts.len() != 5 {
-        println!("Invalid input format");
-        Err("Invalid input format")?;
+        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
-    let name = parts[1].strip_prefix("name=").unwrap_or("");
-    let subnet_address = parts[2].strip_prefix("subnet_address=").unwrap_or("");
+
+    let name = match parts[1].strip_prefix("name=") {
+        Some(name) => name,
+        None => return Err(ParseIpcTransactionError::MissingName),
+    };
+
+    let pk = match parts[2].strip_prefix("pk=") {
+        Some(pk) => pk,
+        None => return Err(ParseIpcTransactionError::MissingPk),
+    };
+
     let required_number_of_validators: u64 = parts[3]
         .strip_prefix("required_number_of_validators=")
         .unwrap_or("")
         .trim()
         .parse()
-        .expect("Invalid number of validators");
+        .map_err(|_| ParseIpcTransactionError::CannotParseNumberOfValidators)?;
+
+    if required_number_of_validators == 0 {
+        return Err(ParseIpcTransactionError::NumberOfValidatorsZero);
+    }
+
     let required_collateral: u64 = parts[4]
         .strip_prefix("required_collateral=")
         .unwrap_or("")
         .trim()
         .parse()
-        .expect("Invalid collateral amount");
+        .map_err(|_| ParseIpcTransactionError::CollateralZero)?;
 
-    if name.is_empty()
-        || subnet_address.is_empty()
-        || required_number_of_validators == 0
-        || required_collateral == 0
-    {
-        println!("Invalid input format");
-        Err("Invalid input format")?;
+    if required_collateral == 0 {
+        return Err(ParseIpcTransactionError::CollateralZero);
     }
 
     let ipc_subnet_state = IPCState::new(
@@ -48,7 +58,10 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, Box<dyn std::erro
         required_collateral,
     );
 
-    ipc_subnet_state.save_state();
+    match ipc_subnet_state.save_state() {
+        Ok(_) => {}
+        Err(_) => return Err(ParseIpcTransactionError::CannotWriteIpcState),
+    };
 
     Ok(ipc_subnet_state)
 }
@@ -78,12 +91,11 @@ fn run_subnet_interactor(subnet_name: String) {
         .expect("The script was not completed successfully");
 }
 
-fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error::Error>> {
+fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
     if parts.len() != 5 {
-        println!("Invalid input format");
-        Err("Invalid input format")?;
+        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
     let ip = parts[1].strip_prefix("ip=").unwrap_or("");
@@ -96,7 +108,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error:
 
     if ip.is_empty() || pk.is_empty() || username.is_empty() || subnet_name.is_empty() {
         println!("Invalid input format");
-        Err("Invalid input format")?;
+        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
     let file_name = format!(
@@ -105,9 +117,15 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, Box<dyn std::error:
         subnet_name,
         subnet_name
     );
-    let mut ipc_subnet_state = IPCState::load_state(file_name)?;
+    let mut ipc_subnet_state = match IPCState::load_state(file_name) {
+        Ok(state) => state,
+        Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+    };
 
-    ipc_subnet_state.add_validator(ip.to_string(), username.clone(), pk.to_string());
+    match ipc_subnet_state.add_validator(ip.to_string(), username.clone(), pk.to_string()) {
+        Ok(_) => {}
+        Err(_) => return Err(ParseIpcTransactionError::CannotWriteIpcState),
+    };
 
     // start the interactor after enough validators have joined.
     if ipc_subnet_state.has_required_validators() {
@@ -128,23 +146,24 @@ fn find_valid_utf8(data: &[u8]) -> &str {
     ""
 }
 
-pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
+pub fn main() {
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env().expect("Fatal error.");
 
     let rpc = Client::new(
         &rpc_url,
         Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()),
-    )?;
+    )
+    .expect("Fatal error.");
 
     let _ = rpc.load_wallet(&wallet_name);
 
     let mut blockchain_info;
 
-    let mut current_block_height = rpc.get_blockchain_info()?.blocks;
+    let mut current_block_height = rpc.get_blockchain_info().expect("Fatal error.").blocks;
 
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = rpc.get_blockchain_info()?;
+        blockchain_info = rpc.get_blockchain_info().expect("Fatal error.");
         let latest_block_height = blockchain_info.blocks;
 
         // Check for new blocks
@@ -152,8 +171,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
 
-                let block_hash = rpc.get_block_hash(block_height)?;
-                let block = rpc.get_block(&block_hash)?;
+                let block_hash = rpc.get_block_hash(block_height).expect("Fatal error.");
+                let block = rpc.get_block(&block_hash).expect("Fatal error.");
 
                 for tx in block.txdata {
                     println!("Checking transaction: {}", tx.compute_txid());
@@ -166,15 +185,23 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
                                     println!("Command: {}", witness_str);
                                     println!("Executing the CREATE command...");
-                                    let _ = parse_create_command(witness_str)?;
-                                    println!("CREATE Command executed successfully");
+                                    match parse_create_command(witness_str) {
+                                        Ok(_) => println!("CREATE Command successfully parsed"),
+                                        Err(e) => println!(
+                                            "CREATE Command could not be parsed. Error: {e}"
+                                        ),
+                                    };
                                 }
                                 _ if witness_str.contains(bitcoin_ipc::IPC_JOIN_SUBNET_TAG) => {
                                     println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
                                     println!("Command: {}", witness_str);
                                     println!("Executing the JOIN command...");
-                                    let _ = parse_join_command(witness_str)?;
-                                    println!("JOIN Command executed successfully");
+                                    match parse_join_command(witness_str) {
+                                        Ok(_) => println!("JOIN Command successfully parsed"),
+                                        Err(e) => {
+                                            println!("JOIN Command could not be parsed. Error: {e}")
+                                        }
+                                    };
                                 }
                                 _ => {}
                             }
@@ -240,4 +267,34 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::sleep(Duration::from_secs(10));
     }
+}
+
+#[derive(Error, Debug)]
+pub enum ParseIpcTransactionError {
+    #[error("invalid witness format")]
+    InvalidWitnessFormat,
+
+    #[error("Cannot parse number of validators")]
+    CannotParseNumberOfValidators,
+
+    #[error("Cannot parse collateral")]
+    CannotParseCollateral,
+
+    #[error("number of validators cannot be 0")]
+    NumberOfValidatorsZero,
+
+    #[error("required collateral cannot be 0")]
+    CollateralZero,
+
+    #[error("missing field name")]
+    MissingName,
+
+    #[error("missing field pk")]
+    MissingPk,
+
+    #[error("cannot write ipc state")]
+    CannotWriteIpcState,
+
+    #[error("cannot read ipc state")]
+    CannotReadIpcState,
 }
