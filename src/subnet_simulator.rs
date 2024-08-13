@@ -42,8 +42,8 @@ impl SubnetSimulator {
         if let Ok(mut file) = File::open(format!("{}/{}/keypair.yaml", crate::L1_NAME, subnet_name))
         {
             let mut json = String::new();
-            file.read_to_string(&mut json)
-                .expect("Failed to read state file");
+            file.read_to_string(&mut json)?;
+
             if let Ok(keypair) = serde_json::from_str(&json) {
                 return Ok(SubnetSimulator {
                     subnet_name: String::from(subnet_name),
@@ -60,7 +60,7 @@ impl SubnetSimulator {
         });
     }
 
-    pub fn create_account(&mut self, address: &str) {
+    pub fn create_account(&mut self, address: &String) {
         if self.state.accounts.contains_key(address) {
             println!("Account {} already exists", address);
             return;
@@ -73,7 +73,7 @@ impl SubnetSimulator {
         println!("Account {}", address);
     }
 
-    pub fn fund_account(&mut self, address: &str, amount: u64) {
+    pub fn fund_account(&mut self, address: &String, amount: u64) {
         let account = self
             .state
             .accounts
@@ -85,7 +85,7 @@ impl SubnetSimulator {
         println!("Account {} funded", address);
     }
 
-    pub fn transfer(&mut self, from: &str, to: &str, amount: u64) -> Result<(), String> {
+    pub fn transfer(&mut self, from: &String, to: &String, amount: u64) -> Result<(), String> {
         let from_account = self
             .state
             .accounts
@@ -196,4 +196,7 @@ impl SubnetSimulator {
 pub enum SubnetSimulatorError {
     #[error("account not found")]
     BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
+
+    #[error("error when reading the keypair file")]
+    IoError(#[from] std::io::Error),
 }

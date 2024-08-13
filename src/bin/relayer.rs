@@ -12,8 +12,7 @@ fn checkpoint(subnet_name: String) -> Result<(), RelayerError> {
             bitcoin_ipc::L1_NAME,
             subnet_name,
             subnet_name
-        ))
-        .unwrap();
+        ))?;
 
         if subnet.has_required_validators() {
             let mut simulator = SubnetSimulator::new(&subnet_name)?;
@@ -44,6 +43,9 @@ struct Args {
 pub enum RelayerError {
     #[error(transparent)]
     SubnetSimulatorError(#[from] bitcoin_ipc::subnet_simulator::SubnetSimulatorError),
+
+    #[error(transparent)]
+    IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),

@@ -579,6 +579,9 @@ pub enum BitcoinUtilsError {
     #[error("cannot create change tx for the given arguments")]
     InsufficientAmoutForChangeTx,
 
+    #[error("cannot generate prevouts")]
+    CannotGeneratePrevouts,
+
     #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
     CannotSignTransaction {
         tx: Transaction,
@@ -617,9 +620,8 @@ pub fn create_checkpoint_tx(
     subnet_name: String,
     checkpoint_hash: [u8; 32],
     keypair: Keypair,
-) -> Transaction {
-    let input_info =
-        collect_amount(&rpc, Amount::from_sat(0), fee, keypair.public_key().into()).unwrap();
+) -> Result<Transaction, BitcoinUtilsError> {
+    let input_info = collect_amount(&rpc, Amount::from_sat(0), fee, keypair.public_key().into())?;
 
     let input_vec: Vec<TxIn> = input_info
         .clone()
@@ -632,8 +634,7 @@ pub fn create_checkpoint_tx(
         })
         .collect();
 
-    let change =
-        create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(keypair)).unwrap();
+    let change = create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
 
     let data = format!("n={}{}cp=", subnet_name, crate::DELIMITER);
 
@@ -654,7 +655,7 @@ pub fn create_checkpoint_tx(
     };
 
     // We don't need to sign the transaction, the subnetPK will sign it.
-    unsigned_tx
+    Ok(unsigned_tx)
 }
 
 /// This function hashes  an input string using the Keccak256 algorithm.
@@ -686,7 +687,10 @@ pub fn hash(input: String) -> [u8; 32] {
 pub fn get_seed(input: String) -> usize {
     let hash = hash(input);
     let encoded = encode(hash);
-    usize::from_str_radix(&encoded[..8], 16).unwrap()
+    match usize::from_str_radix(&encoded[..8], 16) {
+        Ok(usz) => usz,
+        Err(_) => 0,
+    }
 }
 
 /// This function generates a keypair from a string input.
@@ -717,16 +721,24 @@ pub fn generate_keypair(input: String) -> Result<Keypair, BitcoinUtilsError> {
 /// # Returns
 ///
 /// * `TxOut` - The previous output for the given input
-pub fn find_prevout_for_input(rpc: &Client, input: TxIn) -> TxOut {
+pub fn find_prevout_for_input(rpc: &Client, input: TxIn) -> Result<TxOut, BitcoinUtilsError> {
     let txid = input.previous_output.txid;
     let vout = input.previous_output.vout;
 
-    let tx_out = rpc.get_tx_out(&txid, vout, None).unwrap().unwrap();
+    let tx_out_option = match rpc.get_tx_out(&txid, vout, None) {
+        Ok(tx_out_option) => tx_out_option,
+        Err(_) => None,
+    };
 
-    TxOut {
+    let tx_out = match tx_out_option {
+        Some(tx_out) => tx_out,
+        None => return Err(BitcoinUtilsError::CannotGeneratePrevouts),
+    };
+
+    Ok(TxOut {
         value: tx_out.value,
         script_pubkey: ScriptBuf::from(tx_out.script_pub_key.hex),
-    }
+    })
 }
 
 /// This function finds the previous outputs for a given transaction.
@@ -739,9 +751,16 @@ pub fn find_prevout_for_input(rpc: &Client, input: TxIn) -> TxOut {
 /// # Returns
 ///
 /// * `Vec<TxOut>` - The previous outputs for the given transaction
-pub fn find_prevouts_for_tx(rpc: &Client, tx: Transaction) -> Vec<TxOut> {
-    tx.input
+pub fn find_prevouts_for_tx(
+    rpc: &Client,
+    tx: Transaction,
+) -> Result<Vec<TxOut>, BitcoinUtilsError> {
+    Ok(tx
+        .input
         .iter()
-        .map(|a: &TxIn| find_prevout_for_input(rpc, a.clone()))
-        .collect()
+        .map(|a: &TxIn| {
+            let prevout = find_prevout_for_input(rpc, a.clone())?;
+            Ok(prevout)
+        })
+        .collect::<Result<Vec<TxOut>, BitcoinUtilsError>>()?)
 }

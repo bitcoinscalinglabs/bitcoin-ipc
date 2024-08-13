@@ -1,4 +1,6 @@
 // subnet_interactor.rs
+use thiserror::Error;
+
 use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use clap::Parser;
 use std::io::{self};
@@ -34,85 +36,133 @@ impl SubnetInteractor {
 
     pub fn interactive_interface(&mut self) {
         loop {
-            println!("Select an option:");
-            println!("1. Create account");
-            println!("2. Fund account");
-            println!("3. Transfer funds");
-            println!("4. Checkpoint state");
-            println!("5. Print state");
-            println!("6. Exit");
+            let prompt = "Select an option:\n\
+                                1. Create account\n\
+                                2. Fund account\n\
+                                3. Transfer funds\n\
+                                4. Checkpoint state\n\
+                                5. Print state\n\
+                                6. Exit";
 
-            let mut choice = String::new();
-            io::stdin()
-                .read_line(&mut choice)
-                .expect("Failed to read line");
-            match choice.trim() {
-                "1" => {
-                    let mut address = String::new();
-
-                    println!("Enter account address:");
-                    io::stdin()
-                        .read_line(&mut address)
-                        .expect("Failed to read account address");
-
-                    self.subnet.create_account(address.trim());
+            let choice = match get_user_input(prompt) {
+                Ok(c) => c,
+                Err(_) => {
+                    println!("Invalid option. Please try again.");
+                    continue;
                 }
-                "2" => {
-                    let mut address = String::new();
-                    let mut amount = String::new();
-
-                    println!("Enter account address:");
-                    io::stdin()
-                        .read_line(&mut address)
-                        .expect("Failed to read account address");
-
-                    println!("Enter amount to add:");
-                    io::stdin()
-                        .read_line(&mut amount)
-                        .expect("Failed to read amount");
-
-                    let amount: u64 = amount.trim().parse().expect("Invalid balance amount");
-
-                    self.subnet.fund_account(address.trim(), amount);
+            };
+            let choice: usize = match choice.parse() {
+                Ok(c) => c,
+                Err(_) => {
+                    println!("Invalid option. Please try again.");
+                    continue;
                 }
-                "3" => {
-                    let mut from = String::new();
-                    let mut to = String::new();
-                    let mut amount = String::new();
+            };
+            match choice {
+                1 => {
+                    let address = match get_user_input("Enter account address:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read account address: {}", e);
+                            continue;
+                        }
+                    };
 
-                    println!("Enter from account address:");
-                    io::stdin()
-                        .read_line(&mut from)
-                        .expect("Failed to read from account address");
+                    self.subnet.create_account(&address);
+                }
+                2 => {
+                    let address = match get_user_input("Enter account address:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read account address: {}", e);
+                            continue;
+                        }
+                    };
+                    let amount = match get_user_input("Enter amount to add:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read amount: {}", e);
+                            continue;
+                        }
+                    };
 
-                    println!("Enter to account address:");
-                    io::stdin()
-                        .read_line(&mut to)
-                        .expect("Failed to read to account address");
+                    let amount: u64 = match amount.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Invalid balance amount: {}", e);
+                            continue;
+                        }
+                    };
 
-                    println!("Enter amount:");
-                    io::stdin()
-                        .read_line(&mut amount)
-                        .expect("Failed to read amount");
+                    self.subnet.fund_account(&address, amount);
+                }
+                3 => {
+                    let from = match get_user_input("Enter from account address:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read from account address: {}", e);
+                            continue;
+                        }
+                    };
+                    let to = match get_user_input("Enter to account address:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read to account address: {}", e);
+                            continue;
+                        }
+                    };
 
-                    let amount: u64 = amount.trim().parse().expect("Invalid amount");
-
-                    match self.subnet.transfer(from.trim(), to.trim(), amount) {
+                    let amount = match get_user_input("Enter amount:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read amount: {}", e);
+                            continue;
+                        }
+                    };
+                    let amount: u64 = match amount.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Invalid amount: {}", e);
+                            continue;
+                        }
+                    };
+                    match self.subnet.transfer(&from, &to, amount) {
                         Ok(_) => {}
                         Err(e) => println!("Transfer failed: {}", e),
                     }
                 }
-                "4" => {
+                4 => {
                     let checkpoint = self.subnet.get_checkpoint();
                     let str_cp = hex::encode(checkpoint);
                     println!("Checkpoint: {:?}", str_cp);
                 }
-                "5" => self.subnet.print_state(),
-                "6" => break,
+                5 => self.subnet.print_state(),
+                6 => break,
                 _ => println!("Invalid option. Please try again."),
             }
         }
     }
+}
+
+fn get_user_input(prompt: &str) -> Result<String, SubnetInteractorError> {
+    println!("{prompt}");
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => Ok(input.trim().to_string()),
+        Err(e) => return Err(e.into()),
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SubnetInteractorError {
+    #[error(transparent)]
+    SubnetSimulatorError(#[from] bitcoin_ipc::subnet_simulator::SubnetSimulatorError),
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error("could not parse user input")]
+    CannotReadUserInput(#[from] std::io::Error),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

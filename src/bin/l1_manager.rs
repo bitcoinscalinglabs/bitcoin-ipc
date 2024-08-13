@@ -31,18 +31,16 @@ impl L1Manager {
         let path = std::path::Path::new(file_path);
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create directories");
+            std::fs::create_dir_all(parent)?;
         }
 
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(file_path)
-            .expect("Failed to open state file");
+            .open(file_path)?;
 
-        file.write_all(serialized.as_bytes())
-            .expect("Failed to write state to file");
+        file.write_all(serialized.as_bytes())?;
 
         Ok(())
     }
@@ -104,10 +102,18 @@ impl L1Manager {
     fn join_child(&self) -> Result<(), L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
-        let choice = get_user_input(&format!(
-            "Pick a subnet (between 1 and {}) to join: ",
+        if subnets.len() == 0 {
+            return Err(L1ManagerError::NoSubnetAvailable);
+        }
+
+        let mut prompt: String = format!(
+            "Select a subnet (between 1 and {}) to join:\n",
             subnets.len()
-        ))?;
+        );
+        for (i, subnet) in subnets.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_name()));
+        }
+        let choice = get_user_input(&prompt)?;
 
         let choice: usize = choice
             .parse()

@@ -120,9 +120,9 @@ pub fn submit_checkpoint(
         ipc_state.get_name(),
         checkpoint_hash,
         simulator.get_keypair(),
-    );
+    )?;
 
-    let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone());
+    let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(checkpoint_tx.clone(), prevouts);

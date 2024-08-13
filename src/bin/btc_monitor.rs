@@ -66,7 +66,7 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
     Ok(ipc_subnet_state)
 }
 
-fn run_subnet_interactor(subnet_name: String) {
+fn run_subnet_interactor(subnet_name: String) -> Result<(), BtcMonitorError> {
     let arg;
 
     if cfg!(target_os = "linux") {
@@ -74,8 +74,7 @@ fn run_subnet_interactor(subnet_name: String) {
     } else if cfg!(target_os = "macos") {
         arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_MACOS;
     } else {
-        eprintln!("Unsupported operating system.");
-        return;
+        return Err(BtcMonitorError::UnsuportedOperatingSystemError);
     }
 
     let mut handle = Command::new("bash")
@@ -83,12 +82,11 @@ fn run_subnet_interactor(subnet_name: String) {
         .arg(subnet_name)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
-        .expect("Failed to execute script");
+        .spawn()?;
 
-    handle
-        .wait()
-        .expect("The script was not completed successfully");
+    handle.wait()?;
+
+    Ok(())
 }
 
 fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
@@ -136,7 +134,10 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
 
     // start the interactor after enough validators have joined.
     if ipc_subnet_state.has_required_validators() {
-        run_subnet_interactor(ipc_subnet_state.get_name());
+        match run_subnet_interactor(ipc_subnet_state.get_name()) {
+            Ok(_) => {}
+            Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
+        }
     }
 
     Ok(ipc_subnet_state)
@@ -154,23 +155,22 @@ fn find_valid_utf8(data: &[u8]) -> &str {
 }
 
 pub fn main() -> Result<(), BtcMonitorError> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env().expect("Fatal error.");
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
     let rpc = Client::new(
         &rpc_url,
         Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()),
-    )
-    .expect("Fatal error.");
+    )?;
 
     let _ = rpc.load_wallet(&wallet_name);
 
     let mut blockchain_info;
 
-    let mut current_block_height = rpc.get_blockchain_info().expect("Fatal error.").blocks;
+    let mut current_block_height = rpc.get_blockchain_info()?.blocks;
 
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = rpc.get_blockchain_info().expect("Fatal error.");
+        blockchain_info = rpc.get_blockchain_info()?;
         let latest_block_height = blockchain_info.blocks;
 
         // Check for new blocks
@@ -178,8 +178,8 @@ pub fn main() -> Result<(), BtcMonitorError> {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
 
-                let block_hash = rpc.get_block_hash(block_height).expect("Fatal error.");
-                let block = rpc.get_block(&block_hash).expect("Fatal error.");
+                let block_hash = rpc.get_block_hash(block_height)?;
+                let block = rpc.get_block(&block_hash)?;
 
                 for tx in block.txdata {
                     println!("Checking transaction: {}", tx.compute_txid());
@@ -293,6 +293,18 @@ pub enum BtcMonitorError {
     #[error(transparent)]
     IPCStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
 
+    #[error("unsupported operating system")]
+    UnsuportedOperatingSystemError,
+
+    #[error("Env var error")]
+    EnvVarError(#[from] std::env::VarError),
+
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    BtcCoreRpcError(#[from] bitcoincore_rpc::Error),
+
     #[error("internal error")]
     Internal,
 }
@@ -307,6 +319,9 @@ pub enum ParseIpcTransactionError {
 
     #[error("Cannot parse collateral")]
     CannotParseCollateral,
+
+    #[error("cannot launch subnet interactor")]
+    CannotLaunchInteractor,
 
     #[error("number of validators cannot be 0")]
     NumberOfValidatorsZero,
