@@ -1,21 +1,112 @@
-use bitcoin::{key::Secp256k1, Amount};
-use bitcoin_ipc::{
-    bitcoin_utils::{get_address_from_private_key, get_private_key},
-    ipc_lib::{create_child, join_child},
-};
+use std::process::{Command, Stdio};
+use std::thread;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subnet_data = bitcoin_ipc::IPC_CREATE_SUBNET_TAG;
+use bitcoin_ipc::ipc_state::IPCState;
 
-    let receiver_key: bitcoin::bip32::Xpriv = get_private_key(1, bitcoin_ipc::NETWORK);
-    let subnet_address =
-        get_address_from_private_key(&Secp256k1::new(), &receiver_key, bitcoin_ipc::NETWORK);
+fn main() {
+    // Step 1: Run bitcoind in a new terminal
+    let _bitcoind_handle = thread::spawn(|| {
+        Command::new("sh")
+            // .arg("--title=bitcoind")
+            // .arg("--")
+            // .arg("bash")
+            .arg("-c")
+            .arg("bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001; exec bash")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to start bitcoind");
+    });
 
-    create_child(&subnet_address, subnet_data)?;
+    // Wait a bit to ensure the previous steps are complete
+    thread::sleep(std::time::Duration::from_secs(1));
 
-    let collateral = Amount::from_btc(1.0)?;
-    let validator_data = format!("{} IP:{}", bitcoin_ipc::IPC_JOIN_SUBNET_TAG, "...");
-    join_child(&subnet_address, collateral, &validator_data)?;
+    // Step 2: Run btc_monitor in a new terminal
+    let _btc_monitor_handle = thread::spawn(|| {
+        Command::new("sh")
+            // .arg("--title=btc_monitor")
+            // .arg("--")
+            // .arg("bash")
+            .arg("-c")
+            .arg("cargo run --bin btc_monitor; exec bash")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to start btc_monitor");
+    });
 
-    Ok(())
+    // Wait a bit to ensure the previous steps are complete
+    thread::sleep(std::time::Duration::from_secs(1));
+
+    // Step 3: Run l1_manager in a new terminal
+    let _l1_manager_handle = thread::spawn(|| {
+        Command::new("sh")
+            // .arg("--title=l1_manager")
+            // .arg("--")
+            // .arg("bash")
+            .arg("-c")
+            .arg("cargo run --bin l1_manager; exec bash")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to start l1_manager");
+    });
+
+    // Wait a bit to ensure the previous steps are complete
+    thread::sleep(std::time::Duration::from_secs(1));
+
+    let subnets = IPCState::load_all().unwrap_or_else(|_| Vec::new());
+
+    subnets.iter().for_each(|subnet| {
+        if subnet.has_required_validators() {
+            let subnet_name = subnet.get_name().clone();
+            let l1_name = bitcoin_ipc::L1_NAME.to_string();
+            let _subnet_interactor_handle = thread::spawn(move || {
+                Command::new("sh")
+                    // .arg(format!("--title=subnet_interactor {}", subnet_name))
+                    // .arg("--")
+                    // .arg("bash")
+                    .arg("-c")
+                    .arg(format!(
+                        "cargo run --bin subnet_interactor -- --url {}; exec bash",
+                        format!("{}/{}", l1_name, subnet_name)
+                    ))
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("Failed to start subnet_interactor");
+            });
+            _subnet_interactor_handle
+                .join()
+                .expect("Failed to join subnet_interactor thread");
+        }
+    });
+
+    // Step 4: Generate a keypair for the subnet
+    let _generate_keypair_handle = thread::spawn(|| {
+        Command::new("sh")
+            // .arg("--title=generate_keypair")
+            // .arg("--")
+            // .arg("bash")
+            .arg("-c")
+            .arg("cargo run --bin generate_keypair; exec bash")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Failed to generate keypair");
+    });
+
+    // Join threads to wait for them to complete
+    _bitcoind_handle
+        .join()
+        .expect("Failed to join bitcoind thread");
+    _btc_monitor_handle
+        .join()
+        .expect("Failed to join btc_monitor thread");
+    _l1_manager_handle
+        .join()
+        .expect("Failed to join l1_manager thread");
+    _generate_keypair_handle
+        .join()
+        .expect("Failed to join generate_keypair thread");
 }
