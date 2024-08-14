@@ -27,7 +27,7 @@ impl L1Manager {
             "".to_string()
         });
 
-        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, name);
+        let file_path = &format!("{}/{}/keypair.json", bitcoin_ipc::L1_NAME, name);
         let path = std::path::Path::new(file_path);
 
         if let Some(parent) = path.parent() {
@@ -44,6 +44,31 @@ impl L1Manager {
 
         Ok(())
     }
+
+    // fn create_state_file(name: &str) -> Result<(), L1ManagerError> {
+    //     let state = SubnetState::new();
+    //     let serialized = serde_json::to_string(state).unwrap_or_else(|_| {
+    //         println!("Failed to serialize keypair");
+    //         "".to_string()
+    //     });
+
+    //     let file_path = &format!("{}/{}/keypair.json", bitcoin_ipc::L1_NAME, name);
+    //     let path = std::path::Path::new(file_path);
+
+    //     if let Some(parent) = path.parent() {
+    //         std::fs::create_dir_all(parent)?;
+    //     }
+
+    //     let mut file = OpenOptions::new()
+    //         .write(true)
+    //         .create(true)
+    //         .truncate(true)
+    //         .open(file_path)?;
+
+    //     file.write_all(serialized.as_bytes())?;
+
+    //     Ok(())
+    // }
 
     fn create_child(&self) -> Result<(), L1ManagerError> {
         let name = get_user_input("Enter subnet name:")?;
@@ -99,7 +124,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn join_child(&self) -> Result<(), L1ManagerError> {
+    fn choose_subnet(&self) -> Result<IPCState, L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
         if subnets.len() == 0 {
@@ -107,12 +132,14 @@ impl L1Manager {
         }
 
         let mut prompt: String = format!(
-            "Select a subnet (between 1 and {}) to join:\n",
+            "Select a subnet (between 1 and {}) to deposit funds:\n",
             subnets.len()
         );
+
         for (i, subnet) in subnets.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_name()));
         }
+
         let choice = get_user_input(&prompt)?;
 
         let choice: usize = choice
@@ -127,7 +154,11 @@ impl L1Manager {
             });
         }
 
-        let ipc_state = &subnets[choice - 1];
+        Ok(subnets[choice - 1].clone())
+    }
+
+    fn join_child(&self) -> Result<(), L1ManagerError> {
+        let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
         let pk = get_user_input("Enter validator's public key:")?;
@@ -155,12 +186,56 @@ impl L1Manager {
         Ok(())
     }
 
+    fn deposit(&self) -> Result<(), L1ManagerError> {
+        let ipc_state = self.choose_subnet()?;
+
+        let amount = get_user_input("Enter amount to deposit (in satoshis):")?;
+
+        let amount: u64 = amount
+            .parse()
+            .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
+
+        if amount < 200 {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "amount must be at least 200 satoshis",
+            });
+        }
+
+        let subnet_address = &ipc_state.get_subnet_address()?;
+
+        let target_address = get_user_input("Enter target address:")?;
+
+        let mut deposit_data = String::new();
+        deposit_data.push_str(bitcoin_ipc::IPC_DEPOSIT_TAG);
+        deposit_data.push_str(&format!(
+            "{}amount={}{}",
+            bitcoin_ipc::DELIMITER,
+            amount,
+            bitcoin_ipc::DELIMITER
+        ));
+        deposit_data.push_str(&format!(
+            "subnet_name={}{}",
+            ipc_state.get_name(),
+            bitcoin_ipc::DELIMITER
+        ));
+        deposit_data.push_str(&format!("target_address={}", target_address));
+
+        bitcoin_ipc::ipc_lib::create_and_submit_deposit_tx(
+            subnet_address,
+            Amount::from_sat(amount),
+            &deposit_data,
+        )?;
+
+        Ok(())
+    }
+
     fn interactive_interface(&mut self) {
         let prompt = "Select an option:\n\
             1. Read state\n\
             2. Create child\n\
             3. Join child\n\
-            4. Exit";
+            4. Deposit\n\
+            5. Exit";
 
         loop {
             let choice = match get_user_input(prompt) {
@@ -211,7 +286,16 @@ impl L1Manager {
                     }
                 },
 
-                4 => break,
+                4 => match self.deposit() {
+                    Ok(_) => {
+                        println!("Transaction to deposit funds has been submited to bitcoin, please wait for confirmation.");
+                    }
+                    Err(e) => {
+                        println!("An error occured, funds were not deposited. Error: {e}");
+                    }
+                },
+
+                5 => break,
 
                 _ => println!("Invalid option. Please try again."),
             }

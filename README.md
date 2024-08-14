@@ -131,6 +131,11 @@ This guide will walk you through the necessary steps needed to setup the environ
 ./scripts/demo_ubuntu.sh 
 ```
 
+- Or if there are already existing subnets that have the required number of validators, the subnet names can be supplied as arguments to the demo scripts
+for example
+```sh
+./scripts/demo_ubuntu.sh "<subnet-name1>" "<subnet-name2>" ...
+
 This will run `bitcoind`, `btc_monitor`, the `l1_manager` and it will open a `subnet_interactor` terminal for every existing subnet that has the required number of validators.
 
 Additionally, when interacting with the `l1_manager`, after enough validators join a subnet, you can run the `subnet_interactor` for that subnet by exectuing

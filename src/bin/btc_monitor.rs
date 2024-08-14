@@ -3,7 +3,12 @@ use thiserror::Error;
 use std::{thread, time::Duration};
 
 use bitcoin::script::Instruction;
-use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, utils};
+use bitcoin_ipc::{
+    bitcoin_utils,
+    ipc_state::IPCState,
+    subnet_simulator::{SubnetSimulator, SubnetSimulatorError},
+    utils,
+};
 
 use bitcoincore_rpc::RpcApi;
 
@@ -108,6 +113,50 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
     Ok(ipc_subnet_state)
 }
 
+fn parse_deposit_command(witness_str: &str) -> Result<SubnetSimulator, ParseIpcTransactionError> {
+    let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
+
+    if parts.len() != 4 {
+        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
+    }
+
+    let amount: u64 = parts[1]
+        .strip_prefix("amount=")
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .map_err(|_| ParseIpcTransactionError::CannotParseAmount)?;
+
+    let subnet_name = match parts[2].strip_prefix("subnet_name=") {
+        Some(subnet_name) => subnet_name,
+        None => return Err(ParseIpcTransactionError::MissingName),
+    };
+
+    let target_address = match parts[3].strip_prefix("target_address=") {
+        Some(target_address) => target_address,
+        None => return Err(ParseIpcTransactionError::MissingTargetAddress),
+    };
+
+    let mut simulator = match SubnetSimulator::new(&subnet_name) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Failed to start simulator: {}", e);
+            return Err(ParseIpcTransactionError::CannotLaunchSimulator);
+        }
+    };
+
+    match simulator.fund_account(&target_address.to_string(), amount) {
+        Ok(_) => {}
+        Err(_) => {
+            return Err(ParseIpcTransactionError::SubnetSimulatorError(
+                SubnetSimulatorError::CannotFundAccount,
+            ))
+        }
+    }
+
+    Ok(simulator)
+}
+
 fn find_valid_utf8(data: &[u8]) -> &str {
     let mut start = 0;
     while start < data.len() {
@@ -206,6 +255,19 @@ pub fn main() {
                                         Ok(_) => println!("JOIN Command successfully parsed"),
                                         Err(e) => {
                                             println!("JOIN Command could not be parsed. Error: {e}")
+                                        }
+                                    };
+                                }
+                                _ if witness_str.contains(bitcoin_ipc::IPC_DEPOSIT_TAG) => {
+                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_DEPOSIT_TAG);
+                                    println!("Command: {}", witness_str);
+                                    println!("Executing the DEPOSIT command...");
+                                    match parse_deposit_command(witness_str) {
+                                        Ok(_) => println!("DEPOSIT Command successfully parsed"),
+                                        Err(e) => {
+                                            println!(
+                                                "DEPOSIT Command could not be parsed. Error: {e}"
+                                            )
                                         }
                                     };
                                 }
@@ -325,8 +387,14 @@ pub enum ParseIpcTransactionError {
     #[error("Cannot parse collateral")]
     CannotParseCollateral,
 
-    #[error("cannot launch subnet interactor")]
-    CannotLaunchInteractor,
+    #[error("Cannot parse amount")]
+    CannotParseAmount,
+
+    #[error("cannot launch subnet simulator")]
+    CannotLaunchSimulator,
+
+    #[error("subnet simulator error")]
+    SubnetSimulatorError(#[from] bitcoin_ipc::subnet_simulator::SubnetSimulatorError),
 
     #[error("number of validators cannot be 0")]
     NumberOfValidatorsZero,
@@ -336,6 +404,9 @@ pub enum ParseIpcTransactionError {
 
     #[error("missing field name")]
     MissingName,
+
+    #[error("missing target address")]
+    MissingTargetAddress,
 
     #[error("missing field pk")]
     MissingPk,

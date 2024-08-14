@@ -104,7 +104,7 @@ pub fn create_and_submit_join_child_tx(
 /// * `checkpoint_hash` - A string representing the hash of the checkpoint to be submitted.
 /// * `ipc_state` - An instance of IPCState representing the state of the subnet.
 /// * `simulator` - An instance of SubnetSimulator representing the state of the subnet.
-pub fn submit_checkpoint(
+pub fn create_and_submit_checkpoint_tx(
     checkpoint_hash: [u8; 32],
     ipc_state: IPCState,
     simulator: SubnetSimulator,
@@ -133,6 +133,39 @@ pub fn submit_checkpoint(
     match test_and_submit(&rpc, vec![signed_transaction], miner_address) {
         Ok(_) => Ok(()),
         Err(e) => Err(SubmitCheckpointError::BitcoinUtilsError(e)),
+    }
+}
+
+/// Creates a deposit transaction for a subnet represented by a Bitcoin address and submits it to the Bitcoin network.
+///
+/// This function creates a Bitcoin transaction that includes specified deposit data
+/// and submits it to the Bitcoin network. The transaction involves creating and revealing
+/// a script containing the data using the Taproot script-path. This process ensures
+/// the data is embedded in the blockchain.
+///
+/// # Arguments
+///
+/// * `subnet_address` - A reference to a `bitcoin::Address` that represents the subnet's multisig address.
+/// * `amount` - An `Amount` representing the amount to be deposited to the subnet's multisig address.
+/// * `deposit_data` - A string slice that holds the deposit data to be embedded in the transaction.
+pub fn create_and_submit_deposit_tx(
+    subnet_address: &bitcoin::Address,
+    amount: Amount,
+    deposit_data: &str,
+) -> Result<(), IpcLibError> {
+    // Init RPC connection and wallet
+    let fee: Amount = Amount::from_sat(200);
+
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
+    let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
+    let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
+
+    let (commit_tx, reveal_tx) =
+        write_arbitrary_data(&rpc, amount + fee, fee, deposit_data, subnet_address)?;
+
+    match test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
     }
 }
 

@@ -31,9 +31,17 @@ fn checkpoint(subnet_name: String) {
                 }
             };
 
-            let hash = simulator.get_checkpoint();
+            let hash = match simulator.get_checkpoint() {
+                Ok(h) => h,
+                Err(e) => {
+                    println!("Failed to get checkpoint: {}", e);
+                    thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
 
-            if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator) {
+            if let Ok(_) = ipc_lib::create_and_submit_checkpoint_tx(hash, subnet.clone(), simulator)
+            {
                 println!("Checkpoint for {} submitted successfully", subnet.get_url());
             } else {
                 println!("Failed to submit checkpoint for {}", subnet.get_url());
