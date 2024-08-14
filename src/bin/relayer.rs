@@ -5,21 +5,38 @@ use std::{thread, time::Duration};
 
 use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulator};
 
-fn checkpoint(subnet_name: String) -> Result<(), RelayerError> {
+fn checkpoint(subnet_name: String) {
     loop {
-        let subnet = IPCState::load_state(format!(
+        let subnet = match IPCState::load_state(format!(
             "{}/{}/{}.json",
             bitcoin_ipc::L1_NAME,
             subnet_name,
             subnet_name
-        ))?;
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Failed to load subnet state: {}", e);
+                thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        };
 
         if subnet.has_required_validators() {
-            let mut simulator = SubnetSimulator::new(&subnet_name)?;
+            let mut simulator = match SubnetSimulator::new(&subnet_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("Failed to start simulator: {}", e);
+                    thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+
             let hash = simulator.get_checkpoint();
 
             if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator) {
                 println!("Checkpoint for {} submitted successfully", subnet.get_url());
+            } else {
+                println!("Failed to submit checkpoint for {}", subnet.get_url());
             }
         } else {
             println!(
@@ -51,10 +68,8 @@ pub enum RelayerError {
     Other(#[from] Box<dyn std::error::Error>),
 }
 
-fn main() -> Result<(), RelayerError> {
+fn main() {
     let args = Args::parse();
 
-    checkpoint(args.subnet_name)?;
-
-    Ok(())
+    checkpoint(args.subnet_name);
 }

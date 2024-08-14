@@ -121,51 +121,43 @@ This guide will walk you through the necessary steps needed to setup the environ
 
 ## Running the demo
 
-1. Make sure you have the bitcoind client and btc_monitor running.
-
+- On MacOS run the following command:
 ```sh
-bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001
+./scripts/demo_ubuntu.sh 
 ```
 
+- On Ubuntu run the following command:
 ```sh
-cargo run --bin btc_monitor
+./scripts/demo_ubuntu.sh 
 ```
 
-2. Run the l1_manager binary to interact with L1 IPC
+This will run `bitcoind`, `btc_monitor`, the `l1_manager` and it will open a `subnet_interactor` terminal for every existing subnet that has the required number of validators.
 
+Additionally, when interacting with the `l1_manager`, after enough validators join a subnet, you can run the `subnet_interactor` for that subnet by exectuing
 ```sh
-cargo run --bin l1_manager
+cargo run --bin subnet_interactor -- --subnet-name=<subnet_name>
 ```
 
-3. Generate a valid keypair for the subnet
-```sh
-cargo run --bin generate_keypair
-```
+Launch a relayer manually by following step 8. to checkpoint a certain subnet state on the L1.
 
-4. Press 2 to create a child subnet, enter the name and subnet_pk (for now, this has to be a valid bitcoin pk) prompts.
-
-5. You can also press 3 to join a subnet, enter the prompts and watch the btc_monitor.
-
-6. Run the subnet_interactor binary to interact with a child subnet.
-
-```sh
-cargo run --bin subnet_interactor -- --subnet-name <subnet_name> 
-```
-7. Interact with the subnet by calling the commands presented on the terminal.
-
-8. Run a relayer that submits checkpoint transactions for a subnet periodically 
+- Run a relayer that submits checkpoint transactions for a subnet periodically 
 ```sh
 cargo run --bin relayer -- --subnet-name <subnet_name>
 ```
 
-## Running the demo with 1 command
+## Interacting with the L1 Manager
+
+1. Press 1 to Read the state where all subnets are listed.
+
+2. Press 2 to create a child subnet, enter the name, required number of validators and a collateral (in satoshi) prompts.
+
+3. Press 3 to join a subnet, first pick a subnet to join, then enter the prompts (ip address, validator public key and username) and watch the btc_monitor.
+
+## Running the subnet interactor
+
+1. Run the subnet_interactor binary to interact with a child subnet.
 
 ```sh
-cargo run
+cargo run --bin subnet_interactor -- --subnet-name <subnet_name> 
 ```
-
-This will run `bitcoind`, `btc_monitor`, the `l1_manager`, generate a key_pair and additionally, it will open a `subnet_interactor` terminal for every existing subnet that has the required number of validators.
-
-Additionally, when interacting with the `l1_manager`, if enough validators join a new subnet, upon transaction confirmation, a `subnet_interactor` for that subnet will be opened.
-
-Launch a relayer manually by following step 8. to checkpoint a certain subnet state on the L1.
+2. Interact with the subnet by calling the commands presented on the terminal.

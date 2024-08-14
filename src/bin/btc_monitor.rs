@@ -1,15 +1,11 @@
 use thiserror::Error;
 
-use std::{
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
 
 use bitcoin::script::Instruction;
-use bitcoin_ipc::{ipc_state::IPCState, utils};
+use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, utils};
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::RpcApi;
 
 fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
@@ -66,29 +62,6 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
     Ok(ipc_subnet_state)
 }
 
-fn run_subnet_interactor(subnet_name: String) -> Result<(), BtcMonitorError> {
-    let arg;
-
-    if cfg!(target_os = "linux") {
-        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_UBUNTU;
-    } else if cfg!(target_os = "macos") {
-        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_MACOS;
-    } else {
-        return Err(BtcMonitorError::UnsuportedOperatingSystemError);
-    }
-
-    let mut handle = Command::new("bash")
-        .arg(arg)
-        .arg(subnet_name)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-
-    handle.wait()?;
-
-    Ok(())
-}
-
 fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
@@ -132,14 +105,6 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         Err(_) => return Err(ParseIpcTransactionError::CannotWriteIpcState),
     };
 
-    // start the interactor after enough validators have joined.
-    if ipc_subnet_state.has_required_validators() {
-        match run_subnet_interactor(ipc_subnet_state.get_name()) {
-            Ok(_) => {}
-            Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
-        }
-    }
-
     Ok(ipc_subnet_state)
 }
 
@@ -154,23 +119,45 @@ fn find_valid_utf8(data: &[u8]) -> &str {
     ""
 }
 
-pub fn main() -> Result<(), BtcMonitorError> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
+pub fn main() {
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = match utils::load_env() {
+        Ok(env) => env,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
 
-    let rpc = Client::new(
-        &rpc_url,
-        Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()),
-    )?;
+    let rpc = match bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
 
     let _ = rpc.load_wallet(&wallet_name);
 
     let mut blockchain_info;
 
-    let mut current_block_height = rpc.get_blockchain_info()?.blocks;
+    let mut current_block_height = match rpc.get_blockchain_info() {
+        Ok(info) => info.blocks,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
 
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = rpc.get_blockchain_info()?;
+        blockchain_info = match rpc.get_blockchain_info() {
+            Ok(info) => info,
+            Err(e) => {
+                println!("Error: {}", e);
+                thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        };
         let latest_block_height = blockchain_info.blocks;
 
         // Check for new blocks
@@ -178,8 +165,20 @@ pub fn main() -> Result<(), BtcMonitorError> {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
 
-                let block_hash = rpc.get_block_hash(block_height)?;
-                let block = rpc.get_block(&block_hash)?;
+                let block_hash = match rpc.get_block_hash(block_height) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        continue;
+                    }
+                };
+                let block = match rpc.get_block(&block_hash) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        continue;
+                    }
+                };
 
                 for tx in block.txdata {
                     println!("Checking transaction: {}", tx.compute_txid());
@@ -240,7 +239,13 @@ pub fn main() -> Result<(), BtcMonitorError> {
                                                 continue;
                                             }
 
-                                            let subnets = IPCState::load_all()?;
+                                            let subnets = match IPCState::load_all() {
+                                                Ok(subnets) => subnets,
+                                                Err(_) => {
+                                                    println!("Could not load subnets");
+                                                    continue;
+                                                }
+                                            };
 
                                             let name = parts[0].strip_prefix("n=").unwrap_or("");
                                             let checkpoint = hex::encode(

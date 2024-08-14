@@ -46,9 +46,10 @@ pub fn create_and_submit_create_child_tx(
     let (commit_tx, reveal_tx) =
         write_arbitrary_data(&rpc, amount_to_send, fee, subnet_data, subnet_address)?;
 
-    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
-
-    Ok(())
+    match test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+    }
 }
 
 /// Joins an existing subnet by attaching validator data to a Bitcoin transaction.
@@ -86,8 +87,10 @@ pub fn create_and_submit_join_child_tx(
     let (commit_tx, reveal_tx) =
         write_arbitrary_data(&rpc, collateral, fee, validator_data, subnet_address)?;
 
-    test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address)?;
-    Ok(())
+    match test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+    }
 }
 
 /// Submits a checkpoint of a subnet represented by IPCState and SubnetSimulator to the Bitcoin network.
@@ -127,9 +130,10 @@ pub fn submit_checkpoint(
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(checkpoint_tx.clone(), prevouts);
 
-    test_and_submit(&rpc, vec![signed_transaction], miner_address)?;
-
-    Ok(())
+    match test_and_submit(&rpc, vec![signed_transaction], miner_address) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(SubmitCheckpointError::BitcoinUtilsError(e)),
+    }
 }
 
 #[derive(Error, Debug)]

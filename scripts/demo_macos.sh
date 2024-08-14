@@ -18,10 +18,6 @@ end tell'
 
 sleep 1
 
-osascript -e 'tell app "Terminal"
-    do script "cargo run --bin generate_keypair"
-end tell'
-
 for subnet_name in "$@"
 do
     osascript -e 'tell app "Terminal"

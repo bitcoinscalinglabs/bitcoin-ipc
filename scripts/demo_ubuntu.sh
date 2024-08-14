@@ -12,8 +12,6 @@ gnome-terminal --title="l1_manager" -- bash -c "cargo run --bin l1_manager; exec
 
 sleep 1
 
-gnome-terminal --title="generate_keypair" -- bash -c "cargo run --bin generate_keypair; exec bash"
-
 for subnet_name in "$@"
 do
     gnome-terminal --title="subnet_interactor $subnet_name" -- bash -c "cargo run --bin subnet_interactor -- --subnet-name $subnet_name; exec bash"
