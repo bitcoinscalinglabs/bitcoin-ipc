@@ -1,38 +1,60 @@
-// pub fn get_parent(self) -> Self {
-//     let mut parent_subnet: Option<Self> = None;
+use clap::Parser;
+use thiserror::Error;
 
-//     if self.url.eq("BTC") {
-//         return self;
-//     }
+use std::{thread, time::Duration};
 
-//     let url = self.url.clone();
-//     let parent_url_length = url.split('/').count() - 1;
-//     let parent_name = url
-//         .split("/")
-//         .nth(parent_url_length - 1)
-//         .unwrap_or_default();
+use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulator};
 
-//     let mut parent_file_name = url
-//         .split('/')
-//         .take(parent_url_length)
-//         .collect::<Vec<&str>>()
-//         .join("/");
+fn checkpoint(subnet_name: String) -> Result<(), RelayerError> {
+    loop {
+        let subnet = IPCState::load_state(format!(
+            "{}/{}/{}.json",
+            bitcoin_ipc::L1_NAME,
+            subnet_name,
+            subnet_name
+        ))?;
 
-//     parent_file_name.push_str("/");
-//     parent_file_name.push_str(parent_name);
-//     parent_file_name.push_str(".json");
+        if subnet.has_required_validators() {
+            let mut simulator = SubnetSimulator::new(&subnet_name)?;
+            let hash = simulator.get_checkpoint();
 
-//     println!("Parent file name: {}", parent_file_name);
+            if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator) {
+                println!("Checkpoint for {} submitted successfully", subnet.get_url());
+            }
+        } else {
+            println!(
+                "Waiting for validators to join subnet: {}",
+                subnet.get_url()
+            );
+        }
 
-//     if let Ok(mut file) = File::open(parent_file_name) {
-//         let mut json = String::new();
-//         file.read_to_string(&mut json)
-//             .expect("Failed to read parent file");
-//         parent_subnet = serde_json::from_str(&json).expect("Failed to deserialize parent");
-//     }
-//     parent_subnet.clone().expect("Failed to load parent")
-// }
+        thread::sleep(Duration::from_secs(100));
+    }
+}
 
-fn main() {
-    println!("Hello, world!");
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    subnet_name: String,
+}
+
+#[derive(Error, Debug)]
+pub enum RelayerError {
+    #[error(transparent)]
+    SubnetSimulatorError(#[from] bitcoin_ipc::subnet_simulator::SubnetSimulatorError),
+
+    #[error(transparent)]
+    IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+}
+
+fn main() -> Result<(), RelayerError> {
+    let args = Args::parse();
+
+    checkpoint(args.subnet_name)?;
+
+    Ok(())
 }

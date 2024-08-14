@@ -3,9 +3,8 @@ use thiserror::Error;
 use bitcoin::Amount;
 use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::ipc_state::IPCState;
-
-use std::io::{self};
-use std::str::FromStr;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 
 struct L1Manager {
     subnets: Vec<IPCState>,
@@ -18,16 +17,36 @@ impl L1Manager {
         L1Manager { subnets }
     }
 
+    fn store_keypair(
+        &self,
+        keypair: &bitcoin::secp256k1::Keypair,
+        name: &str,
+    ) -> Result<(), L1ManagerError> {
+        let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
+            println!("Failed to serialize keypair");
+            "".to_string()
+        });
+
+        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, name);
+        let path = std::path::Path::new(file_path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)?;
+
+        file.write_all(serialized.as_bytes())?;
+
+        Ok(())
+    }
+
     fn create_child(&self) -> Result<(), L1ManagerError> {
         let name = get_user_input("Enter subnet name:")?;
-
-        let pubkey_str = get_user_input("Enter subnet's public key:")?;
-        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&pubkey_str).map_err(|_| {
-            L1ManagerError::InvalidUserInput {
-                field: "public key",
-            }
-        })?;
-
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
         let required_number_of_validators: u64 =
             required_number_of_validators.parse().map_err(|_| {
@@ -52,9 +71,22 @@ impl L1Manager {
             name,
             bitcoin_ipc::DELIMITER
         ));
-        let subnet_address =
-            bitcoin_utils::get_address_from_public_key(pubkey, bitcoin_ipc::NETWORK);
-        subnet_data.push_str(&format!("pk={}{}", pubkey_str, bitcoin_ipc::DELIMITER));
+
+        let key_pair = bitcoin_utils::generate_keypair(name.to_string())?;
+
+        self.store_keypair(&key_pair, &name)?;
+
+        let subnet_address = bitcoin_utils::get_address_from_private_key(
+            key_pair.secret_key(),
+            bitcoin_ipc::NETWORK,
+        );
+
+        subnet_data.push_str(&format!(
+            "subnet_address={}{}",
+            subnet_address.to_string(),
+            bitcoin_ipc::DELIMITER
+        ));
+
         subnet_data.push_str(&format!(
             "required_number_of_validators={}{}",
             required_number_of_validators,
@@ -70,29 +102,25 @@ impl L1Manager {
     fn join_child(&self) -> Result<(), L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
-        let available_subnets: Vec<&IPCState> = subnets
-            .iter()
-            .filter(|subnet| !subnet.has_required_validators())
-            .collect();
-
-        if available_subnets.is_empty() {
+        if subnets.len() == 0 {
             return Err(L1ManagerError::NoSubnetAvailable);
         }
 
-        available_subnets
-            .iter()
-            .enumerate()
-            .for_each(|(index, subnet)| println!("{}. {}", index + 1, subnet.get_name()));
+        let mut prompt: String = format!(
+            "Select a subnet (between 1 and {}) to join:\n",
+            subnets.len()
+        );
+        for (i, subnet) in subnets.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_name()));
+        }
+        let choice = get_user_input(&prompt)?;
 
-        let choice = get_user_input(&format!(
-            "Pick a subnet (between 1 and  {}) to join: ",
-            available_subnets.len()
-        ))?;
         let choice: usize = choice
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput {
                 field: "invalid choice",
             })?;
+
         if choice < 1 || choice > subnets.len() {
             return Err(L1ManagerError::InvalidUserInput {
                 field: "invalid choice",
@@ -187,6 +215,7 @@ impl L1Manager {
 
                 _ => println!("Invalid option. Please try again."),
             }
+            println!("===============")
         }
     }
 }
@@ -216,6 +245,9 @@ pub enum L1ManagerError {
 
     #[error(transparent)]
     IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] bitcoin_ipc::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),

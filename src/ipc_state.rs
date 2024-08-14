@@ -8,8 +8,6 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
-use crate::bitcoin_utils;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorData {
     pub name: String,
@@ -20,7 +18,7 @@ pub struct ValidatorData {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IPCState {
     name: String,
-    subnet_pk: String,
+    subnet_address: String,
     pub file_path: String,
     url: String,
     required_number_of_validators: u64,
@@ -38,7 +36,7 @@ impl IPCState {
     ) -> Self {
         IPCState {
             name: name.clone(),
-            subnet_pk,
+            subnet_address: subnet_pk,
             file_path: format!("{}/{}.json", url, name),
             url,
             required_number_of_validators,
@@ -98,22 +96,24 @@ impl IPCState {
         self.required_collateral
     }
 
+    pub fn get_url(&self) -> String {
+        self.url.clone()
+    }
+
     pub fn get_name(&self) -> String {
         self.name.clone()
     }
 
     pub fn get_subnet_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
-        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&self.subnet_pk)
-            .map_err(|_| IpcStateError::InvalidSubnetPK)?;
-        Ok(bitcoin_utils::get_address_from_public_key(
-            pubkey,
-            crate::NETWORK,
-        ))
+        return match Address::from_str(&self.subnet_address) {
+            Ok(address) => Ok(address.assume_checked()),
+            Err(_) => Err(IpcStateError::InvalidSubnetPK),
+        };
     }
 
     pub fn load_all() -> Result<Vec<Self>, IpcStateError> {
         let mut ipc_states = Vec::new();
-        let btc_dir = Path::new("BTC");
+        let btc_dir = Path::new(crate::L1_NAME);
 
         if btc_dir.is_dir() {
             for entry in fs::read_dir(btc_dir)? {
@@ -143,7 +143,7 @@ impl IPCState {
         // print in a more organized manner:
         println!("Subnet: {}", self.name);
         println!("URL: {}", self.url);
-        println!("Subnet PK: {}", self.subnet_pk.clone());
+        println!("Subnet Address: {}", self.subnet_address.clone());
         println!(
             "Required number of validators: {}",
             self.required_number_of_validators

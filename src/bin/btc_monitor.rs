@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use bitcoin::script::Instruction;
 use bitcoin_ipc::{ipc_state::IPCState, utils};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -22,8 +23,8 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
         None => return Err(ParseIpcTransactionError::MissingName),
     };
 
-    let pk = match parts[2].strip_prefix("pk=") {
-        Some(pk) => pk,
+    let subnet_address = match parts[2].strip_prefix("subnet_address=") {
+        Some(subnet_address) => subnet_address,
         None => return Err(ParseIpcTransactionError::MissingPk),
     };
 
@@ -52,7 +53,7 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
     let ipc_subnet_state = IPCState::new(
         name.to_string(),
         format!("{}/{}", bitcoin_ipc::L1_NAME, name.to_string()),
-        pk.to_string(),
+        subnet_address.to_string(),
         required_number_of_validators,
         required_collateral,
     );
@@ -65,6 +66,29 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
     Ok(ipc_subnet_state)
 }
 
+fn run_subnet_interactor(subnet_name: String) -> Result<(), BtcMonitorError> {
+    let arg;
+
+    if cfg!(target_os = "linux") {
+        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_UBUNTU;
+    } else if cfg!(target_os = "macos") {
+        arg = bitcoin_ipc::RUN_SUBNET_INTERACTOR_MACOS;
+    } else {
+        return Err(BtcMonitorError::UnsuportedOperatingSystemError);
+    }
+
+    let mut handle = Command::new("bash")
+        .arg(arg)
+        .arg(subnet_name)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    handle.wait()?;
+
+    Ok(())
+}
+
 fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
@@ -72,18 +96,25 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
-    let ip = parts[1].strip_prefix("ip=").unwrap_or("");
-    let pk = parts[2].strip_prefix("pk=").unwrap_or("");
-    let username: String = parts[3].strip_prefix("username=").unwrap_or("").to_string();
-    let subnet_name: String = parts[4]
-        .strip_prefix("subnet_name=")
-        .unwrap_or("")
-        .to_string();
+    let ip = match parts[1].strip_prefix("ip=") {
+        Some(ip) => ip,
+        None => return Err(ParseIpcTransactionError::MissingIP),
+    };
 
-    if ip.is_empty() || pk.is_empty() || username.is_empty() || subnet_name.is_empty() {
-        println!("Invalid input format");
-        return Err(ParseIpcTransactionError::InvalidWitnessFormat);
-    }
+    let pk = match parts[2].strip_prefix("pk=") {
+        Some(pk) => pk,
+        None => return Err(ParseIpcTransactionError::MissingPk),
+    };
+
+    let username = match parts[3].strip_prefix("username=") {
+        Some(subnet_address) => subnet_address.to_string(),
+        None => return Err(ParseIpcTransactionError::MissingUsername),
+    };
+
+    let subnet_name = match parts[4].strip_prefix("subnet_name=") {
+        Some(subnet_name) => subnet_name,
+        None => return Err(ParseIpcTransactionError::MissingName),
+    };
 
     let file_name = format!(
         "{}/{}/{}.json",
@@ -103,21 +134,10 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
 
     // start the interactor after enough validators have joined.
     if ipc_subnet_state.has_required_validators() {
-        let _subnet_interactor_handle = thread::spawn(move || {
-            Command::new("gnome-terminal")
-                .arg(format!("--title=subnet_interactor_{}", subnet_name))
-                .arg("--")
-                .arg("bash")
-                .arg("-c")
-                .arg(format!(
-                    "cargo run --bin subnet_interactor -- --url {}; exec bash",
-                    format!("{}/{}", bitcoin_ipc::L1_NAME, subnet_name)
-                ))
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("Failed to start subnet_interactor");
-        });
+        match run_subnet_interactor(ipc_subnet_state.get_name()) {
+            Ok(_) => {}
+            Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
+        }
     }
 
     Ok(ipc_subnet_state)
@@ -134,24 +154,23 @@ fn find_valid_utf8(data: &[u8]) -> &str {
     ""
 }
 
-pub fn main() {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env().expect("Fatal error.");
+pub fn main() -> Result<(), BtcMonitorError> {
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
     let rpc = Client::new(
         &rpc_url,
         Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()),
-    )
-    .expect("Fatal error.");
+    )?;
 
     let _ = rpc.load_wallet(&wallet_name);
 
     let mut blockchain_info;
 
-    let mut current_block_height = rpc.get_blockchain_info().expect("Fatal error.").blocks;
+    let mut current_block_height = rpc.get_blockchain_info()?.blocks;
 
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = rpc.get_blockchain_info().expect("Fatal error.");
+        blockchain_info = rpc.get_blockchain_info()?;
         let latest_block_height = blockchain_info.blocks;
 
         // Check for new blocks
@@ -159,16 +178,14 @@ pub fn main() {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
 
-                let block_hash = rpc.get_block_hash(block_height).expect("Fatal error.");
-                let block = rpc.get_block(&block_hash).expect("Fatal error.");
+                let block_hash = rpc.get_block_hash(block_height)?;
+                let block = rpc.get_block(&block_hash)?;
 
                 for tx in block.txdata {
                     println!("Checking transaction: {}", tx.compute_txid());
                     for input in &tx.input {
                         for witness in input.witness.iter() {
                             let witness_str = find_valid_utf8(&witness[..]);
-
-                            println!("Witness: {:?}", witness_str);
 
                             match () {
                                 _ if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) => {
@@ -197,6 +214,68 @@ pub fn main() {
                             }
                         }
                     }
+                    // Look for checkpoints
+                    for output in &tx.output {
+                        let script = &output.script_pubkey;
+                        let mut instructions = script.instructions();
+                        if let Some(Ok(Instruction::Op(
+                            bitcoin::blockdata::opcodes::all::OP_RETURN,
+                        ))) = instructions.next()
+                        {
+                            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
+                                if data.len() > 32 {
+                                    if let Ok(data_str) =
+                                        std::str::from_utf8(&data.as_bytes()[..data.len() - 32])
+                                    {
+                                        if data_str.contains("n=")
+                                            && data_str.contains("cp=")
+                                            && data_str.contains(bitcoin_ipc::DELIMITER)
+                                        {
+                                            println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
+                                            let parts: Vec<&str> =
+                                                data_str.split(bitcoin_ipc::DELIMITER).collect();
+
+                                            if parts.len() != 2 {
+                                                println!("Invalid checkpoint format");
+                                                continue;
+                                            }
+
+                                            let subnets = IPCState::load_all()?;
+
+                                            let name = parts[0].strip_prefix("n=").unwrap_or("");
+                                            let checkpoint = hex::encode(
+                                                data.as_bytes()[data.len() - 32..].to_vec(),
+                                            );
+
+                                            println!("Checkpoint for subnet: {}", name);
+
+                                            subnets.iter().for_each(|subnet| {
+                                                if subnet.get_name() == name {
+
+                                                    let subnet_address = match subnet.get_subnet_address() {
+                                                        Ok(address) => address,
+                                                        Err(_) => {
+                                                            println!("Could not determine address for subnet");
+                                                            return;
+                                                        }
+                                                    };
+
+                                                    println!(
+                                                        "Subnet address: {}",
+                                                        subnet_address
+                                                    );
+                                                }
+                                            });
+
+                                            println!("Checkpoint: {}", checkpoint);
+                                        } else {
+                                            println!("Could not determine address for checkpoint");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             current_block_height = latest_block_height;
@@ -204,6 +283,30 @@ pub fn main() {
 
         thread::sleep(Duration::from_secs(10));
     }
+}
+
+#[derive(Error, Debug)]
+pub enum BtcMonitorError {
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error(transparent)]
+    IPCStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error("unsupported operating system")]
+    UnsuportedOperatingSystemError,
+
+    #[error("Env var error")]
+    EnvVarError(#[from] std::env::VarError),
+
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    BtcCoreRpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("internal error")]
+    Internal,
 }
 
 #[derive(Error, Debug)]
@@ -217,6 +320,9 @@ pub enum ParseIpcTransactionError {
     #[error("Cannot parse collateral")]
     CannotParseCollateral,
 
+    #[error("cannot launch subnet interactor")]
+    CannotLaunchInteractor,
+
     #[error("number of validators cannot be 0")]
     NumberOfValidatorsZero,
 
@@ -228,6 +334,12 @@ pub enum ParseIpcTransactionError {
 
     #[error("missing field pk")]
     MissingPk,
+
+    #[error("missing field ip")]
+    MissingIP,
+
+    #[error("missing field username")]
+    MissingUsername,
 
     #[error("cannot write ipc state")]
     CannotWriteIpcState,

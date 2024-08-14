@@ -1,7 +1,15 @@
-use hex::encode;
+use crate::bitcoin_utils;
+
+use bitcoin::key::{TapTweak, TweakedKeypair};
+use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::{TapSighashType, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use tiny_keccak::{Hasher, Keccak};
+use std::io::Read;
+use std::{collections::HashMap, fs::File};
+
+use bitcoin::secp256k1::{Message, Secp256k1};
+
+use thiserror::Error;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Account {
@@ -24,18 +32,35 @@ impl SubnetState {
 pub struct SubnetSimulator {
     pub subnet_name: String,
     state: SubnetState,
+    keypair: bitcoin::secp256k1::Keypair,
 }
 
 impl SubnetSimulator {
-    pub fn new(subnet_name: &str) -> Self {
+    pub fn new(subnet_name: &str) -> Result<Self, SubnetSimulatorError> {
         println!("Starting simulator for subnet {subnet_name}.");
-        SubnetSimulator {
+
+        if let Ok(mut file) = File::open(format!("{}/{}/keypair.yaml", crate::L1_NAME, subnet_name))
+        {
+            let mut json = String::new();
+            file.read_to_string(&mut json)?;
+
+            if let Ok(keypair) = serde_json::from_str(&json) {
+                return Ok(SubnetSimulator {
+                    subnet_name: String::from(subnet_name),
+                    state: SubnetState::new(),
+                    keypair,
+                });
+            }
+        }
+
+        return Ok(SubnetSimulator {
             subnet_name: String::from(subnet_name),
             state: SubnetState::new(),
-        }
+            keypair: bitcoin_utils::generate_keypair(subnet_name.to_string())?,
+        });
     }
 
-    pub fn create_account(&mut self, address: &str) {
+    pub fn create_account(&mut self, address: &String) {
         if self.state.accounts.contains_key(address) {
             println!("Account {} already exists", address);
             return;
@@ -48,7 +73,7 @@ impl SubnetSimulator {
         println!("Account {}", address);
     }
 
-    pub fn fund_account(&mut self, address: &str, amount: u64) {
+    pub fn fund_account(&mut self, address: &String, amount: u64) {
         let account = self
             .state
             .accounts
@@ -60,7 +85,7 @@ impl SubnetSimulator {
         println!("Account {} funded", address);
     }
 
-    pub fn transfer(&mut self, from: &str, to: &str, amount: u64) -> Result<(), String> {
+    pub fn transfer(&mut self, from: &String, to: &String, amount: u64) -> Result<(), String> {
         let from_account = self
             .state
             .accounts
@@ -84,29 +109,94 @@ impl SubnetSimulator {
         Ok(())
     }
 
-    pub fn get_checkpoint(&mut self) -> String {
+    pub fn get_checkpoint(&mut self) -> [u8; 32] {
         println!("Computing state checkpoint...");
 
         // Disclaimer: this is not secure. It has not checked whether the serialization method and the HashMap
         // implementations avoid collisions.
         let json = serde_json::to_string(&self.state.accounts).expect("Failed to serialize state");
 
-        let mut keccak = Keccak::v256();
-        keccak.update(json.as_bytes());
-        let mut hash = [0u8; 32];
-        keccak.finalize(&mut hash);
-        encode(hash)
+        bitcoin_utils::hash(json)
+    }
+
+    /// This function signs a transaction with the keypair of the subnet a.k.a. subnetPK
+    /// # Arguments
+    ///
+    /// * `tx` - The transaction to sign
+    /// * `prevouts` - The txouts referenced by the inputs of the transaction
+    ///
+    /// # Returns
+    ///
+    /// * A signed transaction
+    pub fn sign_transaction(&self, mut tx: Transaction, prevouts: Vec<TxOut>) -> Transaction {
+        let signatures: Vec<Vec<u8>> = tx
+            .input
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let secp = Secp256k1::new();
+                let mut sighash_cache = SighashCache::new(&tx);
+
+                let sighash = sighash_cache
+                    .taproot_key_spend_signature_hash(
+                        i,
+                        &Prevouts::All(&prevouts),
+                        TapSighashType::Default,
+                    )
+                    .expect("failed to construct sighash");
+
+                // Sign the sighash using the secp256k1 library
+                let tweaked_keypair: TweakedKeypair = self.keypair.tap_tweak(&secp, None);
+                let msg = Message::from_digest_slice(&sighash[..]).expect("32 bytes");
+                let signature = secp.sign_schnorr(&msg, &tweaked_keypair.to_inner());
+
+                bitcoin::taproot::Signature {
+                    signature,
+                    sighash_type: TapSighashType::Default,
+                }
+                .to_vec()
+            })
+            .collect();
+
+        for (i, input) in tx.input.iter_mut().enumerate() {
+            input.witness.push(signatures[i].clone());
+            println!("Signed input {}", i);
+        }
+
+        tx
+    }
+
+    pub fn get_public_key(&self) -> bitcoin::secp256k1::PublicKey {
+        self.keypair.public_key()
+    }
+
+    pub fn get_keypair(&self) -> bitcoin::secp256k1::Keypair {
+        self.keypair
     }
 
     pub fn print_state(&mut self) {
         println!("#################################");
         // print in a more organized manner:
+        println!("Subnet: {}", self.subnet_name);
+        println!("Subnet PK: {}", self.get_public_key());
         println!("Accounts:");
         for (address, account) in &self.state.accounts {
             println!("  {}: {}", address, account.balance);
         }
 
-        println!("Checkpoint: {}", self.get_checkpoint());
+        let checkpoint = self.get_checkpoint();
+        let str_cp = hex::encode(checkpoint);
+
+        println!("Checkpoint: {}", str_cp);
         println!();
     }
+}
+
+#[derive(Error, Debug)]
+pub enum SubnetSimulatorError {
+    #[error("account not found")]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
+
+    #[error("error when reading the keypair file")]
+    IoError(#[from] std::io::Error),
 }

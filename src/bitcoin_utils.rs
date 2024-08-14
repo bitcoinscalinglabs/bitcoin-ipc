@@ -1,10 +1,12 @@
+use std::vec;
 use thiserror::Error;
 
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
-use bitcoin::secp256k1::{All, Keypair, Secp256k1};
+use bitcoin::secp256k1::{All, Keypair, Secp256k1, SecretKey};
 use bitcoin::taproot::TaprootSpendInfo;
+use bitcoin::PublicKey;
 use bitcoin::{
     amount::Amount,
     bip32::Xpriv,
@@ -13,6 +15,9 @@ use bitcoin::{
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, XOnlyPublicKey,
 };
+use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
+use hex::encode;
+use tiny_keccak::{Hasher, Keccak};
 
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 
@@ -197,6 +202,7 @@ pub fn create_change_txout(
     input_info: &Vec<OutPoint>,
     amount_to_send: Amount,
     fee: Amount,
+    keypair: Option<Keypair>,
 ) -> Result<TxOut, BitcoinUtilsError> {
     let mut input_total_value = 0;
 
@@ -214,11 +220,23 @@ pub fn create_change_txout(
 
     let change_amount = input_total_value - amount_to_send.to_sat() - fee.to_sat();
 
-    let change_address = rpc.get_new_address(None, None)?;
-    let change_script_pubkey = change_address.assume_checked().script_pubkey();
+    let script_pub_key: ScriptBuf;
+
+    if !keypair.is_some() {
+        script_pub_key = rpc
+            .get_new_address(None, None)?
+            .assume_checked()
+            .script_pubkey();
+    } else {
+        script_pub_key = ScriptBuf::new_p2tr(
+            &Secp256k1::new(),
+            keypair.unwrap().x_only_public_key().0,
+            None,
+        );
+    }
     Ok(TxOut {
         value: Amount::from_sat(change_amount),
-        script_pubkey: change_script_pubkey,
+        script_pubkey: script_pub_key,
     })
 }
 
@@ -275,15 +293,12 @@ pub fn commit_arbitrary_data(
     data: &[u8],
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
-    let push_bytes: &PushBytes;
-    unsafe {
-        push_bytes = &*(data as *const [u8] as *const PushBytes);
-    }
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
 
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key(&secp);
-
     let script = Builder::new().push_slice(push_bytes).into_script();
+
     let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
     let taproot_spend_info = builder
         .finalize(&secp, unspendable_pubkey)
@@ -325,41 +340,19 @@ pub fn commit_arbitrary_data(
     ))
 }
 
-/// Collects a specified amount of Bitcoin from the wallet.
-/// This function collects a specified amount of Bitcoin from the wallet by selecting
-/// a set of unspent outputs (UTXOs) that sum up to the desired amount. The function
-/// returns a vector of `OutPoint` objects that represent the selected UTXOs.
-/// If the wallet does not have enough funds, the function returns an error.
-///
-/// # Arguments
-///
-/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
-/// * `amount` - The amount of Bitcoin to collect, of type `Amount`
-/// * `fee` - The fee to pay for the transaction, of type `Amount`
-///
-/// # Returns
-///
-/// * `Vec<OutPoint>` - A vector of `OutPoint` objects representing the selected UTXOs
-pub fn collect_amount(
-    rpc: &Client,
-    amount: Amount,
-    fee: Amount,
+fn assemble_outpoints_for_target_amount(
+    output: Vec<Utxo>,
+    target_amount: u64,
 ) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
-    // Fetch the list of unspent outputs
-    let unspent = rpc.list_unspent(None, None, None, None, None)?;
-
-    // Target amount is the sum of the desired amount and the fee
-    let target_amount = amount.to_sat() + fee.to_sat();
     let mut collected_outpoints = Vec::new();
     let mut total_collected: u64 = 0;
 
-    for utxo in unspent {
+    for utxo in output {
         // Break the loop if we've collected enough
         if total_collected >= target_amount {
             break;
         }
 
-        // Create an OutPoint from the UTXO data
         let outpoint = OutPoint {
             txid: utxo.txid,
             vout: utxo.vout,
@@ -380,6 +373,59 @@ pub fn collect_amount(
     }
 }
 
+pub fn collect_amount_for_wallet(
+    rpc: &Client,
+    amount: Amount,
+    fee: Amount,
+) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
+    let unspent = rpc.list_unspent(None, None, None, None, None)?;
+
+    let outpoints: Vec<Utxo> = unspent
+        .iter()
+        .map(|utxo| Utxo {
+            txid: utxo.txid,
+            vout: utxo.vout,
+            amount: utxo.amount,
+            height: 1,
+            descriptor: "".to_string(),
+            script_pub_key: utxo.script_pub_key.clone(),
+        })
+        .collect();
+
+    assemble_outpoints_for_target_amount(outpoints, amount.to_sat() + fee.to_sat())
+}
+
+/// Collects a specified amount of Bitcoin from a specified pubkey
+/// This function collects a specified amount of Bitcoin that the specified pubkey can spend
+/// by selecting a set of unspent outputs (UTXOs) that sum up to the desired amount. The function
+/// returns a vector of `OutPoint` objects that represent the selected UTXOs.
+/// If the pubkey does not have enough funds, the function returns an error.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `amount` - The amount of Bitcoin to collect, of type `Amount`
+/// * `fee` - The fee to pay for the transaction, of type `Amount`
+/// * `pubkey` - The public key that can spend the utxos, of type `PublicKey`
+///
+/// # Returns
+///
+/// * `Vec<OutPoint>` - A vector of `OutPoint` objects representing the selected UTXOs
+pub fn collect_amount(
+    rpc: &Client,
+    amount: Amount,
+    fee: Amount,
+    pubkey: PublicKey,
+) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
+    let desc = format!("tr({})", pubkey);
+
+    let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
+
+    println!("{:?}", result);
+
+    assemble_outpoints_for_target_amount(result.unspents, amount.to_sat() + fee.to_sat())
+}
+
 /// Converts a given secp256k1 private key to a Bitcoin address for a specified network.
 ///
 /// This function takes a secp256k1 private key and a network identifier, and returns
@@ -387,36 +433,15 @@ pub fn collect_amount(
 ///
 /// # Arguments
 ///
-/// * `secp` - A secp256k1 context of type `bitcoin::secp256k1::Secp256k1<All>`
 /// * `private_key` - A secp256k1 private key of type `bitcoin::bip32::Xpriv`
 /// * `network` - The Bitcoin network for which the address is generated. This is of type `Network`.
 ///
 /// # Returns
-/// * `Address` - A P2PKH Bitcoin address for the specified network.
-pub fn get_address_from_private_key(
-    secp: &Secp256k1<All>,
-    private_key: &Xpriv,
-    network: Network,
-) -> Address {
-    let receiver_pubkey = private_key.to_keypair(&secp).public_key();
-    get_address_from_public_key(receiver_pubkey, network)
-}
+/// * `Address` - A P2WPKH Bitcoin address for the specified network.
+pub fn get_address_from_private_key(sk: SecretKey, network: Network) -> Address {
+    let secp = Secp256k1::new();
 
-/// Converts a given secp256k1 public key to a Bitcoin address for a specified network.
-///
-/// This function takes a secp256k1 public key and a network identifier, and returns
-/// the corresponding Pay-to-PubKey-Hash (P2PKH) Bitcoin address for that network.
-///
-/// # Arguments
-///
-/// * `pk` - A secp256k1 public key of type `bitcoin::secp256k1::PublicKey`
-/// * `network` - The Bitcoin network for which the address is generated. This is of type `Network`.
-///
-/// # Returns
-/// * `Address` - A P2PKH Bitcoin address for the specified network.
-pub fn get_address_from_public_key(pk: bitcoin::secp256k1::PublicKey, network: Network) -> Address {
-    let btc_pubkey = bitcoin::PublicKey::new(pk);
-    Address::p2pkh(btc_pubkey, network)
+    Address::p2tr(&secp, sk.x_only_public_key(&secp).0, None, network)
 }
 
 /// This function reveals arbitrary data that was previously committed to the blockchain
@@ -488,9 +513,9 @@ pub fn write_arbitrary_data(
     data: &str,
     receiver_address: &Address,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
-    let input_info = collect_amount(&rpc, amount_to_send, fee)?;
+    let input_info = collect_amount_for_wallet(&rpc, amount_to_send, fee)?;
 
-    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee)?;
+    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee, None)?;
 
     let secp = Secp256k1::new();
 
@@ -554,15 +579,188 @@ pub enum BitcoinUtilsError {
     #[error("cannot create change tx for the given arguments")]
     InsufficientAmoutForChangeTx,
 
+    #[error("cannot generate prevouts")]
+    CannotGeneratePrevouts,
+
     #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
     CannotSignTransaction {
         tx: Transaction,
         errors: Vec<bitcoincore_rpc::json::SignRawTransactionResultError>,
     },
 
+    #[error("cannot generate a keypair")]
+    CannotGenerateKeypaair,
+
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 
     #[error("internal error")]
     Internal,
+}
+
+pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
+    unsafe { &*(data as *const [u8] as *const PushBytes) }
+}
+
+/// This function creates a checkpoint transaction that commits a checkpoint hash to the blockchain.
+/// The function creates a transaction that sends the checkpoint hash to an OP_RETURN output
+/// and returns the signed transaction.
+///
+/// # Arguments
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `fee` - The fee to pay for the transaction, of type `Amount`
+/// * `checkpoint_hash` - The checkpoint hash to commit, as a string
+///
+/// # Returns
+///
+/// * `Transaction` - A transaction that commits the checkpoint hash to the blockchain
+pub fn create_checkpoint_tx(
+    rpc: &Client,
+    fee: Amount,
+    subnet_name: String,
+    checkpoint_hash: [u8; 32],
+    keypair: Keypair,
+) -> Result<Transaction, BitcoinUtilsError> {
+    let input_info = collect_amount(&rpc, Amount::from_sat(0), fee, keypair.public_key().into())?;
+
+    let input_vec: Vec<TxIn> = input_info
+        .clone()
+        .into_iter()
+        .map(|input| TxIn {
+            previous_output: input,
+            script_sig: ScriptBuf::new(),
+            sequence: transaction::Sequence::MAX,
+            witness: Witness::default(),
+        })
+        .collect();
+
+    let change = create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
+
+    let data = format!("n={}{}cp=", subnet_name, crate::DELIMITER);
+
+    let data_bytes = vec![data.as_bytes(), &checkpoint_hash].concat();
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&data_bytes);
+
+    let op_return_out = transaction::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(push_bytes),
+    };
+
+    let unsigned_tx = transaction::Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: input_vec,
+        output: vec![op_return_out, change],
+    };
+
+    // We don't need to sign the transaction, the subnetPK will sign it.
+    Ok(unsigned_tx)
+}
+
+/// This function hashes  an input string using the Keccak256 algorithm.
+///
+/// # Arguments
+///
+/// * `input` - The data to hash
+///
+/// # Returns
+///
+/// * `[u8; 32]` - The hash of the input as a 32-byte array
+pub fn hash(input: String) -> [u8; 32] {
+    let mut keccak = Keccak::v256();
+    keccak.update(input.as_bytes());
+    let mut hash = [0u8; 32];
+    keccak.finalize(&mut hash);
+    hash
+}
+
+/// This function generates a seed from a string input.
+///
+/// # Arguments
+///
+/// * `input` - The input string
+///
+/// # Returns
+///
+/// * `usize` - The seed generated from the input string
+pub fn get_seed(input: String) -> usize {
+    let hash = hash(input);
+    let encoded = encode(hash);
+    match usize::from_str_radix(&encoded[..8], 16) {
+        Ok(usz) => usz,
+        Err(_) => 0,
+    }
+}
+
+/// This function generates a keypair from a string input.
+///
+/// # Arguments
+///
+/// * `input` - The input string
+///
+/// # Returns
+///
+/// * `Keypair` - A keypair generated from the input string
+pub fn generate_keypair(input: String) -> Result<Keypair, BitcoinUtilsError> {
+    let secp = &Secp256k1::new();
+
+    let seed = get_seed(input);
+
+    let private_key = generate_private_key(seed, crate::NETWORK)?;
+    Ok(private_key.to_keypair(secp))
+}
+
+/// This function finds the previous output for a given input.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `input` - The input of type `TxIn`
+///
+/// # Returns
+///
+/// * `TxOut` - The previous output for the given input
+pub fn find_prevout_for_input(rpc: &Client, input: TxIn) -> Result<TxOut, BitcoinUtilsError> {
+    let txid = input.previous_output.txid;
+    let vout = input.previous_output.vout;
+
+    let tx_out_option = match rpc.get_tx_out(&txid, vout, None) {
+        Ok(tx_out_option) => tx_out_option,
+        Err(_) => None,
+    };
+
+    let tx_out = match tx_out_option {
+        Some(tx_out) => tx_out,
+        None => return Err(BitcoinUtilsError::CannotGeneratePrevouts),
+    };
+
+    Ok(TxOut {
+        value: tx_out.value,
+        script_pubkey: ScriptBuf::from(tx_out.script_pub_key.hex),
+    })
+}
+
+/// This function finds the previous outputs for a given transaction.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `tx` - The transaction of type `Transaction`
+///
+/// # Returns
+///
+/// * `Vec<TxOut>` - The previous outputs for the given transaction
+pub fn find_prevouts_for_tx(
+    rpc: &Client,
+    tx: Transaction,
+) -> Result<Vec<TxOut>, BitcoinUtilsError> {
+    Ok(tx
+        .input
+        .iter()
+        .map(|a: &TxIn| {
+            let prevout = find_prevout_for_input(rpc, a.clone())?;
+            Ok(prevout)
+        })
+        .collect::<Result<Vec<TxOut>, BitcoinUtilsError>>()?)
 }
