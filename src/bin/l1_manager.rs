@@ -45,31 +45,6 @@ impl L1Manager {
         Ok(())
     }
 
-    // fn create_state_file(name: &str) -> Result<(), L1ManagerError> {
-    //     let state = SubnetState::new();
-    //     let serialized = serde_json::to_string(state).unwrap_or_else(|_| {
-    //         println!("Failed to serialize keypair");
-    //         "".to_string()
-    //     });
-
-    //     let file_path = &format!("{}/{}/keypair.json", bitcoin_ipc::L1_NAME, name);
-    //     let path = std::path::Path::new(file_path);
-
-    //     if let Some(parent) = path.parent() {
-    //         std::fs::create_dir_all(parent)?;
-    //     }
-
-    //     let mut file = OpenOptions::new()
-    //         .write(true)
-    //         .create(true)
-    //         .truncate(true)
-    //         .open(file_path)?;
-
-    //     file.write_all(serialized.as_bytes())?;
-
-    //     Ok(())
-    // }
-
     fn create_child(&self) -> Result<(), L1ManagerError> {
         let name = get_user_input("Enter subnet name:")?;
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
