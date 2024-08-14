@@ -215,6 +215,7 @@ impl L1Manager {
 
                 _ => println!("Invalid option. Please try again."),
             }
+            println!("===============")
         }
     }
 }

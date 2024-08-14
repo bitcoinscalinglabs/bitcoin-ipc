@@ -165,12 +165,17 @@ pub enum SubnetInteractorError {
     CannotReadUserInput(#[from] std::io::Error),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let args = Args::parse();
 
-    let subnet = SubnetSimulator::new(&args.subnet_name)?;
+    let subnet = match SubnetSimulator::new(&args.subnet_name) {
+        Ok(subnet) => subnet,
+        Err(e) => {
+            print!("Could not start a Subnet Simulator. Error: {e}");
+            return;
+        }
+    };
     let mut interactor = SubnetInteractor::new(subnet);
 
     interactor.interactive_interface();
-    Ok(())
 }
