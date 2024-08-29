@@ -72,8 +72,8 @@ It contains the following deliverables:
 - Definition for a *Subnet Multisig*: A Bitcoin script that requires the signature from some specified keys in order to spend a UTXO. We refer to this set of keys as *subnetPK*. For the first stage, only a signature from one key will be required. This key is controlled by the the Simulator for subnet *A*.
 >  **See `subnet-pk.md` for a more precise definition of `subnetPK`.**
 
-- Implement functionality *txWithArbitraryData()* to attach arbitrary data on a Bitcoin transaction.
->  **See `transactions.md` for the definition of txWithArbitraryData().**
+- Implement functionality *writeArbitraryData()* to attach arbitrary data on a Bitcoin transaction.
+>  **See `transactions.md` for the definition of writeArbitraryData().**
 
 - Definitions for the following Bitcoin transactions:
     - *createChild()* can be created by anyone who wants to create a subnet (doesn’t have to be a validator on the new subnet).
@@ -108,7 +108,7 @@ It contains the following deliverables:
 
 ### Step 4: Transfer funds from subnet *A* to subnet *B* 
 - Definition of a Bitcoin *Propagate(A, B, Transfers[])* transaction:
-    - The transaction will be submitted using the *txWithArbitraryData(in, out, data)* functionality, where:
+    - The transaction will be submitted using the *writeArbitraryData(in, out, data)* functionality, where:
         - *in*: **UTXO(s) spendable by *A*
         - *out*: **a UTXO locked with the *subnetPK* of *B,* with the total amount to be transferred
         - *data*: **it contains the destination subnet and information about the transfers to be made: the amounts and the destination addresses.

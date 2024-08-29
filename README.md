@@ -119,7 +119,7 @@ This guide will walk you through the necessary steps needed to setup the environ
 
 
 
-## Running the demo
+## Running the demo using the automated scripts
 
 - On MacOS run the following command:
 ```sh
@@ -131,33 +131,41 @@ This guide will walk you through the necessary steps needed to setup the environ
 ./scripts/demo_ubuntu.sh 
 ```
 
-This will run `bitcoind`, `btc_monitor`, the `l1_manager` and it will open a `subnet_interactor` terminal for every existing subnet that has the required number of validators.
+This will run `bitcoind`, `btc_monitor`, the `l1_manager`, and it will open a `subnet_interactor` terminal for every existing subnet.
 
-Additionally, when interacting with the `l1_manager`, after enough validators join a subnet, you can run the `subnet_interactor` for that subnet by exectuing
+
+## Running the demo manually
+1. Make sure you have started the `bitcoin core` client 
+
 ```sh
-cargo run --bin subnet_interactor -- --subnet-name=<subnet_name>
+bitcoind --printtoconsole --regtest --maxtxfee=50 --mintxfee=0.001
 ```
 
-Launch a relayer manually by following step 8. to checkpoint a certain subnet state on the L1.
+2. Start `btc_monitor`
+```sh
+cargo run --bin btc_monitor
+```
 
-- Run a relayer that submits checkpoint transactions for a subnet periodically 
+3. Run the `l1_manager` binary to interact with L1 IPC
+```sh
+cargo run --bin l1_manager
+```
+
+4. Run the `subnet_interactor` binary to interact with a child subnet.
+```sh
+cargo run --bin subnet_interactor -- --subnet-name <subnet_name> 
+```
+
+5. Run a relayer that submits checkpoint transactions for a subnet periodically 
 ```sh
 cargo run --bin relayer -- --subnet-name <subnet_name>
 ```
 
 ## Interacting with the L1 Manager
+After the L1 Manager has been started, either using a script or manually, you can interact with it as follows:
 
 1. Press 1 to Read the state where all subnets are listed.
 
 2. Press 2 to create a child subnet, enter the name, required number of validators and a collateral (in satoshi) prompts.
 
 3. Press 3 to join a subnet, first pick a subnet to join, then enter the prompts (ip address, validator public key and username) and watch the btc_monitor.
-
-## Running the subnet interactor
-
-1. Run the subnet_interactor binary to interact with a child subnet.
-
-```sh
-cargo run --bin subnet_interactor -- --subnet-name <subnet_name> 
-```
-2. Interact with the subnet by calling the commands presented on the terminal.

@@ -1,12 +1,12 @@
-Please make sure you read `scope-of-work.md` first, so as to get familiar with the goal, structure, assumptions of this project, and terminology such as `createChild`, `joinChild`, `transfer`, `propagate`, `deposit`, `withdraw`, `postBox`
 
+# Software stack on an IPC-aware node
 **Definition:**
 An *IPC-aware node* is a bitcoin full node with IPC integration, i.e., that supports viewing, creating, and joining existing IPC subnets on Bitcoin.
 
-
-# Software stack on an IPC-aware node
-An IPC-aware node runs all the following modules.
 ![IPC-aware node](../diagrams/ipc-aware-node.png)
+
+An IPC-aware node runs all the following modules.
+
 
 ## Bitcoin full node
 A bitcoin node must be available to connect to over RPC. This can be either a local node running Bitcoin Core or a public bitcoin full node.
@@ -40,7 +40,7 @@ Hence, the interface of the Subnet Simulator looks like the following (described
 - withdraw()
 - get_checkpoint()
 
-As the Subnet Simulator is the only point in the architecture where the `SubnetState` is help, it is responsible to returning the state to be checkpointed. This is facilitated by the `get_checkpoint()` method.
+As the Subnet Simulator is the only point in the architecture where the `SubnetState` is help, it is responsible to return the state to be checkpointed. This is facilitated by the `get_checkpoint()` method.
 
 ## Relayer
 It is responsible for monitoring all IPC subnets and relaying necessary information to bitcoin.
@@ -58,7 +58,7 @@ The Subnet Interactor is not mandatory on an IPC-aware node.
 It allows the users of a subnet to interact with it.
 
 The Subnet Interactor connects to all the validators of the subnet in order to submit subnet-related commands.
-Similar to what we describe with the Relayer, in the initial stages, where the subnet is instantiated by a `Subnet Simulator` running locally (see `scope-of-work.md`), the Subnet Interactor only uses the interface of the `Subnet Simulator`.
+Similar to what we describe with the Relayer, in the initial stages where the subnet is instantiated by a `Subnet Simulator` running locally, the Subnet Interactor only uses the interface of the `Subnet Simulator`.
 In later stages, when the Fendermint node will be used to instantiate a subnet, the Subnet Interactor will actually connect to all subnet validators.
 
 
