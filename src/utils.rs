@@ -1,5 +1,13 @@
 use dotenv::dotenv;
-use std::env;
+use serde::Deserialize;
+use std::{env, fs::File, io::Read};
+use thiserror::Error;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub listener_interval: u64,
+    pub ipc_finalization_parameter: u64,
+}
 
 /// Load environment variables from a .env file
 ///
@@ -14,4 +22,27 @@ pub fn load_env() -> Result<(String, String, String, String), env::VarError> {
     let wallet_name = env::var("WALLET_NAME")?;
 
     Ok((rpc_user, rpc_pass, rpc_url, wallet_name))
+}
+
+/// Load the configuration from a JSON file
+///
+/// # Returns
+///
+pub fn load_config() -> Result<Config, LoadConfigError> {
+    let mut file = File::open("config.json")?;
+    let mut json = String::new();
+    file.read_to_string(&mut json)?;
+
+    let config: Config = serde_json::from_str(&json)?;
+
+    Ok(config)
+}
+
+#[derive(Error, Debug)]
+pub enum LoadConfigError {
+    #[error("cannot open or read file")]
+    IoError(#[from] std::io::Error),
+
+    #[error("cannot deserialize file")]
+    JsonError(#[from] serde_json::Error),
 }

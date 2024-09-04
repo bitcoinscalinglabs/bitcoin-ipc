@@ -148,6 +148,14 @@ pub fn main() {
         }
     };
 
+    let config: utils::Config = match utils::load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+
     loop {
         println!("Checking for new blocks...");
         blockchain_info = match rpc.get_blockchain_info() {
@@ -164,6 +172,12 @@ pub fn main() {
         if latest_block_height > current_block_height {
             for block_height in (current_block_height + 1)..=latest_block_height {
                 println!("Checking block height: {}", block_height);
+
+                if (latest_block_height - block_height) < config.ipc_finalization_parameter {
+                    current_block_height = block_height - 1;
+                    println!("Block not finalized, waiting for more blocks...");
+                    break;
+                }
 
                 let block_hash = match rpc.get_block_hash(block_height) {
                     Ok(hash) => hash,
@@ -283,10 +297,10 @@ pub fn main() {
                     }
                 }
             }
-            current_block_height = latest_block_height;
+            // current_block_height = latest_block_height;
         }
 
-        thread::sleep(Duration::from_secs(10));
+        thread::sleep(Duration::from_secs(config.listener_interval));
     }
 }
 
