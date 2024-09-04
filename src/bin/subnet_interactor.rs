@@ -1,7 +1,7 @@
 // subnet_interactor.rs
 use thiserror::Error;
 
-use bitcoin_ipc::{ipc_state::IPCState, subnet_simulator::SubnetSimulator};
+use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use clap::Parser;
 use std::io::{self};
 
@@ -149,7 +149,7 @@ fn get_user_input(prompt: &str) -> Result<String, SubnetInteractorError> {
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
         Ok(_) => Ok(input.trim().to_string()),
-        Err(e) => return Err(e.into()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -167,26 +167,6 @@ pub enum SubnetInteractorError {
 
 fn main() {
     let args = Args::parse();
-
-    let file_name = format!(
-        "{}/{}/{}.json",
-        bitcoin_ipc::L1_NAME,
-        args.subnet_name.clone(),
-        args.subnet_name.clone()
-    );
-
-    let ipc_state = match IPCState::load_state(file_name) {
-        Ok(state) => state,
-        Err(e) => {
-            println!("Subnet doesn't exist. Error: {e}");
-            return;
-        }
-    };
-
-    if !ipc_state.has_required_validators() {
-        println!("Subnet does not have the required number of validators. Please wait for more validators to join.");
-        return;
-    }
 
     let subnet = match SubnetSimulator::new(&args.subnet_name) {
         Ok(subnet) => subnet,

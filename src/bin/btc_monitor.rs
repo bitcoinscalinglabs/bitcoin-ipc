@@ -119,7 +119,7 @@ fn find_valid_utf8(data: &[u8]) -> &str {
     ""
 }
 
-pub fn main() {
+fn main() {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = match utils::load_env() {
         Ok(env) => env,
         Err(e) => {
@@ -138,7 +138,13 @@ pub fn main() {
 
     let _ = rpc.load_wallet(&wallet_name);
 
-    let mut blockchain_info;
+    let config = match utils::load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("Error loading config: {}", e);
+            return;
+        }
+    };
 
     let mut current_block_height = match rpc.get_blockchain_info() {
         Ok(info) => info.blocks,
@@ -148,160 +154,162 @@ pub fn main() {
         }
     };
 
-    let config: utils::Config = match utils::load_config() {
-        Ok(config) => config,
-        Err(e) => {
-            println!("Error: {}", e);
-            return;
-        }
-    };
-
     loop {
         println!("Checking for new blocks...");
-        blockchain_info = match rpc.get_blockchain_info() {
-            Ok(info) => info,
-            Err(e) => {
-                println!("Error: {}", e);
-                thread::sleep(Duration::from_secs(10));
-                continue;
-            }
-        };
-        let latest_block_height = blockchain_info.blocks;
-
-        // Check for new blocks
-        if latest_block_height > current_block_height {
-            for block_height in (current_block_height + 1)..=latest_block_height {
-                println!("Checking block height: {}", block_height);
-
-                if (latest_block_height - block_height) < config.ipc_finalization_parameter {
-                    current_block_height = block_height - 1;
-                    println!("Block not finalized, waiting for more blocks...");
-                    break;
-                }
-
-                let block_hash = match rpc.get_block_hash(block_height) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        println!("Error: {}", e);
-                        continue;
-                    }
-                };
-                let block = match rpc.get_block(&block_hash) {
-                    Ok(block) => block,
-                    Err(e) => {
-                        println!("Error: {}", e);
-                        continue;
-                    }
-                };
-
-                for tx in block.txdata {
-                    println!("Checking transaction: {}", tx.compute_txid());
-                    for input in &tx.input {
-                        for witness in input.witness.iter() {
-                            let witness_str = find_valid_utf8(&witness[..]);
-
-                            match () {
-                                _ if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) => {
-                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
-                                    println!("Command: {}", witness_str);
-                                    println!("Executing the CREATE command...");
-                                    match parse_create_command(witness_str) {
-                                        Ok(_) => println!("CREATE Command successfully parsed"),
-                                        Err(e) => println!(
-                                            "CREATE Command could not be parsed. Error: {e}"
-                                        ),
-                                    };
-                                }
-                                _ if witness_str.contains(bitcoin_ipc::IPC_JOIN_SUBNET_TAG) => {
-                                    println!("Transaction {} at block height {} contains the keyword '{:?}'", tx.compute_txid(), block_height, bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
-                                    println!("Command: {}", witness_str);
-                                    println!("Executing the JOIN command...");
-                                    match parse_join_command(witness_str) {
-                                        Ok(_) => println!("JOIN Command successfully parsed"),
-                                        Err(e) => {
-                                            println!("JOIN Command could not be parsed. Error: {e}")
-                                        }
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    // Look for checkpoints
-                    for output in &tx.output {
-                        let script = &output.script_pubkey;
-                        let mut instructions = script.instructions();
-                        if let Some(Ok(Instruction::Op(
-                            bitcoin::blockdata::opcodes::all::OP_RETURN,
-                        ))) = instructions.next()
-                        {
-                            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
-                                if data.len() > 32 {
-                                    if let Ok(data_str) =
-                                        std::str::from_utf8(&data.as_bytes()[..data.len() - 32])
-                                    {
-                                        if data_str.contains("n=")
-                                            && data_str.contains("cp=")
-                                            && data_str.contains(bitcoin_ipc::DELIMITER)
-                                        {
-                                            println!("Transaction {} at block height {} contains a checkpoint", tx.compute_txid(), block_height);
-                                            let parts: Vec<&str> =
-                                                data_str.split(bitcoin_ipc::DELIMITER).collect();
-
-                                            if parts.len() != 2 {
-                                                println!("Invalid checkpoint format");
-                                                continue;
-                                            }
-
-                                            let subnets = match IPCState::load_all() {
-                                                Ok(subnets) => subnets,
-                                                Err(_) => {
-                                                    println!("Could not load subnets");
-                                                    continue;
-                                                }
-                                            };
-
-                                            let name = parts[0].strip_prefix("n=").unwrap_or("");
-                                            let checkpoint = hex::encode(
-                                                data.as_bytes()[data.len() - 32..].to_vec(),
-                                            );
-
-                                            println!("Checkpoint for subnet: {}", name);
-
-                                            subnets.iter().for_each(|subnet| {
-                                                if subnet.get_name() == name {
-
-                                                    let subnet_address = match subnet.get_subnet_address() {
-                                                        Ok(address) => address,
-                                                        Err(_) => {
-                                                            println!("Could not determine address for subnet");
-                                                            return;
-                                                        }
-                                                    };
-
-                                                    println!(
-                                                        "Subnet address: {}",
-                                                        subnet_address
-                                                    );
-                                                }
-                                            });
-
-                                            println!("Checkpoint: {}", checkpoint);
-                                        } else {
-                                            println!("Could not determine address for checkpoint");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // current_block_height = latest_block_height;
+        if let Err(e) = check_new_blocks(&rpc, &config, &mut current_block_height) {
+            println!("Error: {}", e);
+            thread::sleep(Duration::from_secs(10));
         }
 
         thread::sleep(Duration::from_secs(config.listener_interval));
     }
+}
+
+fn check_new_blocks(
+    rpc: &bitcoincore_rpc::Client,
+    config: &utils::Config,
+    current_block_height: &mut u64,
+) -> Result<(), String> {
+    let latest_block_height = match rpc.get_blockchain_info() {
+        Ok(info) => info.blocks,
+        Err(e) => {
+            println!("Error: {}", e);
+            return Err(e.to_string());
+        }
+    };
+
+    if latest_block_height > *current_block_height {
+        for block_height in (*current_block_height + 1)..=latest_block_height {
+            if let Err(e) = process_block(rpc, config, block_height, current_block_height) {
+                println!("Error processing block {}: {}", block_height, e);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn process_block(
+    rpc: &bitcoincore_rpc::Client,
+    config: &utils::Config,
+    block_height: u64,
+    current_block_height: &mut u64,
+) -> Result<(), String> {
+    if block_height - *current_block_height < config.ipc_finalization_parameter {
+        *current_block_height = block_height - 1;
+        println!("Block not finalized, waiting for more blocks...");
+        return Ok(());
+    }
+
+    let block_hash = rpc
+        .get_block_hash(block_height)
+        .map_err(|e| e.to_string())?;
+    let block = rpc.get_block(&block_hash).map_err(|e| e.to_string())?;
+
+    println!("Processing block: {}", block_height);
+
+    for tx in block.txdata {
+        process_transaction(&tx, block_height)?;
+    }
+
+    *current_block_height = block_height;
+    Ok(())
+}
+
+fn process_transaction(tx: &bitcoin::Transaction, block_height: u64) -> Result<(), String> {
+    println!("Checking transaction: {}", tx.compute_txid());
+
+    for input in &tx.input {
+        for witness in input.witness.iter() {
+            let witness_str = find_valid_utf8(&witness[..]);
+
+            if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
+                println!(
+                    "Transaction {} at block height {} contains the keyword '{:?}'",
+                    tx.compute_txid(),
+                    block_height,
+                    bitcoin_ipc::IPC_CREATE_SUBNET_TAG
+                );
+                println!("Command: {}", witness_str);
+                println!("Executing the CREATE command...");
+                match parse_create_command(witness_str) {
+                    Ok(_) => println!("CREATE Command successfully parsed"),
+                    Err(e) => println!("CREATE Command could not be parsed. Error: {e}"),
+                };
+            } else if witness_str.contains(bitcoin_ipc::IPC_JOIN_SUBNET_TAG) {
+                println!(
+                    "Transaction {} at block height {} contains the keyword '{:?}'",
+                    tx.compute_txid(),
+                    block_height,
+                    bitcoin_ipc::IPC_JOIN_SUBNET_TAG
+                );
+                println!("Command: {}", witness_str);
+                println!("Executing the JOIN command...");
+                match parse_join_command(witness_str) {
+                    Ok(_) => println!("JOIN Command successfully parsed"),
+                    Err(e) => println!("JOIN Command could not be parsed. Error: {e}"),
+                };
+            }
+        }
+    }
+
+    process_checkpoints(&tx)?;
+
+    Ok(())
+}
+
+fn process_checkpoints(tx: &bitcoin::Transaction) -> Result<(), String> {
+    for output in &tx.output {
+        let script = &output.script_pubkey;
+        let mut instructions = script.instructions();
+        if let Some(Ok(Instruction::Op(bitcoin::blockdata::opcodes::all::OP_RETURN))) =
+            instructions.next()
+        {
+            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
+                if data.len() > 32 {
+                    handle_checkpoint_data(data)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_checkpoint_data(data: &bitcoin::script::PushBytes) -> Result<(), String> {
+    if let Ok(data_str) = std::str::from_utf8(&data.as_bytes()[..data.len() - 32]) {
+        if data_str.contains("n=")
+            && data_str.contains("cp=")
+            && data_str.contains(bitcoin_ipc::DELIMITER)
+        {
+            let parts: Vec<&str> = data_str.split(bitcoin_ipc::DELIMITER).collect();
+            if parts.len() != 2 {
+                return Err("Invalid checkpoint format".into());
+            }
+
+            let subnets = match IPCState::load_all() {
+                Ok(subnets) => subnets,
+                Err(_) => return Err("Could not load subnets".into()),
+            };
+
+            let name = parts[0].strip_prefix("n=").unwrap_or("");
+            let checkpoint = hex::encode(&data[data.len() - 32..]);
+
+            println!("Checkpoint for subnet: {}", name);
+
+            subnets.iter().for_each(|subnet| {
+                if subnet.get_name() == name {
+                    match subnet.get_subnet_address() {
+                        Ok(subnet_address) => println!("Subnet address: {}", subnet_address),
+                        Err(_) => println!("Could not determine address for subnet"),
+                    };
+                }
+            });
+
+            println!("Checkpoint: {}", checkpoint);
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Error, Debug)]

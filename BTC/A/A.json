@@ -1,1 +1,0 @@
-{"name":"A","subnet_address":"bcrt1pwq4uvmv34pkah2ta35ucf3arv698cvfgtj3c6hj2w76k6pdj84dsl4jgjy","file_path":"BTC/A/A.json","url":"BTC/A","required_number_of_validators":1,"required_collateral":1000,"validators":[{"name":"n","ip":"1.1.1.1","pk":"pk"},{"name":"n","ip":"2.2.2.2","pk":"pk"}]}
