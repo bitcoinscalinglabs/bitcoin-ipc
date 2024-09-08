@@ -1,3 +1,4 @@
+use bitcoin::{BlockHash, Txid};
 use std::vec;
 use thiserror::Error;
 
@@ -6,14 +7,15 @@ use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
 use bitcoin::secp256k1::{All, Keypair, Secp256k1, SecretKey};
 use bitcoin::taproot::TaprootSpendInfo;
-use bitcoin::PublicKey;
 use bitcoin::{
     amount::Amount,
     bip32::Xpriv,
     blockdata::{locktime::absolute::LockTime, script, transaction, witness::Witness},
-    key::rand,
+    key::{rand, TapTweak, TweakedPublicKey},
+    secp256k1::{schnorr::Signature, Message},
+    sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TaprootBuilder},
-    Address, Network, ScriptBuf, XOnlyPublicKey,
+    Address, Network, ScriptBuf, TapSighashType, XOnlyPublicKey,
 };
 use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
 use hex::encode;
@@ -34,7 +36,7 @@ use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 pub fn create_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
     let secret_key =
         bitcoin::secp256k1::SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng());
-    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let keypair = Keypair::from_secret_key(secp, &secret_key);
     let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
     x_only_pubkey
 }
@@ -77,16 +79,15 @@ pub fn init_rpc_client(
 pub fn init_wallet(
     rpc: &Client,
     network: Network,
-    wallet: &String,
+    wallet: &str,
 ) -> Result<(Address, Option<Transaction>, u32), BitcoinUtilsError> {
     let random_number = rand::random::<usize>().to_string();
     let random_label = random_number.as_str();
 
     let mut created_wallet = false;
 
-    match rpc.create_wallet(wallet, None, None, None, None) {
-        Ok(_) => created_wallet = true,
-        Err(_) => {}
+    if rpc.create_wallet(wallet, None, None, None, None).is_ok() {
+        created_wallet = true;
     }
 
     let _ = rpc.load_wallet(wallet);
@@ -101,7 +102,7 @@ pub fn init_wallet(
 
         let coinbase_txid = rpc
             .list_transactions(Some(random_label), Some(101), Some(100), None)?
-            .get(0)
+            .first()
             .ok_or(BitcoinUtilsError::Internal)?
             .info
             .txid;
@@ -220,20 +221,14 @@ pub fn create_change_txout(
 
     let change_amount = input_total_value - amount_to_send.to_sat() - fee.to_sat();
 
-    let script_pub_key: ScriptBuf;
-
-    if !keypair.is_some() {
-        script_pub_key = rpc
-            .get_new_address(None, None)?
-            .assume_checked()
-            .script_pubkey();
+    let script_pub_key: ScriptBuf = if let Some(keypair) = keypair {
+        ScriptBuf::new_p2tr(&Secp256k1::new(), keypair.x_only_public_key().0, None)
     } else {
-        script_pub_key = ScriptBuf::new_p2tr(
-            &Secp256k1::new(),
-            keypair.unwrap().x_only_public_key().0,
-            None,
-        );
-    }
+        rpc.get_new_address(None, None)?
+            .assume_checked()
+            .script_pubkey()
+    };
+
     Ok(TxOut {
         value: Amount::from_sat(change_amount),
         script_pubkey: script_pub_key,
@@ -296,16 +291,16 @@ pub fn commit_arbitrary_data(
     let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
 
     // this transaction can only be spent through the script path
-    let unspendable_pubkey = create_unspendable_internal_key(&secp);
+    let unspendable_pubkey = create_unspendable_internal_key(secp);
     let script = Builder::new().push_slice(push_bytes).into_script();
 
     let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
     let taproot_spend_info = builder
-        .finalize(&secp, unspendable_pubkey)
+        .finalize(secp, unspendable_pubkey)
         .map_err(|_| BitcoinUtilsError::BuilderNotFinalizable)?;
 
     let script_pubkey = script::ScriptBuf::new_p2tr(
-        &secp,
+        secp,
         taproot_spend_info.internal_key(),
         taproot_spend_info.merkle_root(),
     );
@@ -327,7 +322,7 @@ pub fn commit_arbitrary_data(
         output: vec![
             TxOut {
                 value: amount_to_send,
-                script_pubkey: script_pubkey,
+                script_pubkey,
             },
             change,
         ],
@@ -415,9 +410,15 @@ pub fn collect_amount(
     rpc: &Client,
     amount: Amount,
     fee: Amount,
-    pubkey: PublicKey,
+    pubkey: XOnlyPublicKey,
 ) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
     let desc = format!("tr({})", pubkey);
+
+    let secp = Secp256k1::new();
+    println!(
+        "Addressssssss: {:?}",
+        Address::p2tr(&secp, pubkey, None, Network::Regtest)
+    );
 
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
 
@@ -513,15 +514,15 @@ pub fn write_arbitrary_data(
     data: &str,
     receiver_address: &Address,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
-    let input_info = collect_amount_for_wallet(&rpc, amount_to_send, fee)?;
+    let input_info = collect_amount_for_wallet(rpc, amount_to_send, fee)?;
 
-    let change = create_change_txout(&rpc, &input_info, amount_to_send, fee, None)?;
+    let change = create_change_txout(rpc, &input_info, amount_to_send, fee, None)?;
 
     let secp = Secp256k1::new();
 
     // Commit the arbitrary data
     let (commit_tx, script, taproot_spend_info) = commit_arbitrary_data(
-        &rpc,
+        rpc,
         input_info,
         amount_to_send,
         change,
@@ -594,6 +595,12 @@ pub enum BitcoinUtilsError {
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 
+    #[error("cannot load prevouts")]
+    CannotLoadPrevouts,
+
+    #[error("invalid schnorr signature")]
+    InvalidSchnorrSig,
+
     #[error("internal error")]
     Internal,
 }
@@ -610,6 +617,7 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 /// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
 /// * `fee` - The fee to pay for the transaction, of type `Amount`
 /// * `checkpoint_hash` - The checkpoint hash to commit, as a string
+/// * `keypair` - The keypair of the subnet that is committing the checkpoint hash
 ///
 /// # Returns
 ///
@@ -617,11 +625,12 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 pub fn create_checkpoint_tx(
     rpc: &Client,
     fee: Amount,
-    subnet_name: String,
     checkpoint_hash: [u8; 32],
     keypair: Keypair,
 ) -> Result<Transaction, BitcoinUtilsError> {
-    let input_info = collect_amount(&rpc, Amount::from_sat(0), fee, keypair.public_key().into())?;
+    println!("{:?}", keypair.public_key().to_string());
+
+    let input_info = collect_amount(rpc, Amount::from_sat(0), fee, keypair.x_only_public_key().0)?;
 
     let input_vec: Vec<TxIn> = input_info
         .clone()
@@ -634,13 +643,9 @@ pub fn create_checkpoint_tx(
         })
         .collect();
 
-    let change = create_change_txout(&rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
+    let change = create_change_txout(rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
 
-    let data = format!("n={}{}cp=", subnet_name, crate::DELIMITER);
-
-    let data_bytes = vec![data.as_bytes(), &checkpoint_hash].concat();
-
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&data_bytes);
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&checkpoint_hash);
 
     let op_return_out = transaction::TxOut {
         value: Amount::ZERO,
@@ -687,10 +692,7 @@ pub fn hash(input: String) -> [u8; 32] {
 pub fn get_seed(input: String) -> usize {
     let hash = hash(input);
     let encoded = encode(hash);
-    match usize::from_str_radix(&encoded[..8], 16) {
-        Ok(usz) => usz,
-        Err(_) => 0,
-    }
+    usize::from_str_radix(&encoded[..8], 16).unwrap_or(0)
 }
 
 /// This function generates a keypair from a string input.
@@ -755,12 +757,133 @@ pub fn find_prevouts_for_tx(
     rpc: &Client,
     tx: Transaction,
 ) -> Result<Vec<TxOut>, BitcoinUtilsError> {
-    Ok(tx
-        .input
+    println!("{:?}", tx.compute_txid());
+    tx.input
         .iter()
         .map(|a: &TxIn| {
             let prevout = find_prevout_for_input(rpc, a.clone())?;
             Ok(prevout)
         })
-        .collect::<Result<Vec<TxOut>, BitcoinUtilsError>>()?)
+        .collect::<Result<Vec<TxOut>, BitcoinUtilsError>>()
+}
+
+/// This function finds the block hash containing a given transaction ID.
+/// The function iterates through all blocks in the blockchain to find the block
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `txid` - The transaction ID of type `Txid`
+///
+/// # Returns
+///
+/// * `BlockHash` - The block hash containing the given transaction ID
+/// * `BitcoinUtilsError` - An error if the block hash cannot be found
+pub fn find_block_hash_containing_txid(
+    rpc: &Client,
+    txid: &Txid,
+) -> Result<BlockHash, BitcoinUtilsError> {
+    let latest_block_height = match rpc.get_blockchain_info() {
+        Ok(info) => info.blocks,
+        Err(_) => {
+            return Err(BitcoinUtilsError::Internal);
+        }
+    };
+
+    for block_height in 0..=latest_block_height {
+        let block_hash = match rpc.get_block_hash(block_height) {
+            Ok(hash) => hash,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let block = match rpc.get_block(&block_hash) {
+            Ok(block) => block,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if block.txdata.iter().any(|tx| &tx.compute_txid() == txid) {
+            return Ok(block_hash);
+        }
+    }
+
+    Err(BitcoinUtilsError::Internal)
+}
+
+/// This function finds the previous outputs for an already sent transaction.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `tx` - The transaction of type `Transaction`
+///
+/// # Returns
+///
+/// * `Vec<TxOut>` - The previous outputs for the given transaction
+/// * `BitcoinUtilsError` - An error if the previous outputs cannot be found
+pub fn find_prevouts_for_a_sent_transaction(
+    rpc: &Client,
+    tx: &Transaction,
+) -> Result<Vec<TxOut>, BitcoinUtilsError> {
+    tx.input
+        .iter()
+        .map(|input| {
+            let prev_txid = input.previous_output.txid;
+            let vout = input.previous_output.vout;
+
+            let block_hash = find_block_hash_containing_txid(rpc, &prev_txid)?;
+
+            let prev_tx: Transaction = rpc.get_raw_transaction(&prev_txid, Some(&block_hash))?;
+
+            Ok(prev_tx.output[vout as usize].clone())
+        })
+        .collect()
+}
+
+pub fn verify_taproot_signature(
+    rpc: &bitcoincore_rpc::Client,
+    tx: &Transaction,
+    public_key: XOnlyPublicKey,
+) -> Result<bool, BitcoinUtilsError> {
+    let secp = Secp256k1::new();
+
+    let prevouts = match find_prevouts_for_a_sent_transaction(rpc, tx) {
+        Ok(prevouts) => prevouts,
+        Err(_) => return Err(BitcoinUtilsError::CannotLoadPrevouts),
+    };
+
+    for (i, input) in tx.input.iter().enumerate() {
+        if let Some(signature_bytes) = input.witness.last() {
+            let signature = match Signature::from_slice(signature_bytes) {
+                Ok(sig) => sig,
+                Err(_) => return Err(BitcoinUtilsError::InvalidSchnorrSig),
+            };
+
+            let mut sighash_cache = SighashCache::new(tx);
+
+            let sighash = sighash_cache
+                .taproot_key_spend_signature_hash(
+                    i,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .expect("failed to construct sighash");
+
+            let msg = Message::from_digest_slice(&sighash[..]).expect("32 bytes");
+
+            let tweaked_pubkey: TweakedPublicKey = public_key.tap_tweak(&secp, None).0;
+
+            if secp
+                .verify_schnorr(&signature, &msg, &tweaked_pubkey.to_inner())
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }

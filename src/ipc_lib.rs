@@ -116,14 +116,12 @@ pub fn submit_checkpoint(
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
-    println!("Submitting checkpoint for subnet: {}", ipc_state.get_url());
-    let checkpoint_tx = bitcoin_utils::create_checkpoint_tx(
-        &rpc,
-        fee,
-        ipc_state.get_name(),
-        checkpoint_hash,
-        simulator.get_keypair(),
-    )?;
+    println!(
+        "Submitting checkpoint for subnet: {}",
+        ipc_state.get_subnet_id()
+    );
+    let checkpoint_tx =
+        bitcoin_utils::create_checkpoint_tx(&rpc, fee, checkpoint_hash, simulator.get_keypair())?;
 
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone())?;
 
