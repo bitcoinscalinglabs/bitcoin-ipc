@@ -416,7 +416,7 @@ pub fn collect_amount(
 
     let secp = Secp256k1::new();
     println!(
-        "Addressssssss: {:?}",
+        "Address: {:?}",
         Address::p2tr(&secp, pubkey, None, Network::Regtest)
     );
 

@@ -44,3 +44,4 @@ In Stage 3, the bitcoin user that submits `createChild()` does not have to becom
 - when the transaction `childReady(A, subnetPK_A)` is finalized, each validator
     - calls (as in Stage 1) `joinChild()`, which will send the collateral to a UTXO controlled by `subnetPK_A`
     - starts a subnet node and connects to the other validators
+- subsequently, when the subnet has to create a `subnetMultiSig` (e.g., for the checkpoint() function), we are planning to have the *Relayer* orchestrate a multi-signature protocol among the validators of the subnet.
