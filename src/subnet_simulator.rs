@@ -8,6 +8,7 @@ use std::io::Read;
 use std::{collections::HashMap, fs::File};
 
 use bitcoin::secp256k1::{Message, Secp256k1};
+use bitcoin::XOnlyPublicKey;
 
 use thiserror::Error;
 
@@ -185,8 +186,10 @@ impl SubnetSimulator {
         // print in a more organized manner:
         println!("Subnet: {}", self.subnet_id);
         println!("Subnet PK: {}", self.get_public_key());
-        let subnet_address =
-            bitcoin_utils::get_address_from_private_key(self.keypair.secret_key(), crate::NETWORK);
+        let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
+            XOnlyPublicKey::from(self.get_public_key()),
+            crate::NETWORK,
+        );
         println!("Subnet Address: {}", subnet_address);
         println!("Accounts:");
         for (address, account) in &self.state.accounts {

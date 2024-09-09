@@ -80,8 +80,8 @@ impl L1Manager {
 
         let key_pair = bitcoin_utils::generate_keypair(seed)?;
 
-        let subnet_address = bitcoin_utils::get_address_from_private_key(
-            key_pair.secret_key(),
+        let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
+            key_pair.x_only_public_key().0,
             bitcoin_ipc::NETWORK,
         );
 
