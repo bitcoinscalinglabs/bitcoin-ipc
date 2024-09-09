@@ -9,11 +9,10 @@ use bitcoin::Network;
 pub const NETWORK: Network = Network::Regtest;
 pub const IPC_CREATE_SUBNET_TAG: &str = "IPC:CREATE";
 pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOIN";
-pub const DELIMITER: &str = "<-->";
+pub const IPC_CHECKPOINT_TAG: &str = "IPC:CHECKPOINT";
+pub const DELIMITER: &str = "#";
 
 pub const DEMO_UBUNTU: &str = "scripts/demo_ubuntu.sh";
 pub const DEMO_MACOS: &str = "scripts/demo_macos.sh";
-pub const RUN_SUBNET_INTERACTOR_MACOS: &str = "scripts/run_subnet_interactor_macos.sh";
-pub const RUN_SUBNET_INTERACTOR_UBUNTU: &str = "scripts/run_subnet_interactor_ubuntu.sh";
 
 pub const L1_NAME: &str = "BTC";

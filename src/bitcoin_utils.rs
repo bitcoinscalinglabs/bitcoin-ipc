@@ -5,7 +5,7 @@ use thiserror::Error;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::PushBytes;
-use bitcoin::secp256k1::{All, Keypair, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{All, Keypair, Secp256k1};
 use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{
     amount::Amount,
@@ -159,8 +159,6 @@ pub fn test_and_submit(
             i + 1,
             rpc.send_raw_transaction(tx.raw_hex())?
         );
-
-        println!("Submitted transaction #{}: {:#?}", i + 1, tx)
     }
     println!(
         "Mined new block: {:#?}",
@@ -414,35 +412,26 @@ pub fn collect_amount(
 ) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
     let desc = format!("tr({})", pubkey);
 
-    let secp = Secp256k1::new();
-    println!(
-        "Address: {:?}",
-        Address::p2tr(&secp, pubkey, None, Network::Regtest)
-    );
-
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
-
-    println!("{:?}", result);
 
     assemble_outpoints_for_target_amount(result.unspents, amount.to_sat() + fee.to_sat())
 }
 
-/// Converts a given secp256k1 private key to a Bitcoin address for a specified network.
-///
-/// This function takes a secp256k1 private key and a network identifier, and returns
-/// the corresponding Pay-to-PubKey-Hash (P2PKH) Bitcoin address for that network.
+/// Converts a given x_only_pubkey to a taproot address.
 ///
 /// # Arguments
 ///
-/// * `private_key` - A secp256k1 private key of type `bitcoin::bip32::Xpriv`
+/// * `x_only_pubkey` - A public key of type `XOnlyPublicKey`
 /// * `network` - The Bitcoin network for which the address is generated. This is of type `Network`.
 ///
 /// # Returns
 /// * `Address` - A P2WPKH Bitcoin address for the specified network.
-pub fn get_address_from_private_key(sk: SecretKey, network: Network) -> Address {
+pub fn get_address_from_x_only_public_key(
+    x_only_pubkey: XOnlyPublicKey,
+    network: Network,
+) -> Address {
     let secp = Secp256k1::new();
-
-    Address::p2tr(&secp, sk.x_only_public_key(&secp).0, None, network)
+    Address::p2tr(&secp, x_only_pubkey, None, network)
 }
 
 /// This function reveals arbitrary data that was previously committed to the blockchain
@@ -628,8 +617,6 @@ pub fn create_checkpoint_tx(
     checkpoint_hash: [u8; 32],
     keypair: Keypair,
 ) -> Result<Transaction, BitcoinUtilsError> {
-    println!("{:?}", keypair.public_key().to_string());
-
     let input_info = collect_amount(rpc, Amount::from_sat(0), fee, keypair.x_only_public_key().0)?;
 
     let input_vec: Vec<TxIn> = input_info
@@ -645,7 +632,11 @@ pub fn create_checkpoint_tx(
 
     let change = create_change_txout(rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
 
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&checkpoint_hash);
+    let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::DELIMITER);
+
+    let data_bytes = [data.as_bytes(), &checkpoint_hash].concat();
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&data_bytes);
 
     let op_return_out = transaction::TxOut {
         value: Amount::ZERO,

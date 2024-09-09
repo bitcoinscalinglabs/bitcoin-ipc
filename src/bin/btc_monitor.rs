@@ -264,17 +264,39 @@ fn process_transaction(
         }
     }
 
-    match process_checkpoints(rpc, tx) {
-        Ok(_) => println!("CHECKPOINT Command successfully parsed"),
-        Err(e) => println!("CHECKPOINT Command could not be parsed. Error: {e}"),
+    for output in &tx.output {
+        let script = &output.script_pubkey;
+        let mut instructions = script.instructions();
+        if let Some(Ok(Instruction::Op(bitcoin::blockdata::opcodes::all::OP_RETURN))) =
+            instructions.next()
+        {
+            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
+                if data.len() > 32 {
+                    if let Ok(data_str) = std::str::from_utf8(&data.as_bytes()[..data.len() - 32]) {
+                        if data_str.contains(bitcoin_ipc::IPC_CHECKPOINT_TAG)
+                            && data_str.contains(bitcoin_ipc::DELIMITER)
+                        {
+                            let checkpoint = hex::encode(&data.as_bytes()[data.len() - 32..]);
+                            match process_checkpoint(rpc, tx, checkpoint) {
+                                Ok(_) => println!("CHECKPOINT Command successfully parsed"),
+                                Err(e) => {
+                                    println!("CHECKPOINT Command could not be parsed. Error: {e}")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-fn process_checkpoints(
+fn process_checkpoint(
     rpc: &bitcoincore_rpc::Client,
     tx: &bitcoin::Transaction,
+    checkpoint: String,
 ) -> Result<(), BtcMonitorError> {
     let subnets = match IPCState::load_all() {
         Ok(subnets) => subnets,
@@ -287,33 +309,12 @@ fn process_checkpoints(
         match bitcoin_utils::verify_taproot_signature(rpc, tx, public_key) {
             Ok(is_valid) => {
                 if is_valid {
-                    println!(
-                        "Valid taproot signature found for subnet: {}",
-                        subnet.get_subnet_id()
-                    );
-
-                    for output in &tx.output {
-                        let script = &output.script_pubkey;
-                        let mut instructions = script.instructions();
-                        if let Some(Ok(Instruction::Op(
-                            bitcoin::blockdata::opcodes::all::OP_RETURN,
-                        ))) = instructions.next()
-                        {
-                            if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
-                                if data.len() == 32 {
-                                    println!(
-                                        "Checkpoint found for subnet: {}",
-                                        subnet.get_subnet_id()
-                                    );
-                                    let checkpoint = hex::encode(data);
-                                    println!("Checkpoint: {}", checkpoint);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
+                    println!("Checkpoint found for subnet: {}", subnet.get_subnet_id());
+                    println!("Checkpoint: {}", checkpoint);
+                    return Ok(());
                 }
             }
+
             Err(_) => continue,
         }
     }
