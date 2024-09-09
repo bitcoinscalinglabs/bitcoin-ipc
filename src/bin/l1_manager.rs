@@ -3,6 +3,7 @@ use thiserror::Error;
 use bitcoin::Amount;
 use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::ipc_state::IPCState;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 
@@ -20,14 +21,14 @@ impl L1Manager {
     fn store_keypair(
         &self,
         keypair: &bitcoin::secp256k1::Keypair,
-        name: &str,
+        address: &str,
     ) -> Result<(), L1ManagerError> {
         let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
             println!("Failed to serialize keypair");
             "".to_string()
         });
 
-        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, name);
+        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, address);
         let path = std::path::Path::new(file_path);
 
         if let Some(parent) = path.parent() {
@@ -46,7 +47,6 @@ impl L1Manager {
     }
 
     fn create_child(&self) -> Result<(), L1ManagerError> {
-        let name = get_user_input("Enter subnet name:")?;
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
         let required_number_of_validators: u64 =
             required_number_of_validators.parse().map_err(|_| {
@@ -66,24 +66,30 @@ impl L1Manager {
         let mut subnet_data = String::new();
         subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
         subnet_data.push_str(&format!(
-            "{}name={}{}",
+            "{}parent_id={}{}",
             bitcoin_ipc::DELIMITER,
-            name,
+            bitcoin_ipc::L1_NAME,
             bitcoin_ipc::DELIMITER
         ));
 
-        let key_pair = bitcoin_utils::generate_keypair(name.to_string())?;
+        let seed = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(30)
+            .map(char::from)
+            .collect();
 
-        self.store_keypair(&key_pair, &name)?;
+        let key_pair = bitcoin_utils::generate_keypair(seed)?;
 
         let subnet_address = bitcoin_utils::get_address_from_private_key(
             key_pair.secret_key(),
             bitcoin_ipc::NETWORK,
         );
 
+        self.store_keypair(&key_pair, &subnet_address.to_string())?;
+
         subnet_data.push_str(&format!(
             "subnet_address={}{}",
-            subnet_address.to_string(),
+            subnet_address,
             bitcoin_ipc::DELIMITER
         ));
 
@@ -92,7 +98,13 @@ impl L1Manager {
             required_number_of_validators,
             bitcoin_ipc::DELIMITER
         ));
-        subnet_data.push_str(&format!("required_collateral={}", required_collateral));
+        subnet_data.push_str(&format!(
+            "required_collateral={}{}",
+            required_collateral,
+            bitcoin_ipc::DELIMITER
+        ));
+
+        subnet_data.push_str(&format!("subnet_pk={}", key_pair.public_key()));
 
         bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
 
@@ -102,7 +114,7 @@ impl L1Manager {
     fn join_child(&self) -> Result<(), L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
-        if subnets.len() == 0 {
+        if subnets.is_empty() {
             return Err(L1ManagerError::NoSubnetAvailable);
         }
 
@@ -111,7 +123,7 @@ impl L1Manager {
             subnets.len()
         );
         for (i, subnet) in subnets.iter().enumerate() {
-            prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_name()));
+            prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_subnet_id()));
         }
         let choice = get_user_input(&prompt)?;
 
@@ -143,7 +155,7 @@ impl L1Manager {
         ));
         validator_data.push_str(&format!("pk={}{}", pk, bitcoin_ipc::DELIMITER));
         validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
-        validator_data.push_str(&format!("subnet_name={}", ipc_state.get_name()));
+        validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
         let subnet_address = &ipc_state.get_subnet_address()?;
         bitcoin_ipc::ipc_lib::create_and_submit_join_child_tx(
@@ -225,7 +237,7 @@ fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
         Ok(_) => Ok(input.trim().to_string()),
-        Err(e) => return Err(e.into()),
+        Err(e) => Err(e.into()),
     }
 }
 

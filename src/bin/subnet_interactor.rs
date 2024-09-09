@@ -22,14 +22,14 @@ pub struct SubnetInteractor {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    subnet_name: String,
+    subnet_id: String,
 }
 
 impl SubnetInteractor {
     pub fn new(subnet_sim: SubnetSimulator) -> Self {
         println!(
             "Starting a Subnet Interactor for subnet {}",
-            subnet_sim.subnet_name
+            subnet_sim.subnet_id
         );
         SubnetInteractor { subnet: subnet_sim }
     }
@@ -168,7 +168,7 @@ pub enum SubnetInteractorError {
 fn main() {
     let args = Args::parse();
 
-    let subnet = match SubnetSimulator::new(&args.subnet_name) {
+    let subnet = match SubnetSimulator::new(&args.subnet_id) {
         Ok(subnet) => subnet,
         Err(e) => {
             println!("Could not start a Subnet Simulator. Error: {e}");

@@ -29,35 +29,40 @@ impl SubnetState {
     }
 }
 
+impl Default for SubnetState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SubnetSimulator {
-    pub subnet_name: String,
+    pub subnet_id: String,
     state: SubnetState,
     keypair: bitcoin::secp256k1::Keypair,
 }
 
 impl SubnetSimulator {
-    pub fn new(subnet_name: &str) -> Result<Self, SubnetSimulatorError> {
-        println!("Starting simulator for subnet {subnet_name}.");
+    pub fn new(subnet_id: &str) -> Result<Self, SubnetSimulatorError> {
+        println!("Starting simulator for subnet {subnet_id}.");
 
-        if let Ok(mut file) = File::open(format!("{}/{}/keypair.yaml", crate::L1_NAME, subnet_name))
-        {
+        if let Ok(mut file) = File::open(format!("{}/keypair.yaml", subnet_id)) {
             let mut json = String::new();
             file.read_to_string(&mut json)?;
 
             if let Ok(keypair) = serde_json::from_str(&json) {
                 return Ok(SubnetSimulator {
-                    subnet_name: String::from(subnet_name),
+                    subnet_id: String::from(subnet_id),
                     state: SubnetState::new(),
                     keypair,
                 });
             }
         }
 
-        return Ok(SubnetSimulator {
-            subnet_name: String::from(subnet_name),
+        Ok(SubnetSimulator {
+            subnet_id: String::from(subnet_id),
             state: SubnetState::new(),
-            keypair: bitcoin_utils::generate_keypair(subnet_name.to_string())?,
-        });
+            keypair: bitcoin_utils::generate_keypair(subnet_id.to_string())?,
+        })
     }
 
     pub fn create_account(&mut self, address: &String) {
@@ -148,6 +153,7 @@ impl SubnetSimulator {
                 // Sign the sighash using the secp256k1 library
                 let tweaked_keypair: TweakedKeypair = self.keypair.tap_tweak(&secp, None);
                 let msg = Message::from_digest_slice(&sighash[..]).expect("32 bytes");
+
                 let signature = secp.sign_schnorr(&msg, &tweaked_keypair.to_inner());
 
                 bitcoin::taproot::Signature {
@@ -177,8 +183,11 @@ impl SubnetSimulator {
     pub fn print_state(&mut self) {
         println!("#################################");
         // print in a more organized manner:
-        println!("Subnet: {}", self.subnet_name);
+        println!("Subnet: {}", self.subnet_id);
         println!("Subnet PK: {}", self.get_public_key());
+        let subnet_address =
+            bitcoin_utils::get_address_from_private_key(self.keypair.secret_key(), crate::NETWORK);
+        println!("Subnet Address: {}", subnet_address);
         println!("Accounts:");
         for (address, account) in &self.state.accounts {
             println!("  {}: {}", address, account.balance);
@@ -196,6 +205,9 @@ impl SubnetSimulator {
 pub enum SubnetSimulatorError {
     #[error("account not found")]
     BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
+
+    #[error("Error reading address")]
+    ErrorReadingAddress,
 
     #[error("error when reading the keypair file")]
     IoError(#[from] std::io::Error),

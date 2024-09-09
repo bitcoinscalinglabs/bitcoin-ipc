@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use bitcoin::address::NetworkChecked;
-use bitcoin::Address;
+use bitcoin::{secp256k1::PublicKey, Address};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -10,17 +10,16 @@ use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorData {
-    pub name: String,
-    pub ip: String,
-    pub pk: String,
+    name: String,
+    ip: String,
+    pk: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IPCState {
-    name: String,
+    subnet_id: String,
     subnet_address: String,
-    pub file_path: String,
-    url: String,
+    subnet_pk: PublicKey,
     required_number_of_validators: u64,
     required_collateral: u64,
     validators: Vec<ValidatorData>,
@@ -28,17 +27,16 @@ pub struct IPCState {
 
 impl IPCState {
     pub fn new(
-        name: String,
-        url: String,
-        subnet_pk: String,
+        parent_id: String,
+        subnet_address: String,
+        subnet_pk: PublicKey,
         required_number_of_validators: u64,
         required_collateral: u64,
     ) -> Self {
         IPCState {
-            name: name.clone(),
-            subnet_address: subnet_pk,
-            file_path: format!("{}/{}.json", url, name),
-            url,
+            subnet_id: format!("{}/{}", parent_id, subnet_address),
+            subnet_address,
+            subnet_pk,
             required_number_of_validators,
             required_collateral,
             validators: Vec::new(),
@@ -56,7 +54,9 @@ impl IPCState {
     pub fn save_state(&self) -> Result<String, IpcStateError> {
         let json = serde_json::to_string(&self)?;
 
-        let path = std::path::Path::new(&self.file_path);
+        let file_path = format!("{}/{}.json", self.subnet_id, self.subnet_address);
+
+        let path = std::path::Path::new(&file_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -65,7 +65,7 @@ impl IPCState {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&self.file_path)?;
+            .open(&file_path)?;
 
         file.write_all(json.as_bytes())?;
 
@@ -96,19 +96,27 @@ impl IPCState {
         self.required_collateral
     }
 
-    pub fn get_url(&self) -> String {
-        self.url.clone()
+    pub fn get_subnet_id(&self) -> String {
+        self.subnet_id.clone()
     }
 
-    pub fn get_name(&self) -> String {
-        self.name.clone()
+    pub fn get_subnet_address_str(&self) -> String {
+        self.subnet_address.clone()
+    }
+
+    pub fn get_file_path(&self) -> String {
+        format!("{}/{}.json", self.subnet_id, self.subnet_address)
+    }
+
+    pub fn get_subnet_pk(&self) -> PublicKey {
+        self.subnet_pk
     }
 
     pub fn get_subnet_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
-        return match Address::from_str(&self.subnet_address) {
+        match Address::from_str(&self.subnet_address) {
             Ok(address) => Ok(address.assume_checked()),
             Err(_) => Err(IpcStateError::InvalidSubnetPK),
-        };
+        }
     }
 
     pub fn load_all() -> Result<Vec<Self>, IpcStateError> {
@@ -141,8 +149,8 @@ impl IPCState {
     pub fn print_state(&mut self) {
         println!("#################################");
         // print in a more organized manner:
-        println!("Subnet: {}", self.name);
-        println!("URL: {}", self.url);
+        println!("Subnet: {}", self.subnet_id);
+        println!("File path: {}", self.get_file_path());
         println!("Subnet Address: {}", self.subnet_address.clone());
         println!(
             "Required number of validators: {}",

@@ -5,14 +5,14 @@ use std::{thread, time::Duration};
 
 use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulator};
 
-fn checkpoint(subnet_name: String) {
+fn checkpoint(subnet_id: String) -> Result<(), RelayerError> {
+    let subnet_address = match subnet_id.split("/").last() {
+        Some(subnet_address) => subnet_address,
+        None => return Err(RelayerError::InvalidId),
+    };
+
     loop {
-        let subnet = match IPCState::load_state(format!(
-            "{}/{}/{}.json",
-            bitcoin_ipc::L1_NAME,
-            subnet_name,
-            subnet_name
-        )) {
+        let subnet = match IPCState::load_state(format!("{}/{}.json", subnet_id, subnet_address)) {
             Ok(s) => s,
             Err(e) => {
                 println!("Failed to load subnet state: {}", e);
@@ -22,7 +22,7 @@ fn checkpoint(subnet_name: String) {
         };
 
         if subnet.has_required_validators() {
-            let mut simulator = match SubnetSimulator::new(&subnet_name) {
+            let mut simulator = match SubnetSimulator::new(&subnet_id) {
                 Ok(s) => s,
                 Err(e) => {
                     println!("Failed to start simulator: {}", e);
@@ -33,15 +33,18 @@ fn checkpoint(subnet_name: String) {
 
             let hash = simulator.get_checkpoint();
 
-            if let Ok(_) = ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator) {
-                println!("Checkpoint for {} submitted successfully", subnet.get_url());
+            if ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator).is_ok() {
+                println!(
+                    "Checkpoint for {} submitted successfully",
+                    subnet.get_subnet_id()
+                )
             } else {
-                println!("Failed to submit checkpoint for {}", subnet.get_url());
+                println!("Failed to submit checkpoint for {}", subnet.get_subnet_id());
             }
         } else {
             println!(
                 "Waiting for validators to join subnet: {}",
-                subnet.get_url()
+                subnet.get_subnet_id()
             );
         }
 
@@ -53,7 +56,7 @@ fn checkpoint(subnet_name: String) {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    subnet_name: String,
+    subnet_id: String,
 }
 
 #[derive(Error, Debug)]
@@ -64,6 +67,9 @@ pub enum RelayerError {
     #[error(transparent)]
     IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
 
+    #[error("invalid id")]
+    InvalidId,
+
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 }
@@ -71,5 +77,8 @@ pub enum RelayerError {
 fn main() {
     let args = Args::parse();
 
-    checkpoint(args.subnet_name);
+    match checkpoint(args.subnet_id) {
+        Ok(_) => println!("Relayer stopped"),
+        Err(e) => println!("Relayer error: {}", e),
+    }
 }
