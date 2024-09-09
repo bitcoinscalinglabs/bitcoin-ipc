@@ -51,4 +51,5 @@ It is implemented as a single bitcoin transaction with the following inputs and 
 - outputs: (1) A UTXO of value *V*, locked with the *subnetPK* that corresponds to *subnetAddress*. (2) A UTXO with 0 value, containing the OP_RETURN opcode and *userAddress*.
 
 Prior to creating this transaction, the user contacts the L2 subnet to obtain *userAddress*.
+In our implementation, the user can user the `Subnet Interactor` to interact with the subnet.
 The function is signed and submitted by the user. 
