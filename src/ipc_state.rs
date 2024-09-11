@@ -133,7 +133,18 @@ impl IPCState {
                         let sub_entry = sub_entry?;
                         let sub_path = sub_entry.path();
 
-                        if sub_path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        if sub_path.extension().and_then(|s| s.to_str()) == Some("json")
+                            && !sub_path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap()
+                                .starts_with("subnet_state")
+                            && !sub_path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap()
+                                .starts_with("keypair")
+                        {
                             let file = File::open(&sub_path)?;
                             let ipc_state: IPCState = serde_json::from_reader(file)?;
                             ipc_states.push(ipc_state);

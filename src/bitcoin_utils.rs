@@ -535,65 +535,6 @@ pub fn write_arbitrary_data(
     Ok((commit_tx, reveal_tx))
 }
 
-#[derive(Error, Debug)]
-pub enum BitcoinUtilsError {
-    #[error("cannot connect to the bitcoin node")]
-    CannotConnectToBitcoinNode(#[from] bitcoincore_rpc::Error),
-
-    #[error("tried to create a wallet on an invalid or non-existing network")]
-    InvalidNetwork(#[from] bitcoin::address::ParseError),
-
-    #[error("cannot parse a transaction")]
-    CannotDeserializeTransaction(#[from] bitcoin::consensus::encode::Error),
-
-    #[error(
-        "failed to submit transaction, mempool acceptance test failed. reason: {reject_reason}"
-    )]
-    MempoolAcceptanceFailed { reject_reason: String },
-
-    #[error("an error related to the BIP32 specification occured")]
-    Bip32Error(#[from] bitcoin::bip32::Error),
-
-    #[error("an error occured when building a taproot transaction")]
-    TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
-
-    #[error("tried to finalize a taproot transaction builder that is not ready")]
-    BuilderNotFinalizable,
-
-    #[error("cannot construct control block for the given script")]
-    CannotConstructControlBlock,
-
-    #[error("the utxo was not found")]
-    UtxoNotFound,
-
-    #[error("cannot create change tx for the given arguments")]
-    InsufficientAmoutForChangeTx,
-
-    #[error("cannot generate prevouts")]
-    CannotGeneratePrevouts,
-
-    #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
-    CannotSignTransaction {
-        tx: Transaction,
-        errors: Vec<bitcoincore_rpc::json::SignRawTransactionResultError>,
-    },
-
-    #[error("cannot generate a keypair")]
-    CannotGenerateKeypaair,
-
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error>),
-
-    #[error("cannot load prevouts")]
-    CannotLoadPrevouts,
-
-    #[error("invalid schnorr signature")]
-    InvalidSchnorrSig,
-
-    #[error("internal error")]
-    Internal,
-}
-
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
     unsafe { &*(data as *const [u8] as *const PushBytes) }
 }
@@ -652,6 +593,72 @@ pub fn create_checkpoint_tx(
 
     // We don't need to sign the transaction, the subnetPK will sign it.
     Ok(unsigned_tx)
+}
+
+/// This function creates a deposit transaction that sends a specified amount of Bitcoin to a deposit address.
+/// The function specifies the deposit address into an OP_RETURN output. It sends the deposited amount to the target address
+/// And returns the the signed transaction.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * 'amount_to_send' - The amount of Bitcoin to send, of type `Amount`'
+/// * `fee` - The fee to pay for the transaction, of type `Amount`
+/// * `deposit_address` - The address that the wrapped tokens are sent to
+/// * `target_address` - The address to which the Bitcoin is sent
+///
+/// # Returns
+///
+/// * `Transaction` - A transaction that deposits Bitcoin to the deposit address
+/// * `BitcoinUtilsError` - An error that occurred during the transaction creation
+pub fn create_deposit_tx(
+    rpc: &Client,
+    amount_to_send: Amount,
+    fee: Amount,
+    deposit_address: &str,
+    target_address: &Address,
+) -> Result<Transaction, BitcoinUtilsError> {
+    let input_info = collect_amount_for_wallet(rpc, amount_to_send, fee)?;
+
+    let input_vec: Vec<TxIn> = input_info
+        .clone()
+        .into_iter()
+        .map(|input| TxIn {
+            previous_output: input,
+            script_sig: ScriptBuf::new(),
+            sequence: transaction::Sequence::MAX,
+            witness: Witness::default(),
+        })
+        .collect();
+
+    let change = create_change_txout(rpc, &input_info, amount_to_send, fee, None)?;
+
+    let data = format!("{}{}", crate::IPC_DEPOSIT_TAG, crate::DELIMITER);
+
+    let target_address_bytes = deposit_address.as_bytes();
+
+    let data_bytes = [data.as_bytes(), target_address_bytes].concat();
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(&data_bytes);
+
+    let op_return_out = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(push_bytes),
+    };
+
+    let output = TxOut {
+        value: amount_to_send,
+        script_pubkey: target_address.script_pubkey(),
+    };
+
+    let unsigned_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: input_vec,
+        output: vec![op_return_out, output, change],
+    };
+
+    sign_transaction_safe(rpc, unsigned_tx)
 }
 
 /// This function hashes  an input string using the Keccak256 algorithm.
@@ -834,6 +841,17 @@ pub fn find_prevouts_for_a_sent_transaction(
         .collect()
 }
 
+/// This function verifies a taproot signature for a given transaction.
+///
+/// Arguments:
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `tx` - The transaction of type `Transaction`
+/// * `public_key` - The public key of type `XOnlyPublicKey`
+///
+/// Returns:
+///
+/// * `bool` - A boolean indicating whether the signature is valid
 pub fn verify_taproot_signature(
     rpc: &bitcoincore_rpc::Client,
     tx: &Transaction,
@@ -855,15 +873,19 @@ pub fn verify_taproot_signature(
 
             let mut sighash_cache = SighashCache::new(tx);
 
-            let sighash = sighash_cache
-                .taproot_key_spend_signature_hash(
-                    i,
-                    &Prevouts::All(&prevouts),
-                    TapSighashType::Default,
-                )
-                .expect("failed to construct sighash");
+            let sighash = match sighash_cache.taproot_key_spend_signature_hash(
+                i,
+                &Prevouts::All(&prevouts),
+                TapSighashType::Default,
+            ) {
+                Ok(sighash) => sighash,
+                Err(_) => return Err(BitcoinUtilsError::ErrorCreatingSigHash),
+            };
 
-            let msg = Message::from_digest_slice(&sighash[..]).expect("32 bytes");
+            let msg = match Message::from_digest_slice(&sighash[..]) {
+                Ok(msg) => msg,
+                Err(_) => return Err(BitcoinUtilsError::ErrorCreatingMessage),
+            };
 
             let tweaked_pubkey: TweakedPublicKey = public_key.tap_tweak(&secp, None).0;
 
@@ -877,4 +899,69 @@ pub fn verify_taproot_signature(
     }
 
     Ok(false)
+}
+
+#[derive(Error, Debug)]
+pub enum BitcoinUtilsError {
+    #[error("cannot connect to the bitcoin node")]
+    CannotConnectToBitcoinNode(#[from] bitcoincore_rpc::Error),
+
+    #[error("tried to create a wallet on an invalid or non-existing network")]
+    InvalidNetwork(#[from] bitcoin::address::ParseError),
+
+    #[error("cannot parse a transaction")]
+    CannotDeserializeTransaction(#[from] bitcoin::consensus::encode::Error),
+
+    #[error(
+        "failed to submit transaction, mempool acceptance test failed. reason: {reject_reason}"
+    )]
+    MempoolAcceptanceFailed { reject_reason: String },
+
+    #[error("an error related to the BIP32 specification occured")]
+    Bip32Error(#[from] bitcoin::bip32::Error),
+
+    #[error("an error occured when building a taproot transaction")]
+    TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
+
+    #[error("tried to finalize a taproot transaction builder that is not ready")]
+    BuilderNotFinalizable,
+
+    #[error("cannot construct control block for the given script")]
+    CannotConstructControlBlock,
+
+    #[error("the utxo was not found")]
+    UtxoNotFound,
+
+    #[error("cannot create change tx for the given arguments")]
+    InsufficientAmoutForChangeTx,
+
+    #[error("cannot generate prevouts")]
+    CannotGeneratePrevouts,
+
+    #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
+    CannotSignTransaction {
+        tx: Transaction,
+        errors: Vec<bitcoincore_rpc::json::SignRawTransactionResultError>,
+    },
+
+    #[error("cannot generate a keypair")]
+    CannotGenerateKeypaair,
+
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+
+    #[error("cannot load prevouts")]
+    CannotLoadPrevouts,
+
+    #[error("invalid schnorr signature")]
+    InvalidSchnorrSig,
+
+    #[error("error creating signature hash")]
+    ErrorCreatingSigHash,
+
+    #[error("error creating message")]
+    ErrorCreatingMessage,
+
+    #[error("internal error")]
+    Internal,
 }

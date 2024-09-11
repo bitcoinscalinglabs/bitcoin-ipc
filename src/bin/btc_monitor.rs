@@ -1,3 +1,4 @@
+use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
 use thiserror::Error;
 
 use std::{str::FromStr, thread, time::Duration};
@@ -5,7 +6,8 @@ use std::{str::FromStr, thread, time::Duration};
 use bitcoin::{secp256k1::PublicKey, XOnlyPublicKey};
 
 use bitcoin::script::Instruction;
-use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, utils};
+use bitcoin::Transaction;
+use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
 
 use bitcoincore_rpc::RpcApi;
 
@@ -113,6 +115,42 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
     };
 
     Ok(ipc_subnet_state)
+}
+
+fn parse_deposit_command(
+    tx: &Transaction,
+    data: &[u8],
+) -> Result<IPCState, ParseIpcTransactionError> {
+    let subnets = match IPCState::load_all() {
+        Ok(subnets) => subnets,
+        Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+    };
+
+    for subnet in subnets {
+        let subnet_address = match subnet.get_subnet_address() {
+            Ok(address) => address,
+            Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+        };
+
+        let script_pubkey = subnet_address.script_pubkey();
+
+        for output in tx.clone().output {
+            if script_pubkey == output.script_pubkey {
+                let mut simulator = match SubnetSimulator::new(&subnet.get_subnet_id()) {
+                    Ok(simulator) => simulator,
+                    Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+                };
+
+                match simulator
+                    .fund_account(&find_valid_utf8(data).to_string(), output.value.to_sat())
+                {
+                    Ok(_) => return Ok(subnet),
+                    Err(_) => return Err(ParseIpcTransactionError::CannotDepositToAccount),
+                }
+            }
+        }
+    }
+    Err(ParseIpcTransactionError::Internal)
 }
 
 fn find_valid_utf8(data: &[u8]) -> &str {
@@ -272,18 +310,35 @@ fn process_transaction(
         {
             if let Some(Ok(Instruction::PushBytes(data))) = instructions.next() {
                 if data.len() > 32 {
-                    if let Ok(data_str) = std::str::from_utf8(&data.as_bytes()[..data.len() - 32]) {
-                        if data_str.contains(bitcoin_ipc::IPC_CHECKPOINT_TAG)
-                            && data_str.contains(bitcoin_ipc::DELIMITER)
-                        {
-                            let checkpoint = hex::encode(&data.as_bytes()[data.len() - 32..]);
-                            match process_checkpoint(rpc, tx, checkpoint) {
-                                Ok(_) => println!("CHECKPOINT Command successfully parsed"),
-                                Err(e) => {
-                                    println!("CHECKPOINT Command could not be parsed. Error: {e}")
-                                }
+                    let data_str = find_valid_utf8(data[..data.len() - 32].as_bytes());
+                    if data_str.contains(bitcoin_ipc::IPC_CHECKPOINT_TAG)
+                        && data_str.contains(bitcoin_ipc::DELIMITER)
+                    {
+                        let checkpoint = hex::encode(&data.as_bytes()[data.len() - 32..]);
+                        match process_checkpoint(rpc, tx, checkpoint) {
+                            Ok(_) => println!("CHECKPOINT Command successfully parsed"),
+                            Err(e) => {
+                                println!("CHECKPOINT Command could not be parsed. Error: {e}")
                             }
                         }
+                    }
+                }
+
+                if data.len() > IPC_DEPOSIT_TAG.len() + DELIMITER.len() {
+                    let data_str =
+                        find_valid_utf8(data[..IPC_DEPOSIT_TAG.len() + DELIMITER.len()].as_bytes());
+                    if data_str.contains(IPC_DEPOSIT_TAG) && data_str.contains(DELIMITER) {
+                        println!(
+                            "Transaction {} at block height {} contains the keyword '{:?}'",
+                            tx.compute_txid(),
+                            block_height,
+                            IPC_DEPOSIT_TAG
+                        );
+                        println!("Executing the DEPOSIT command...");
+                        match parse_deposit_command(tx, data[data_str.len()..].as_bytes()) {
+                            Ok(_) => println!("DEPOSIT Command successfully parsed"),
+                            Err(e) => println!("DEPOSIT Command could not be parsed. Error: {e}"),
+                        };
                     }
                 }
             }
@@ -312,6 +367,8 @@ fn process_checkpoint(
                     println!("Checkpoint found for subnet: {}", subnet.get_subnet_id());
                     println!("Checkpoint: {}", checkpoint);
                     return Ok(());
+                } else {
+                    println!("Invalid checkpoint for subnet: {}", subnet.get_subnet_id());
                 }
             }
 
@@ -388,4 +445,10 @@ pub enum ParseIpcTransactionError {
 
     #[error("cannot read ipc state")]
     CannotReadIpcState,
+
+    #[error("cannot deposit to account")]
+    CannotDepositToAccount,
+
+    #[error("error")]
+    Internal,
 }

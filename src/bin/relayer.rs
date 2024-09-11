@@ -30,8 +30,14 @@ fn checkpoint(subnet_id: String) -> Result<(), RelayerError> {
                     continue;
                 }
             };
-
-            let hash = simulator.get_checkpoint();
+            let hash = match simulator.get_checkpoint() {
+                Ok(h) => h,
+                Err(e) => {
+                    println!("Failed to get checkpoint: {}", e);
+                    thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
 
             if ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator).is_ok() {
                 println!(
