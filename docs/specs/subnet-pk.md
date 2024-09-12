@@ -24,8 +24,9 @@ In the general case, `subnetPK` is defined when **all validators** of the subnet
 
 
 ### Specifically for Stage 1:
-In Stage 1, subnets have a single validator. The same bitcoin user submits the `createChild()` function and the `joinChild()`  function, hence becoming the single validator.
-This user defines the `subnetPK` and can produce valid `subnetMultiSig`. The process is the following:
+In Stage 1, subnets have a single validator. The same bitcoin user submits the `createChild()` function and the `joinChild()` function, hence becoming the single validator.
+This user defines the `subnetPK` and can produce valid `subnetMultiSig`.
+The process of creating and joining a child subnet is the following:
 
 - create a bitcoin key pair, call the secret and public keys `SubnetSK_A` and `subnetPK_A`, respectively
 - store locally the  `SubnetSK_A`

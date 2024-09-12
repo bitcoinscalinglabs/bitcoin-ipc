@@ -49,7 +49,7 @@ We model this as a functionality *deposit(subnetAddress, amount, userAddress)*.
 It is implemented as a single bitcoin transaction with the following inputs and outputs:
 - inputs: One or more UTXOs, spendable by the user's wallet, with total value the desired *amount* plus the miner's fee.
 - outputs: (1) A UTXO of value *V*, locked with the *subnetPK* that corresponds to *subnetAddress*. (2) A UTXO with 0 value, containing the OP_RETURN opcode and *userAddress*.
-
-Prior to creating this transaction, the user contacts the L2 subnet to obtain *userAddress*.
-In our implementation, the user can user the `Subnet Interactor` (see `architecture.md`) to interact with the subnet.
 The function is signed and submitted by the user. 
+
+Prior to creating this transaction, the user locally creates a secret key and obtains a *userAddress* for the subnet.
+
