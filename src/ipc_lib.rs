@@ -134,6 +134,38 @@ pub fn submit_checkpoint(
     }
 }
 
+/// Creates a deposit transaction for a subnet represented by a Bitcoin address and submits it to the Bitcoin network.
+///
+/// This function creates a Bitcoin transaction that includes specified deposit target address
+/// and submits it to the Bitcoin network. The transaction involves creating an OP_RETURN output
+/// that contains the address.
+///
+/// # Arguments
+///
+/// * `subnet_address` - A reference to a `bitcoin::Address` that represents the subnet's multisig address.
+/// * `amount` - An `Amount` representing the amount to be deposited to the subnet's multisig address.
+/// * `deposit_data` - A string slice that holds the deposit data to be embedded in the transaction.
+pub fn create_and_submit_deposit_tx(
+    subnet_address: &bitcoin::Address,
+    amount: Amount,
+    deposit_address: &str,
+) -> Result<(), IpcLibError> {
+    // Init RPC connection and wallet
+    let fee: Amount = Amount::from_sat(250);
+
+    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
+    let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
+    let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
+
+    let deposit_tx =
+        bitcoin_utils::create_deposit_tx(&rpc, amount, fee, deposit_address, subnet_address)?;
+
+    match test_and_submit(&rpc, vec![deposit_tx], miner_address) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum IpcLibError {
     #[error("error when reading an environment variable")]

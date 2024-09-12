@@ -111,7 +111,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn join_child(&self) -> Result<(), L1ManagerError> {
+    fn choose_subnet(&self) -> Result<IPCState, L1ManagerError> {
         let subnets = IPCState::load_all()?;
 
         if subnets.is_empty() {
@@ -119,12 +119,14 @@ impl L1Manager {
         }
 
         let mut prompt: String = format!(
-            "Select a subnet (between 1 and {}) to join:\n",
+            "Select a subnet (between 1 and {}) to deposit funds:\n",
             subnets.len()
         );
+
         for (i, subnet) in subnets.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_subnet_id()));
         }
+
         let choice = get_user_input(&prompt)?;
 
         let choice: usize = choice
@@ -139,7 +141,11 @@ impl L1Manager {
             });
         }
 
-        let ipc_state = &subnets[choice - 1];
+        Ok(subnets[choice - 1].clone())
+    }
+
+    fn join_child(&self) -> Result<(), L1ManagerError> {
+        let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
         let pk = get_user_input("Enter validator's public key:")?;
@@ -167,12 +173,41 @@ impl L1Manager {
         Ok(())
     }
 
+    fn deposit(&self) -> Result<(), L1ManagerError> {
+        let ipc_state = self.choose_subnet()?;
+
+        let amount = get_user_input("Enter amount to deposit (in satoshis):")?;
+
+        let amount: u64 = amount
+            .parse()
+            .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
+
+        if amount < 200 {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "amount must be at least 200 satoshis",
+            });
+        }
+
+        let subnet_address = &ipc_state.get_subnet_address()?;
+
+        let target_address = get_user_input("Enter target address:")?;
+
+        bitcoin_ipc::ipc_lib::create_and_submit_deposit_tx(
+            subnet_address,
+            Amount::from_sat(amount),
+            &target_address,
+        )?;
+
+        Ok(())
+    }
+
     fn interactive_interface(&mut self) {
         let prompt = "Select an option:\n\
             1. Read state\n\
             2. Create child\n\
             3. Join child\n\
-            4. Exit";
+            4. Deposit\n\
+            5. Exit";
 
         loop {
             let choice = match get_user_input(prompt) {
@@ -223,7 +258,16 @@ impl L1Manager {
                     }
                 },
 
-                4 => break,
+                4 => match self.deposit() {
+                    Ok(_) => {
+                        println!("Transaction to deposit funds has been submited to bitcoin, please wait for confirmation.");
+                    }
+                    Err(e) => {
+                        println!("An error occured, funds were not deposited. Error: {e}");
+                    }
+                },
+
+                5 => break,
 
                 _ => println!("Invalid option. Please try again."),
             }

@@ -68,7 +68,7 @@ impl SubnetInteractor {
                         }
                     };
 
-                    self.subnet.create_account(&address);
+                    let _ = self.subnet.create_account(&address);
                 }
                 2 => {
                     let address = match get_user_input("Enter account address:") {
@@ -94,7 +94,7 @@ impl SubnetInteractor {
                         }
                     };
 
-                    self.subnet.fund_account(&address, amount);
+                    let _ = self.subnet.fund_account(&address, amount);
                 }
                 3 => {
                     let from = match get_user_input("Enter from account address:") {
@@ -132,7 +132,13 @@ impl SubnetInteractor {
                     }
                 }
                 4 => {
-                    let checkpoint = self.subnet.get_checkpoint();
+                    let checkpoint = match self.subnet.get_checkpoint() {
+                        Ok(cp) => cp,
+                        Err(e) => {
+                            println!("Failed to get checkpoint: {}", e);
+                            continue;
+                        }
+                    };
                     let str_cp = hex::encode(checkpoint);
                     println!("Checkpoint: {:?}", str_cp);
                 }
