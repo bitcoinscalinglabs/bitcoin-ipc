@@ -9,7 +9,7 @@ The *subnetPK* for an L2 subnet is a *bitcoin script* that can be unlocked by th
 A bitcoin user that wants to deposit funds from bitcoin to an L2 (lock BTC and mint wrapped BTC) broadcasts a transaction that locks a specific amount of BTC on the bitcoin network with the *subnetPK* of the L2 subnet.
 
 **Implementation.**
-The subnetPK is implemented as a Pay-to-Taproot (P2TR) script.
+The subnetPK is implemented as a Pay-to-Taproot (P2TR) script in all three Stages of the project.
 
 ## subnetSig
 It is *bitcoin witness* that can be used to unlock a UTXO locked with *subnetPK*.
@@ -17,7 +17,7 @@ It is *bitcoin witness* that can be used to unlock a UTXO locked with *subnetPK*
 **Example: Unlocking funds.**
 When an L2 subnet wants to release funds from the L2 back to bitcoin chain (a user withdraws wrapped BTC), the validators of the subnet provide their signatures to create a *subnetSig*, which is the witness that unlocks a UTXO locked with *subnetPK*.
 
-**Implementation.** The subnetSig is implemented as a taproot witness. 
+**Implementation.** The subnetSig is implemented as a taproot witness, which unlocks subnetPK using either the key-spend path (in Stages 1-2, and potentially in Stage 3) or the script path (in Stage 3, if we decide to change from the key-spend path). We remark that changing from the key-spend to the script path is a simple change, confined to specific parts of the code.
 
 ## Uniqueness of subnetPK
 Each `subnetPK` must be unique. If two subnets have the same `subnetPK`, then the validators of one would be able to affect the state of the other. Note that this also applies if the subnets have the same validators.

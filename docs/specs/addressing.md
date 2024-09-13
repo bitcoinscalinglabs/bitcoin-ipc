@@ -4,9 +4,10 @@
 The subnet Address we use for Bitcoin, in string representation, is `BTC`.
 
 ### L2 subnet over bitcoin
-For an L2 subnet with bitcoin as L1, we use as subnet address the bitcoin address derived from `subnetPK` (see `subnet-pk.md`).
+For an L2 subnet with bitcoin as L1, we use as subnet address the *bitcoin address* derived from `subnetPK` (see `subnet-pk.md`).
+Since subnetPK is implemented as a P2TR script, its address is a P2TR bitcoin address derived from `SubnetPK`. 
 
-Implementation: The code currently uses a P2TR bitcoin address derived from `SubnetPK`. This gives a 64-byte output.
+Details: The address of a P2TR script is a [bech32m encoding](https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki) of the scriptPubKey version (0x5120 for a P2TR script) and the 32-byte Merkle root hash. This gives 62 characters.
 
 Example: An L2 subnet address could be `bcrt1p203537p7w99xlmrxqlmxywnjh6y8dlq6cf9appg5hph06gplfzqsedm67f`.
 
