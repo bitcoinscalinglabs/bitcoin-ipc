@@ -1,7 +1,7 @@
 
 # Software stack on an IPC-aware node
 **Definition:**
-An *IPC-aware node* is a bitcoin full node with IPC integration, i.e., that supports viewing, creating, and joining existing IPC subnets on Bitcoin.
+An *IPC-aware node* (or simply *IPC-node*) is a bitcoin full node with IPC integration, i.e., that supports viewing, creating, and joining existing IPC subnets on Bitcoin.
 
 ![IPC-aware node](../diagrams/ipc-aware-node.png)
 
@@ -12,21 +12,24 @@ An IPC-aware node runs all the following modules.
 A bitcoin node must be available to connect to over RPC. This can be either a local node running Bitcoin Core or a public bitcoin full node.
 All examples and demos in this repo assume the first approach, with a `bitcoin core` connected to a local testnet.
 
+
 ## IPC L1 Manager
 It is responsible for keeping track of the `IpcState`.
 It also exposes an interface that allows the user to modify it (e.g., create new subnet or join an existing).
 It consists of two submodules, the Bitcoin Monitor and the BTC-IPC library.
 
-## Bitcoin Monitor
+
+### Bitcoin Monitor
 It monitors the bitcoin chain (using the Bitcoin full node over RPC) for IPC-related transactions.
 This could be, for example, a create-subnet command, submitted by another bitcoin user.
 Whenever such a transaction is detected and becomes final, the Bitcoin Monitor parses it and communicates the result back to the IPC L1 Manager.
 
-## BTC-IPC library
+### BTC-IPC library
 It contains all the necessary logic for translating IPC commands (such as `createChild`, `joinChild`, submit a checkpoint from a subnet, propagate subnet transactions for one subnet to another) to bitcoin transactions.
 It is used by the IPC L1 Manager and the Relayer modules.
 
-## Subnet Simulator
+
+## Subnet Validator (Simulator)
 An IPC-aware node that decides to join a child runs a validator for that subnet.
 
 As explained in `scope-of-work.md`, in the first stage a `Subnet Simulator` will be used to instantiate the subnet. This is a mock implementation of a validator that runs locally on the IPC-aware node and connects to no other validators (equivalent to a single-validator subnet). It maintains the `SubnetState` and exposes a simple interface, simulating a token-transfer application.
@@ -40,18 +43,24 @@ Hence, the interface of the Subnet Simulator looks like the following (described
 - withdraw()
 - get_checkpoint()
 
-As the Subnet Simulator is the only point in the architecture where the `SubnetState` is help, it is responsible to return the state to be checkpointed. This is facilitated by the `get_checkpoint()` method.
+As the Subnet Simulator is the only point in the architecture where the `SubnetState` is held, it is responsible to return the state to be checkpointed. This is facilitated by the `get_checkpoint()` method.
+
+Since the node runs a bitcoin full node, it can use that node for bridging events from the bitcoin chain into the subnet.
+
+
+# Off-chain componnets
 
 ## Relayer
-It is responsible for monitoring all IPC subnets and relaying necessary information to bitcoin.
-Specifically:
+This component is responsible for monitoring all IPC subnets and relaying necessary information from IPC subnets to bitcoin.
+It could also run on a different machine, by a different entity, or be implemented in a decentralized manner. Here we make it a process run by an IPC node.
+
+It works as follows:
 - It periodically checks the `postBox` of each subnet. If there are cross-chain `transfer` or `withdraw` commands, it uses the BTC-IPC library to submit the appropriate transaction to bitcoin.
 - It periodically calls `get_checkpoint()` on the subnet and submits the checkpoint to bitcoin, using the BTC-IPC library.
 
 To achieve these, it connects to all the validators of the subnet. In the initial stages, where the subnet is instantiated by a Subnet Simulator, the Relayer only uses the interface of the Subnet Simulator to read the postbox and perform the checkpointing.
 In later stages, when the Fendermint node will be used to instantiate a subnet, the Relayer will connect to it using the means provided by Fendermint.
 
-We stress that the Relayer could also run on a different machine or by a different entity, but here we do not take that approach.
 
 ## Subnet Interactor
 The Subnet Interactor is not mandatory on an IPC-aware node.

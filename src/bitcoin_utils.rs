@@ -540,8 +540,8 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 }
 
 /// This function creates a checkpoint transaction that commits a checkpoint hash to the blockchain.
-/// The function creates a transaction that sends the checkpoint hash to an OP_RETURN output
-/// and returns the signed transaction.
+/// The function creates a transaction that contains the checkpoint hash in an OP_RETURN output,
+/// and returns the unsigned transaction.
 ///
 /// # Arguments
 /// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`

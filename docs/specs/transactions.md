@@ -31,7 +31,13 @@ We model this as a functionality *createChild(subnetData)*:
 Here is the flow of a subnet creation.
 ![Create Subnet](../diagrams/create-subnet.png)
 
-Observe in the diagram that *subnetPK* is computed locally at the machine of the process that submits the *createChild()* command. In later stages this will be replaced by an interactive protocol. See `subnet-pk.md` for more explanation.
+Specifically, the user that wants to create an IPC subnet does the following:
+- create a bitcoin key pair, let `subnetPK` and `subnetSK` be the public and scret key, respectively
+- store locally the  `subnetSK`
+- use `subnetPK` when calling `createChild()`
+
+Observe in the diagram that *subnetPK* is computed locally at the machine of the process that submits the *createChild()* command. The *subnetSK* will be used when a signature from the subnet is required.
+In Stage 3 this will be replaced by an interactive protocol. See `subnet-pk.md` for more explanation.
 
 ## Join subnet
 We model this as a functionality *joinChild(subnetAddress, validatorData)*:
