@@ -20,7 +20,7 @@ When an L2 subnet wants to release funds from the L2 back to bitcoin chain (a us
 **Implementation.** The subnetSig is implemented as a taproot witness. 
 
 ## Uniqueness of subnetPK
-Each `subnetPK` must be unique. If two subnets have the same `subnetPK`, then the validators of the one would be able to affect the state of the other. Note that this also applies if the subnets have the same validators.
+Each `subnetPK` must be unique. If two subnets have the same `subnetPK`, then the validators of one would be able to affect the state of the other. Note that this also applies if the subnets have the same validators.
 
 
 # Computing subnetPK in Stages 1-2
