@@ -81,12 +81,13 @@ Specifically, they can "lock" an amount of BTC on L1 and "mine" an equal amount 
 We model this as a functionality *deposit(subnetAddress, amount, userAddress)*.
 It is implemented as a single bitcoin transaction with the following inputs and outputs:
 - *in*: UTXO(s), spendable by the user's wallet, with total value the desired *amount* plus the miner's fee.
-- *output*: (1) A UTXO of value *V*, locked with the *subnetPK* that corresponds to *subnetAddress*. (2) A UTXO with 0 value, containing the OP_RETURN opcode *ipcDepositKeyword* *userAddress*.
+- *output*: (1) A UTXO of value *V*, locked with the *subnetPK* that corresponds to *subnetAddress*. (2) A UTXO with 0 value, containing "<OP_RETURN opcode> <*ipcDepositKeyword*> <*userAddress*>".
 The function is signed and submitted by the user. 
 
-Prior to creating this transaction, the user locally creates a secret key and obtains a *userAddress* for the subnet.
+We assume that, prior to using the deposit functionality, the user connects to the subnet
+and creates a key pair, from which and obtains the *userAddress* for the subnet.
 
-The deposit transaction also contains an IPC command keyword to be able to be detected by the btc_monitor. 
+The deposit transaction contains *ipcDepositKeyword*, an IPC keyword, so as to be able to be detected by the btc_monitor. 
 The BTC monitor checks if a subnet exists such that the script pubkey of the deposit transaction corresponds to 
 a script pubkey generated using a *subnetAddress*. This is the way that btc_monitor fully identifies a
 deposit trnasaction. After fetching all the required parameters, the btc_monitor calls the subnet simulator deposit function.
