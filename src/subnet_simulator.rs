@@ -4,10 +4,10 @@ use bitcoin::key::{TapTweak, TweakedKeypair};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::{TapSighashType, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs::File};
+use std::{collections::BTreeMap, collections::BTreeSet, fs::File};
 
 use bitcoin::secp256k1::{Message, Secp256k1};
-use bitcoin::XOnlyPublicKey;
+use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -21,12 +21,43 @@ pub struct Account {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetState {
     accounts: BTreeMap<String, Account>,
+    postbox: Postbox,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
+pub struct TransferEvent {
+    subnet_id: String,
+    deposit_address: String,
+    amount: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
+pub struct WithdrawEvent {
+    target_address: Address<NetworkUnchecked>,
+    amount: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeleteEvent {
+    subnet_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Postbox {
+    transfers: BTreeSet<TransferEvent>,
+    withdraws: BTreeSet<WithdrawEvent>,
+    deletes: Option<DeleteEvent>,
 }
 
 impl SubnetState {
     pub fn new() -> Self {
         SubnetState {
             accounts: BTreeMap::new(),
+            postbox: Postbox {
+                transfers: BTreeSet::new(),
+                withdraws: BTreeSet::new(),
+                deletes: None,
+            },
         }
     }
 }
@@ -153,18 +184,87 @@ impl SubnetSimulator {
 
         from_account.balance -= amount;
 
-        // TODO: update logic when address is from another subnet.
-        let to_account = self
-            .state
-            .accounts
-            .entry(to.to_string())
-            .or_insert(Account { balance: 0 });
+        if to.contains("/") {
+            let address = match to.split("/").last() {
+                Some(a) => a,
+                None => {
+                    return Err(SubnetStateError::AccountNotFound);
+                }
+            };
 
-        to_account.balance += amount;
+            let subnet_id = match to.strip_suffix(&format!("/{}", address)) {
+                Some(s) => s,
+                None => {
+                    return Err(SubnetStateError::AccountNotFound);
+                }
+            };
+
+            self.state.postbox.transfers.insert(TransferEvent {
+                subnet_id: subnet_id.to_string(),
+                deposit_address: address.to_string(),
+                amount,
+            });
+
+            println!("Transfer request submitted to postbox");
+        } else {
+            let to_account = self
+                .state
+                .accounts
+                .entry(to.to_string())
+                .or_insert(Account { balance: 0 });
+
+            to_account.balance += amount;
+
+            println!("Transfer successful");
+        }
 
         self.save_state()?;
 
-        println!("Transfer successful");
+        Ok(())
+    }
+
+    pub fn withdraw(
+        &mut self,
+        from: &String,
+        amount: u64,
+        target_address: Address<NetworkUnchecked>,
+    ) -> Result<(), SubnetStateError> {
+        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+
+        let from_account = match self.state.accounts.get_mut(from) {
+            Some(a) => a,
+            None => {
+                return Err(SubnetStateError::AccountNotFound);
+            }
+        };
+
+        if from_account.balance < amount {
+            return Err(SubnetStateError::InsufficientFunds);
+        }
+
+        from_account.balance -= amount;
+
+        self.state.postbox.withdraws.insert(WithdrawEvent {
+            target_address,
+            amount,
+        });
+
+        self.save_state()?;
+
+        println!("Withdraw request submitted to postbox");
+        Ok(())
+    }
+
+    pub fn delete(&mut self) -> Result<(), SubnetStateError> {
+        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+
+        self.state.postbox.deletes = Some(DeleteEvent {
+            subnet_id: self.subnet_id.clone(),
+        });
+
+        self.save_state()?;
+
+        println!("Delete request submitted to postbox");
         Ok(())
     }
 
@@ -254,6 +354,36 @@ impl SubnetSimulator {
         tx
     }
 
+    pub fn get_postbox_transfers(&mut self) -> &BTreeSet<TransferEvent> {
+        &self.state.postbox.transfers
+    }
+
+    pub fn empty_postbox_transfers(&mut self) -> Result<(), SubnetStateError> {
+        self.state.postbox.transfers = BTreeSet::new();
+        self.save_state()?;
+        Ok(())
+    }
+
+    pub fn get_postbox_withdraws(&mut self) -> &BTreeSet<WithdrawEvent> {
+        &self.state.postbox.withdraws
+    }
+
+    pub fn empty_postbox_withdraws(&mut self) -> Result<(), SubnetStateError> {
+        self.state.postbox.withdraws = BTreeSet::new();
+        self.save_state()?;
+        Ok(())
+    }
+
+    pub fn get_postbox_delete(&mut self) -> Option<&DeleteEvent> {
+        self.state.postbox.deletes.as_ref()
+    }
+
+    pub fn empty_postbox_delete(&mut self) -> Result<(), SubnetStateError> {
+        self.state.postbox.deletes = None;
+        self.save_state()?;
+        Ok(())
+    }
+
     pub fn get_public_key(&self) -> bitcoin::secp256k1::PublicKey {
         self.keypair.public_key()
     }
@@ -276,6 +406,23 @@ impl SubnetSimulator {
         for (address, account) in &self.state.accounts {
             println!("  {}: {}", address, account.balance);
         }
+
+        println!("Postbox:");
+        for transfer in &self.state.postbox.transfers {
+            println!(
+                "  Transfer to {}/{} : {}",
+                transfer.subnet_id, transfer.deposit_address, transfer.amount
+            );
+        }
+        for withdraw in &self.state.postbox.withdraws {
+            println!(
+                "  Withdraw: {} : {}",
+                withdraw.target_address.clone().assume_checked(),
+                withdraw.amount
+            );
+        }
+
+        println!("  Delete: {:?}", self.state.postbox.deletes);
 
         let checkpoint = match self.get_checkpoint() {
             Ok(cp) => cp,
