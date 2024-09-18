@@ -1,4 +1,6 @@
 {
   "listener_interval": 10,
-  "ipc_finalization_parameter": 1
+  "ipc_finalization_parameter": 1,
+  "checkpoint_interval": 100,
+  "postbox_interval": 5
 }

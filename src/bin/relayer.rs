@@ -1,61 +1,144 @@
 use clap::Parser;
 use thiserror::Error;
 
-use std::{thread, time::Duration};
+use tokio::{task, time};
 
-use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulator};
+use std::time::Duration;
 
-fn checkpoint(subnet_id: String) -> Result<(), RelayerError> {
+use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
+
+async fn get_subnet_and_simulator(
+    subnet_id: &String,
+) -> Result<(IPCState, SubnetSimulator), RelayerError> {
     let subnet_address = match subnet_id.split("/").last() {
         Some(subnet_address) => subnet_address,
         None => return Err(RelayerError::InvalidId),
     };
 
-    loop {
-        let subnet = match IPCState::load_state(format!("{}/{}.json", subnet_id, subnet_address)) {
+    let subnet = match IPCState::load_state(format!("{}/{}.json", subnet_id, subnet_address)) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(RelayerError::IpcStateError(e));
+        }
+    };
+
+    if subnet.has_required_validators() {
+        let simulator = match SubnetSimulator::new(subnet_id) {
             Ok(s) => s,
             Err(e) => {
-                println!("Failed to load subnet state: {}", e);
-                thread::sleep(Duration::from_secs(10));
-                continue;
+                return Err(RelayerError::SubnetSimulatorError(e));
             }
         };
 
-        if subnet.has_required_validators() {
-            let mut simulator = match SubnetSimulator::new(&subnet_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    println!("Failed to start simulator: {}", e);
-                    thread::sleep(Duration::from_secs(10));
-                    continue;
-                }
-            };
-            let hash = match simulator.get_checkpoint() {
-                Ok(h) => h,
-                Err(e) => {
-                    println!("Failed to get checkpoint: {}", e);
-                    thread::sleep(Duration::from_secs(10));
-                    continue;
-                }
-            };
+        Ok((subnet, simulator))
+    } else {
+        println!(
+            "Waiting for validators to join subnet: {}",
+            subnet.get_subnet_id()
+        );
+        Err(RelayerError::WaitingForValidators)
+    }
+}
 
-            if ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator).is_ok() {
-                println!(
-                    "Checkpoint for {} submitted successfully",
-                    subnet.get_subnet_id()
-                )
-            } else {
-                println!("Failed to submit checkpoint for {}", subnet.get_subnet_id());
+async fn checkpoint(subnet_id: &String) -> Result<(), RelayerError> {
+    let (subnet, mut simulator) = match get_subnet_and_simulator(subnet_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    let hash = match simulator.get_checkpoint() {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(RelayerError::SubnetStateError(e));
+        }
+    };
+
+    if ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator).is_ok() {
+        println!(
+            "Checkpoint for {} submitted successfully",
+            subnet.get_subnet_id()
+        )
+    } else {
+        println!("Failed to submit checkpoint for {}", subnet.get_subnet_id());
+    }
+
+    Ok(())
+}
+
+async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
+    let (subnet, mut simulator) = match get_subnet_and_simulator(subnet_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    {
+        let transfers = simulator.get_postbox_transfers();
+        if !transfers.is_empty() {
+            // TODO: batch and send transfers here!
+
+            match simulator.empty_postbox_transfers() {
+                Ok(_) => {
+                    println!(
+                        "Handled transfers in postbox for subnet: {}",
+                        subnet.get_subnet_id()
+                    );
+                }
+                Err(e) => {
+                    return Err(RelayerError::SubnetStateError(e));
+                }
             }
         } else {
-            println!(
-                "Waiting for validators to join subnet: {}",
-                subnet.get_subnet_id()
-            );
+            println!("No transfers in postbox")
         }
-
-        thread::sleep(Duration::from_secs(100));
     }
+
+    {
+        let withdraws = simulator.get_postbox_withdraws();
+        if !withdraws.is_empty() {
+            // TODO: batch and send withdraws here!
+
+            match simulator.empty_postbox_withdraws() {
+                Ok(_) => {
+                    println!(
+                        "Handled withdraws in postbox for subnet: {}",
+                        subnet.get_subnet_id()
+                    );
+                }
+                Err(e) => {
+                    return Err(RelayerError::SubnetStateError(e));
+                }
+            }
+        } else {
+            println!("No withdraws in postbox")
+        }
+    }
+
+    {
+        let delete = simulator.get_postbox_delete();
+        if delete.is_some() {
+            // TODO: send delete tx here!
+
+            match simulator.empty_postbox_delete() {
+                Ok(_) => {
+                    println!(
+                        "Handled delete in postbox for subnet: {}",
+                        subnet.get_subnet_id()
+                    );
+                }
+                Err(e) => {
+                    return Err(RelayerError::SubnetStateError(e));
+                }
+            }
+        } else {
+            println!("No delete in postbox")
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -71,20 +154,63 @@ pub enum RelayerError {
     SubnetSimulatorError(#[from] bitcoin_ipc::subnet_simulator::SubnetSimulatorError),
 
     #[error(transparent)]
+    SubnetStateError(#[from] bitcoin_ipc::subnet_simulator::SubnetStateError),
+
+    #[error(transparent)]
     IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
 
     #[error("invalid id")]
     InvalidId,
 
+    #[error("waiting for validators to join subnet")]
+    WaitingForValidators,
+
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
-    match checkpoint(args.subnet_id) {
-        Ok(_) => println!("Relayer stopped"),
-        Err(e) => println!("Relayer error: {}", e),
-    }
+    let config = match utils::load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("Error loading config: {}", e);
+            return;
+        }
+    };
+
+    let checkpoint_interval = Duration::from_secs(config.checkpoint_interval);
+    let postbox_interval = Duration::from_secs(config.postbox_interval);
+
+    let mut subnet_id = args.subnet_id.clone();
+
+    let checkpoint_task = task::spawn(async move {
+        let mut interval = time::interval(checkpoint_interval);
+        loop {
+            interval.tick().await;
+            match checkpoint(&subnet_id).await {
+                Ok(_) => println!("Checkpoint submitted successfully"),
+                Err(e) => println!("Error submitting checkpoint: {}", e),
+            }
+        }
+    });
+
+    subnet_id = args.subnet_id.clone();
+
+    let postbox_task = task::spawn(async move {
+        let mut interval = time::interval(postbox_interval);
+        loop {
+            interval.tick().await;
+            match check_postbox(&subnet_id).await {
+                Ok(_) => println!("Postbox checked successfully"),
+                Err(e) => println!("Error checking postbox: {}", e),
+            }
+        }
+    });
+
+    let _ = tokio::try_join!(checkpoint_task, postbox_task);
+
+    println!("Relayer stopped");
 }

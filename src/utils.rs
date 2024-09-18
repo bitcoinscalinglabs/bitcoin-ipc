@@ -7,6 +7,8 @@ use thiserror::Error;
 pub struct Config {
     pub listener_interval: u64,
     pub ipc_finalization_parameter: u64,
+    pub checkpoint_interval: u64,
+    pub postbox_interval: u64,
 }
 
 /// Load environment variables from a .env file

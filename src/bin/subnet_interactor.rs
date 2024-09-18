@@ -1,6 +1,8 @@
 // subnet_interactor.rs
 use thiserror::Error;
 
+use std::str::FromStr;
+
 use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use clap::Parser;
 use std::io::{self};
@@ -41,8 +43,10 @@ impl SubnetInteractor {
                                 2. Fund account\n\
                                 3. Transfer funds\n\
                                 4. Checkpoint state\n\
-                                5. Print state\n\
-                                6. Exit";
+                                5. Withdraw funds\n\
+                                6. Delete subnet\n\
+                                7. Print state\n\
+                                8. Exit";
 
             let choice = match get_user_input(prompt) {
                 Ok(c) => c,
@@ -142,8 +146,58 @@ impl SubnetInteractor {
                     let str_cp = hex::encode(checkpoint);
                     println!("Checkpoint: {:?}", str_cp);
                 }
-                5 => self.subnet.print_state(),
-                6 => break,
+                5 => {
+                    let address = match get_user_input("Enter account address:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read account address: {}", e);
+                            continue;
+                        }
+                    };
+                    let amount = match get_user_input("Enter amount to withdraw:") {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read amount: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let amount: u64 = match amount.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Invalid balance amount: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let btc_address_str = match get_user_input("Enter BTC address to withdraw to:")
+                    {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read BTC address: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let btc_address = match bitcoin::Address::from_str(&btc_address_str) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to parse BTC address: {}", e);
+                            continue;
+                        }
+                    };
+
+                    match self.subnet.withdraw(&address, amount, btc_address) {
+                        Ok(_) => {}
+                        Err(e) => println!("Failed to submit withdraw request: {}", e),
+                    };
+                }
+                6 => match self.subnet.delete() {
+                    Ok(_) => {}
+                    Err(e) => println!("Failed to submit delete subnet request: {}", e),
+                },
+                7 => self.subnet.print_state(),
+                8 => break,
                 _ => println!("Invalid option. Please try again."),
             }
         }
