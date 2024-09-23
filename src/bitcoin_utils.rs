@@ -421,8 +421,6 @@ pub fn collect_amount(
 
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
 
-    println!("{:?}", result.unspents);
-
     assemble_outpoints_for_target_amount(result.unspents, amount.to_sat() + fee.to_sat())
 }
 
