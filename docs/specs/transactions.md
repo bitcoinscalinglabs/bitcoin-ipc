@@ -96,19 +96,32 @@ regardless of whether the system operates in a single or multi-validator setting
 
 
 ## Transfer 
-This command allows users of a subet (e.g. subnet_A) to transfer funds to one or more different subnet(s) (e.g. subnet_B and subnet_C).
-We model this as sa functionality transfer(transferData)
-- transferData contains a batch of transfers. Each entry of the batch is identified by the target subnetAddress, the destination
-address where the amount should be transfered and the amount.
-- It is implemented using the writeArbitraryData(in, out, data) functionality, where:
-    - in: UTXO(s), spendable by the subnetPK of subnet_A
-    - out: UTXO(s), each having a value corresponding to a certain transfer encoded in data, locked by the subnetPK of the transfer's destination subnet.
-    - data: contains a batch of transfers from subnet_A
+This command allows users of a subnet (e.g. subnet_A) to transfer funds to one or more different subnets (e.g. subnet_B and subnet_C).
+We model this as a functionality *transfer(transferData)*, where:
+- *transferData* contains a batch of transfers. Each entry batch contains (1) the target *subnetAddress*, (2) the *destinationAddress* where the amount should be transferred, and (3) the *amount*.
 
-Since we use the writeArbitraryData functionality, we send both a commit and a reveal transaction to the network.
-The commit transaction, apart from the encoded data, it also locks UTXOs with the subnetPK of subnet_B or subnetPK
-of subnet_C depending on the transfer destination.
-The data contains ipcTransferKeyword, an IPC keyword, to allow the btc_monitor to detect this transaction.
+It is implemented using the *writeArbitraryData(in, out, data)* functionality, where:
+- *in*: UTXO(s), spendable by the subnetPK of subnet_A
+- *out*: UTXO(s), each having a value corresponding to a certain transfer encoded in data, locked by the subnetPK of the destination subnet *subnetAddress*.
+- *data*: contains the *transferData*
+
+Example:
+- Accounts on subnet A: *u,v,w,x*.
+- Accounts on B: *d,e*.
+- Accounts on C: *j,k*.
+- We want to batch: 
+    - A.u->B.d, amount v1
+    - A.v->B.e, amount v2
+    - A.w->C.j, amount v3
+    - A.x->C.k., amount v4
+
+The following diagram shows how the transaction is implemented:
+![Transfer example](../diagrams/transfer-example.png)
+
+Since we use the *writeArbitraryData* functionality, we send both a commit and a reveal transaction to the network.
+The commit transaction, apart from the encoded data, it also locks UTXOs with the subnetPK of subnets B and C.
+
+The data contains an IPC keyword *ipcTransferKeyword* to allow the btc_monitor to detect this transaction.
 The BTC monitor then extracts the data which is encoded in the commit-reveal transaction and validates whether the UTXO(s) 
 locked by the target subnetPK correspond to the values specified by the transfers in transferData. After successful
 confirmation, the target addresses specified in the transfers get funded through the subnet simulator.
