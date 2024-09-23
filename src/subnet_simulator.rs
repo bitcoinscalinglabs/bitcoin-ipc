@@ -2,7 +2,7 @@ use crate::bitcoin_utils;
 
 use bitcoin::key::{TapTweak, TweakedKeypair};
 use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::{TapSighashType, Transaction, TxOut};
+use bitcoin::{Amount, TapSighashType, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, fs::File};
 
@@ -26,9 +26,9 @@ pub struct SubnetState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
 pub struct TransferEvent {
-    subnet_id: String,
-    deposit_address: String,
-    amount: u64,
+    pub target_subnet_id: String,
+    pub deposit_address: String,
+    pub amount: Amount,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
@@ -185,9 +185,15 @@ impl SubnetSimulator {
         from_account.balance -= amount;
 
         if to.contains("/") {
+            if amount < 1000 {
+                from_account.balance += amount;
+                return Err(SubnetStateError::InsufficientAmount);
+            }
+
             let address = match to.split("/").last() {
                 Some(a) => a,
                 None => {
+                    from_account.balance += amount;
                     return Err(SubnetStateError::AccountNotFound);
                 }
             };
@@ -195,14 +201,15 @@ impl SubnetSimulator {
             let subnet_id = match to.strip_suffix(&format!("/{}", address)) {
                 Some(s) => s,
                 None => {
+                    from_account.balance += amount;
                     return Err(SubnetStateError::AccountNotFound);
                 }
             };
 
             self.state.postbox.transfers.insert(TransferEvent {
-                subnet_id: subnet_id.to_string(),
+                target_subnet_id: subnet_id.to_string(),
                 deposit_address: address.to_string(),
-                amount,
+                amount: Amount::from_sat(amount),
             });
 
             println!("Transfer request submitted to postbox");
@@ -354,7 +361,7 @@ impl SubnetSimulator {
         tx
     }
 
-    pub fn get_postbox_transfers(&mut self) -> &BTreeSet<TransferEvent> {
+    pub fn get_postbox_transfers(&self) -> &BTreeSet<TransferEvent> {
         &self.state.postbox.transfers
     }
 
@@ -364,7 +371,7 @@ impl SubnetSimulator {
         Ok(())
     }
 
-    pub fn get_postbox_withdraws(&mut self) -> &BTreeSet<WithdrawEvent> {
+    pub fn get_postbox_withdraws(&self) -> &BTreeSet<WithdrawEvent> {
         &self.state.postbox.withdraws
     }
 
@@ -374,7 +381,7 @@ impl SubnetSimulator {
         Ok(())
     }
 
-    pub fn get_postbox_delete(&mut self) -> Option<&DeleteEvent> {
+    pub fn get_postbox_delete(&self) -> Option<&DeleteEvent> {
         self.state.postbox.deletes.as_ref()
     }
 
@@ -411,7 +418,7 @@ impl SubnetSimulator {
         for transfer in &self.state.postbox.transfers {
             println!(
                 "  Transfer to {}/{} : {}",
-                transfer.subnet_id, transfer.deposit_address, transfer.amount
+                transfer.target_subnet_id, transfer.deposit_address, transfer.amount
             );
         }
         for withdraw in &self.state.postbox.withdraws {
@@ -469,6 +476,9 @@ pub enum SubnetStateError {
 
     #[error("insufficient funds")]
     InsufficientFunds,
+
+    #[error("insufficient amount for cross-subnet transfer")]
+    InsufficientAmount,
 
     #[error("account already exists")]
     AccountAlreadyExists,

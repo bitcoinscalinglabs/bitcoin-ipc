@@ -63,6 +63,12 @@ impl L1Manager {
                     field: "collateral amount",
                 })?;
 
+        if required_collateral < 1000 {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "amount must be at least 1000 satoshis",
+            });
+        }
+
         let mut subnet_data = String::new();
         subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
         subnet_data.push_str(&format!(
@@ -182,9 +188,9 @@ impl L1Manager {
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
 
-        if amount < 200 {
+        if amount < 250 {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "amount must be at least 200 satoshis",
+                field: "amount must be at least 250 satoshis",
             });
         }
 

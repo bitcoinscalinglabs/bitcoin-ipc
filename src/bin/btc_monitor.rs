@@ -1,9 +1,11 @@
+use bitcoin_ipc::subnet_simulator::TransferEvent;
 use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
 use thiserror::Error;
 
+use std::collections::{BTreeSet, HashMap};
 use std::{str::FromStr, thread, time::Duration};
 
-use bitcoin::{secp256k1::PublicKey, XOnlyPublicKey};
+use bitcoin::{secp256k1::PublicKey, TxIn, XOnlyPublicKey};
 
 use bitcoin::script::Instruction;
 use bitcoin::Transaction;
@@ -115,6 +117,82 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
     };
 
     Ok(ipc_subnet_state)
+}
+
+fn parse_transfer_command(
+    rpc: &bitcoincore_rpc::Client,
+    wintess_str: &str,
+    tx_in: &TxIn,
+) -> Result<(), ParseIpcTransactionError> {
+    let parts: Vec<&str> = wintess_str.split(bitcoin_ipc::DELIMITER).collect();
+    let transfers_str = parts[1].strip_prefix("transfers=").unwrap_or("").trim();
+
+    let transfers = match serde_json::from_str::<BTreeSet<TransferEvent>>(transfers_str)
+        .map_err(|_| ParseIpcTransactionError::Internal)
+    {
+        Ok(transfers) => transfers,
+        Err(_) => return Err(ParseIpcTransactionError::Internal),
+    };
+
+    let mut map = HashMap::new();
+
+    let subnets = match IPCState::load_all() {
+        Ok(subnets) => subnets,
+        Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+    };
+
+    for subnet in subnets {
+        let subnet_script_pubkey = match subnet.get_subnet_address() {
+            Ok(address) => address.script_pubkey(),
+            Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+        };
+        map.insert(subnet_script_pubkey, subnet);
+    }
+
+    let commit_tx_block_hash =
+        match bitcoin_utils::find_block_hash_containing_txid(rpc, &tx_in.previous_output.txid) {
+            Ok(hash) => hash,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
+
+    let commit_tx =
+        match rpc.get_raw_transaction(&tx_in.previous_output.txid, Some(&commit_tx_block_hash)) {
+            Ok(tx) => tx,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
+
+    for transfer in transfers {
+        let matching_output = commit_tx
+            .output
+            .iter()
+            .find(|output| output.value == transfer.amount);
+
+        let output = match matching_output {
+            Some(output) => output,
+            None => {
+                return Err(ParseIpcTransactionError::Internal);
+            }
+        };
+
+        let subnet = match map.get(&output.script_pubkey) {
+            Some(subnet) => subnet,
+            None => continue,
+        };
+
+        if subnet.get_subnet_id() == transfer.target_subnet_id {
+            let mut simulator = match SubnetSimulator::new(&transfer.target_subnet_id) {
+                Ok(simulator) => simulator,
+                Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
+            };
+
+            match simulator.fund_account(&transfer.deposit_address, transfer.amount.to_sat()) {
+                Ok(_) => {}
+                Err(_) => return Err(ParseIpcTransactionError::CannotDepositToAccount),
+            };
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_deposit_command(
@@ -297,6 +375,19 @@ fn process_transaction(
                 match parse_join_command(witness_str) {
                     Ok(_) => println!("JOIN Command successfully parsed"),
                     Err(e) => println!("JOIN Command could not be parsed. Error: {e}"),
+                };
+            } else if witness_str.contains(bitcoin_ipc::IPC_TRANSFER_TAG) {
+                println!(
+                    "Transaction {} at block height {} contains the keyword '{:?}'",
+                    tx.compute_txid(),
+                    block_height,
+                    bitcoin_ipc::IPC_TRANSFER_TAG
+                );
+                println!("Command: {}", witness_str);
+                println!("Executing the TRANSFER command...");
+                match parse_transfer_command(rpc, witness_str, input) {
+                    Ok(_) => println!("TRANSFER Command successfully parsed"),
+                    Err(e) => println!("TRANSFER Command could not be parsed. Error: {e}"),
                 };
             }
         }

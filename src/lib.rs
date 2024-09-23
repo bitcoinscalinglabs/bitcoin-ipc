@@ -11,6 +11,7 @@ pub const IPC_CREATE_SUBNET_TAG: &str = "IPC:CREATE";
 pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOIN";
 pub const IPC_DEPOSIT_TAG: &str = "IPC:DEPOSIT";
 pub const IPC_CHECKPOINT_TAG: &str = "IPC:CHECKPOINT";
+pub const IPC_TRANSFER_TAG: &str = "IPC:TRANSFER";
 pub const DELIMITER: &str = "#";
 
 pub const DEMO_UBUNTU: &str = "scripts/demo_ubuntu.sh";

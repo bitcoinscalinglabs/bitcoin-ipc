@@ -75,20 +75,42 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         }
     };
 
+    let source_subnet_address = match subnet.get_subnet_address() {
+        Ok(a) => a,
+        Err(e) => {
+            return Err(RelayerError::IpcStateError(e));
+        }
+    };
+
+    let all_subnets = IPCState::load_all()?;
+
     {
         let transfers = simulator.get_postbox_transfers();
-        if !transfers.is_empty() {
-            // TODO: batch and send transfers here!
 
-            match simulator.empty_postbox_transfers() {
-                Ok(_) => {
-                    println!(
-                        "Handled transfers in postbox for subnet: {}",
-                        subnet.get_subnet_id()
-                    );
-                }
-                Err(e) => {
-                    return Err(RelayerError::SubnetStateError(e));
+        println!("Handling Transfers: {:?}", transfers);
+
+        if !transfers.is_empty() {
+            {
+                ipc_lib::create_and_submit_transfer_tx(
+                    source_subnet_address,
+                    subnet.get_subnet_pk(),
+                    transfers,
+                    all_subnets,
+                    &simulator,
+                )?;
+            }
+
+            {
+                match simulator.empty_postbox_transfers() {
+                    Ok(_) => {
+                        println!(
+                            "Handled transfers in postbox for subnet: {}",
+                            subnet.get_subnet_id()
+                        );
+                    }
+                    Err(e) => {
+                        return Err(RelayerError::SubnetStateError(e));
+                    }
                 }
             }
         } else {
@@ -158,6 +180,9 @@ pub enum RelayerError {
 
     #[error(transparent)]
     IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+
+    #[error(transparent)]
+    IpcLibError(#[from] bitcoin_ipc::ipc_lib::IpcLibError),
 
     #[error("invalid id")]
     InvalidId,

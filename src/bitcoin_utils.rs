@@ -132,8 +132,16 @@ pub fn test_and_submit(
     txs: Vec<transaction::Transaction>,
     miner_address: Address,
 ) -> Result<(), BitcoinUtilsError> {
-    let result =
-        rpc.test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())?;
+    let result = match rpc
+        .test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())
+    {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(BitcoinUtilsError::MempoolAcceptanceFailed {
+                reject_reason: "Unknown".to_string(),
+            });
+        }
+    };
 
     let print_mempool_failure_message = || {
         println!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
@@ -201,7 +209,7 @@ pub fn create_change_txout(
     input_info: &Vec<OutPoint>,
     amount_to_send: Amount,
     fee: Amount,
-    keypair: Option<Keypair>,
+    address: Option<&Address>,
 ) -> Result<TxOut, BitcoinUtilsError> {
     let mut input_total_value = 0;
 
@@ -219,8 +227,8 @@ pub fn create_change_txout(
 
     let change_amount = input_total_value - amount_to_send.to_sat() - fee.to_sat();
 
-    let script_pub_key: ScriptBuf = if let Some(keypair) = keypair {
-        ScriptBuf::new_p2tr(&Secp256k1::new(), keypair.x_only_public_key().0, None)
+    let script_pub_key: ScriptBuf = if let Some(address) = address {
+        address.script_pubkey()
     } else {
         rpc.get_new_address(None, None)?
             .assume_checked()
@@ -277,11 +285,10 @@ pub fn sign_transaction_safe(
 ///
 /// # Returns
 ///
-/// * `(Transaction, ScriptBuf, TaprootSpendInfo)` - A tuple containing the signed transaction, the script containing the data, and the Taproot spend information
+/// * `(Transaction, ScriptBuf, TaprootSpendInfo)` - A tuple containing the transaction, the script containing the data, and the Taproot spend information
 pub fn commit_arbitrary_data(
-    rpc: &Client,
     input_info: Vec<OutPoint>,
-    amount_to_send: Amount,
+    fee: Amount,
     change: TxOut,
     data: &[u8],
     secp: &Secp256k1<All>,
@@ -319,18 +326,14 @@ pub fn commit_arbitrary_data(
         input: input_vec,
         output: vec![
             TxOut {
-                value: amount_to_send,
+                value: fee,
                 script_pubkey,
             },
             change,
         ],
     };
 
-    Ok((
-        sign_transaction_safe(rpc, unsigned_tx)?,
-        script,
-        taproot_spend_info,
-    ))
+    Ok((unsigned_tx, script, taproot_spend_info))
 }
 
 fn assemble_outpoints_for_target_amount(
@@ -350,6 +353,10 @@ fn assemble_outpoints_for_target_amount(
             txid: utxo.txid,
             vout: utxo.vout,
         };
+
+        if utxo.amount.to_sat() < 600 {
+            continue;
+        }
 
         // Add the outpoint to the collection
         collected_outpoints.push(outpoint);
@@ -413,6 +420,8 @@ pub fn collect_amount(
     let desc = format!("tr({})", pubkey);
 
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
+
+    println!("{:?}", result.unspents);
 
     assemble_outpoints_for_target_amount(result.unspents, amount.to_sat() + fee.to_sat())
 }
@@ -492,6 +501,8 @@ pub fn reveal_arbitrary_data(
 /// * `fee` - The fee to pay for the transaction, of type `Amount`
 /// * `data` - The arbitrary data to commit, as a string
 /// * `receiver_address` - The Bitcoin address of the recipient of the output associated with the reveal transaction
+/// * `additional_outputs` - Additional outputs to include in the commit transaction
+/// * `pubkey` - The public key that receives the change utxos, of type `PublicKey`
 ///
 /// # Returns
 ///
@@ -502,22 +513,41 @@ pub fn write_arbitrary_data(
     fee: Amount,
     data: &str,
     receiver_address: &Address,
+    additional_outputs: Vec<TxOut>,
+    pubkey: Option<XOnlyPublicKey>,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
-    let input_info = collect_amount_for_wallet(rpc, amount_to_send, fee)?;
+    let input_info = if pubkey.is_none() {
+        collect_amount_for_wallet(rpc, amount_to_send, fee + fee)?
+    } else {
+        collect_amount(rpc, amount_to_send, fee + fee, pubkey.unwrap())?
+    };
 
-    let change = create_change_txout(rpc, &input_info, amount_to_send, fee, None)?;
+    let change = create_change_txout(
+        rpc,
+        &input_info,
+        amount_to_send,
+        fee + fee,
+        if pubkey.is_none() {
+            None
+        } else {
+            Some(receiver_address)
+        },
+    )?;
 
     let secp = Secp256k1::new();
 
     // Commit the arbitrary data
-    let (commit_tx, script, taproot_spend_info) = commit_arbitrary_data(
-        rpc,
-        input_info,
-        amount_to_send,
-        change,
-        data.as_bytes(),
-        &secp,
-    )?;
+    let (mut commit_tx, script, taproot_spend_info) =
+        commit_arbitrary_data(input_info, fee, change, data.as_bytes(), &secp)?;
+
+    commit_tx.output.extend(additional_outputs);
+
+    if pubkey.is_none() {
+        commit_tx = match sign_transaction_safe(rpc, commit_tx) {
+            Ok(tx) => tx,
+            Err(e) => return Err(e),
+        };
+    }
 
     let commit_tx_outpoint = OutPoint {
         txid: commit_tx.compute_txid(),
@@ -525,7 +555,7 @@ pub fn write_arbitrary_data(
     };
 
     let output = TxOut {
-        value: amount_to_send - fee,
+        value: fee - Amount::from_sat(200),
         script_pubkey: receiver_address.script_pubkey(),
     };
 
@@ -547,7 +577,7 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 /// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
 /// * `fee` - The fee to pay for the transaction, of type `Amount`
 /// * `checkpoint_hash` - The checkpoint hash to commit, as a string
-/// * `keypair` - The keypair of the subnet that is committing the checkpoint hash
+/// * `public_key` - The public key of the subnet that is committing the checkpoint hash
 ///
 /// # Returns
 ///
@@ -556,9 +586,9 @@ pub fn create_checkpoint_tx(
     rpc: &Client,
     fee: Amount,
     checkpoint_hash: [u8; 32],
-    keypair: Keypair,
+    public_key: XOnlyPublicKey,
 ) -> Result<Transaction, BitcoinUtilsError> {
-    let input_info = collect_amount(rpc, Amount::from_sat(0), fee, keypair.x_only_public_key().0)?;
+    let input_info = collect_amount(rpc, Amount::from_sat(0), fee, public_key)?;
 
     let input_vec: Vec<TxIn> = input_info
         .clone()
@@ -571,7 +601,15 @@ pub fn create_checkpoint_tx(
         })
         .collect();
 
-    let change = create_change_txout(rpc, &input_info, Amount::from_sat(0), fee, Some(keypair))?;
+    let subnet_address = get_address_from_x_only_public_key(public_key, crate::NETWORK);
+
+    let change = create_change_txout(
+        rpc,
+        &input_info,
+        Amount::from_sat(0),
+        fee,
+        Some(&subnet_address),
+    )?;
 
     let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::DELIMITER);
 
