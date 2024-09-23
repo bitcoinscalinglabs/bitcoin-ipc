@@ -2,16 +2,16 @@
 - We identify L2 subnets using their `subnetAddress`, see `addressing.md`.
 
 ## Attach arbitrary data to bitcoin transactions
-This will be done using the script-path of a taproot transaction.
+This will be done using the script-spend path of a taproot transaction.
 
 We model this as a functionality **writeArbitraryData(in, out, data**), where *in* and *out* are the input and output UTXOS, respectively, and *data* some arbitrary data. The functionality is implemented by **two** bitcoin transactions. Specifically:
 - Create a script containing *data*.
-- Create **commitTx**, the first Bitcoin transaction, that spends the UTXO(s) *in* and creates an output UTXO *temp* that contains a hash of the script.
-- Create **revealTx**, the second bitcoin transaction, that spends *temp* by revealing the content of the script as the *witness,* and outputs *out* as the output UTXO.
-    - Observe that *data* is submitted with a lower transaction fee as witness.
+- Create **commitTx**, the first Bitcoin transaction, that spends the UTXO(s) *in* and creates the output UTXOs *out* and an UTXO *temp*, which contains the hash of the script.
+- Create **revealTx**, the second bitcoin transaction, that spends *temp* by revealing the content of the script as the *witness*.
+- Observe that *data* is submitted with a lower transaction fee as witness.
 - These two bitcoin transactions are submitted to Bitcoin by the same entity.
 
-We will be using the **writeArbitraryData()** functionality to implement IPC commands such as *createChild* and *joinChild*.
+We will be using the **writeArbitraryData()** functionality to implement IPC commands such as *createChild*, *joinChild*, and *transfer*.
 
 
 ## Create child subnet
