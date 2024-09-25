@@ -6,7 +6,9 @@ use bitcoin_ipc::subnet_simulator::TransferEvent;
 use csv::Writer;
 use rand::{thread_rng, Rng};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::fs::OpenOptions;
+use std::path::Path;
 use thiserror::Error;
 
 fn generate_random_filecoin_address() -> String {
@@ -36,7 +38,19 @@ fn generate_random_transfers(num_transfers: usize) -> BTreeSet<TransferEvent> {
     transfers
 }
 
+fn delete_file_if_exists(file_path: &str) {
+    let path = Path::new(file_path);
+
+    if path.exists() {
+        if let Err(e) = fs::remove_file(path) {
+            eprintln!("Failed to delete the file: {}", e);
+        }
+    }
+}
+
 fn main() -> Result<(), TestWeightError> {
+    delete_file_if_exists("output.csv");
+
     for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
         for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
             let all_subnets = IPCState::load_all()?;
@@ -71,13 +85,11 @@ fn main() -> Result<(), TestWeightError> {
                 )?;
 
             let output = format!(
-                "{},{},{},{},{},{}",
+                "{},{},{},{}",
                 number_of_subnets,
                 transfers_per_subnet,
                 commit_tx.vsize(),
                 reveal_tx.vsize(),
-                commit_tx.weight(),
-                reveal_tx.weight(),
             );
 
             let file = match OpenOptions::new()
@@ -106,8 +118,6 @@ fn main() -> Result<(), TestWeightError> {
                     "Transfers per Subnet",
                     "Commit Tx vsize",
                     "Reveal Tx vsize",
-                    "Commit Tx weight",
-                    "Reveal Tx weight",
                 ]) {
                     return Err(TestWeightError::Other(Box::new(e)));
                 };
