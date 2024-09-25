@@ -26,7 +26,6 @@ pub struct SubnetState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
 pub struct TransferEvent {
-    pub target_subnet_id: String,
     pub deposit_address: String,
     pub amount: Amount,
 }
@@ -44,7 +43,7 @@ pub struct DeleteEvent {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Postbox {
-    transfers: BTreeSet<TransferEvent>,
+    transfers: BTreeMap<String, BTreeSet<TransferEvent>>,
     withdraws: BTreeSet<WithdrawEvent>,
     deletes: Option<DeleteEvent>,
 }
@@ -54,7 +53,7 @@ impl SubnetState {
         SubnetState {
             accounts: BTreeMap::new(),
             postbox: Postbox {
-                transfers: BTreeSet::new(),
+                transfers: BTreeMap::new(),
                 withdraws: BTreeSet::new(),
                 deletes: None,
             },
@@ -206,8 +205,14 @@ impl SubnetSimulator {
                 }
             };
 
-            self.state.postbox.transfers.insert(TransferEvent {
-                target_subnet_id: subnet_id.to_string(),
+            let transfers = self
+                .state
+                .postbox
+                .transfers
+                .entry(subnet_id.to_string())
+                .or_default();
+
+            transfers.insert(TransferEvent {
                 deposit_address: address.to_string(),
                 amount: Amount::from_sat(amount),
             });
@@ -361,12 +366,12 @@ impl SubnetSimulator {
         tx
     }
 
-    pub fn get_postbox_transfers(&self) -> &BTreeSet<TransferEvent> {
+    pub fn get_postbox_transfers(&self) -> &BTreeMap<String, BTreeSet<TransferEvent>> {
         &self.state.postbox.transfers
     }
 
     pub fn empty_postbox_transfers(&mut self) -> Result<(), SubnetStateError> {
-        self.state.postbox.transfers = BTreeSet::new();
+        self.state.postbox.transfers = BTreeMap::new();
         self.save_state()?;
         Ok(())
     }
@@ -415,11 +420,12 @@ impl SubnetSimulator {
         }
 
         println!("Postbox:");
-        for transfer in &self.state.postbox.transfers {
-            println!(
-                "  Transfer to {}/{} : {}",
-                transfer.target_subnet_id, transfer.deposit_address, transfer.amount
-            );
+        for (subnet, transfers) in &mut self.state.postbox.transfers {
+            println!("  Transfers to subnet: {}", subnet);
+
+            for transfer in transfers.iter() {
+                println!("    To {} : {}", transfer.deposit_address, transfer.amount);
+            }
         }
         for withdraw in &self.state.postbox.withdraws {
             println!(

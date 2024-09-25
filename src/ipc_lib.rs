@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use thiserror::Error;
 
-use bitcoin::{secp256k1::PublicKey, Amount, TxOut, XOnlyPublicKey};
+use bitcoin::{secp256k1::PublicKey, Amount, Transaction, TxOut, XOnlyPublicKey};
 
 use crate::{
     bitcoin_utils::{self, init_rpc_client, init_wallet, test_and_submit, write_arbitrary_data},
@@ -208,18 +208,18 @@ pub fn create_and_submit_deposit_tx(
 ///
 /// * `source_subnet_address` - A reference to a `bitcoin::Address` that represents the source subnet's multisig address.
 /// * `source_subnet_pk` - A `PublicKey` representing the public key of the source subnet.
-/// * `transfers` - A reference to a `BTreeSet` of `TransferEvent` representing the transfers to be made.
+/// * `transfer_map` - A reference to a `BTreeSet` of `TransferEvent` representing the transfers to be made.
 /// * `subnets` - A vector of `IPCState` representing the state of the subnets.
 /// * `simulator` - An instance of `SubnetSimulator` representing the state of the subnet.
 pub fn create_and_submit_transfer_tx(
     source_subnet_address: bitcoin::Address,
     source_subnet_pk: PublicKey,
-    transfers: &BTreeSet<TransferEvent>,
+    transfer_map: &BTreeMap<String, BTreeSet<TransferEvent>>,
     subnets: Vec<IPCState>,
     simulator: &SubnetSimulator,
-) -> Result<(), IpcLibError> {
+) -> Result<(Transaction, Transaction), IpcLibError> {
     // Init RPC connection and wallet
-    let fee: Amount = Amount::from_sat(800);
+    let fee: Amount = Amount::from_sat(10000);
 
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
@@ -230,7 +230,7 @@ pub fn create_and_submit_transfer_tx(
         subnet_id_to_address.insert(subnet.get_subnet_id(), subnet.get_subnet_address());
     }
 
-    let serialized_transfers = match serde_json::to_string(&transfers) {
+    let serialized_transfers = match serde_json::to_string(&transfer_map) {
         Ok(t) => t,
         Err(_) => {
             return Err(IpcLibError::Internal);
@@ -245,10 +245,10 @@ pub fn create_and_submit_transfer_tx(
     );
 
     let mut tx_outs = Vec::new();
-    let mut total_value = 0;
+    let mut total_value_per_subnet = HashMap::new();
 
-    for transfer in transfers {
-        let map_result = match subnet_id_to_address.get(&transfer.target_subnet_id) {
+    for (target_subnet_id, transfers) in transfer_map {
+        let map_result = match subnet_id_to_address.get(&target_subnet_id.clone()) {
             Some(result) => result,
             None => {
                 return Err(IpcLibError::SubnetIdNotFound);
@@ -262,10 +262,19 @@ pub fn create_and_submit_transfer_tx(
             }
         };
 
-        total_value += transfer.amount.to_sat();
+        for transfer in transfers {
+            total_value_per_subnet
+                .entry(target_subnet_id.clone())
+                .and_modify(|e| *e += transfer.amount.to_sat())
+                .or_insert_with(|| transfer.amount.to_sat());
+        }
+
+        let value = total_value_per_subnet
+            .get(&target_subnet_id.clone())
+            .unwrap();
 
         let tx_out = bitcoin::TxOut {
-            value: transfer.amount,
+            value: Amount::from_sat(*value),
             script_pubkey,
         };
         tx_outs.push(tx_out);
@@ -273,7 +282,7 @@ pub fn create_and_submit_transfer_tx(
 
     let (commit_tx, reveal_tx) = match bitcoin_utils::write_arbitrary_data(
         &rpc,
-        Amount::from_sat(total_value),
+        Amount::from_sat(total_value_per_subnet.values().sum::<u64>()),
         fee,
         command.as_str(),
         &source_subnet_address,
@@ -287,13 +296,19 @@ pub fn create_and_submit_transfer_tx(
     };
 
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, commit_tx.clone())?;
+
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(commit_tx, prevouts);
 
-    match test_and_submit(&rpc, vec![signed_transaction, reveal_tx], miner_address) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
-    }
+    // if let Err(e) = test_and_submit(
+    //     &rpc,
+    //     vec![signed_transaction.clone(), reveal_tx.clone()],
+    //     miner_address,
+    // ) {
+    //     return Err(IpcLibError::BitcoinUtilsError(e));
+    // }
+
+    Ok((signed_transaction, reveal_tx))
 }
 
 #[derive(Error, Debug)]

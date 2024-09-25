@@ -2,7 +2,7 @@ use bitcoin_ipc::subnet_simulator::TransferEvent;
 use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
 use thiserror::Error;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::{str::FromStr, thread, time::Duration};
 
 use bitcoin::{secp256k1::PublicKey, TxIn, XOnlyPublicKey};
@@ -127,27 +127,18 @@ fn parse_transfer_command(
     let parts: Vec<&str> = wintess_str.split(bitcoin_ipc::DELIMITER).collect();
     let transfers_str = parts[1].strip_prefix("transfers=").unwrap_or("").trim();
 
-    let transfers = match serde_json::from_str::<BTreeSet<TransferEvent>>(transfers_str)
-        .map_err(|_| ParseIpcTransactionError::Internal)
-    {
-        Ok(transfers) => transfers,
-        Err(_) => return Err(ParseIpcTransactionError::Internal),
-    };
-
-    let mut map = HashMap::new();
+    let transfers =
+        match serde_json::from_str::<BTreeMap<String, BTreeSet<TransferEvent>>>(transfers_str)
+            .map_err(|_| ParseIpcTransactionError::Internal)
+        {
+            Ok(transfers) => transfers,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
 
     let subnets = match IPCState::load_all() {
         Ok(subnets) => subnets,
         Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
     };
-
-    for subnet in subnets {
-        let subnet_script_pubkey = match subnet.get_subnet_address() {
-            Ok(address) => address.script_pubkey(),
-            Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
-        };
-        map.insert(subnet_script_pubkey, subnet);
-    }
 
     let commit_tx_block_hash =
         match bitcoin_utils::find_block_hash_containing_txid(rpc, &tx_in.previous_output.txid) {
@@ -161,30 +152,43 @@ fn parse_transfer_command(
             Err(_) => return Err(ParseIpcTransactionError::Internal),
         };
 
-    for transfer in transfers {
-        let matching_output = commit_tx
-            .output
+    for (target_subnet_id, transfers) in transfers {
+        let subnet = subnets
             .iter()
-            .find(|output| output.value == transfer.amount);
+            .find(|subnet| subnet.get_subnet_id() == target_subnet_id);
 
-        let output = match matching_output {
+        let address_result = match subnet {
+            Some(subnet) => subnet.get_subnet_address(),
+            None => continue,
+        };
+
+        let address = match address_result {
+            Ok(address) => address,
+            Err(_) => continue,
+        };
+
+        let total_amount = transfers
+            .iter()
+            .map(|transfer_event| transfer_event.amount)
+            .sum::<bitcoin::Amount>();
+
+        let matching_output = commit_tx.output.iter().find(|output| {
+            output.script_pubkey == address.script_pubkey() && total_amount == output.value
+        });
+
+        match matching_output {
             Some(output) => output,
             None => {
                 return Err(ParseIpcTransactionError::Internal);
             }
         };
 
-        let subnet = match map.get(&output.script_pubkey) {
-            Some(subnet) => subnet,
-            None => continue,
+        let mut simulator = match SubnetSimulator::new(&target_subnet_id) {
+            Ok(simulator) => simulator,
+            Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
         };
 
-        if subnet.get_subnet_id() == transfer.target_subnet_id {
-            let mut simulator = match SubnetSimulator::new(&transfer.target_subnet_id) {
-                Ok(simulator) => simulator,
-                Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
-            };
-
+        for transfer in transfers {
             match simulator.fund_account(&transfer.deposit_address, transfer.amount.to_sat()) {
                 Ok(_) => {}
                 Err(_) => return Err(ParseIpcTransactionError::CannotDepositToAccount),
