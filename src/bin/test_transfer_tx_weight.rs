@@ -41,18 +41,17 @@ fn main() -> Result<(), TestWeightError> {
         for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
             let all_subnets = IPCState::load_all()?;
 
-            let source_subnet = &all_subnets[0];
-
             let mut transfer_map: BTreeMap<String, BTreeSet<TransferEvent>> = BTreeMap::new();
             {
-                for _ in 0..number_of_subnets {
-                    let subnet_index = thread_rng().gen_range(1..number_of_subnets + 1);
+                for target_subnet_index in 0..number_of_subnets {
+                    let target_subnet_id =
+                        all_subnets[target_subnet_index as usize].get_subnet_id();
                     let transfers = generate_random_transfers(transfers_per_subnet);
-                    let subnet_id = all_subnets[subnet_index as usize].get_subnet_id();
-                    transfer_map.insert(subnet_id, transfers);
+                    transfer_map.insert(target_subnet_id, transfers);
                 }
             }
 
+            let source_subnet = &all_subnets[0];
             let source_subnet_address = source_subnet.get_subnet_address()?;
 
             let simulator = match SubnetSimulator::new(source_subnet.get_subnet_id().as_str()) {
