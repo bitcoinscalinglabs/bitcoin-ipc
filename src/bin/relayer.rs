@@ -87,11 +87,12 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         if !transfers.is_empty() {
             {
                 ipc_lib::create_and_submit_transfer_tx(
-                    source_subnet_bitcoin_address,
+                    source_subnet_bitcoin_address.clone(),
                     subnet.get_subnet_pk(),
                     transfers,
                     all_subnets,
                     &simulator,
+                    true,
                 )?;
             }
 
@@ -117,6 +118,14 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         let withdraws = simulator.get_postbox_withdraws();
         if !withdraws.is_empty() {
             // TODO: batch and send withdraws here!
+
+            ipc_lib::create_and_submit_withdraw_tx(
+                source_subnet_bitcoin_address.clone(),
+                subnet.get_subnet_pk(),
+                withdraws,
+                &simulator,
+                true,
+            )?;
 
             match simulator.empty_postbox_withdraws() {
                 Ok(_) => {

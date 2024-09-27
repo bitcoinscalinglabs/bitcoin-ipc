@@ -49,7 +49,7 @@ fn delete_file_if_exists(file_path: &str) {
 }
 
 fn main() -> Result<(), TestWeightError> {
-    delete_file_if_exists("output.csv");
+    delete_file_if_exists("output-transfer.csv");
 
     for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
         for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
@@ -82,6 +82,7 @@ fn main() -> Result<(), TestWeightError> {
                     &transfer_map,
                     all_subnets,
                     &simulator,
+                    false,
                 )?;
 
             let output = format!(
@@ -95,7 +96,7 @@ fn main() -> Result<(), TestWeightError> {
             let file = match OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open("output.csv")
+                .open("output-transfer.csv")
             {
                 Ok(f) => f,
                 Err(e) => {
@@ -105,7 +106,7 @@ fn main() -> Result<(), TestWeightError> {
 
             let mut wtr = Writer::from_writer(file);
 
-            let metadata = match std::fs::metadata("output.csv") {
+            let metadata = match std::fs::metadata("output-transfer.csv") {
                 Ok(m) => m,
                 Err(e) => {
                     return Err(TestWeightError::Other(Box::new(e)));

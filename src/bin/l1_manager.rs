@@ -118,10 +118,7 @@ impl L1Manager {
             return Err(L1ManagerError::NoSubnetAvailable);
         }
 
-        let mut prompt: String = format!(
-            "Select a subnet (between 1 and {}) to deposit funds:\n",
-            subnets.len()
-        );
+        let mut prompt: String = format!("Select a subnet (between 1 and {}):\n", subnets.len());
 
         for (i, subnet) in subnets.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_subnet_id()));
