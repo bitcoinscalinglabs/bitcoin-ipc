@@ -84,13 +84,14 @@ is the number of validators that call execute the joinChild command.
 ## Checkpoint
 We model this as a functionality *checkpoint(checkpointHash)*
 It is implemented as a single bitcoin transaction with the following inputs and outputs:
-    - *in*: UTXO(s) spendable by the *subnetPK* that is submitting the checkpoint
-    - *output*: a UTXO with 0 value, containing the OP_RETURN opcode *ipcCheckpointKeyword* *checkpointHash*
+- *in*: UTXO(s) spendable by the *subnetPK* that is submitting the checkpoint
+- *output*: a UTXO with 0 value, containing the OP_RETURN opcode *ipcCheckpointKeyword* *checkpointHash*
 
-The relayer is responsible for periodically submitting checkpoints on behalf of the subnet. the Relayer obtains a 
+The relayer is responsible for periodically (every `checkpoint_interval`) submitting checkpoints on behalf of the subnet. The Relayer obtains a 
 commitment (implemented as a hash) of the state from the subnet (specifically for Stage 1 from the simulator), it 
-creates a bitcoin transaction that includes the IPC checkpoint command keyword and the commitment, and asks the 
+creates a bitcoin transaction that includes the IPC checkpoint command keyword *ipcCheckpointKeyword* and the commitment *checkpointHash*, and asks the 
 validators to sign it. Upon constructing a valid signature, the relayer submits the transaction to the network.
+The fees for this transaction are taken from UTXO *in*, that is, the subnet pays for the checkpoint fees.
 
 It is the responsibility of the btc_monitor to also detect checkpoint transactions. Upon examining the OP_RETURN outputs 
 and detecting the IPC checkpoint keyword, the btc_monitor looks for the subnet whose *subnetPK* verifies
