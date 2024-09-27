@@ -10,12 +10,7 @@ use bitcoin_ipc::{ipc_lib, ipc_state::IPCState, subnet_simulator::SubnetSimulato
 async fn get_subnet_and_simulator(
     subnet_id: &String,
 ) -> Result<(IPCState, SubnetSimulator), RelayerError> {
-    let subnet_address = match subnet_id.split("/").last() {
-        Some(subnet_address) => subnet_address,
-        None => return Err(RelayerError::InvalidId),
-    };
-
-    let subnet = match IPCState::load_state(format!("{}/{}.json", subnet_id, subnet_address)) {
+    let subnet = match IPCState::load_state(format!("{}/ipc_state.json", subnet_id)) {
         Ok(s) => s,
         Err(e) => {
             return Err(RelayerError::IpcStateError(e));
@@ -75,7 +70,7 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         }
     };
 
-    let source_subnet_address = match subnet.get_subnet_address() {
+    let source_subnet_bitcoin_address = match subnet.get_bitcoin_address() {
         Ok(a) => a,
         Err(e) => {
             return Err(RelayerError::IpcStateError(e));
@@ -92,7 +87,7 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         if !transfers.is_empty() {
             {
                 ipc_lib::create_and_submit_transfer_tx(
-                    source_subnet_address,
+                    source_subnet_bitcoin_address,
                     subnet.get_subnet_pk(),
                     transfers,
                     all_subnets,
@@ -215,9 +210,8 @@ async fn main() {
         let mut interval = time::interval(checkpoint_interval);
         loop {
             interval.tick().await;
-            match checkpoint(&subnet_id).await {
-                Ok(_) => println!("Checkpoint submitted successfully"),
-                Err(e) => println!("Error submitting checkpoint: {}", e),
+            if let Err(e) = checkpoint(&subnet_id).await {
+                println!("Error submitting checkpoint: {}", e);
             }
         }
     });

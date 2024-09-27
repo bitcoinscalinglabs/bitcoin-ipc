@@ -34,7 +34,7 @@ use crate::{
 pub fn create_and_submit_create_child_tx(
     subnet_address: &bitcoin::Address,
     subnet_data: &str,
-) -> Result<(), IpcLibError> {
+) -> Result<(Transaction, Transaction), IpcLibError> {
     println!("{:?}", subnet_data);
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
 
@@ -60,8 +60,12 @@ pub fn create_and_submit_create_child_tx(
         None,
     )?;
 
-    match test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address) {
-        Ok(_) => Ok(()),
+    match test_and_submit(
+        &rpc,
+        vec![commit_tx.clone(), reveal_tx.clone()],
+        miner_address,
+    ) {
+        Ok(_) => Ok((commit_tx, reveal_tx)),
         Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
     }
 }
@@ -227,7 +231,7 @@ pub fn create_and_submit_transfer_tx(
 
     let mut subnet_id_to_address = HashMap::new();
     for subnet in subnets {
-        subnet_id_to_address.insert(subnet.get_subnet_id(), subnet.get_subnet_address());
+        subnet_id_to_address.insert(subnet.get_subnet_id(), subnet.get_bitcoin_address());
     }
 
     let serialized_transfers = match serde_json::to_string(&transfer_map) {
@@ -300,13 +304,13 @@ pub fn create_and_submit_transfer_tx(
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(commit_tx, prevouts);
 
-    // if let Err(e) = test_and_submit(
-    //     &rpc,
-    //     vec![signed_transaction.clone(), reveal_tx.clone()],
-    //     miner_address,
-    // ) {
-    //     return Err(IpcLibError::BitcoinUtilsError(e));
-    // }
+    if let Err(e) = test_and_submit(
+        &rpc,
+        vec![signed_transaction.clone(), reveal_tx.clone()],
+        miner_address,
+    ) {
+        return Err(IpcLibError::BitcoinUtilsError(e));
+    }
 
     Ok((signed_transaction, reveal_tx))
 }

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Txid};
 use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::ipc_state::IPCState;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -21,14 +21,14 @@ impl L1Manager {
     fn store_keypair(
         &self,
         keypair: &bitcoin::secp256k1::Keypair,
-        address: &str,
+        subnet_id: &str,
     ) -> Result<(), L1ManagerError> {
         let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
             println!("Failed to serialize keypair");
             "".to_string()
         });
 
-        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, address);
+        let file_path = &format!("{}/keypair.yaml", subnet_id);
         let path = std::path::Path::new(file_path);
 
         if let Some(parent) = path.parent() {
@@ -71,12 +71,6 @@ impl L1Manager {
 
         let mut subnet_data = String::new();
         subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
-        subnet_data.push_str(&format!(
-            "{}parent_id={}{}",
-            bitcoin_ipc::DELIMITER,
-            bitcoin_ipc::L1_NAME,
-            bitcoin_ipc::DELIMITER
-        ));
 
         let seed = thread_rng()
             .sample_iter(&Alphanumeric)
@@ -91,16 +85,9 @@ impl L1Manager {
             bitcoin_ipc::NETWORK,
         );
 
-        self.store_keypair(&key_pair, &subnet_address.to_string())?;
-
         subnet_data.push_str(&format!(
-            "subnet_address={}{}",
-            subnet_address,
-            bitcoin_ipc::DELIMITER
-        ));
-
-        subnet_data.push_str(&format!(
-            "required_number_of_validators={}{}",
+            "{}required_number_of_validators={}{}",
+            bitcoin_ipc::DELIMITER,
             required_number_of_validators,
             bitcoin_ipc::DELIMITER
         ));
@@ -112,7 +99,14 @@ impl L1Manager {
 
         subnet_data.push_str(&format!("subnet_pk={}", key_pair.public_key()));
 
-        bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
+        let (commit_tx, _) =
+            bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
+
+        let commit_tx_id: Txid = commit_tx.compute_txid();
+
+        let subnet_id = format!("{}/{}", bitcoin_ipc::L1_NAME, commit_tx_id);
+
+        self.store_keypair(&key_pair, &subnet_id)?;
 
         Ok(())
     }
@@ -169,9 +163,9 @@ impl L1Manager {
         validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
         validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
-        let subnet_address = &ipc_state.get_subnet_address()?;
+        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
         bitcoin_ipc::ipc_lib::create_and_submit_join_child_tx(
-            subnet_address,
+            subnet_bitcoin_address,
             Amount::from_sat(ipc_state.get_required_collateral()),
             &validator_data,
         )?;
@@ -194,12 +188,12 @@ impl L1Manager {
             });
         }
 
-        let subnet_address = &ipc_state.get_subnet_address()?;
+        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
 
         let target_address = get_user_input("Enter target address:")?;
 
         bitcoin_ipc::ipc_lib::create_and_submit_deposit_tx(
-            subnet_address,
+            subnet_bitcoin_address,
             Amount::from_sat(amount),
             &target_address,
         )?;

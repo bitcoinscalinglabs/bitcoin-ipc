@@ -18,7 +18,8 @@ pub struct ValidatorData {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IPCState {
     subnet_id: String,
-    subnet_address: String,
+    ipc_address: String,
+    bitcoin_address: String,
     subnet_pk: PublicKey,
     required_number_of_validators: u64,
     required_collateral: u64,
@@ -27,15 +28,17 @@ pub struct IPCState {
 
 impl IPCState {
     pub fn new(
-        parent_id: String,
-        subnet_address: String,
+        subnet_id: String,
+        tx_id: String,
+        bitcoin_address: String,
         subnet_pk: PublicKey,
         required_number_of_validators: u64,
         required_collateral: u64,
     ) -> Self {
         IPCState {
-            subnet_id: format!("{}/{}", parent_id, subnet_address),
-            subnet_address,
+            subnet_id,
+            ipc_address: tx_id,
+            bitcoin_address,
             subnet_pk,
             required_number_of_validators,
             required_collateral,
@@ -54,7 +57,7 @@ impl IPCState {
     pub fn save_state(&self) -> Result<String, IpcStateError> {
         let json = serde_json::to_string(&self)?;
 
-        let file_path = format!("{}/{}.json", self.subnet_id, self.subnet_address);
+        let file_path = format!("{}/ipc_state.json", self.subnet_id);
 
         let path = std::path::Path::new(&file_path);
         if let Some(parent) = path.parent() {
@@ -100,20 +103,16 @@ impl IPCState {
         self.subnet_id.clone()
     }
 
-    pub fn get_subnet_address_str(&self) -> String {
-        self.subnet_address.clone()
-    }
-
-    pub fn get_file_path(&self) -> String {
-        format!("{}/{}.json", self.subnet_id, self.subnet_address)
+    pub fn get_bitcoin_address_str(&self) -> String {
+        self.bitcoin_address.clone()
     }
 
     pub fn get_subnet_pk(&self) -> PublicKey {
         self.subnet_pk
     }
 
-    pub fn get_subnet_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
-        match Address::from_str(&self.subnet_address) {
+    pub fn get_bitcoin_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
+        match Address::from_str(&self.bitcoin_address) {
             Ok(address) => Ok(address.assume_checked()),
             Err(_) => Err(IpcStateError::InvalidSubnetPK),
         }
@@ -134,16 +133,11 @@ impl IPCState {
                         let sub_path = sub_entry.path();
 
                         if sub_path.extension().and_then(|s| s.to_str()) == Some("json")
-                            && !sub_path
+                            && sub_path
                                 .file_name()
                                 .and_then(|s| s.to_str())
                                 .unwrap()
-                                .starts_with("subnet_state")
-                            && !sub_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap()
-                                .starts_with("keypair")
+                                .starts_with("ipc")
                         {
                             let file = File::open(&sub_path)?;
                             let ipc_state: IPCState = serde_json::from_reader(file)?;
@@ -161,8 +155,10 @@ impl IPCState {
         println!("#################################");
         // print in a more organized manner:
         println!("Subnet: {}", self.subnet_id);
-        println!("File path: {}", self.get_file_path());
-        println!("Subnet Address: {}", self.subnet_address.clone());
+        println!("Bitcoin Address: {}", self.bitcoin_address.clone());
+        println!("Subnet PK: {}", self.subnet_pk);
+        println!("IPC Address: {}", self.ipc_address);
+
         println!(
             "Required number of validators: {}",
             self.required_number_of_validators
