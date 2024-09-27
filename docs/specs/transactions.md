@@ -36,13 +36,37 @@ Specifically, the user that wants to create an IPC subnet does the following:
 - store locally the  `subnetSK`
 - use `subnetPK` when calling `createChild()`
 
-The btc_monitor is responsible for detecting a createChild transaction. The btc monitor pools the chain 
+Observe in the diagram that *subnetPK* is computed locally at the machine of the process that submits the *createChild()* command. The *subnetSK* will be used when a signature from the subnet is required.
+In Stage 3 this will be replaced by an interactive protocol. See `subnet-pk.md` for more explanation.
+
+The btc_monitor is responsible for detecting a *createChild* transaction. The btc_monitor pools the chain 
 for newly produced blocks and checks if a transaction contains an IPC create command in the witness.
 If the IPC create command keyword is detected in the witness, the btc_monitor extracts the other parameters
 encoded in the commit-reveal transaction and creates a new subnet entity.
 
-Observe in the diagram that *subnetPK* is computed locally at the machine of the process that submits the *createChild()* command. The *subnetSK* will be used when a signature from the subnet is required.
-In Stage 3 this will be replaced by an interactive protocol. See `subnet-pk.md` for more explanation.
+**Example:**
+
+Let's visualize how the commit-reveal technique works through an example.
+Assume we want to create a subnet with 1 validator (as is the case in Stage 1), whose required collateral is 1 BTC.
+
+The code that implements *createChild* constructs the following *subnetData* string:
+`IPC:CREATE#required_number_of_validators=1#required_collateral=100000000#subnet_pk=bc1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqenm`. The bytes of this string are put into a P2TR script. 
+
+First the commit transaction is constructed:
+- The input is a UTXO of value at least 2*fee* (this will be used for the fees of the two transactions), spendable by the user that creates the subnet.
+- The output is a UTXO locked with P2TR script. i.e., the script serves as a scriptPubKey. The value of this UTXO must be at least *fee*.
+
+Observe that, at this point, only the hash of the script is visible on the bitcoin network. The commit transaction is signed (using the wallet of the user that creates the subnet) and submitted to bitcoin.
+
+Then, the reveal transaction is constructed, with one input and one output UTXO:
+- The input is the UTXO that we previously locked with the script.
+- The output is a change UTXO that returns the whole value of the input minus *fee* to the user (hence, *fee* is the fee for the reveal transaction).
+
+For the reveal transaction to be valid, it must contain a *witness* that unlocks the input UTXO. The witness contains the full *subnetData* string.
+
+The following diagram shows how this example pictorially:
+![Transfer example](../diagrams/create-child-example.png)
+
 
 ## Join subnet
 We model this as a functionality *joinChild(subnetAddress, validatorData)*:
