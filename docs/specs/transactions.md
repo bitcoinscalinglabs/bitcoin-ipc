@@ -153,7 +153,7 @@ locked by the target subnetPK correspond to the values specified by the transfer
 confirmation, the target addresses specified in the transfers get funded through the subnet simulator.
 
 
-## Deposit
+## Withdraw
 This command allows users of a subnet (e.g. subnet_A) to withdraw funds from the subnet to a certain bitcoin address.
 We model this as a functionality *withdraw(withdrawData)*, where:
 - *withdrawData* contains a batch of withdraws. Each entry in the batch contains (1) the target *userAddress* on bitcoin, (2) the *amount* to be withdrawn.
