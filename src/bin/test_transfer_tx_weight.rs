@@ -66,7 +66,7 @@ fn main() -> Result<(), TestWeightError> {
             }
 
             let source_subnet = &all_subnets[0];
-            let source_subnet_address = source_subnet.get_subnet_address()?;
+            let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address()?;
 
             let simulator = match SubnetSimulator::new(source_subnet.get_subnet_id().as_str()) {
                 Ok(s) => s,
@@ -77,7 +77,7 @@ fn main() -> Result<(), TestWeightError> {
 
             let (commit_tx, reveal_tx): (Transaction, Transaction) =
                 bitcoin_ipc::ipc_lib::create_and_submit_transfer_tx(
-                    source_subnet_address,
+                    source_subnet_bitcoin_address,
                     source_subnet.get_subnet_pk(),
                     &transfer_map,
                     all_subnets,
