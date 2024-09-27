@@ -66,7 +66,7 @@ For the reveal transaction to be valid, it must contain a *witness* that unlocks
 
 The following diagram shows how this example pictorially:
 ![Transfer example](../diagrams/create-child-example.png)
-
+Remark: In the diagram we simplify the fee logic, assuming that each transaction pays the same fee.
 
 ## Join subnet
 We model this as a functionality *joinChild(subnetAddress, validatorData)*:
@@ -141,6 +141,7 @@ Example:
 
 The following diagram shows how the transaction is implemented:
 ![Transfer example](../diagrams/transfer-example.png)
+Remark: In the diagram we simplify the fee logic, assuming that each transaction pays the same fee.
 
 Since we use the *writeArbitraryData* functionality, we send both a commit and a reveal transaction to the network.
 The commit transaction, apart from the encoded data, it also locks UTXOs with the subnetPK of subnets B and C.
