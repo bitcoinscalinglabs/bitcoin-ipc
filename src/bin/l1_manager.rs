@@ -46,7 +46,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn create_child(&self) -> Result<(), L1ManagerError> {
+    fn parse_create_child_args() -> Result<CreateChildArgs, L1ManagerError> {
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
         let required_number_of_validators: u64 =
             required_number_of_validators.parse().map_err(|_| {
@@ -63,7 +63,14 @@ impl L1Manager {
                     field: "collateral amount",
                 })?;
 
-        if required_collateral < 1000 {
+        Ok(CreateChildArgs {
+            required_number_of_validators,
+            required_collateral,
+        })
+    }
+
+    fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
+        if args.required_collateral < 1000 {
             return Err(L1ManagerError::InvalidUserInput {
                 field: "amount must be at least 1000 satoshis",
             });
@@ -88,12 +95,12 @@ impl L1Manager {
         subnet_data.push_str(&format!(
             "{}required_number_of_validators={}{}",
             bitcoin_ipc::DELIMITER,
-            required_number_of_validators,
+            args.required_number_of_validators,
             bitcoin_ipc::DELIMITER
         ));
         subnet_data.push_str(&format!(
             "required_collateral={}{}",
-            required_collateral,
+            args.required_collateral,
             bitcoin_ipc::DELIMITER
         ));
 
@@ -240,7 +247,12 @@ impl L1Manager {
                     };
                 }
 
-                2 => match self.create_child() {
+                2 => match {
+                    || -> Result<(), L1ManagerError> {
+                        let args: CreateChildArgs = L1Manager::parse_create_child_args()?;
+                        self.create_child(args)
+                    }()
+                } {
                     Ok(_) => {
                         println!("Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation.");
                     }
@@ -274,6 +286,16 @@ impl L1Manager {
             println!("===============")
         }
     }
+
+    // pub fn create_subnets_batch(
+    //     &self,
+    //     subnets_args: Vec<CreateChildArgs>,
+    // ) -> Result<(), L1ManagerError> {
+    //     for subnet_args in subnets_args {
+    //         self.create_child(subnet_args)?;
+    //     }
+    //     Ok(())
+    // }
 }
 
 fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
@@ -283,6 +305,11 @@ fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
         Ok(_) => Ok(input.trim().to_string()),
         Err(e) => Err(e.into()),
     }
+}
+
+pub struct CreateChildArgs {
+    required_number_of_validators: u64,
+    required_collateral: u64,
 }
 
 #[derive(Error, Debug)]

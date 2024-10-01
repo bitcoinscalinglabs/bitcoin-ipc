@@ -49,13 +49,17 @@ fn delete_file_if_exists(file_path: &str) {
 }
 
 fn main() -> Result<(), TestWeightError> {
-    delete_file_if_exists("output.csv");
+    delete_file_if_exists("benches/output.csv");
     // for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
     //     for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [10, 20, 50, 100, 200, 500, 1000] {
             let transfers_per_subnet = total_transfers / number_of_subnets;
+
             let all_subnets = IPCState::load_all()?;
+            if all_subnets.len() < number_of_subnets {
+                return Err(TestWeightError::NotEnoughSubnetsCreated);
+            }
 
             let mut transfer_map: BTreeMap<String, BTreeSet<TransferEvent>> = BTreeMap::new();
             {
@@ -87,7 +91,7 @@ fn main() -> Result<(), TestWeightError> {
                 )?;
 
             let output = format!(
-                "{},{},{},{},{},{}",
+                "{},{},{},{}",
                 // number_of_subnets,
                 // transfers_per_subnet,
                 number_of_subnets,
@@ -161,6 +165,9 @@ pub enum TestWeightError {
 
     #[error("waiting for validators to join subnet")]
     WaitingForValidators,
+
+    #[error("not enough IPC subnets have been created")]
+    NotEnoughSubnetsCreated,
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
