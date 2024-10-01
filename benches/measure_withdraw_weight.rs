@@ -62,7 +62,7 @@ fn delete_file_if_exists(file_path: &str) {
 }
 
 fn main() -> Result<(), TestWeightError> {
-    delete_file_if_exists("output-withdraw.csv");
+    delete_file_if_exists("outputs/withdraw.csv");
 
     for number_of_withdraws in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
         let all_subnets = IPCState::load_all()?;
@@ -92,7 +92,7 @@ fn main() -> Result<(), TestWeightError> {
         let file = match OpenOptions::new()
             .append(true)
             .create(true)
-            .open("output-withdraw.csv")
+            .open("outputs/withdraw.csv")
         {
             Ok(f) => f,
             Err(e) => {
@@ -102,7 +102,7 @@ fn main() -> Result<(), TestWeightError> {
 
         let mut wtr = Writer::from_writer(file);
 
-        let metadata = match std::fs::metadata("output-withdraw.csv") {
+        let metadata = match std::fs::metadata("outputs/withdraw.csv") {
             Ok(m) => m,
             Err(e) => {
                 return Err(TestWeightError::Other(Box::new(e)));

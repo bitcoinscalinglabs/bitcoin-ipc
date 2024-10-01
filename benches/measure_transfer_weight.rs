@@ -49,9 +49,7 @@ fn delete_file_if_exists(file_path: &str) {
 }
 
 fn main() -> Result<(), TestWeightError> {
-    delete_file_if_exists("benches/output.csv");
-    // for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
-    //     for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
+    delete_file_if_exists("outputs/transfer.csv");
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [10, 20, 50, 100, 200, 500, 1000] {
             let transfers_per_subnet = total_transfers / number_of_subnets;
@@ -92,8 +90,6 @@ fn main() -> Result<(), TestWeightError> {
 
             let output = format!(
                 "{},{},{},{}",
-                // number_of_subnets,
-                // transfers_per_subnet,
                 number_of_subnets,
                 total_transfers,
                 commit_tx.vsize(),
@@ -103,7 +99,7 @@ fn main() -> Result<(), TestWeightError> {
             let file = match OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open("output-transfer.csv")
+                .open("outputs/transfer.csv")
             {
                 Ok(f) => f,
                 Err(e) => {
@@ -113,7 +109,7 @@ fn main() -> Result<(), TestWeightError> {
 
             let mut wtr = Writer::from_writer(file);
 
-            let metadata = match std::fs::metadata("output-transfer.csv") {
+            let metadata = match std::fs::metadata("outputs/transfer.csv") {
                 Ok(m) => m,
                 Err(e) => {
                     return Err(TestWeightError::Other(Box::new(e)));
@@ -131,12 +127,10 @@ fn main() -> Result<(), TestWeightError> {
                 };
             }
 
-            // Write the output row
             if let Err(e) = wtr.write_record(output.split(',')) {
                 return Err(TestWeightError::Other(Box::new(e)));
             };
 
-            // Flush and finish writing to the file
             if let Err(e) = wtr.flush() {
                 return Err(TestWeightError::Other(Box::new(e)));
             }
