@@ -1,9 +1,11 @@
-use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
+use bitcoin_ipc::subnet_simulator::TransferEvent;
+use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
 use thiserror::Error;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::{str::FromStr, thread, time::Duration};
 
-use bitcoin::{secp256k1::PublicKey, XOnlyPublicKey};
+use bitcoin::{secp256k1::PublicKey, TxIn, XOnlyPublicKey};
 
 use bitcoin::script::Instruction;
 use bitcoin::Transaction;
@@ -11,24 +13,17 @@ use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, subnet_simulator::SubnetSi
 
 use bitcoincore_rpc::RpcApi;
 
-fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransactionError> {
+fn parse_create_command(
+    witness_str: &str,
+    tx_in: &TxIn,
+) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
-    if parts.len() != 6 {
+    if parts.len() != 4 {
         return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
-    let parent_id = match parts[1].strip_prefix("parent_id=") {
-        Some(name) => name,
-        None => return Err(ParseIpcTransactionError::MissingId),
-    };
-
-    let subnet_address = match parts[2].strip_prefix("subnet_address=") {
-        Some(subnet_address) => subnet_address,
-        None => return Err(ParseIpcTransactionError::MissingPk),
-    };
-
-    let required_number_of_validators: u64 = parts[3]
+    let required_number_of_validators: u64 = parts[1]
         .strip_prefix("required_number_of_validators=")
         .unwrap_or("")
         .trim()
@@ -39,24 +34,32 @@ fn parse_create_command(witness_str: &str) -> Result<IPCState, ParseIpcTransacti
         return Err(ParseIpcTransactionError::NumberOfValidatorsZero);
     }
 
-    let required_collateral: u64 = parts[4]
+    let required_collateral: u64 = parts[2]
         .strip_prefix("required_collateral=")
         .unwrap_or("")
         .trim()
         .parse()
         .map_err(|_| ParseIpcTransactionError::CollateralZero)?;
 
-    let subnet_pk = match parts[5].strip_prefix("subnet_pk=") {
+    let subnet_pk = match parts[3].strip_prefix("subnet_pk=") {
         Some(pk) => PublicKey::from_str(pk).map_err(|_| ParseIpcTransactionError::MissingPk)?,
         None => return Err(ParseIpcTransactionError::MissingPk),
     };
+
+    let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
+        XOnlyPublicKey::from(subnet_pk),
+        bitcoin_ipc::NETWORK,
+    );
+
+    let subnet_id = format!("{}/{}", bitcoin_ipc::L1_NAME, tx_in.previous_output.txid);
 
     if required_collateral == 0 {
         return Err(ParseIpcTransactionError::CollateralZero);
     }
 
     let ipc_subnet_state = IPCState::new(
-        parent_id.to_string(),
+        subnet_id.to_string(),
+        tx_in.previous_output.txid.to_string(),
         subnet_address.to_string(),
         subnet_pk,
         required_number_of_validators,
@@ -98,12 +101,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         None => return Err(ParseIpcTransactionError::MissingId),
     };
 
-    let subnet_address = match subnet_id.split("/").last() {
-        Some(subnet_address) => subnet_address,
-        None => return Err(ParseIpcTransactionError::MissingId),
-    };
-
-    let file_name = format!("{}/{}.json", subnet_id, subnet_address);
+    let file_name = format!("{}/ipc_state.json", subnet_id);
     let mut ipc_subnet_state = match IPCState::load_state(file_name) {
         Ok(state) => state,
         Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
@@ -117,6 +115,94 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
     Ok(ipc_subnet_state)
 }
 
+fn parse_transfer_command(
+    rpc: &bitcoincore_rpc::Client,
+    wintess_str: &str,
+    tx_in: &TxIn,
+) -> Result<(), ParseIpcTransactionError> {
+    let parts: Vec<&str> = wintess_str.split(bitcoin_ipc::DELIMITER).collect();
+    let transfers_str = parts[1].strip_prefix("transfers=").unwrap_or("").trim();
+
+    let transfers =
+        match serde_json::from_str::<BTreeMap<String, BTreeSet<TransferEvent>>>(transfers_str)
+            .map_err(|_| ParseIpcTransactionError::Internal)
+        {
+            Ok(transfers) => transfers,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
+
+    let subnets = match IPCState::load_all() {
+        Ok(subnets) => subnets,
+        Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
+    };
+
+    let commit_tx_block_hash =
+        match bitcoin_utils::find_block_hash_containing_txid(rpc, &tx_in.previous_output.txid) {
+            Ok(hash) => hash,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
+
+    let commit_tx =
+        match rpc.get_raw_transaction(&tx_in.previous_output.txid, Some(&commit_tx_block_hash)) {
+            Ok(tx) => tx,
+            Err(_) => return Err(ParseIpcTransactionError::Internal),
+        };
+
+    for (target_subnet_id, transfers) in transfers {
+        let subnet = subnets
+            .iter()
+            .find(|subnet| subnet.get_subnet_id() == target_subnet_id);
+
+        let subnet_bitcoin_address_result = match subnet {
+            Some(subnet) => subnet.get_bitcoin_address(),
+            None => continue,
+        };
+
+        let subnet_bitcoin_address = match subnet_bitcoin_address_result {
+            Ok(address) => address,
+            Err(_) => continue,
+        };
+
+        let total_amount = transfers
+            .iter()
+            .map(|transfer_event| transfer_event.amount)
+            .sum::<bitcoin::Amount>();
+
+        let matching_output = commit_tx.output.iter().find(|output| {
+            output.script_pubkey == subnet_bitcoin_address.script_pubkey()
+                && total_amount == output.value
+        });
+
+        match matching_output {
+            Some(output) => output,
+            None => {
+                return Err(ParseIpcTransactionError::Internal);
+            }
+        };
+
+        let mut simulator = match SubnetSimulator::new(&target_subnet_id) {
+            Ok(simulator) => simulator,
+            Err(_) => return Err(ParseIpcTransactionError::CannotLaunchInteractor),
+        };
+
+        for transfer in transfers {
+            match simulator.fund_account(&transfer.deposit_address, transfer.amount.to_sat()) {
+                Ok(_) => {}
+                Err(_) => return Err(ParseIpcTransactionError::CannotDepositToAccount),
+            };
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_withdraw_command(tx: &Transaction) -> Result<(), ParseIpcTransactionError> {
+    for output in tx.output.iter().skip(2) {
+        println!("Withdraw amount: {} --- CONFIRMED", output.value);
+    }
+    Ok(())
+}
+
 fn parse_deposit_command(
     tx: &Transaction,
     data: &[u8],
@@ -127,12 +213,12 @@ fn parse_deposit_command(
     };
 
     for subnet in subnets {
-        let subnet_address = match subnet.get_subnet_address() {
+        let subnet_bitcoin_address = match subnet.get_bitcoin_address() {
             Ok(address) => address,
             Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
         };
 
-        let script_pubkey = subnet_address.script_pubkey();
+        let script_pubkey = subnet_bitcoin_address.script_pubkey();
 
         for output in tx.clone().output {
             if script_pubkey == output.script_pubkey {
@@ -281,7 +367,7 @@ fn process_transaction(
                 );
                 println!("Command: {}", witness_str);
                 println!("Executing the CREATE command...");
-                match parse_create_command(witness_str) {
+                match parse_create_command(witness_str, input) {
                     Ok(_) => println!("CREATE Command successfully parsed"),
                     Err(e) => println!("CREATE Command could not be parsed. Error: {e}"),
                 };
@@ -297,6 +383,19 @@ fn process_transaction(
                 match parse_join_command(witness_str) {
                     Ok(_) => println!("JOIN Command successfully parsed"),
                     Err(e) => println!("JOIN Command could not be parsed. Error: {e}"),
+                };
+            } else if witness_str.contains(bitcoin_ipc::IPC_TRANSFER_TAG) {
+                println!(
+                    "Transaction {} at block height {} contains the keyword '{:?}'",
+                    tx.compute_txid(),
+                    block_height,
+                    bitcoin_ipc::IPC_TRANSFER_TAG
+                );
+                println!("Command: {}", witness_str);
+                println!("Executing the TRANSFER command...");
+                match parse_transfer_command(rpc, witness_str, input) {
+                    Ok(_) => println!("TRANSFER Command successfully parsed"),
+                    Err(e) => println!("TRANSFER Command could not be parsed. Error: {e}"),
                 };
             }
         }
@@ -338,6 +437,23 @@ fn process_transaction(
                         match parse_deposit_command(tx, data[data_str.len()..].as_bytes()) {
                             Ok(_) => println!("DEPOSIT Command successfully parsed"),
                             Err(e) => println!("DEPOSIT Command could not be parsed. Error: {e}"),
+                        };
+                    }
+                }
+
+                if data.len() > IPC_WITHDRAW_TAG.len() {
+                    let data_str = find_valid_utf8(data.as_bytes());
+                    if data_str.contains(bitcoin_ipc::IPC_WITHDRAW_TAG) {
+                        println!(
+                            "Transaction {} at block height {} contains the keyword '{:?}'",
+                            tx.compute_txid(),
+                            block_height,
+                            bitcoin_ipc::IPC_WITHDRAW_TAG
+                        );
+                        println!("Executing the WITHDRAW command...");
+                        match parse_withdraw_command(tx) {
+                            Ok(_) => println!("WITHDRAW Command successfully parsed"),
+                            Err(e) => println!("WITHDRAW Command could not be parsed. Error: {e}"),
                         };
                     }
                 }

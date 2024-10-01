@@ -2,7 +2,7 @@ use crate::bitcoin_utils;
 
 use bitcoin::key::{TapTweak, TweakedKeypair};
 use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::{TapSighashType, Transaction, TxOut};
+use bitcoin::{Amount, TapSighashType, Transaction, TxOut};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, fs::File};
 
@@ -26,15 +26,8 @@ pub struct SubnetState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
 pub struct TransferEvent {
-    subnet_id: String,
-    deposit_address: String,
-    amount: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
-pub struct WithdrawEvent {
-    target_address: Address<NetworkUnchecked>,
-    amount: u64,
+    pub deposit_address: String,
+    pub amount: Amount,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -44,8 +37,8 @@ pub struct DeleteEvent {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Postbox {
-    transfers: BTreeSet<TransferEvent>,
-    withdraws: BTreeSet<WithdrawEvent>,
+    transfers: BTreeMap<String, BTreeSet<TransferEvent>>,
+    withdraws: BTreeMap<Address<NetworkUnchecked>, Amount>,
     deletes: Option<DeleteEvent>,
 }
 
@@ -54,8 +47,8 @@ impl SubnetState {
         SubnetState {
             accounts: BTreeMap::new(),
             postbox: Postbox {
-                transfers: BTreeSet::new(),
-                withdraws: BTreeSet::new(),
+                transfers: BTreeMap::new(),
+                withdraws: BTreeMap::new(),
                 deletes: None,
             },
         }
@@ -185,9 +178,15 @@ impl SubnetSimulator {
         from_account.balance -= amount;
 
         if to.contains("/") {
+            if amount < 1000 {
+                from_account.balance += amount;
+                return Err(SubnetStateError::InsufficientAmount);
+            }
+
             let address = match to.split("/").last() {
                 Some(a) => a,
                 None => {
+                    from_account.balance += amount;
                     return Err(SubnetStateError::AccountNotFound);
                 }
             };
@@ -195,14 +194,21 @@ impl SubnetSimulator {
             let subnet_id = match to.strip_suffix(&format!("/{}", address)) {
                 Some(s) => s,
                 None => {
+                    from_account.balance += amount;
                     return Err(SubnetStateError::AccountNotFound);
                 }
             };
 
-            self.state.postbox.transfers.insert(TransferEvent {
-                subnet_id: subnet_id.to_string(),
+            let transfers = self
+                .state
+                .postbox
+                .transfers
+                .entry(subnet_id.to_string())
+                .or_default();
+
+            transfers.insert(TransferEvent {
                 deposit_address: address.to_string(),
-                amount,
+                amount: Amount::from_sat(amount),
             });
 
             println!("Transfer request submitted to postbox");
@@ -238,16 +244,22 @@ impl SubnetSimulator {
             }
         };
 
+        if amount < 1000 {
+            return Err(SubnetStateError::InsufficientAmount);
+        }
+
         if from_account.balance < amount {
             return Err(SubnetStateError::InsufficientFunds);
         }
 
         from_account.balance -= amount;
 
-        self.state.postbox.withdraws.insert(WithdrawEvent {
-            target_address,
-            amount,
-        });
+        self.state
+            .postbox
+            .withdraws
+            .entry(target_address)
+            .and_modify(|e| *e += Amount::from_sat(amount))
+            .or_insert(Amount::from_sat(amount));
 
         self.save_state()?;
 
@@ -354,27 +366,27 @@ impl SubnetSimulator {
         tx
     }
 
-    pub fn get_postbox_transfers(&mut self) -> &BTreeSet<TransferEvent> {
+    pub fn get_postbox_transfers(&self) -> &BTreeMap<String, BTreeSet<TransferEvent>> {
         &self.state.postbox.transfers
     }
 
     pub fn empty_postbox_transfers(&mut self) -> Result<(), SubnetStateError> {
-        self.state.postbox.transfers = BTreeSet::new();
+        self.state.postbox.transfers = BTreeMap::new();
         self.save_state()?;
         Ok(())
     }
 
-    pub fn get_postbox_withdraws(&mut self) -> &BTreeSet<WithdrawEvent> {
+    pub fn get_postbox_withdraws(&self) -> &BTreeMap<Address<NetworkUnchecked>, Amount> {
         &self.state.postbox.withdraws
     }
 
     pub fn empty_postbox_withdraws(&mut self) -> Result<(), SubnetStateError> {
-        self.state.postbox.withdraws = BTreeSet::new();
+        self.state.postbox.withdraws = BTreeMap::new();
         self.save_state()?;
         Ok(())
     }
 
-    pub fn get_postbox_delete(&mut self) -> Option<&DeleteEvent> {
+    pub fn get_postbox_delete(&self) -> Option<&DeleteEvent> {
         self.state.postbox.deletes.as_ref()
     }
 
@@ -395,30 +407,31 @@ impl SubnetSimulator {
     pub fn print_state(&mut self) {
         println!("#################################");
         // print in a more organized manner:
-        println!("Subnet: {}", self.subnet_id);
+        println!("Subnet ID: {}", self.subnet_id);
         println!("Subnet PK: {}", self.get_public_key());
         let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
             XOnlyPublicKey::from(self.get_public_key()),
             crate::NETWORK,
         );
-        println!("Subnet Address: {}", subnet_address);
+        println!("Bitcoin Address: {}", subnet_address);
         println!("Accounts:");
         for (address, account) in &self.state.accounts {
             println!("  {}: {}", address, account.balance);
         }
 
         println!("Postbox:");
-        for transfer in &self.state.postbox.transfers {
-            println!(
-                "  Transfer to {}/{} : {}",
-                transfer.subnet_id, transfer.deposit_address, transfer.amount
-            );
+        for (subnet, transfers) in &mut self.state.postbox.transfers {
+            println!("  Transfers to subnet: {}", subnet);
+
+            for transfer in transfers.iter() {
+                println!("    To {} : {}", transfer.deposit_address, transfer.amount);
+            }
         }
-        for withdraw in &self.state.postbox.withdraws {
+        for (address, amount) in &self.state.postbox.withdraws {
             println!(
                 "  Withdraw: {} : {}",
-                withdraw.target_address.clone().assume_checked(),
-                withdraw.amount
+                address.clone().assume_checked(),
+                amount
             );
         }
 
@@ -469,6 +482,9 @@ pub enum SubnetStateError {
 
     #[error("insufficient funds")]
     InsufficientFunds,
+
+    #[error("insufficient amount for cross-subnet transfer")]
+    InsufficientAmount,
 
     #[error("account already exists")]
     AccountAlreadyExists,

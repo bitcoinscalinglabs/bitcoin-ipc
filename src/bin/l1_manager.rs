@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Txid};
 use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::ipc_state::IPCState;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -21,14 +21,14 @@ impl L1Manager {
     fn store_keypair(
         &self,
         keypair: &bitcoin::secp256k1::Keypair,
-        address: &str,
+        subnet_id: &str,
     ) -> Result<(), L1ManagerError> {
         let serialized = serde_json::to_string(&keypair).unwrap_or_else(|_| {
             println!("Failed to serialize keypair");
             "".to_string()
         });
 
-        let file_path = &format!("{}/{}/keypair.yaml", bitcoin_ipc::L1_NAME, address);
+        let file_path = &format!("{}/keypair.yaml", subnet_id);
         let path = std::path::Path::new(file_path);
 
         if let Some(parent) = path.parent() {
@@ -46,7 +46,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn create_child(&self) -> Result<(), L1ManagerError> {
+    fn parse_create_child_args() -> Result<CreateChildArgs, L1ManagerError> {
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
         let required_number_of_validators: u64 =
             required_number_of_validators.parse().map_err(|_| {
@@ -63,14 +63,21 @@ impl L1Manager {
                     field: "collateral amount",
                 })?;
 
+        Ok(CreateChildArgs {
+            required_number_of_validators,
+            required_collateral,
+        })
+    }
+
+    fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
+        if args.required_collateral < 1000 {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "amount must be at least 1000 satoshis",
+            });
+        }
+
         let mut subnet_data = String::new();
         subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
-        subnet_data.push_str(&format!(
-            "{}parent_id={}{}",
-            bitcoin_ipc::DELIMITER,
-            bitcoin_ipc::L1_NAME,
-            bitcoin_ipc::DELIMITER
-        ));
 
         let seed = thread_rng()
             .sample_iter(&Alphanumeric)
@@ -85,28 +92,28 @@ impl L1Manager {
             bitcoin_ipc::NETWORK,
         );
 
-        self.store_keypair(&key_pair, &subnet_address.to_string())?;
-
         subnet_data.push_str(&format!(
-            "subnet_address={}{}",
-            subnet_address,
-            bitcoin_ipc::DELIMITER
-        ));
-
-        subnet_data.push_str(&format!(
-            "required_number_of_validators={}{}",
-            required_number_of_validators,
+            "{}required_number_of_validators={}{}",
+            bitcoin_ipc::DELIMITER,
+            args.required_number_of_validators,
             bitcoin_ipc::DELIMITER
         ));
         subnet_data.push_str(&format!(
             "required_collateral={}{}",
-            required_collateral,
+            args.required_collateral,
             bitcoin_ipc::DELIMITER
         ));
 
         subnet_data.push_str(&format!("subnet_pk={}", key_pair.public_key()));
 
-        bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
+        let (commit_tx, _) =
+            bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
+
+        let commit_tx_id: Txid = commit_tx.compute_txid();
+
+        let subnet_id = format!("{}/{}", bitcoin_ipc::L1_NAME, commit_tx_id);
+
+        self.store_keypair(&key_pair, &subnet_id)?;
 
         Ok(())
     }
@@ -118,10 +125,7 @@ impl L1Manager {
             return Err(L1ManagerError::NoSubnetAvailable);
         }
 
-        let mut prompt: String = format!(
-            "Select a subnet (between 1 and {}) to deposit funds:\n",
-            subnets.len()
-        );
+        let mut prompt: String = format!("Select a subnet (between 1 and {}):\n", subnets.len());
 
         for (i, subnet) in subnets.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_subnet_id()));
@@ -163,9 +167,9 @@ impl L1Manager {
         validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
         validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
-        let subnet_address = &ipc_state.get_subnet_address()?;
+        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
         bitcoin_ipc::ipc_lib::create_and_submit_join_child_tx(
-            subnet_address,
+            subnet_bitcoin_address,
             Amount::from_sat(ipc_state.get_required_collateral()),
             &validator_data,
         )?;
@@ -182,18 +186,18 @@ impl L1Manager {
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
 
-        if amount < 200 {
+        if amount < 250 {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "amount must be at least 200 satoshis",
+                field: "amount must be at least 250 satoshis",
             });
         }
 
-        let subnet_address = &ipc_state.get_subnet_address()?;
+        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
 
         let target_address = get_user_input("Enter target address:")?;
 
         bitcoin_ipc::ipc_lib::create_and_submit_deposit_tx(
-            subnet_address,
+            subnet_bitcoin_address,
             Amount::from_sat(amount),
             &target_address,
         )?;
@@ -240,7 +244,10 @@ impl L1Manager {
                     };
                 }
 
-                2 => match self.create_child() {
+                2 => match || -> Result<(), L1ManagerError> {
+                    let args: CreateChildArgs = L1Manager::parse_create_child_args()?;
+                    self.create_child(args)
+                }() {
                     Ok(_) => {
                         println!("Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation.");
                     }
@@ -274,6 +281,16 @@ impl L1Manager {
             println!("===============")
         }
     }
+
+    // pub fn create_subnets_batch(
+    //     &self,
+    //     subnets_args: Vec<CreateChildArgs>,
+    // ) -> Result<(), L1ManagerError> {
+    //     for subnet_args in subnets_args {
+    //         self.create_child(subnet_args)?;
+    //     }
+    //     Ok(())
+    // }
 }
 
 fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
@@ -283,6 +300,11 @@ fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
         Ok(_) => Ok(input.trim().to_string()),
         Err(e) => Err(e.into()),
     }
+}
+
+pub struct CreateChildArgs {
+    required_number_of_validators: u64,
+    required_collateral: u64,
 }
 
 #[derive(Error, Debug)]

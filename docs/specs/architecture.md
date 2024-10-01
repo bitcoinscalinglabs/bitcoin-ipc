@@ -65,6 +65,9 @@ It works as follows:
 To achieve these, it connects to all the validators of the subnet. In the initial stages, where the subnet is instantiated by a Subnet Simulator, the Relayer only uses the interface of the Subnet Simulator to read the postbox and perform the checkpointing.
 In later stages, when the Fendermint node will be used to instantiate a subnet, the Relayer will connect to it using the means provided by Fendermint.
 
+Remark: When starting the relayer, it is important that *checkpoint_interval* and *postbox_interval* have different values. The reason behind this choice is that both checkpoint
+and postbox listeners run in parallel and if they are executed at the same time, they can end up using the same UTXO(s) which would result in one of the transactions to fail.
+When first starting the relayer, both checkpoint and postbox are executed at the same time which can result in an error.
 
 ## Subnet Interactor
 The Subnet Interactor is not mandatory on an IPC-aware node.

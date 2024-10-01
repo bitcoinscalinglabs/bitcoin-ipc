@@ -5,3 +5,7 @@
 .vscode
 tmux*
 BTC/*
+output.csv
+output-transfer.csv
+output-withdraw.csv
+outputs/*
