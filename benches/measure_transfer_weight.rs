@@ -49,17 +49,22 @@ fn delete_file_if_exists(file_path: &str) {
 }
 
 fn main() -> Result<(), TestWeightError> {
-    delete_file_if_exists("output-transfer.csv");
+    delete_file_if_exists("benches/output.csv");
+    // for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+    //     for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
+    for number_of_subnets in [1, 2, 5, 10] {
+        for total_transfers in [10, 20, 50, 100, 200, 500, 1000] {
+            let transfers_per_subnet = total_transfers / number_of_subnets;
 
-    for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
-        for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
             let all_subnets = IPCState::load_all()?;
+            if all_subnets.len() < number_of_subnets {
+                return Err(TestWeightError::NotEnoughSubnetsCreated);
+            }
 
             let mut transfer_map: BTreeMap<String, BTreeSet<TransferEvent>> = BTreeMap::new();
             {
-                for target_subnet_index in 0..number_of_subnets {
-                    let target_subnet_id =
-                        all_subnets[target_subnet_index as usize].get_subnet_id();
+                for target_subnet in all_subnets.iter().take(number_of_subnets) {
+                    let target_subnet_id = target_subnet.get_subnet_id();
                     let transfers = generate_random_transfers(transfers_per_subnet);
                     transfer_map.insert(target_subnet_id, transfers);
                 }
@@ -87,8 +92,10 @@ fn main() -> Result<(), TestWeightError> {
 
             let output = format!(
                 "{},{},{},{}",
+                // number_of_subnets,
+                // transfers_per_subnet,
                 number_of_subnets,
-                transfers_per_subnet,
+                total_transfers,
                 commit_tx.vsize(),
                 reveal_tx.vsize(),
             );
@@ -115,8 +122,8 @@ fn main() -> Result<(), TestWeightError> {
 
             if metadata.len() == 0 {
                 if let Err(e) = wtr.write_record([
-                    "Number of Subnets",
-                    "Transfers per Subnet",
+                    "Number of subnets",
+                    "Total transfers",
                     "Commit Tx vsize",
                     "Reveal Tx vsize",
                 ]) {
@@ -158,6 +165,9 @@ pub enum TestWeightError {
 
     #[error("waiting for validators to join subnet")]
     WaitingForValidators,
+
+    #[error("not enough IPC subnets have been created")]
+    NotEnoughSubnetsCreated,
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
