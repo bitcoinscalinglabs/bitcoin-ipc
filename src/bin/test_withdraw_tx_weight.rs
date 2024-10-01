@@ -79,21 +79,15 @@ fn main() -> Result<(), TestWeightError> {
             }
         };
 
-        let (commit_tx, reveal_tx): (Transaction, Transaction) =
-            bitcoin_ipc::ipc_lib::create_and_submit_withdraw_tx(
-                source_subnet_bitcoin_address,
-                source_subnet.get_subnet_pk(),
-                &withdraws,
-                &simulator,
-                false,
-            )?;
+        let withdraw_tx: Transaction = bitcoin_ipc::ipc_lib::create_and_submit_withdraw_tx(
+            source_subnet_bitcoin_address,
+            source_subnet.get_subnet_pk(),
+            &withdraws,
+            &simulator,
+            false,
+        )?;
 
-        let output = format!(
-            "{},{},{}",
-            number_of_withdraws,
-            commit_tx.vsize(),
-            reveal_tx.vsize(),
-        );
+        let output = format!("{},{}", number_of_withdraws, withdraw_tx.vsize(),);
 
         let file = match OpenOptions::new()
             .append(true)
@@ -116,9 +110,7 @@ fn main() -> Result<(), TestWeightError> {
         };
 
         if metadata.len() == 0 {
-            if let Err(e) =
-                wtr.write_record(["Number of withdraws", "Commit Tx vsize", "Reveal Tx vsize"])
-            {
+            if let Err(e) = wtr.write_record(["Number of withdraws", "Withdraw Tx vsize"]) {
                 return Err(TestWeightError::Other(Box::new(e)));
             };
         }

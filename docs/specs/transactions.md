@@ -155,20 +155,16 @@ confirmation, the target addresses specified in the transfers get funded through
 
 ## Withdraw
 This command allows users of a subnet (e.g. subnet_A) to withdraw funds from the subnet to a certain bitcoin address.
-We model this as a functionality *withdraw(withdrawData)*, where:
-- *withdrawData* contains a batch of withdraws. Each entry in the batch contains (1) the target *userAddress* on bitcoin, (2) the *amount* to be withdrawn.
 
-It is implemented using the *writeArbitraryData(in, out, data)* functionality, where:
+It is implemented as a single bitcoin transaction with the following inputs and outputs:
 - *in*: UTXO(s), spendable by the subnetPK of subnet_A
-- *out*: UTXO(s), each having a value corresponding to the value of a particular withdraw encoded in data, locked by the public key of the user
-- *data*: contains the *withdrawData*
+- *out*: UTXO(s), each having a value corresponding to the value of a particular withdraw, locked by the public key of the user.
+Additionally, it has an OP_RETURN output that contains the *ipcWithdrawKeyword*
 
 Remark: It is important to note that we can further optimize the functionality by merging both withdrawals and transfers to be handled within
-a single commit-reveal tx. But for demo purposes, to clearly separate the functionality, we separate these two functionalities.
+a single commit-reveal tx, where the withdraws+opreturn would be encoded on the commit-tx. But for demo purposes, to clearly separate the functionality, we separate these two functionalities.
 
-The data contains an IPC keyword *ipcWithdrawKeyword* to allow the btc_monitor to detect this transaction.
-The BTC monitor then proceeds to extract the data which is encoded in the commit-reveal transaction and validates whether the UTXO(s)
-of the commit tx correspond to the withdrawals encoded in the reveal transaction. Upon successful validation, 
-the btc_monitor prints a message that a withdrawal has been executed.
+The OP_RETURN contains an IPC keyword *ipcWithdrawKeyword* to allow the btc_monitor to detect this transaction.
+The BTC monitor then proceeds to print a message for the amounts that were withdrawn.
 
 

@@ -1,6 +1,5 @@
-use bitcoin::address::NetworkUnchecked;
 use bitcoin_ipc::subnet_simulator::TransferEvent;
-use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
+use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
 use thiserror::Error;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -197,55 +196,10 @@ fn parse_transfer_command(
     Ok(())
 }
 
-fn parse_withdraw_command(
-    rpc: &bitcoincore_rpc::Client,
-    witness_str: &str,
-    tx_in: &TxIn,
-) -> Result<(), ParseIpcTransactionError> {
-    let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
-    let withdraws_str = parts[1].strip_prefix("withdraws=").unwrap_or("").trim();
-
-    let withdraws = match serde_json::from_str::<
-        BTreeMap<bitcoin::Address<NetworkUnchecked>, bitcoin::Amount>,
-    >(withdraws_str)
-    .map_err(|_| ParseIpcTransactionError::Internal)
-    {
-        Ok(transfers) => transfers,
-        Err(_) => return Err(ParseIpcTransactionError::Internal),
-    };
-
-    let commit_tx_block_hash =
-        match bitcoin_utils::find_block_hash_containing_txid(rpc, &tx_in.previous_output.txid) {
-            Ok(hash) => hash,
-            Err(_) => return Err(ParseIpcTransactionError::Internal),
-        };
-
-    let commit_tx =
-        match rpc.get_raw_transaction(&tx_in.previous_output.txid, Some(&commit_tx_block_hash)) {
-            Ok(tx) => tx,
-            Err(_) => return Err(ParseIpcTransactionError::Internal),
-        };
-
-    for (address, amount) in withdraws {
-        let matching_output = commit_tx.output.iter().find(|output| {
-            output.script_pubkey == address.clone().assume_checked().script_pubkey()
-                && amount == output.value
-        });
-
-        match matching_output {
-            Some(output) => output,
-            None => {
-                return Err(ParseIpcTransactionError::Internal);
-            }
-        };
-
-        println!(
-            "Withdraw to address: {} amount: {} --- CONFIRMED",
-            address.clone().assume_checked(),
-            amount
-        );
+fn parse_withdraw_command(tx: &Transaction) -> Result<(), ParseIpcTransactionError> {
+    for output in tx.output.iter().skip(2) {
+        println!("Withdraw amount: {} --- CONFIRMED", output.value);
     }
-
     Ok(())
 }
 
@@ -443,19 +397,6 @@ fn process_transaction(
                     Ok(_) => println!("TRANSFER Command successfully parsed"),
                     Err(e) => println!("TRANSFER Command could not be parsed. Error: {e}"),
                 };
-            } else if witness_str.contains(bitcoin_ipc::IPC_WITHDRAW_TAG) {
-                println!(
-                    "Transaction {} at block height {} contains the keyword '{:?}'",
-                    tx.compute_txid(),
-                    block_height,
-                    bitcoin_ipc::IPC_WITHDRAW_TAG
-                );
-                println!("Command: {}", witness_str);
-                println!("Executing the WITHDRAW command...");
-                match parse_withdraw_command(rpc, witness_str, input) {
-                    Ok(_) => println!("WITHDRAW Command successfully parsed"),
-                    Err(e) => println!("WITHDRAW Command could not be parsed. Error: {e}"),
-                };
             }
         }
     }
@@ -496,6 +437,23 @@ fn process_transaction(
                         match parse_deposit_command(tx, data[data_str.len()..].as_bytes()) {
                             Ok(_) => println!("DEPOSIT Command successfully parsed"),
                             Err(e) => println!("DEPOSIT Command could not be parsed. Error: {e}"),
+                        };
+                    }
+                }
+
+                if data.len() > IPC_WITHDRAW_TAG.len() {
+                    let data_str = find_valid_utf8(data.as_bytes());
+                    if data_str.contains(bitcoin_ipc::IPC_WITHDRAW_TAG) {
+                        println!(
+                            "Transaction {} at block height {} contains the keyword '{:?}'",
+                            tx.compute_txid(),
+                            block_height,
+                            bitcoin_ipc::IPC_WITHDRAW_TAG
+                        );
+                        println!("Executing the WITHDRAW command...");
+                        match parse_withdraw_command(tx) {
+                            Ok(_) => println!("WITHDRAW Command successfully parsed"),
+                            Err(e) => println!("WITHDRAW Command could not be parsed. Error: {e}"),
                         };
                     }
                 }

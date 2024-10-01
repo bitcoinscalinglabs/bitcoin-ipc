@@ -341,7 +341,7 @@ pub fn create_and_submit_withdraw_tx(
     withdraws: &BTreeMap<bitcoin::Address<NetworkUnchecked>, Amount>,
     simulator: &SubnetSimulator,
     submit_tx: bool,
-) -> Result<(Transaction, Transaction), IpcLibError> {
+) -> Result<Transaction, IpcLibError> {
     let fee: Amount = Amount::from_sat(10000);
 
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
@@ -350,19 +350,7 @@ pub fn create_and_submit_withdraw_tx(
 
     let mut tx_outs = Vec::new();
 
-    let serialized_withdraws = match serde_json::to_string(withdraws) {
-        Ok(t) => t,
-        Err(_) => {
-            return Err(IpcLibError::Internal);
-        }
-    };
-
-    let command = format!(
-        "t={}{}withdraws={}",
-        crate::IPC_WITHDRAW_TAG,
-        crate::DELIMITER,
-        serialized_withdraws
-    );
+    let command = format!("t={}", crate::IPC_WITHDRAW_TAG,);
 
     for (address, amount) in withdraws {
         let tx_out = bitcoin::TxOut {
@@ -372,14 +360,14 @@ pub fn create_and_submit_withdraw_tx(
         tx_outs.push(tx_out);
     }
 
-    let (commit_tx, reveal_tx) = match bitcoin_utils::write_arbitrary_data(
+    let withdraw_tx = match bitcoin_utils::create_withdraw_tx(
         &rpc,
         Amount::from_sat(withdraws.values().map(|x| x.to_sat()).sum::<u64>()),
         fee,
         command.as_str(),
-        &subnet_bitcoin_address,
         tx_outs,
-        Some(XOnlyPublicKey::from(subnet_pk)),
+        &subnet_bitcoin_address,
+        XOnlyPublicKey::from(subnet_pk),
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -387,24 +375,20 @@ pub fn create_and_submit_withdraw_tx(
         }
     };
 
-    let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, commit_tx.clone())?;
+    let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, withdraw_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(commit_tx, prevouts);
+    let signed_transaction = simulator.sign_transaction(withdraw_tx, prevouts);
 
     if !submit_tx {
-        return Ok((signed_transaction, reveal_tx));
+        return Ok(signed_transaction);
     }
 
-    if let Err(e) = test_and_submit(
-        &rpc,
-        vec![signed_transaction.clone(), reveal_tx.clone()],
-        miner_address,
-    ) {
+    if let Err(e) = test_and_submit(&rpc, vec![signed_transaction.clone()], miner_address) {
         return Err(IpcLibError::BitcoinUtilsError(e));
     }
 
-    Ok((signed_transaction, reveal_tx))
+    Ok(signed_transaction)
 }
 
 #[derive(Error, Debug)]
