@@ -50,9 +50,11 @@ fn delete_file_if_exists(file_path: &str) {
 
 fn main() -> Result<(), TestWeightError> {
     delete_file_if_exists("output.csv");
-
-    for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
-        for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
+    // for number_of_subnets in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+    //     for transfers_per_subnet in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
+    for number_of_subnets in [1, 2, 5, 10] {
+        for total_transfers in [10, 20, 50, 100, 200, 500, 1000] {
+            let transfers_per_subnet = total_transfers / number_of_subnets;
             let all_subnets = IPCState::load_all()?;
 
             let mut transfer_map: BTreeMap<String, BTreeSet<TransferEvent>> = BTreeMap::new();
@@ -85,9 +87,11 @@ fn main() -> Result<(), TestWeightError> {
                 )?;
 
             let output = format!(
-                "{},{},{},{}",
+                "{},{},{},{},{},{}",
+                // number_of_subnets,
+                // transfers_per_subnet,
                 number_of_subnets,
-                transfers_per_subnet,
+                total_transfers,
                 commit_tx.vsize(),
                 reveal_tx.vsize(),
             );
@@ -114,8 +118,8 @@ fn main() -> Result<(), TestWeightError> {
 
             if metadata.len() == 0 {
                 if let Err(e) = wtr.write_record([
-                    "Number of Subnets",
-                    "Transfers per Subnet",
+                    "Number of subnets",
+                    "Total transfers",
                     "Commit Tx vsize",
                     "Reveal Tx vsize",
                 ]) {
