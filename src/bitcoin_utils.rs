@@ -567,6 +567,67 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
     unsafe { &*(data as *const [u8] as *const PushBytes) }
 }
 
+/// This function creates a withdraw transaction that creates multiple outputs each representing a withdraw
+/// It also contains an OP_RETRUN output that contains the withdraw tag and a change output.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `amount_to_send` - The amount of Bitcoin to send, of type `Amount`
+/// * `fee` - The fee to pay for the transaction, of type `Amount`
+/// * `data` - The arbitrary data to encode in the OP_RETURN, as a string
+/// * `additional_outputs` - Additional outputs to include in the transaction
+/// * `spender_address` - The spender bitcoin address
+///
+/// # Returns
+///
+/// * `Transaction` - A transaction that withdraws Bitcoin to multiple outputs
+/// * `BitcoinUtilsError` - An error that occurred during the transaction creation
+pub fn create_withdraw_tx(
+    rpc: &Client,
+    amount_to_send: Amount,
+    fee: Amount,
+    data: &str,
+    additional_outputs: Vec<TxOut>,
+    spender_address: &Address,
+    pubkey: XOnlyPublicKey,
+) -> Result<Transaction, BitcoinUtilsError> {
+    let input_info = collect_amount(rpc, amount_to_send, fee, pubkey)?;
+
+    let input_vec: Vec<TxIn> = input_info
+        .clone()
+        .into_iter()
+        .map(|input| TxIn {
+            previous_output: input,
+            script_sig: ScriptBuf::new(),
+            sequence: transaction::Sequence::MAX,
+            witness: Witness::default(),
+        })
+        .collect();
+
+    let change = create_change_txout(rpc, &input_info, amount_to_send, fee, Some(spender_address))?;
+
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data.as_bytes());
+
+    let op_return_out = transaction::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(push_bytes),
+    };
+
+    let mut all_txouts = vec![op_return_out, change];
+    all_txouts.extend(additional_outputs);
+
+    let unsigned_tx = transaction::Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: input_vec,
+        output: all_txouts,
+    };
+
+    // We don't need to sign the transaction, the subnetPK will sign it.
+    Ok(unsigned_tx)
+}
+
 /// This function creates a checkpoint transaction that commits a checkpoint hash to the blockchain.
 /// The function creates a transaction that contains the checkpoint hash in an OP_RETURN output,
 /// and returns the unsigned transaction.

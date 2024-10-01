@@ -21,3 +21,7 @@ csv = "1.3.0"
 [[bin]]
 name = "measure_transfer_weight"
 path = "benches/measure_transfer_weight.rs"
+
+[[bin]]
+name = "measure_withdraw_weight"
+path = "benches/measure_withdraw_weight.rs"

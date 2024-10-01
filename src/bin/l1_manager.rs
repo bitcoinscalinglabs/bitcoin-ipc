@@ -125,10 +125,7 @@ impl L1Manager {
             return Err(L1ManagerError::NoSubnetAvailable);
         }
 
-        let mut prompt: String = format!(
-            "Select a subnet (between 1 and {}) to deposit funds:\n",
-            subnets.len()
-        );
+        let mut prompt: String = format!("Select a subnet (between 1 and {}):\n", subnets.len());
 
         for (i, subnet) in subnets.iter().enumerate() {
             prompt.push_str(&format!("{}. {}\n", i + 1, subnet.get_subnet_id()));
@@ -247,12 +244,10 @@ impl L1Manager {
                     };
                 }
 
-                2 => match {
-                    || -> Result<(), L1ManagerError> {
-                        let args: CreateChildArgs = L1Manager::parse_create_child_args()?;
-                        self.create_child(args)
-                    }()
-                } {
+                2 => match || -> Result<(), L1ManagerError> {
+                    let args: CreateChildArgs = L1Manager::parse_create_child_args()?;
+                    self.create_child(args)
+                }() {
                     Ok(_) => {
                         println!("Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation.");
                     }

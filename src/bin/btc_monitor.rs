@@ -1,5 +1,5 @@
 use bitcoin_ipc::subnet_simulator::TransferEvent;
-use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG};
+use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
 use thiserror::Error;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,6 +193,13 @@ fn parse_transfer_command(
         }
     }
 
+    Ok(())
+}
+
+fn parse_withdraw_command(tx: &Transaction) -> Result<(), ParseIpcTransactionError> {
+    for output in tx.output.iter().skip(2) {
+        println!("Withdraw amount: {} --- CONFIRMED", output.value);
+    }
     Ok(())
 }
 
@@ -430,6 +437,23 @@ fn process_transaction(
                         match parse_deposit_command(tx, data[data_str.len()..].as_bytes()) {
                             Ok(_) => println!("DEPOSIT Command successfully parsed"),
                             Err(e) => println!("DEPOSIT Command could not be parsed. Error: {e}"),
+                        };
+                    }
+                }
+
+                if data.len() > IPC_WITHDRAW_TAG.len() {
+                    let data_str = find_valid_utf8(data.as_bytes());
+                    if data_str.contains(bitcoin_ipc::IPC_WITHDRAW_TAG) {
+                        println!(
+                            "Transaction {} at block height {} contains the keyword '{:?}'",
+                            tx.compute_txid(),
+                            block_height,
+                            bitcoin_ipc::IPC_WITHDRAW_TAG
+                        );
+                        println!("Executing the WITHDRAW command...");
+                        match parse_withdraw_command(tx) {
+                            Ok(_) => println!("WITHDRAW Command successfully parsed"),
+                            Err(e) => println!("WITHDRAW Command could not be parsed. Error: {e}"),
                         };
                     }
                 }

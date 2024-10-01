@@ -30,12 +30,6 @@ pub struct TransferEvent {
     pub amount: Amount,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
-pub struct WithdrawEvent {
-    target_address: Address<NetworkUnchecked>,
-    amount: u64,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeleteEvent {
     subnet_id: String,
@@ -44,7 +38,7 @@ pub struct DeleteEvent {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Postbox {
     transfers: BTreeMap<String, BTreeSet<TransferEvent>>,
-    withdraws: BTreeSet<WithdrawEvent>,
+    withdraws: BTreeMap<Address<NetworkUnchecked>, Amount>,
     deletes: Option<DeleteEvent>,
 }
 
@@ -54,7 +48,7 @@ impl SubnetState {
             accounts: BTreeMap::new(),
             postbox: Postbox {
                 transfers: BTreeMap::new(),
-                withdraws: BTreeSet::new(),
+                withdraws: BTreeMap::new(),
                 deletes: None,
             },
         }
@@ -250,16 +244,22 @@ impl SubnetSimulator {
             }
         };
 
+        if amount < 1000 {
+            return Err(SubnetStateError::InsufficientAmount);
+        }
+
         if from_account.balance < amount {
             return Err(SubnetStateError::InsufficientFunds);
         }
 
         from_account.balance -= amount;
 
-        self.state.postbox.withdraws.insert(WithdrawEvent {
-            target_address,
-            amount,
-        });
+        self.state
+            .postbox
+            .withdraws
+            .entry(target_address)
+            .and_modify(|e| *e += Amount::from_sat(amount))
+            .or_insert(Amount::from_sat(amount));
 
         self.save_state()?;
 
@@ -376,12 +376,12 @@ impl SubnetSimulator {
         Ok(())
     }
 
-    pub fn get_postbox_withdraws(&self) -> &BTreeSet<WithdrawEvent> {
+    pub fn get_postbox_withdraws(&self) -> &BTreeMap<Address<NetworkUnchecked>, Amount> {
         &self.state.postbox.withdraws
     }
 
     pub fn empty_postbox_withdraws(&mut self) -> Result<(), SubnetStateError> {
-        self.state.postbox.withdraws = BTreeSet::new();
+        self.state.postbox.withdraws = BTreeMap::new();
         self.save_state()?;
         Ok(())
     }
@@ -427,11 +427,11 @@ impl SubnetSimulator {
                 println!("    To {} : {}", transfer.deposit_address, transfer.amount);
             }
         }
-        for withdraw in &self.state.postbox.withdraws {
+        for (address, amount) in &self.state.postbox.withdraws {
             println!(
                 "  Withdraw: {} : {}",
-                withdraw.target_address.clone().assume_checked(),
-                withdraw.amount
+                address.clone().assume_checked(),
+                amount
             );
         }
 
