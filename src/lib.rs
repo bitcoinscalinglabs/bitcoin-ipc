@@ -13,6 +13,7 @@ pub const IPC_DEPOSIT_TAG: &str = "IPC:DEPOSIT";
 pub const IPC_CHECKPOINT_TAG: &str = "IPC:CHECKPOINT";
 pub const IPC_TRANSFER_TAG: &str = "IPC:TRANSFER";
 pub const IPC_WITHDRAW_TAG: &str = "IPC:WITHDRAW";
+pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DELETE";
 
 pub const DELIMITER: &str = "#";
 

@@ -167,4 +167,15 @@ a single commit-reveal tx, where the withdraws+opreturn would be encoded on the 
 The OP_RETURN contains an IPC keyword *ipcWithdrawKeyword* to allow the btc_monitor to detect this transaction.
 The BTC monitor then proceeds to print a message for the amounts that were withdrawn.
 
+## Delete 
+This command allows to delete a subnet (e.g. subnet_A).
+
+It is implemented as a single bitcoin transaction with the following inputs and outputs:
+- *in*: UTXO(s), spendable by the subnetPK of subnet_A
+- *out*: UTXO(s), each having a value corresponding to the *requiredCollateral* value defined by the subnet, locked by the address that each validator provided when joining.
+Additionally, it has an OP_RETURN output that contains the *ipcDeleteKeyword*
+
+The OP_RETURN contains an IPC keyword *ipcWithdrawKeyword* to allow the btc_monitor to detect this transaction.
+The BTC monitor then proceeds to print a message that a particular subnet has been deleted and to delete the stored subnet state.
+
 

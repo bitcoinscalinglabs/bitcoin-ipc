@@ -152,7 +152,7 @@ impl L1Manager {
         let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
-        let pk = get_user_input("Enter validator's public key:")?;
+        let btc_address = get_user_input("Enter validator's btc address:")?;
         let username = get_user_input("Enter validator's name:")?;
 
         let mut validator_data = String::new();
@@ -163,7 +163,11 @@ impl L1Manager {
             ip,
             bitcoin_ipc::DELIMITER
         ));
-        validator_data.push_str(&format!("pk={}{}", pk, bitcoin_ipc::DELIMITER));
+        validator_data.push_str(&format!(
+            "btc_address={}{}",
+            btc_address,
+            bitcoin_ipc::DELIMITER
+        ));
         validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
         validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
