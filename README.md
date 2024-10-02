@@ -169,3 +169,10 @@ After the L1 Manager has been started, either using a script or manually, you ca
 2. Press 2 to create a child subnet, enter the name, required number of validators and a collateral (in satoshi) prompts.
 
 3. Press 3 to join a subnet, first pick a subnet to join, then enter the prompts (ip address, validator public key and username) and watch the btc_monitor.
+
+
+## Shutting down the demo
+You can stop the bitcoin core client by running
+```sh
+bitcoin-cli stop`
+```
