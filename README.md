@@ -148,7 +148,7 @@ cargo run --bin btc_monitor
 
 3. Run the `l1_manager` binary to interact with L1 IPC
 ```sh
-cargo run --bin l1_manager
+cargo run --bin l1_manager_cli
 ```
 
 4. Run the `subnet_interactor` binary to interact with a child subnet.

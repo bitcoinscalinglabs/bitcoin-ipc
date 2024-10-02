@@ -9,10 +9,16 @@ The first case always consumes 141 vB, which is the bitcoin size of a transactio
 In the second case, we can batch multiple transfers, which leads to a lower amortized size per transfer. The logic is the following (see `transactions.md` for details): Periodically we read the postbox of an L2 subnet *A* and batch together all transfers that are found there. Obviously, all batched transfers have the same source subnet, but they may have different target subnets, e.g., we may batch two transfers from *A* to *B* and two from *A* to *C*.
 The code creates two bitcoin transactions, a *commit* and a *reveal* transaction. The commit transaction contains one input UTXO for the source subnet and one output UTXO per target subnet, as well as one output UTXO locked with the hash of a script. The reveal transaction uses this script-UTXO as input and reveals the full script in the witness. The full script contains the details of each transfer, that is, the recipient account and the amount.
 
-### The benchmark
+### Running the benchmark
 We measure the virtual size of the batched transfers in `benches/measure_transfer_weight.rs`, for multiple numbers of target subnet (variable `number_of_subnets`). The benchmark batches a number of transfers (variable `total_transfers`), equally split among all target subnets, and then creates the required bitcoin transactions using the functionality in `src/ipc-lib.rs`.
 
-To run the benchmark, start a local `bitcoin core` node and `btc_monitor` (following the Setup steps and steps 1 and 2 on `README.md`). The code first creates the required number of subnets, if they are not already created, and then runs the benchmark.
+To run the benchmark, start a local `bitcoin core` node and `btc_monitor` (following the Setup steps and steps 1 and 2 on `README.md`).
+Then you can use
+```
+cargo run --bin measure_transfer_weight
+```
+
+The code first creates the required number of subnets, if they are not already created, and then runs the benchmark.
 
 ### Results
 The code writes the result in `outputs/transfer.csv`. We then manually paste the content in a [Spreadsheet file](https://docs.google.com/spreadsheets/d/1VZtpPHY2IwF11sb3uXlqa6nXgET-CbNxcq4vbO-lqiU/edit?usp=sharing) and do the following analysis.
