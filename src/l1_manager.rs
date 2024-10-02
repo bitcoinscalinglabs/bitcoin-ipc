@@ -209,16 +209,6 @@ impl L1Manager {
 
         Ok(())
     }
-
-    // pub fn create_subnets_batch(
-    //     &self,
-    //     subnets_args: Vec<CreateChildArgs>,
-    // ) -> Result<(), L1ManagerError> {
-    //     for subnet_args in subnets_args {
-    //         self.create_child(subnet_args)?;
-    //     }
-    //     Ok(())
-    // }
 }
 
 pub fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
@@ -231,8 +221,8 @@ pub fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
 }
 
 pub struct CreateChildArgs {
-    required_number_of_validators: u64,
-    required_collateral: u64,
+    pub required_number_of_validators: u64,
+    pub required_collateral: u64,
 }
 
 #[derive(Error, Debug)]
