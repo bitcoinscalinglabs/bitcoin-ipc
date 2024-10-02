@@ -4,6 +4,7 @@ use bitcoin_ipc::l1_manager::CreateChildArgs;
 use bitcoin_ipc::l1_manager::L1Manager;
 use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use bitcoin_ipc::subnet_simulator::TransferEvent;
+use core::time;
 use csv::Writer;
 use rand::{thread_rng, Rng};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,25 +52,30 @@ fn delete_file_if_exists(file_path: &str) {
 
 fn main() -> Result<(), TestWeightError> {
     delete_file_if_exists("outputs/transfer.csv");
+
     let mut manager = L1Manager::new()?;
+
+    let existing_subnets = manager.update_and_get_subnets()?.len();
+    let required_subnets = 10;
+    for _ in 0..(required_subnets - existing_subnets) {
+        let args = CreateChildArgs {
+            required_number_of_validators: 1,
+            required_collateral: 1000,
+        };
+        manager.create_child(args)?;
+    }
+    println!("Waiting for subnets to be created.");
+    std::thread::sleep(time::Duration::from_secs(10));
 
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [
             1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 40000, 45000,
         ] {
-            // println!("---> Subnets:{number_of_subnets}");
             let all_subnets = manager.update_and_get_subnets()?;
-            if all_subnets.len() < number_of_subnets {
-                let subnets_to_create = number_of_subnets - all_subnets.len();
-                for _ in 0..subnets_to_create {
-                    let args = CreateChildArgs {
-                        required_number_of_validators: 1,
-                        required_collateral: 1000,
-                    };
-                    manager.create_child(args)?;
-                }
-            }
 
+            if all_subnets.len() < number_of_subnets {
+                return Err(TestWeightError::NotEnoughSubnetsCreated);
+            }
             let source_subnet = &all_subnets[0];
             let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address()?;
             let source_subnet_simulator =
@@ -87,7 +93,6 @@ fn main() -> Result<(), TestWeightError> {
                 }
                 remaining_transfers = remaining_transfers - transfers_to_subnet;
                 remaining_subnets = remaining_subnets - 1;
-                // println!("--->to sub: {transfers_to_subnet}, rem: {remaining_transfers}");
                 let target_subnet_id = all_subnets[i].get_subnet_id();
                 let transfers = generate_random_transfers(transfers_to_subnet);
                 transfer_map.insert(target_subnet_id, transfers);
