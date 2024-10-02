@@ -4,7 +4,7 @@ fn main() {
     let mut manager = match L1Manager::new() {
         Ok(manager) => manager,
         Err(e) => {
-            println!("Could not instantiate L1 Manager. Error:{}", e.to_string());
+            println!("Could not instantiate L1 Manager. Error:{}", e);
             return;
         }
     };
