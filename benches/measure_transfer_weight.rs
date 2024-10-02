@@ -57,15 +57,17 @@ fn main() -> Result<(), TestWeightError> {
 
     let existing_subnets = manager.update_and_get_subnets()?.len();
     let required_subnets = 10;
-    for _ in 0..(required_subnets - existing_subnets) {
-        let args = CreateChildArgs {
-            required_number_of_validators: 1,
-            required_collateral: 1000,
-        };
-        manager.create_child(args)?;
+    if required_subnets - existing_subnets > 0 {
+        for _ in 0..(required_subnets - existing_subnets) {
+            let args = CreateChildArgs {
+                required_number_of_validators: 1,
+                required_collateral: 1000,
+            };
+            manager.create_child(args)?;
+        }
+        println!("Waiting for subnets to be created.");
+        std::thread::sleep(time::Duration::from_secs(10));
     }
-    println!("Waiting for subnets to be created.");
-    std::thread::sleep(time::Duration::from_secs(10));
 
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [
