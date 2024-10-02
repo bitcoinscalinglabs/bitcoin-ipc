@@ -1,21 +1,26 @@
 use thiserror::Error;
 
+use crate::bitcoin_utils;
+use crate::ipc_state::IPCState;
 use bitcoin::{Amount, Txid};
-use bitcoin_ipc::bitcoin_utils;
-use bitcoin_ipc::ipc_state::IPCState;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 
-struct L1Manager {
+pub struct L1Manager {
     subnets: Vec<IPCState>,
 }
 
 impl L1Manager {
-    fn new() -> Self {
-        let subnets: Vec<IPCState> = IPCState::load_all().unwrap_or_else(|_| Vec::new());
+    pub fn new() -> Result<Self, L1ManagerError> {
+        let subnets: Vec<IPCState> = IPCState::load_all()?;
 
-        L1Manager { subnets }
+        Ok(L1Manager { subnets })
+    }
+
+    pub fn update_and_get_subnets(&mut self) -> Result<Vec<IPCState>, L1ManagerError> {
+        self.subnets = IPCState::load_all()?;
+        Ok(self.subnets.clone())
     }
 
     fn store_keypair(
@@ -46,7 +51,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn parse_create_child_args() -> Result<CreateChildArgs, L1ManagerError> {
+    pub fn parse_create_child_args() -> Result<CreateChildArgs, L1ManagerError> {
         let required_number_of_validators = get_user_input("Enter required number of validators:")?;
         let required_number_of_validators: u64 =
             required_number_of_validators.parse().map_err(|_| {
@@ -69,7 +74,7 @@ impl L1Manager {
         })
     }
 
-    fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
+    pub fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
         if args.required_collateral < 1000 {
             return Err(L1ManagerError::InvalidUserInput {
                 field: "amount must be at least 1000 satoshis",
@@ -77,7 +82,7 @@ impl L1Manager {
         }
 
         let mut subnet_data = String::new();
-        subnet_data.push_str(bitcoin_ipc::IPC_CREATE_SUBNET_TAG);
+        subnet_data.push_str(crate::IPC_CREATE_SUBNET_TAG);
 
         let seed = thread_rng()
             .sample_iter(&Alphanumeric)
@@ -89,29 +94,29 @@ impl L1Manager {
 
         let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
             key_pair.x_only_public_key().0,
-            bitcoin_ipc::NETWORK,
+            crate::NETWORK,
         );
 
         subnet_data.push_str(&format!(
             "{}required_number_of_validators={}{}",
-            bitcoin_ipc::DELIMITER,
+            crate::DELIMITER,
             args.required_number_of_validators,
-            bitcoin_ipc::DELIMITER
+            crate::DELIMITER
         ));
         subnet_data.push_str(&format!(
             "required_collateral={}{}",
             args.required_collateral,
-            bitcoin_ipc::DELIMITER
+            crate::DELIMITER
         ));
 
         subnet_data.push_str(&format!("subnet_pk={}", key_pair.public_key()));
 
         let (commit_tx, _) =
-            bitcoin_ipc::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
+            crate::ipc_lib::create_and_submit_create_child_tx(&subnet_address, &subnet_data)?;
 
         let commit_tx_id: Txid = commit_tx.compute_txid();
 
-        let subnet_id = format!("{}/{}", bitcoin_ipc::L1_NAME, commit_tx_id);
+        let subnet_id = format!("{}/{}", crate::L1_NAME, commit_tx_id);
 
         self.store_keypair(&key_pair, &subnet_id)?;
 
@@ -148,31 +153,27 @@ impl L1Manager {
         Ok(subnets[choice - 1].clone())
     }
 
-    fn join_child(&self) -> Result<(), L1ManagerError> {
+    pub fn join_child(&self) -> Result<(), L1ManagerError> {
         let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
-        let btc_address = get_user_input("Enter validator's btc address:")?;
+        let pk = get_user_input("Enter validator's public key:")?;
         let username = get_user_input("Enter validator's name:")?;
 
         let mut validator_data = String::new();
-        validator_data.push_str(bitcoin_ipc::IPC_JOIN_SUBNET_TAG);
+        validator_data.push_str(crate::IPC_JOIN_SUBNET_TAG);
         validator_data.push_str(&format!(
             "{}ip={}{}",
-            bitcoin_ipc::DELIMITER,
+            crate::DELIMITER,
             ip,
-            bitcoin_ipc::DELIMITER
+            crate::DELIMITER
         ));
-        validator_data.push_str(&format!(
-            "btc_address={}{}",
-            btc_address,
-            bitcoin_ipc::DELIMITER
-        ));
-        validator_data.push_str(&format!("username={}{}", username, bitcoin_ipc::DELIMITER));
+        validator_data.push_str(&format!("pk={}{}", pk, crate::DELIMITER));
+        validator_data.push_str(&format!("username={}{}", username, crate::DELIMITER));
         validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
         let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
-        bitcoin_ipc::ipc_lib::create_and_submit_join_child_tx(
+        crate::ipc_lib::create_and_submit_join_child_tx(
             subnet_bitcoin_address,
             Amount::from_sat(ipc_state.get_required_collateral()),
             &validator_data,
@@ -181,7 +182,7 @@ impl L1Manager {
         Ok(())
     }
 
-    fn deposit(&self) -> Result<(), L1ManagerError> {
+    pub fn deposit(&self) -> Result<(), L1ManagerError> {
         let ipc_state = self.choose_subnet()?;
 
         let amount = get_user_input("Enter amount to deposit (in satoshis):")?;
@@ -200,7 +201,7 @@ impl L1Manager {
 
         let target_address = get_user_input("Enter target address:")?;
 
-        bitcoin_ipc::ipc_lib::create_and_submit_deposit_tx(
+        crate::ipc_lib::create_and_submit_deposit_tx(
             subnet_bitcoin_address,
             Amount::from_sat(amount),
             &target_address,
@@ -208,96 +209,9 @@ impl L1Manager {
 
         Ok(())
     }
-
-    fn interactive_interface(&mut self) {
-        let prompt = "Select an option:\n\
-            1. Read state\n\
-            2. Create child\n\
-            3. Join child\n\
-            4. Deposit\n\
-            5. Exit";
-
-        loop {
-            let choice = match get_user_input(prompt) {
-                Ok(c) => c,
-                Err(_) => {
-                    println!("Invalid option. Please try again.");
-                    continue;
-                }
-            };
-            let choice: usize = match choice.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    println!("Invalid option. Please try again.");
-                    continue;
-                }
-            };
-
-            match choice {
-                1 => {
-                    match IPCState::load_all() {
-                        Ok(subnets) => {
-                            subnets
-                                .iter()
-                                .for_each(|subnet| subnet.clone().print_state());
-                            self.subnets = subnets;
-                        }
-                        Err(_) => {
-                            println!("An error occured while reading the state.");
-                        }
-                    };
-                }
-
-                2 => match || -> Result<(), L1ManagerError> {
-                    let args: CreateChildArgs = L1Manager::parse_create_child_args()?;
-                    self.create_child(args)
-                }() {
-                    Ok(_) => {
-                        println!("Transaction to create a child subnet has been submited to bitcoin, please wait for confirmation.");
-                    }
-                    Err(e) => {
-                        println!("An error occured, child subnet was not created. Error: {e}");
-                    }
-                },
-
-                3 => match self.join_child() {
-                    Ok(_) => {
-                        println!("Transaction to join a child subnet has been submited to bitcoin, please wait for confirmation.");
-                    }
-                    Err(e) => {
-                        println!("An error occured, child subnet was not joined. Error: {e}");
-                    }
-                },
-
-                4 => match self.deposit() {
-                    Ok(_) => {
-                        println!("Transaction to deposit funds has been submited to bitcoin, please wait for confirmation.");
-                    }
-                    Err(e) => {
-                        println!("An error occured, funds were not deposited. Error: {e}");
-                    }
-                },
-
-                5 => break,
-
-                _ => println!("Invalid option. Please try again."),
-            }
-            println!("===============")
-        }
-    }
-
-    // pub fn create_subnets_batch(
-    //     &self,
-    //     subnets_args: Vec<CreateChildArgs>,
-    // ) -> Result<(), L1ManagerError> {
-    //     for subnet_args in subnets_args {
-    //         self.create_child(subnet_args)?;
-    //     }
-    //     Ok(())
-    // }
 }
 
-fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
+pub fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
     println!("{prompt}");
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
@@ -307,8 +221,8 @@ fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
 }
 
 pub struct CreateChildArgs {
-    required_number_of_validators: u64,
-    required_collateral: u64,
+    pub required_number_of_validators: u64,
+    pub required_collateral: u64,
 }
 
 #[derive(Error, Debug)]
@@ -323,18 +237,14 @@ pub enum L1ManagerError {
     NoSubnetAvailable,
 
     #[error(transparent)]
-    IpcLibError(#[from] bitcoin_ipc::ipc_lib::IpcLibError),
+    IpcLibError(#[from] crate::ipc_lib::IpcLibError),
 
     #[error(transparent)]
-    IpcStateError(#[from] bitcoin_ipc::ipc_state::IpcStateError),
+    IpcStateError(#[from] crate::ipc_state::IpcStateError),
 
     #[error(transparent)]
-    BitcoinUtilsError(#[from] bitcoin_ipc::bitcoin_utils::BitcoinUtilsError),
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
-}
-
-fn main() {
-    L1Manager::new().interactive_interface();
 }
