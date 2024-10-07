@@ -55,8 +55,8 @@ fn main() -> Result<(), TestWeightError> {
 
     let mut manager = L1Manager::new()?;
 
-    let existing_subnets = manager.update_and_get_subnets()?.len();
-    let required_subnets = 10;
+    let existing_subnets: i64 = manager.update_and_get_subnets()?.len() as i64;
+    let required_subnets: i64 = 10;
     if required_subnets - existing_subnets > 0 {
         for _ in 0..(required_subnets - existing_subnets) {
             let args = CreateChildArgs {
@@ -107,7 +107,7 @@ fn main() -> Result<(), TestWeightError> {
                     &transfer_map,
                     all_subnets,
                     &source_subnet_simulator,
-                    false,
+                    true,
                 )?;
 
             let output = format!(

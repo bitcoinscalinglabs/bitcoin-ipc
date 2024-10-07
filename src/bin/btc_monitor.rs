@@ -1,3 +1,4 @@
+use bitcoin::ScriptBuf;
 use bitcoin_ipc::subnet_simulator::TransferEvent;
 use bitcoin_ipc::{DELIMITER, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
 use thiserror::Error;
@@ -12,6 +13,34 @@ use bitcoin::Transaction;
 use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
 
 use bitcoincore_rpc::RpcApi;
+
+fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BtcMonitorError> {
+    let mut concatenated_data = Vec::new();
+
+    let script = ScriptBuf::from(witness.to_vec().clone());
+
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => {
+                concatenated_data.extend_from_slice(bytes.as_bytes());
+            }
+            Ok(Instruction::Op(op))
+                if op == bitcoin::opcodes::all::OP_DROP || op == bitcoin::opcodes::OP_TRUE =>
+            {
+                // Do nothing, ignore these opcodes
+            }
+            // Return an error if any other instruction is encountered
+            Ok(_) => {
+                return Err(BtcMonitorError::UnsuportedOpCode);
+            }
+            Err(_) => {
+                return Err(BtcMonitorError::ErrorParsingWitnessScript);
+            }
+        }
+    }
+
+    Ok(concatenated_data)
+}
 
 fn parse_create_command(
     witness_str: &str,
@@ -361,7 +390,13 @@ fn process_transaction(
 
     for input in &tx.input {
         for witness in input.witness.iter() {
-            let witness_str = find_valid_utf8(witness);
+            let concatenated_data = match concatenate_op_push_data(witness) {
+                Ok(data) => data,
+                Err(_) => {
+                    continue;
+                }
+            };
+            let witness_str = find_valid_utf8(&concatenated_data);
 
             if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
                 println!(
@@ -559,6 +594,12 @@ pub enum BtcMonitorError {
 
     #[error(transparent)]
     BtcCoreRpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("unsupported opcode")]
+    UnsuportedOpCode,
+
+    #[error("error parsing witness script")]
+    ErrorParsingWitnessScript,
 
     #[error("internal error")]
     Internal,

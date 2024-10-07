@@ -1,4 +1,5 @@
 use bitcoin::{BlockHash, Txid};
+use std::cmp::min;
 use std::vec;
 use thiserror::Error;
 
@@ -12,6 +13,7 @@ use bitcoin::{
     bip32::Xpriv,
     blockdata::{locktime::absolute::LockTime, script, transaction, witness::Witness},
     key::{rand, TapTweak, TweakedPublicKey},
+    opcodes::{all::OP_DROP, OP_TRUE},
     secp256k1::{schnorr::Signature, Message},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TaprootBuilder},
@@ -307,11 +309,23 @@ pub fn commit_arbitrary_data(
     data: &[u8],
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
-
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key(secp);
-    let script = Builder::new().push_slice(push_bytes).into_script();
+
+    let mut builder = Builder::new();
+    let mut offset = 0;
+    let chunk_size = 520;
+
+    while offset < data.len() {
+        let end = min(offset + chunk_size, data.len());
+        builder = builder.push_slice(convert_bytes_to_push_bytes(&data[offset..end]));
+        offset += chunk_size;
+        builder = builder.push_opcode(OP_DROP);
+    }
+
+    builder = builder.push_opcode(OP_TRUE);
+
+    let script = builder.into_script();
 
     let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
     let taproot_spend_info = builder
@@ -487,6 +501,8 @@ pub fn reveal_arbitrary_data(
         }],
         output: vec![output],
     };
+
+    println!("Script size: {:?}", script.len());
 
     let control_block = taproot_spend_info
         .control_block(&(script.clone(), LeafVersion::TapScript))
