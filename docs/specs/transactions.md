@@ -16,13 +16,13 @@ We will be using the **writeArbitraryData()** functionality to implement IPC com
 ## Script construction & parsing
 Bitcoin has a limit of 520 bytes for a single stack push operation. In order not to be limited by this constraint, we split the 
 data that we want to commit to into 520 byte chunks and perform an OP_PUSH for each chunk.
-Bitcoin also has a limit of 1000 stack items at a time, which is why after each OP_PUSH, we add an OP_DROP since the data pushed 
-just needs to be read and no computations need to be performed.
+For a script to be valid, bitcoin expects the script to finish execution with only 1 element on the stack which is why we add
+an OP_DROP opcode after each OP_PUSH.
 To make sure that the script has exactly 1 item after its execution, we add an OP_TRUE in the end.
 
 The btc_monitor is responsible to read and reconstruct the data encoded in the script. By looking only at the OP_PUSH opcodes and 
 appending (in an array) the byte data that comes afterwards, the btc_monitor reconstructs
-the arbitrary data that was encoded within the script. Additionally, since OP_DROP and oP_TRUE are opcodes which are expected to be
+the arbitrary data that was encoded within the script. Additionally, since OP_DROP and OP_TRUE are opcodes which are expected to be
 seen but do not carry any data, the btc_monitor ignores them.
 
 To prevent attacks, the btc_monitor doesn't parse any script that contains any opcode other than OP_PUSH, OP_DROP and OP_TRUE.
