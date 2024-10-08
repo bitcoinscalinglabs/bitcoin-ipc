@@ -196,7 +196,10 @@ impl SubnetInteractor {
                     Ok(_) => {}
                     Err(e) => println!("Failed to submit delete subnet request: {}", e),
                 },
-                7 => self.subnet.print_state(),
+                7 => match self.subnet.print_state() {
+                    Ok(_) => {}
+                    Err(e) => println!("Failed to print subnet state: {}", e),
+                },
                 8 => break,
                 _ => println!("Invalid option. Please try again."),
             }

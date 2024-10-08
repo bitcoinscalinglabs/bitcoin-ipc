@@ -404,7 +404,8 @@ impl SubnetSimulator {
         self.keypair
     }
 
-    pub fn print_state(&mut self) {
+    pub fn print_state(&mut self) -> Result<(), SubnetSimulatorError> {
+        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
         println!("#################################");
         // print in a more organized manner:
         println!("Subnet ID: {}", self.subnet_id);
@@ -441,13 +442,14 @@ impl SubnetSimulator {
             Ok(cp) => cp,
             Err(_) => {
                 println!("Failed to get checkpoint");
-                return;
+                return Err(SubnetSimulatorError::CannotCreateCheckpoint);
             }
         };
         let str_cp = hex::encode(checkpoint);
 
         println!("Checkpoint: {}", str_cp);
         println!();
+        Ok(())
     }
 }
 
@@ -464,6 +466,12 @@ pub enum SubnetSimulatorError {
 
     #[error("error while funding account")]
     CannotFundAccount,
+
+    #[error("error while creating checkpoint")]
+    CannotCreateCheckpoint,
+
+    #[error(transparent)]
+    SubnetStateError(#[from] SubnetStateError),
 }
 
 #[derive(Error, Debug)]

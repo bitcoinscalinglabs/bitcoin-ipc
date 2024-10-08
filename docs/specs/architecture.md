@@ -46,13 +46,13 @@ Hence, the interface of the Subnet Simulator looks like the following (described
 As the Subnet Simulator is the only point in the architecture where the `SubnetState` is held, it is responsible to return the state to be checkpointed. This is facilitated by the `get_checkpoint()` method.
 
 Among other things, it contains a `postBox` component. Since the subnet itself cannot process these commands 
-independently,  `withdraw` or cross-subnet `transfer` commands  are submitted to the `postBox` for handling
+independently, `withdraw` or cross-subnet `transfer` commands are submitted to the `postBox` for handling
 and further processing.
 
 Since the node runs a bitcoin full node, it can use that node for bridging events from the bitcoin chain into the subnet.
 
 
-# Off-chain componnets
+# Off-chain components
 
 ## Relayer
 This component is responsible for monitoring all IPC subnets and relaying necessary information from IPC subnets to bitcoin.
