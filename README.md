@@ -160,7 +160,7 @@ cargo run --bin subnet_interactor -- --subnet-id <subnet_id>
 
 5. Run a relayer that submits checkpoint transactions for a subnet periodically 
 ```sh
-cargo run --bin relayer -- --subnet-name <subnet_name>
+cargo run --bin relayer -- --subnet-id <subnet_id>
 ```
 
 ## Interacting with the L1 Manager
@@ -179,5 +179,5 @@ The Subnet Interactor also exposes an interactive user interface. It allows a su
 ## Shutting down the demo
 You can stop the bitcoin core client by running
 ```sh
-bitcoin-cli stop`
+bitcoin-cli stop
 ```
