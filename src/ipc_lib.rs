@@ -43,7 +43,7 @@ pub fn create_and_submit_create_child_tx(
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
-    let amount_to_send = Amount::from_btc(5.0)?;
+    let amount_to_send = Amount::from_btc(50.0)?;
 
     let commit_fee = bitcoin_utils::calculate_fee(&rpc, 2, 3, 65);
     let reveal_fee = bitcoin_utils::calculate_fee(&rpc, 1, 1, subnet_data.as_bytes().len());
@@ -64,6 +64,11 @@ pub fn create_and_submit_create_child_tx(
         vec![output],
         None,
     )?;
+
+    println!("Commit size: {:?}", commit_tx.vsize());
+    println!("Commit fee: {:?}", commit_fee);
+    println!("Reveal size: {:?}", reveal_tx.vsize());
+    println!("Reveal fee: {:?}", reveal_fee);
 
     match test_and_submit(
         &rpc,
@@ -355,8 +360,12 @@ pub fn create_and_submit_transfer_tx(
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, commit_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(commit_tx, prevouts);
+    let signed_transaction = simulator.sign_transaction(commit_tx.clone(), prevouts);
 
+    println!("Commit size: {:?}", commit_tx.vsize());
+    println!("Commit fee: {:?}", commit_fee);
+    println!("Reveal size: {:?}", reveal_tx.vsize());
+    println!("Reveal fee: {:?}", reveal_fee);
     if !submit_tx {
         return Ok((signed_transaction, reveal_tx));
     }
@@ -434,6 +443,9 @@ pub fn create_and_submit_withdraw_tx(
     if !submit_tx {
         return Ok(signed_transaction);
     }
+
+    println!("Size: {:?}", signed_transaction.vsize());
+    println!("Fee: {:?}", fee.to_btc());
 
     if let Err(e) = test_and_submit(&rpc, vec![signed_transaction.clone()], miner_address) {
         return Err(IpcLibError::BitcoinUtilsError(e));

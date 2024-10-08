@@ -13,6 +13,39 @@ We model this as a functionality **writeArbitraryData(in, out, data**), where *i
 
 We will be using the **writeArbitraryData()** functionality to implement IPC commands such as *createChild*, *joinChild*, and *transfer*.
 
+## Script construction & parsing
+Bitcoin has a limit of 520 bytes for a single stack push operation. In order not to be limited by this constraint, we split the 
+data that we want to commit to into 520 byte chunks and perform an OP_PUSH for each chunk.
+Bitcoin also has a limit of 1000 stack items at a time, which is why after each OP_PUSH, we add an OP_DROP since the data pushed 
+just needs to be read and no computations need to be performed.
+To make sure that the script has exactly 1 item after its execution, we add an OP_TRUE in the end.
+
+The btc_monitor is responsible to read and reconstruct the data encoded in the script. By looking only at the OP_PUSH opcodes and 
+appending (in an array) the byte data that comes afterwards, the btc_monitor reconstructs
+the arbitrary data that was encoded within the script. Additionally, since OP_DROP and oP_TRUE are opcodes which are expected to be
+seen but do not carry any data, the btc_monitor ignores them.
+
+To prevent attacks, the btc_monitor doesn't parse any script that contains any opcode other than OP_PUSH, OP_DROP and OP_TRUE.
+
+## Fee calculation model
+The current fee calculation model uses the *estimatesmartfee* rpc call.
+
+This function returns the *feeRate* per vKB. As parameters to the function, we pass 6 which is when we expect confirmation of the
+transactions and ECONOMICAL which determines how conservative should the protocol be for fee estimation.
+
+We estimate the fee calculation by taking into account the following parameters:
+- Number of inputs (75 vbytes each)
+- Number of outputs (34 vbytes each)
+- Number of witness bytes
+
+For the fee calculation:
+For each transaction, we take an average of 2 inputs, therefore starting with 150 vbytes.
+Depending on what the transaction represents, the number of outputs varies. For instance, for withdraw, we have 1 output per withdraw perfromed.
+The witness bytes are multiplied by 0.25 since they only "weigh" a quarter of the total bytes.
+
+By summing each of these values we get an estimation of the amount of vbytes of the transaction.
+
+After having the vbytes of the transaction, we multiply this number by *feeRate* and divide it by 1000 because we want the fee per vbyte.
 
 ## Create child subnet
 This command allows IPC-aware nodes (see `architecture.md`) to become validators in an IPC L2 subnet.

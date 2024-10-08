@@ -152,9 +152,9 @@ pub fn test_and_submit(
         .test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())
     {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             return Err(BitcoinUtilsError::MempoolAcceptanceFailed {
-                reject_reason: "Unknown".to_string(),
+                reject_reason: e.to_string(),
             });
         }
     };
@@ -502,8 +502,6 @@ pub fn reveal_arbitrary_data(
         output: vec![output],
     };
 
-    println!("Script size: {:?}", script.len());
-
     let control_block = taproot_spend_info
         .control_block(&(script.clone(), LeafVersion::TapScript))
         .ok_or(BitcoinUtilsError::CannotConstructControlBlock)?;
@@ -636,7 +634,7 @@ pub fn calculate_fee(
     let total_tx_size_vbytes = base_tx_size_vbytes + additional_witness_vbytes;
 
     let conf_target = 6;
-    let default_fee_rate = Amount::from_sat(1);
+    let default_fee_rate = Amount::from_sat(10000);
 
     let estimate_fee_result: EstimateSmartFeeResult =
         match rpc.estimate_smart_fee(conf_target, Some(EstimateMode::Economical)) {

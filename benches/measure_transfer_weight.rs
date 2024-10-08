@@ -71,8 +71,14 @@ fn main() -> Result<(), TestWeightError> {
 
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [
-            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 40000, 45000,
+            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000,
+            4500, // 10000, 20000, 40000, 45000,
         ] {
+            println!(
+                "Number of subnets: {}, Total transfers: {}",
+                number_of_subnets, total_transfers
+            );
+
             let all_subnets = manager.update_and_get_subnets()?;
 
             if all_subnets.len() < number_of_subnets {
@@ -107,7 +113,7 @@ fn main() -> Result<(), TestWeightError> {
                     &transfer_map,
                     all_subnets,
                     &source_subnet_simulator,
-                    true,
+                    false,
                 )?;
 
             let output = format!(
