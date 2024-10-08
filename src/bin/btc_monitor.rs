@@ -1,5 +1,6 @@
+use bitcoin::ScriptBuf;
 use bitcoin_ipc::subnet_simulator::TransferEvent;
-use bitcoin_ipc::{DELIMITER, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
+use bitcoin_ipc::{DELIMITER, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_WITHDRAW_TAG};
 use thiserror::Error;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,34 @@ use bitcoin::Transaction;
 use bitcoin_ipc::{bitcoin_utils, ipc_state::IPCState, subnet_simulator::SubnetSimulator, utils};
 
 use bitcoincore_rpc::RpcApi;
+
+fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BtcMonitorError> {
+    let mut concatenated_data = Vec::new();
+
+    let script = ScriptBuf::from(witness.to_vec().clone());
+
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => {
+                concatenated_data.extend_from_slice(bytes.as_bytes());
+            }
+            Ok(Instruction::Op(op))
+                if op == bitcoin::opcodes::all::OP_DROP || op == bitcoin::opcodes::OP_TRUE =>
+            {
+                // Do nothing, ignore these opcodes
+            }
+            // Return an error if any other instruction is encountered
+            Ok(_) => {
+                return Err(BtcMonitorError::UnsuportedOpCode);
+            }
+            Err(_) => {
+                return Err(BtcMonitorError::ErrorParsingWitnessScript);
+            }
+        }
+    }
+
+    Ok(concatenated_data)
+}
 
 fn parse_create_command(
     witness_str: &str,
@@ -86,9 +115,14 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         None => return Err(ParseIpcTransactionError::MissingIP),
     };
 
-    let pk = match parts[2].strip_prefix("pk=") {
-        Some(pk) => pk,
+    let btc_address_str = match parts[2].strip_prefix("btc_address=") {
+        Some(btc_address) => btc_address,
         None => return Err(ParseIpcTransactionError::MissingAddress),
+    };
+
+    let btc_address = match bitcoin::Address::from_str(btc_address_str) {
+        Ok(a) => a,
+        Err(_) => return Err(ParseIpcTransactionError::CannotParseBtcAddress),
     };
 
     let username = match parts[3].strip_prefix("username=") {
@@ -107,7 +141,7 @@ fn parse_join_command(witness_str: &str) -> Result<IPCState, ParseIpcTransaction
         Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
     };
 
-    match ipc_subnet_state.add_validator(ip.to_string(), username.clone(), pk.to_string()) {
+    match ipc_subnet_state.add_validator(ip.to_string(), username.clone(), btc_address) {
         Ok(_) => {}
         Err(_) => return Err(ParseIpcTransactionError::CannotWriteIpcState),
     };
@@ -356,7 +390,13 @@ fn process_transaction(
 
     for input in &tx.input {
         for witness in input.witness.iter() {
-            let witness_str = find_valid_utf8(witness);
+            let concatenated_data = match concatenate_op_push_data(witness) {
+                Ok(data) => data,
+                Err(_) => {
+                    continue;
+                }
+            };
+            let witness_str = find_valid_utf8(&concatenated_data);
 
             if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
                 println!(
@@ -414,12 +454,18 @@ fn process_transaction(
                         && data_str.contains(bitcoin_ipc::DELIMITER)
                     {
                         let checkpoint = hex::encode(&data.as_bytes()[data.len() - 32..]);
-                        match process_checkpoint(rpc, tx, checkpoint) {
-                            Ok(_) => println!("CHECKPOINT Command successfully parsed"),
-                            Err(e) => {
-                                println!("CHECKPOINT Command could not be parsed. Error: {e}")
+                        let subnet = match find_subnet_that_signed_tx(rpc, tx) {
+                            Ok(subnet) => {
+                                println!("CHECKPOINT Command successfully parsed");
+                                subnet
                             }
-                        }
+                            Err(e) => {
+                                println!("CHECKPOINT Command could not be parsed. Error: {e}");
+                                continue;
+                            }
+                        };
+                        println!("Checkpoint found for subnet: {}", subnet.get_subnet_id());
+                        println!("Checkpoint: {}", checkpoint);
                     }
                 }
 
@@ -457,6 +503,31 @@ fn process_transaction(
                         };
                     }
                 }
+
+                if data.len() > IPC_DELETE_SUBNET_TAG.len() {
+                    let data_str = find_valid_utf8(data.as_bytes());
+                    if data_str.contains(bitcoin_ipc::IPC_DELETE_SUBNET_TAG) {
+                        println!(
+                            "Transaction {} at block height {} contains the keyword '{:?}'",
+                            tx.compute_txid(),
+                            block_height,
+                            bitcoin_ipc::IPC_DELETE_SUBNET_TAG
+                        );
+                        println!("Executing the DELETE command...");
+                        let subnet = match find_subnet_that_signed_tx(rpc, tx) {
+                            Ok(subnet) => {
+                                println!("DELETE Command successfully parsed");
+                                subnet
+                            }
+                            Err(e) => {
+                                println!("WITHDRAW Command could not be parsed. Error: {e}");
+                                continue;
+                            }
+                        };
+
+                        delete_subnet_state(subnet);
+                    }
+                }
             }
         }
     }
@@ -464,11 +535,23 @@ fn process_transaction(
     Ok(())
 }
 
-fn process_checkpoint(
+fn delete_subnet_state(subnet: IPCState) {
+    match std::fs::remove_dir_all(subnet.get_subnet_id()) {
+        Ok(_) => println!(
+            "Deleted subnet state for subnet: {}",
+            subnet.get_subnet_id()
+        ),
+        Err(_) => println!(
+            "Failed to delete subnet state for subnet: {}",
+            subnet.get_subnet_id()
+        ),
+    };
+}
+
+fn find_subnet_that_signed_tx(
     rpc: &bitcoincore_rpc::Client,
     tx: &bitcoin::Transaction,
-    checkpoint: String,
-) -> Result<(), BtcMonitorError> {
+) -> Result<IPCState, BtcMonitorError> {
     let subnets = match IPCState::load_all() {
         Ok(subnets) => subnets,
         Err(_) => return Err(BtcMonitorError::Internal),
@@ -480,14 +563,9 @@ fn process_checkpoint(
         match bitcoin_utils::verify_taproot_signature(rpc, tx, public_key) {
             Ok(is_valid) => {
                 if is_valid {
-                    println!("Checkpoint found for subnet: {}", subnet.get_subnet_id());
-                    println!("Checkpoint: {}", checkpoint);
-                    return Ok(());
-                } else {
-                    println!("Invalid checkpoint for subnet: {}", subnet.get_subnet_id());
+                    return Ok(subnet);
                 }
             }
-
             Err(_) => continue,
         }
     }
@@ -516,6 +594,12 @@ pub enum BtcMonitorError {
 
     #[error(transparent)]
     BtcCoreRpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("unsupported opcode")]
+    UnsuportedOpCode,
+
+    #[error("error parsing witness script")]
+    ErrorParsingWitnessScript,
 
     #[error("internal error")]
     Internal,
@@ -555,6 +639,9 @@ pub enum ParseIpcTransactionError {
 
     #[error("missing field username")]
     MissingUsername,
+
+    #[error("cannot parse btc address")]
+    CannotParseBtcAddress,
 
     #[error("cannot write ipc state")]
     CannotWriteIpcState,

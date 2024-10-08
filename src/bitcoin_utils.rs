@@ -1,4 +1,5 @@
 use bitcoin::{BlockHash, Txid};
+use std::cmp::min;
 use std::vec;
 use thiserror::Error;
 
@@ -12,16 +13,31 @@ use bitcoin::{
     bip32::Xpriv,
     blockdata::{locktime::absolute::LockTime, script, transaction, witness::Witness},
     key::{rand, TapTweak, TweakedPublicKey},
+    opcodes::{all::OP_DROP, OP_TRUE},
     secp256k1::{schnorr::Signature, Message},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TaprootBuilder},
     Address, Network, ScriptBuf, TapSighashType, XOnlyPublicKey,
 };
-use bitcoincore_rpc::json::{ScanTxOutRequest, Utxo};
+use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult, ScanTxOutRequest, Utxo};
 use hex::encode;
 use tiny_keccak::{Hasher, Keccak};
 
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
+
+pub struct CommitRevealFee {
+    commit_fee: Amount,
+    reveal_fee: Amount,
+}
+
+impl CommitRevealFee {
+    pub fn new(commit_fee: Amount, reveal_fee: Amount) -> Self {
+        CommitRevealFee {
+            commit_fee,
+            reveal_fee,
+        }
+    }
+}
 
 /// This function creates an unspendable internal key. The internal key is created
 /// by generating a random secret key and deriving the corresponding public key.
@@ -136,9 +152,9 @@ pub fn test_and_submit(
         .test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())
     {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             return Err(BitcoinUtilsError::MempoolAcceptanceFailed {
-                reject_reason: "Unknown".to_string(),
+                reject_reason: e.to_string(),
             });
         }
     };
@@ -288,16 +304,28 @@ pub fn sign_transaction_safe(
 /// * `(Transaction, ScriptBuf, TaprootSpendInfo)` - A tuple containing the transaction, the script containing the data, and the Taproot spend information
 pub fn commit_arbitrary_data(
     input_info: Vec<OutPoint>,
-    fee: Amount,
+    output_amount: Amount,
     change: TxOut,
     data: &[u8],
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
-
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key(secp);
-    let script = Builder::new().push_slice(push_bytes).into_script();
+
+    let mut builder = Builder::new();
+    let mut offset = 0;
+    let chunk_size = 520;
+
+    while offset < data.len() {
+        let end = min(offset + chunk_size, data.len());
+        builder = builder.push_slice(convert_bytes_to_push_bytes(&data[offset..end]));
+        offset += chunk_size;
+        builder = builder.push_opcode(OP_DROP);
+    }
+
+    builder = builder.push_opcode(OP_TRUE);
+
+    let script = builder.into_script();
 
     let builder = TaprootBuilder::new().add_leaf(0, script.clone())?;
     let taproot_spend_info = builder
@@ -326,7 +354,7 @@ pub fn commit_arbitrary_data(
         input: input_vec,
         output: vec![
             TxOut {
-                value: fee,
+                value: output_amount,
                 script_pubkey,
             },
             change,
@@ -508,23 +536,32 @@ pub fn reveal_arbitrary_data(
 pub fn write_arbitrary_data(
     rpc: &Client,
     amount_to_send: Amount,
-    fee: Amount,
+    fee: CommitRevealFee,
     data: &str,
     receiver_address: &Address,
     additional_outputs: Vec<TxOut>,
     pubkey: Option<XOnlyPublicKey>,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
     let input_info = if pubkey.is_none() {
-        collect_amount_for_wallet(rpc, amount_to_send, fee + fee)?
+        collect_amount_for_wallet(
+            rpc,
+            amount_to_send,
+            fee.commit_fee + fee.reveal_fee + fee.reveal_fee,
+        )?
     } else {
-        collect_amount(rpc, amount_to_send, fee + fee, pubkey.unwrap())?
+        collect_amount(
+            rpc,
+            amount_to_send,
+            fee.commit_fee + fee.reveal_fee + fee.reveal_fee,
+            pubkey.unwrap(),
+        )?
     };
 
     let change = create_change_txout(
         rpc,
         &input_info,
         amount_to_send,
-        fee + fee,
+        fee.commit_fee + fee.reveal_fee + fee.reveal_fee,
         if pubkey.is_none() {
             None
         } else {
@@ -535,8 +572,13 @@ pub fn write_arbitrary_data(
     let secp = Secp256k1::new();
 
     // Commit the arbitrary data
-    let (mut commit_tx, script, taproot_spend_info) =
-        commit_arbitrary_data(input_info, fee, change, data.as_bytes(), &secp)?;
+    let (mut commit_tx, script, taproot_spend_info) = commit_arbitrary_data(
+        input_info,
+        fee.reveal_fee + fee.reveal_fee,
+        change,
+        data.as_bytes(),
+        &secp,
+    )?;
 
     commit_tx.output.extend(additional_outputs);
 
@@ -553,7 +595,7 @@ pub fn write_arbitrary_data(
     };
 
     let output = TxOut {
-        value: fee - Amount::from_sat(200),
+        value: fee.reveal_fee,
         script_pubkey: receiver_address.script_pubkey(),
     };
 
@@ -563,12 +605,61 @@ pub fn write_arbitrary_data(
     Ok((commit_tx, reveal_tx))
 }
 
+/// This function calculates the expected fee to be paid for a transaction that has specific number
+/// of inputs outputs and witness bytes.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `num_inputs` - The number of inputs in the transaction
+/// * `num_outputs` - The number of outputs in the transaction
+/// * `witness_bytes` - The number of witness bytes in the transaction
+///
+/// # Returns
+///
+/// * `Amount` - The expected fee to be paid for the transaction
+pub fn calculate_fee(
+    rpc: &Client,
+    num_inputs: usize,
+    num_outputs: usize,
+    witness_bytes: usize,
+) -> Amount {
+    let input_size_vbytes = 75;
+    let output_size_vbytes = 34;
+
+    let base_tx_size_vbytes = (num_inputs * input_size_vbytes) + (num_outputs * output_size_vbytes);
+
+    let additional_witness_vbytes = (witness_bytes as f64 * 0.25).ceil() as usize;
+
+    let total_tx_size_vbytes = base_tx_size_vbytes + additional_witness_vbytes;
+
+    let conf_target = 6;
+    let default_fee_rate = Amount::from_sat(10000);
+
+    let estimate_fee_result: EstimateSmartFeeResult =
+        match rpc.estimate_smart_fee(conf_target, Some(EstimateMode::Economical)) {
+            Ok(result) => result,
+            Err(_) => EstimateSmartFeeResult {
+                fee_rate: Some(default_fee_rate),
+                blocks: conf_target as i64,
+                errors: None,
+            },
+        };
+
+    let fee_rate = match estimate_fee_result.fee_rate {
+        Some(fee_rate) => fee_rate,
+        None => default_fee_rate,
+    };
+
+    fee_rate * (total_tx_size_vbytes as u64) / 1000
+}
+
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
     unsafe { &*(data as *const [u8] as *const PushBytes) }
 }
 
 /// This function creates a withdraw transaction that creates multiple outputs each representing a withdraw
-/// It also contains an OP_RETRUN output that contains the withdraw tag and a change output.
+/// It also contains an OP_RETRUN output that contains the appropriate IPC tag and a change output.
 ///
 /// # Arguments
 ///
@@ -581,13 +672,13 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
 ///
 /// # Returns
 ///
-/// * `Transaction` - A transaction that withdraws Bitcoin to multiple outputs
+/// * `Transaction` - A transaction that withdraws Bitcoin to multiple accounts
 /// * `BitcoinUtilsError` - An error that occurred during the transaction creation
 pub fn create_withdraw_tx(
     rpc: &Client,
     amount_to_send: Amount,
     fee: Amount,
-    data: &str,
+    data: &[u8],
     additional_outputs: Vec<TxOut>,
     spender_address: &Address,
     pubkey: XOnlyPublicKey,
@@ -607,7 +698,7 @@ pub fn create_withdraw_tx(
 
     let change = create_change_txout(rpc, &input_info, amount_to_send, fee, Some(spender_address))?;
 
-    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data.as_bytes());
+    let push_bytes: &PushBytes = convert_bytes_to_push_bytes(data);
 
     let op_return_out = transaction::TxOut {
         value: Amount::ZERO,
@@ -852,7 +943,6 @@ pub fn find_prevouts_for_tx(
     rpc: &Client,
     tx: Transaction,
 ) -> Result<Vec<TxOut>, BitcoinUtilsError> {
-    println!("{:?}", tx.compute_txid());
     tx.input
         .iter()
         .map(|a: &TxIn| {

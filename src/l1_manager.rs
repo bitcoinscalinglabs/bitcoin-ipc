@@ -157,7 +157,7 @@ impl L1Manager {
         let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
-        let pk = get_user_input("Enter validator's public key:")?;
+        let btc_address = get_user_input("Enter validator's btc address:")?;
         let username = get_user_input("Enter validator's name:")?;
 
         let mut validator_data = String::new();
@@ -168,7 +168,7 @@ impl L1Manager {
             ip,
             crate::DELIMITER
         ));
-        validator_data.push_str(&format!("pk={}{}", pk, crate::DELIMITER));
+        validator_data.push_str(&format!("btc_address={}{}", btc_address, crate::DELIMITER));
         validator_data.push_str(&format!("username={}{}", username, crate::DELIMITER));
         validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
@@ -191,9 +191,9 @@ impl L1Manager {
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
 
-        if amount < 250 {
+        if amount < 1000 {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "amount must be at least 250 satoshis",
+                field: "amount must be at least 1000 satoshis",
             });
         }
 

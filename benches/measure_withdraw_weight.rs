@@ -64,7 +64,11 @@ fn delete_file_if_exists(file_path: &str) {
 fn main() -> Result<(), TestWeightError> {
     delete_file_if_exists("outputs/withdraw.csv");
 
-    for number_of_withdraws in [1, 5, 10, 25, 50, 100, 200, 300, 500, 750, 1000] {
+    for number_of_withdraws in [
+        1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000,
+        2300, // 10000, 20000, 40000, 45000,
+    ] {
+        println!("Number of withdraws: {}", number_of_withdraws);
         let all_subnets = IPCState::load_all()?;
 
         let withdraws = generate_random_withdraws(number_of_withdraws);

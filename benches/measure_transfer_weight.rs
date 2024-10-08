@@ -55,8 +55,8 @@ fn main() -> Result<(), TestWeightError> {
 
     let mut manager = L1Manager::new()?;
 
-    let existing_subnets = manager.update_and_get_subnets()?.len();
-    let required_subnets = 10;
+    let existing_subnets: i64 = manager.update_and_get_subnets()?.len() as i64;
+    let required_subnets: i64 = 10;
     if required_subnets - existing_subnets > 0 {
         for _ in 0..(required_subnets - existing_subnets) {
             let args = CreateChildArgs {
@@ -71,8 +71,14 @@ fn main() -> Result<(), TestWeightError> {
 
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [
-            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 40000, 45000,
+            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000,
+            4500, // 10000, 20000, 40000, 45000,
         ] {
+            println!(
+                "Number of subnets: {}, Total transfers: {}",
+                number_of_subnets, total_transfers
+            );
+
             let all_subnets = manager.update_and_get_subnets()?;
 
             if all_subnets.len() < number_of_subnets {
@@ -87,15 +93,15 @@ fn main() -> Result<(), TestWeightError> {
             let mut remaining_subnets = number_of_subnets;
 
             let mut transfer_map: BTreeMap<String, BTreeSet<TransferEvent>> = BTreeMap::new();
-            for i in 0..number_of_subnets {
+            for subnet in all_subnets.iter().take(number_of_subnets) {
                 let transfers_to_subnet =
                     (remaining_transfers as f32 / remaining_subnets as f32).ceil() as usize;
                 if transfers_to_subnet == 0 {
                     continue;
                 }
-                remaining_transfers = remaining_transfers - transfers_to_subnet;
-                remaining_subnets = remaining_subnets - 1;
-                let target_subnet_id = all_subnets[i].get_subnet_id();
+                remaining_transfers -= transfers_to_subnet;
+                remaining_subnets -= 1;
+                let target_subnet_id = subnet.get_subnet_id();
                 let transfers = generate_random_transfers(transfers_to_subnet);
                 transfer_map.insert(target_subnet_id, transfers);
             }

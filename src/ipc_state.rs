@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use bitcoin::address::NetworkChecked;
+use bitcoin::address::{NetworkChecked, NetworkUnchecked};
 use bitcoin::{secp256k1::PublicKey, Address};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -12,7 +12,7 @@ use std::str::FromStr;
 pub struct ValidatorData {
     name: String,
     ip: String,
-    pk: String,
+    address: Address<NetworkUnchecked>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -24,6 +24,24 @@ pub struct IPCState {
     required_number_of_validators: u64,
     required_collateral: u64,
     validators: Vec<ValidatorData>,
+}
+
+impl ValidatorData {
+    pub fn new(name: String, ip: String, address: Address<NetworkUnchecked>) -> Self {
+        ValidatorData { name, ip, address }
+    }
+
+    pub fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    pub fn get_ip(&self) -> String {
+        self.ip.clone()
+    }
+
+    pub fn get_address(&self) -> Address<NetworkUnchecked> {
+        self.address.clone()
+    }
 }
 
 impl IPCState {
@@ -79,15 +97,20 @@ impl IPCState {
         &mut self,
         ip: String,
         name: String,
-        pk: String,
+        bitcoin_address: Address<NetworkUnchecked>,
     ) -> Result<(), IpcStateError> {
         self.validators.push(ValidatorData {
             ip: ip.clone(),
             name: name.clone(),
-            pk: pk.clone(),
+            address: bitcoin_address.clone(),
         });
         self.save_state()?;
-        println!("Validator {} {} {} added", ip, name, pk);
+        println!(
+            "Validator {} {} {} added",
+            ip,
+            name,
+            bitcoin_address.assume_checked()
+        );
         Ok(())
     }
 
@@ -109,6 +132,10 @@ impl IPCState {
 
     pub fn get_subnet_pk(&self) -> PublicKey {
         self.subnet_pk
+    }
+
+    pub fn get_validators(&self) -> Vec<ValidatorData> {
+        self.validators.clone()
     }
 
     pub fn get_bitcoin_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
@@ -168,7 +195,9 @@ impl IPCState {
         for validator in &self.validators {
             println!(
                 "  IP: {}, name: {}, pk: {}",
-                validator.ip, validator.name, validator.pk
+                validator.ip,
+                validator.name,
+                validator.address.clone().assume_checked()
             );
         }
     }

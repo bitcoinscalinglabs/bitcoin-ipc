@@ -50,7 +50,9 @@ async fn checkpoint(subnet_id: &String) -> Result<(), RelayerError> {
         }
     };
 
-    if ipc_lib::submit_checkpoint(hash, subnet.clone(), simulator).is_ok() {
+    println!("Submitting checkpoint for {}", subnet.get_subnet_id());
+
+    if ipc_lib::submit_checkpoint(hash, subnet.get_subnet_pk(), simulator).is_ok() {
         println!(
             "Checkpoint for {} submitted successfully",
             subnet.get_subnet_id()
@@ -81,8 +83,6 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
 
     {
         let transfers = simulator.get_postbox_transfers();
-
-        println!("Handling Transfers: {:?}", transfers);
 
         if !transfers.is_empty() {
             {
@@ -117,8 +117,6 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
     {
         let withdraws = simulator.get_postbox_withdraws();
         if !withdraws.is_empty() {
-            // TODO: batch and send withdraws here!
-
             ipc_lib::create_and_submit_withdraw_tx(
                 source_subnet_bitcoin_address.clone(),
                 subnet.get_subnet_pk(),
@@ -146,7 +144,13 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
     {
         let delete = simulator.get_postbox_delete();
         if delete.is_some() {
-            // TODO: send delete tx here!
+            ipc_lib::create_and_submit_delete_tx(
+                source_subnet_bitcoin_address.clone(),
+                subnet.get_subnet_pk(),
+                subnet.get_validators(),
+                bitcoin::Amount::from_sat(subnet.get_required_collateral()),
+                &simulator,
+            )?;
 
             match simulator.empty_postbox_delete() {
                 Ok(_) => {
