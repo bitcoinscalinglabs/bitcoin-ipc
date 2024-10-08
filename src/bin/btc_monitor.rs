@@ -199,7 +199,7 @@ fn parse_transfer_command(
 
         let total_amount = transfers
             .iter()
-            .map(|transfer_event| transfer_event.amount)
+            .map(|transfer_event| transfer_event.a)
             .sum::<bitcoin::Amount>();
 
         let matching_output = commit_tx.output.iter().find(|output| {
@@ -220,7 +220,7 @@ fn parse_transfer_command(
         };
 
         for transfer in transfers {
-            match simulator.fund_account(&transfer.deposit_address, transfer.amount.to_sat()) {
+            match simulator.fund_account(&transfer.d, transfer.a.to_sat()) {
                 Ok(_) => {}
                 Err(_) => return Err(ParseIpcTransactionError::CannotDepositToAccount),
             };

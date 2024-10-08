@@ -319,8 +319,8 @@ pub fn create_and_submit_transfer_tx(
         for transfer in transfers {
             total_value_per_subnet
                 .entry(target_subnet_id.clone())
-                .and_modify(|e| *e += transfer.amount.to_sat())
-                .or_insert_with(|| transfer.amount.to_sat());
+                .and_modify(|e| *e += transfer.a.to_sat())
+                .or_insert_with(|| transfer.a.to_sat());
         }
 
         let value = match total_value_per_subnet.get(&target_subnet_id.clone()) {

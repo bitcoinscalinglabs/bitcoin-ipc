@@ -32,8 +32,8 @@ fn generate_random_transfers(num_transfers: usize) -> BTreeSet<TransferEvent> {
     let mut transfers = BTreeSet::new();
     for _ in 0..num_transfers {
         let transfer_event = TransferEvent {
-            deposit_address: generate_random_filecoin_address(),
-            amount: generate_random_amount(),
+            d: generate_random_filecoin_address(),
+            a: generate_random_amount(),
         };
         transfers.insert(transfer_event);
     }

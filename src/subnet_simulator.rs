@@ -26,8 +26,8 @@ pub struct SubnetState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Ord, Eq, PartialEq, PartialOrd)]
 pub struct TransferEvent {
-    pub deposit_address: String,
-    pub amount: Amount,
+    pub d: String,
+    pub a: Amount,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -207,8 +207,8 @@ impl SubnetSimulator {
                 .or_default();
 
             transfers.insert(TransferEvent {
-                deposit_address: address.to_string(),
-                amount: Amount::from_sat(amount),
+                d: address.to_string(),
+                a: Amount::from_sat(amount),
             });
 
             println!("Transfer request submitted to postbox");
@@ -425,7 +425,7 @@ impl SubnetSimulator {
             println!("  Transfers to subnet: {}", subnet);
 
             for transfer in transfers.iter() {
-                println!("    To {} : {}", transfer.deposit_address, transfer.amount);
+                println!("    To {} : {}", transfer.d, transfer.a);
             }
         }
         for (address, amount) in &self.state.postbox.withdraws {
