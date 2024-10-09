@@ -120,22 +120,8 @@ The demo uses the paramateres defined in `config.json`.
 
 Remark: You can refer to `architecture.md` for a description of componenets, such as the `btc_listener`, `relayer`, and `postbox`, and to `transactions.md` for a description of IPC-related functionality, such as `checkpoint`.
 
-## Running the demo using the automated scripts
 
-- On MacOS run the following command:
-```sh
-./scripts/demo_ubuntu.sh 
-```
-
-- On Ubuntu run the following command:
-```sh
-./scripts/demo_ubuntu.sh 
-```
-
-This will run `bitcoind`, `btc_monitor`, the `l1_manager`, and it will open a `subnet_interactor` terminal for every existing subnet.
-
-
-## Running the demo manually
+## Running the demo 
 
 1. Make sure you have started the `bitcoin core` client 
 
