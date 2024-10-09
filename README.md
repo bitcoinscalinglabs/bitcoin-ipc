@@ -99,7 +99,7 @@ bitcoin-cli loadwallet "default"
 3.3.3 Generate 101 blocks
 
 ```sh
-bitcoin-cli -regtest generatetoaddress 101 "$(bitcoin-cli -regtest getnewaddress)"
+bitcoin-cli -regtest generatetoaddress 102 "$(bitcoin-cli -regtest getnewaddress)"
 ```
 
 3.3.4 Verify block generation
@@ -107,7 +107,7 @@ bitcoin-cli -regtest generatetoaddress 101 "$(bitcoin-cli -regtest getnewaddress
 ```sh
 bitcoin-cli -regtest getblockcount
 ```
-The output should be 101.
+The output should be 102.
 </details>
 
 
@@ -171,6 +171,14 @@ After the L1 Manager has been started, either using a script or manually, you ca
 2. Press 2 to *create a child subnet*. The L1 Manager prompts for all required subnet data (number of validators and collateral). It then creates the required bitcoin transactions (see `transactions.md`) and submits them to the bitcoin network. Observe the output of the Bitcoin Monitor.
 
 3. Press 3 to *join a subnet*. The L1 Manager prompts to pick a subnet to join and then asks for the required validator data (IP address, a bitcoin public key, where the collateral will be returned, and a name, to be used as identifier for the validator). It then uses the local wallet information to create and submit the required bitcoin transactions (see `transactions.md`). Observe the output of the Bitcoin Monitor. You can also check the balance of the local bitcoin wallet using `bitcoin-cli getbalance` before and after joining the subnet. Observe that in this demo the same bitcoin wallet submits all transactions and mines all blocks, and the block reward is 50 BTC. Hence, after submitting the transactions, the balance should 50 BTC higher, minus the subnet collateral and the fees used for the two transactions.
+
+4. Press 4 to *deposit* to a subnet. The L1 Manager prompts to pick a subnet to deposit to and then asks for the required deposit data (target address and amount). It then 
+uses the local wallet information to create and submit the required bitcoin transaction (see `transactions.md`). 
+Observe the output of the Bitcoin Monitor. You can also check the balance of the local bitcoin wallet 
+using `bitcoin-cli getbalance` before and after depositing to the subnet. Observe that in this demo the 
+same bitcoin wallet submits all transactions and mines all blocks, and the block reward is 50 BTC. 
+Hence, after submitting the transactions, the balance should 50 BTC higher, minus the deposit amount and the fees used for the two transactions.
+
 
 ## Interacting with a subnet using the Subnet Interactor
 The Subnet Interactor also exposes an interactive user interface. It allows a subnet user to create an account, transfer funds from that account, and withdraw funds to a bitcoin wallet. It also allows a subnet user to submit *checkpoint* and *delete* transactions to the subnet - when these transactions get finalized on the subnet, they are written on the postbox of that subnet and handled by the Relayer.
