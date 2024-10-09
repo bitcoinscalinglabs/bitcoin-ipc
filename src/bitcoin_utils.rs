@@ -114,10 +114,10 @@ pub fn init_wallet(
         .require_network(network)?;
 
     if created_wallet {
-        rpc.generate_to_address(101, &address)?;
+        rpc.generate_to_address(102, &address)?;
 
         let coinbase_txid = rpc
-            .list_transactions(Some(random_label), Some(101), Some(100), None)?
+            .list_transactions(Some(random_label), Some(102), Some(101), None)?
             .first()
             .ok_or(BitcoinUtilsError::Internal)?
             .info
@@ -913,10 +913,7 @@ pub fn find_prevout_for_input(rpc: &Client, input: TxIn) -> Result<TxOut, Bitcoi
     let txid = input.previous_output.txid;
     let vout = input.previous_output.vout;
 
-    let tx_out_option = match rpc.get_tx_out(&txid, vout, None) {
-        Ok(tx_out_option) => tx_out_option,
-        Err(_) => None,
-    };
+    let tx_out_option = rpc.get_tx_out(&txid, vout, None).unwrap_or_default();
 
     let tx_out = match tx_out_option {
         Some(tx_out) => tx_out,

@@ -194,7 +194,7 @@ impl IPCState {
         println!("Validators:");
         for validator in &self.validators {
             println!(
-                "  IP: {}, name: {}, pk: {}",
+                "  IP: {}, name: {}, address: {}",
                 validator.ip,
                 validator.name,
                 validator.address.clone().assume_checked()
