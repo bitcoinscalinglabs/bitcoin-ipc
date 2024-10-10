@@ -80,9 +80,9 @@ WALLET_NAME=default
 . .env
 ```
 
-3.3. Set up a wallet (Optional - this is done in the code)
-<details>
-<summary> Manual Wallet Setup and Block Generation.</summary>
+3.3. Set up a wallet 
+
+Manual Wallet Setup and Block Generation
 
 3.3.1 Create a Wallet named default
   
@@ -96,7 +96,7 @@ bitcoin-cli createwallet "default"
 bitcoin-cli loadwallet "default"
 ```
 
-3.3.3 Generate 101 blocks
+3.3.3 Generate 102 blocks
 
 ```sh
 bitcoin-cli -regtest generatetoaddress 102 "$(bitcoin-cli -regtest getnewaddress)"

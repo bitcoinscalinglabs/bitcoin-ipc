@@ -440,12 +440,12 @@ pub fn create_and_submit_withdraw_tx(
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(withdraw_tx, prevouts);
 
+    println!("Size: {:?}", signed_transaction.vsize());
+    println!("Fee: {:?}", fee);
+
     if !submit_tx {
         return Ok(signed_transaction);
     }
-
-    println!("Size: {:?}", signed_transaction.vsize());
-    println!("Fee: {:?}", fee.to_btc());
 
     if let Err(e) = test_and_submit(&rpc, vec![signed_transaction.clone()], miner_address) {
         return Err(IpcLibError::BitcoinUtilsError(e));

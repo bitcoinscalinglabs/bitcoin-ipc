@@ -71,8 +71,7 @@ fn main() -> Result<(), TestWeightError> {
 
     for number_of_subnets in [1, 2, 5, 10] {
         for total_transfers in [
-            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000,
-            4500, // 10000, 20000, 40000, 45000,
+            1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 6350,
         ] {
             println!(
                 "Number of subnets: {}, Total transfers: {}",
