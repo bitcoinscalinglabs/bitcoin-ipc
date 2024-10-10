@@ -39,7 +39,7 @@ In the plot we see the following:
     1. The commit transaction contains one output UTXO per target subnet.
     2. The reveal transaction contains (only once) the address of each target subnet.
 - The usage of IPC subnets starts paying off if we batch at least 3 to 5 transfers, depending on the number of target subnets. For example:
-    - If all transfers have the same target subnet, then IPC can batch 3 transfers using  ~130 vB on average for each, which is cheaper than the 141 vB of native bitcoin.
+    - If all transfers have the same target subnet, then IPC can batch 3 transfers using ~130 vB on average for each, which is cheaper than the 141 vB of native bitcoin.
     - If the transfers have two different target subnets, then IPC needs a bit more space to encode them, ~150 vB per transfer for 3 transfers, and ~117 vB per transfer for 4 transfers, hence IPC saves space if we batch at least 4 transfers.
     - Similarly, if the transfers have five or ten different target subnets, IPC pays off we batch at least 5 of them.
 
@@ -51,7 +51,7 @@ We get the following result.
 ![Transfer virtual size](../bench-plots/transfer-size-all-log.png)
 
 From this plot we can see that
-- For any number of target subnets, the amortized virtual size per transfer using IPC converges to 20.26 vB. This is a 7-times compression, compared to standard bitcoin without IPC L2 networks.
+- For any number of target subnets, the amortized virtual size per transfer using IPC converges to 15.8 vB. This is a 9-times compression, compared to standard bitcoin without IPC L2 networks.
 
 
 ### General observations
