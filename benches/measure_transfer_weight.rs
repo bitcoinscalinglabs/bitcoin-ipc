@@ -65,7 +65,7 @@ fn main() -> Result<(), TestWeightError> {
             };
             manager.create_child(args)?;
         }
-        println!("Waiting for subnets to be created.");
+        println!("Waiting for subnets to be created. Make sure the btc_manager is running.");
         std::thread::sleep(time::Duration::from_secs(10));
     }
 

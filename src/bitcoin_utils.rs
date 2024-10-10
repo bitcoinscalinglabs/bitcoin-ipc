@@ -651,7 +651,7 @@ pub fn calculate_fee(
         None => default_fee_rate,
     };
 
-    fee_rate * (total_tx_size_vbytes as u64) / 1000
+    fee_rate * (total_tx_size_vbytes as u64) / 500
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
