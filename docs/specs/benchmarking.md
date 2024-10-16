@@ -115,7 +115,7 @@ and do the following analysis.
 - We plot the total size of batched withdraws depending on the number of withdraws vs the total size of withdraws if each withdraw is represented by a BTC transfer.
 
 This plot displays the how total vB required to batch all withdraws into one transaction changes as the number of withdraws grows, compared to 141 * *N* representing standard BTC transfers.
-![Withdraw total size](../bench-plots/withdraw-size-all.pngpng)
+![Withdraw total size](../bench-plots/withdraw-size-all.png)
 
 Whereas this plot also shows how the *amortized size* per withdraw changes as the number of withdraws grows compared to the 141 vB required for a BTC transfer.
 ![Withdraw amortized size](../bench-plots/withdraw-amortized-size.png)
