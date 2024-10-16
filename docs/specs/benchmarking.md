@@ -12,7 +12,7 @@ The code creates two bitcoin transactions, a *commit* and a *reveal* transaction
 ### Running the benchmark
 We measure the virtual size of the batched transfers in `benches/measure_transfer_weight.rs`, for multiple numbers of target subnet (variable `number_of_subnets`). The benchmark batches a number of transfers (variable `total_transfers`), equally split among all target subnets, and then creates the required bitcoin transactions using the functionality in `src/ipc-lib.rs`.
 
-To run the benchmark, start a local `bitcoin core` node and `btc_monitor` (following the Setup steps and steps 1 and 2 on `README.md`).
+To run the benchmark, start a local `bitcoin core` node and `btc_monitor` (following the Setup steps and steps 1 and 2 from `README.md`).
 Then you can use
 ```
 cargo run --bin measure_transfer_weight
@@ -57,7 +57,7 @@ We observe that the usage of IPC subnets starts paying off if we batch at least 
 
 ### Taking batching to the limits
 The limit for batching transfers is the limit of bitcoin on `standard transactions`, which is 100K vB [source: bitcoin implementation](https://github.com/bitcoin/bitcoin/blob/3c098a8aa0780009c11b66b1a5d488a928629ebf/src/policy/policy.h#L24).
-To reach this limit, we increase the batched number of transactions, as long as each of the commit and the reveal transactions fit in less that 100K vB (standard, mention), which fits 6350 transfers (we remark that the two transactions can appear in different blocks). 
+To reach this limit, we increase the batched number of transactions, as long as each of the commit and the reveal transactions fit in less than 100K vB (standard, mention), which fits 6350 transfers (we remark that the two transactions can appear in different blocks). 
 
 We get the following result.
 ![Transfer virtual size](../bench-plots/transfer-size-all-log.png)
@@ -77,3 +77,55 @@ Observations from the data on the [Spreadsheet file](https://docs.google.com/spr
 Essentially, IPC offers a throughput-latency trade-off: An IPC subnet, either periodically or when a certain number of outgoing transfers become finalized in it, creates a batch and submits it to bitcoin. The bigger the batch is, the cheaper it will be, in terms of bytes written to bitcoin, but also the more time it takes to fill the batch.
 
 For large enough batches, our experiments show that we can reach a *compression factor* of 9.
+
+# Benchmarking the size of withdraw()
+
+We want to compare the virtual size of data written on bitcoin (in virtual bytes, or vB) for withdrawing some amount from a BTC account when:
+1.  A single BTC transaction per withdraw
+2. The account we withdraw from is an IPC subnet and is batching multiple withdraws
+
+
+As mentioned earlier, the first case always consumes 141 vB, which is the bitcoin size of a transaction with one input (a UTXO owned by the sender) and two outputs (a UTXO locked with the recipient's address and a change UTXO).
+Hence, *N* withdraws require *141N* vB.
+
+In the second case, we can batch multiple withdraws, which leads to a lower amortized size per withdraw. The logic is the following (see `transactions.md` for details): 
+Periodically we read the postbox of an L2 subnet *A* and batch together all withdraws that are found there. Obviously, all batched withdraws have the same source subnet, 
+but they have a different destination address (the user BTC address). The code creates a BTC transaction with 1 input, and *N+2* outputs. 
+There is one output for each of the *N* withdraws, one change output and one *OP_RETURN* output indicating that it is an IPC withdraw command. 
+
+### Running the benchmark
+We measure the virtual size of the batched withdraws in `benches/measure_withdraw_weight.rs`. The benchmark creates a withdraw transaction using the functionality in `src/ipc-lib.rs`
+where the withdraws are generated randomly and the number of withdraws is indicated by the variable `number_of_withdraws`.
+
+To run the benchmark, start a local `bitcoin core` node (following the Setup steps and step 1 fro `README.md`).
+Then you can use
+```
+cargo run --bin measure_withdraw_weight
+```
+
+The code assumes that there exists at least one subnet.
+
+### Results
+The code writes the result in `outputs/withdraw.csv`. We then manually paste the content in a [Spreadsheet file](https://docs.google.com/spreadsheets/d/1VZtpPHY2IwF11sb3uXlqa6nXgET-CbNxcq4vbO-lqiU/edit?usp=sharing) 
+and do the following analysis.
+
+- The benchmark outputs the size (in vB) of the withdraw transaction for a particular number of withdraws.
+- We divide with the total number of withdraws in the batch, which gives us the *amortized size* of each withdraw.
+- We plot the amortized size of each withdraw depending on the number of withdraws vs the size of a withdraw treated like a BTC transfer.
+- We plot the total size of batched withdraws depending on the number of withdraws vs the total size of withdraws if each withdraw is represented by a BTC transfer.
+
+This plot displays the how total vB required to batch all withdraws into one transaction changes as the number of withdraws grows, compared to 141 * *N* representing standard BTC transfers.
+![Withdraw total size](../bench-plots/withdraw-size-all.pngpng)
+
+Whereas this plot also shows how the *amortized size* per withdraw changes as the number of withdraws grows compared to the 141 vB required for a BTC transfer.
+![Withdraw amortized size](../bench-plots/withdraw-amortized-size.png)
+
+
+### Taking batching to the limits
+Similarly to the transfer batching, withdraw batching is also limited by the `standard transactions` size on bitcoin. To reach this limit, we increase the number of withdraws as long as the withdraw transaction fits
+in less than 100K vB, which fits roughly 2300 withdraws. 
+
+
+From the first plot and the compression factor column we can see that even for *N=50* we reach 3-times compression, compared to standard bitcoin transfers.
+
+
