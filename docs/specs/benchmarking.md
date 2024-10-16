@@ -28,7 +28,7 @@ The code writes the result in `outputs/transfer.csv`. We then manually paste the
 - We divide with the total number of transfers in the batch, which gives us the *amortized size* of each transfer.
 - We plot the amortized size per transfer vs total number of transfers.
 
-In the following diagram we see the result for up to 100 total transfers.
+In the following diagram we see the result for up to 100 total transfers.  
 ![Transfer virtual size](../bench-plots/transfer-size-detail-100.png)
 
 In the plot we see the following:
@@ -41,7 +41,7 @@ In the plot we see the following:
 
 ### Finding the breakeven point
 In the following diagram we zoom-in in the area 1-10 transfers.
-The plot also shows the data values for the 1-target-subnet and 10-target-subnet lines.
+The plot also shows the data values for the 1-target-subnet and 10-target-subnet lines.  
 ![Transfer virtual size](../bench-plots/transfer-size-detail-10.png)
 
 Remark: If the number of transfers for a data point is smaller than the number of target subnets, the benchmark does not use all target subnets.
@@ -59,7 +59,7 @@ We observe that the usage of IPC subnets starts paying off if we batch at least 
 The limit for batching transfers is the limit of bitcoin on `standard transactions`, which is 100K vB [source: bitcoin implementation](https://github.com/bitcoin/bitcoin/blob/3c098a8aa0780009c11b66b1a5d488a928629ebf/src/policy/policy.h#L24).
 To reach this limit, we increase the batched number of transactions, as long as each of the commit and the reveal transactions fit in less than 100K vB (standard, mention), which fits 6350 transfers (we remark that the two transactions can appear in different blocks). 
 
-We get the following result.
+We get the following result.  
 ![Transfer virtual size](../bench-plots/transfer-size-all-log.png)
 
 From this plot we can see that
@@ -114,15 +114,15 @@ and do the following analysis.
 - We plot the amortized size of each withdraw depending on the number of withdraws vs the size of a withdraw treated like a BTC transfer.
 - We plot the total size of batched withdraws depending on the number of withdraws vs the total size of withdraws if each withdraw is represented by a BTC transfer.
 
-This plot displays the how total vB required to batch all withdraws into one transaction changes as the number of withdraws grows, compared to 141 * *N* representing standard BTC transfers.
+This plot displays the how total vB required to batch all withdraws into one transaction changes as the number of withdraws grows, compared to 141 * *N* representing standard BTC transfers.  
 ![Withdraw total size](../bench-plots/withdraw-size-all.png)
 
-Whereas this plot also shows how the *amortized size* per withdraw changes as the number of withdraws grows compared to the 141 vB required for a BTC transfer.
+Whereas this plot also shows how the *amortized size* per withdraw changes as the number of withdraws grows compared to the 141 vB required for a BTC transfer.                               
 ![Withdraw amortized size](../bench-plots/withdraw-amortized-size.png)
 
 
 ### Taking batching to the limits
-Similarly to the transfer batching, withdraw batching is also limited by the `standard transactions` size on bitcoin. To reach this limit, we increase the number of withdraws as long as the withdraw transaction fits
+Similarly to the transfer batching, withdraw batching is also limited by the `standard transactions` size on bitcoin. To reach this limit, we increase the number of withdraws as long as the withdraw transaction fits  
 in less than 100K vB, which fits roughly 2300 withdraws. 
 
 
