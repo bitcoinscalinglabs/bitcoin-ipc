@@ -154,7 +154,7 @@ cargo run --bin relayer -- --subnet-id <subnet_id>
 - Step 1: No further comments
 - Steps 2-3: A small remark to note here is that the collateral is specified in Satoshis (1 BTC  = 1,000,000,000 Satoshis). Additionally, after creating and submitting the two tansactions (committing and revealing), 
 one block is mined containing these transactions. After sending these transactions, when querying the balance of the user, the result is `prev_balance - 50 BTC + 25 BTC +/- fee_diff`. The reasons behind these numbers are the following:
-  - The user sends 50 BTC to the subnet. to fund it.
+  - The user sends 50 BTC to the subnet to fund it.
   - The user is the miner of the block so they get rewarded the coinbase transaction which at the time was `25 BTC + fees_100_blocks_ago`. The user can only use coinbase UTXOs after 100 blocks of maturation.
   - `fee_diff=fees_100_blocks_ago - fees_now` is the difference in fees that were paid in the currently mined block compared to the fees paid 100 blocks ago. In this case, the `fees_now` are larger than `fees_100_blocks_ago`, therefore
   `fee_diff` is negative and the user balance got reduced by a small amount.
