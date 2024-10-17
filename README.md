@@ -149,6 +149,21 @@ cargo run --bin subnet_interactor -- --subnet-id <subnet_id>
 cargo run --bin relayer -- --subnet-id <subnet_id>
 ```
 
+### Comments about the demo steps
+- Step 0: When installing Bitcoin Core, there is no need to sync with the Bitcoin network since for the demo the regtest is used. The syncing process can be canceled and the user can proceed directly to running the regtest.
+- Step 1: No further comments
+- Steps 2-3: A small remark to note here is that the collateral is specified in Satoshis (1 BTC  = 1,000,000,000 Satoshis). Additionally, after creating and submitting the two tansactions (committing and revealing), 
+one block is mined containing these transactions. After sending these transactions, when querying the balance of the user, the result is `prev_balance - 50 BTC + 25 BTC +/- fee_diff`. The reasons behind these numbers are the following:
+  - The user sends 50 BTC to the subnet. to fund it.
+  - The user is the miner of the block so they get rewarded the coinbase transaction which at the time was `25 BTC + fees_100_blocks_ago`. The user can only use coinbase UTXOs after 100 blocks of maturation.
+  - `fee_diff=fees_100_blocks_ago - fees_now` is the difference in fees that were paid in the currently mined block compared to the fees paid 100 blocks ago. In this case, the `fees_now` are larger than `fees_100_blocks_ago`, therefore
+  `fee_diff` is negative and the user balance got reduced by a small amount.
+- Steps 4-5: No further comments
+- Step 6: It is important to note that the deposit amount is supposed to be specified in Satoshis (1 BTC  = 1,000,000,000 Satoshis)
+- Step 7: Since the transfer functionality occurs within the subnet, the amounts are expected to be in wBTC (Wrapped Bitcoin), represented in wSatoshis (Wrapped Staoshis). When specifying the transfer amount, the CLI expects wSatoshis. 
+- Steps 8-11: No further comments
+- Step 12: Throughout the demo, the user interacts with two subnets. However, by the time the delete functionality is demonstrated, only one subnet remains. This is because one of the subnets was deleted off-camera.
+
 ## Interacting with the L1 Manager
 After the L1 Manager has been started, either using a script or manually, you can interact with following its interactive interface.
 
