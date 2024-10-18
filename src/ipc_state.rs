@@ -181,7 +181,7 @@ impl IPCState {
     pub fn print_state(&mut self) {
         println!("#################################");
         // print in a more organized manner:
-        println!("Subnet: {}", self.subnet_id);
+        println!("Subnet ID: {}", self.subnet_id);
         println!("Bitcoin Address: {}", self.bitcoin_address.clone());
         println!("Subnet PK: {}", self.subnet_pk);
         println!("IPC Address: {}", self.ipc_address);

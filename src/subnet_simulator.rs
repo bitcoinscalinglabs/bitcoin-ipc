@@ -417,7 +417,7 @@ impl SubnetSimulator {
         println!("Bitcoin Address: {}", subnet_address);
         println!("Accounts:");
         for (address, account) in &self.state.accounts {
-            println!("  {}: {}", address, account.balance);
+            println!("  {}: {} wSatoshis", address, account.balance);
         }
 
         println!("Postbox:");
@@ -425,18 +425,20 @@ impl SubnetSimulator {
             println!("  Transfers to subnet: {}", subnet);
 
             for transfer in transfers.iter() {
-                println!("    To {} : {}", transfer.d, transfer.a);
+                println!("    To {} : {} wBTC", transfer.d, transfer.a.to_btc());
             }
         }
         for (address, amount) in &self.state.postbox.withdraws {
             println!(
-                "  Withdraw: {} : {}",
+                "  Withdraw: {} : {} wBTC",
                 address.clone().assume_checked(),
-                amount
+                amount.to_btc()
             );
         }
 
-        println!("  Delete: {:?}", self.state.postbox.deletes);
+        if let Some(delete) = &self.state.postbox.deletes {
+            println!("  Delete: {}", delete.subnet_id);
+        }
 
         let checkpoint = match self.get_checkpoint() {
             Ok(cp) => cp,

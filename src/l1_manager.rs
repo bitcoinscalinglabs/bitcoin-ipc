@@ -68,10 +68,24 @@ impl L1Manager {
                     field: "collateral amount",
                 })?;
 
-        Ok(CreateChildArgs {
-            required_number_of_validators,
-            required_collateral,
-        })
+        let answer = get_user_input(
+            format!(
+                "Are you sure you want to create a child subnet with collateral {:?} BTC? (press Enter to confirm/any other key+Enter to cancel)",
+                Amount::from_sat(required_collateral).to_btc()
+            )
+            .as_str(),
+        )?;
+
+        if answer.is_empty() {
+            Ok(CreateChildArgs {
+                required_number_of_validators,
+                required_collateral,
+            })
+        } else {
+            Err(L1ManagerError::InvalidUserInput {
+                field: "Confiramtion",
+            })
+        }
     }
 
     pub fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
@@ -194,6 +208,20 @@ impl L1Manager {
         if amount < 1000 {
             return Err(L1ManagerError::InvalidUserInput {
                 field: "amount must be at least 1000 satoshis",
+            });
+        }
+
+        let answer = get_user_input(
+            format!(
+                "Are you sure you want to deposit {:?} BTC to the subnet? (press Enter to confirm/any other key+Enter to cancel)",
+                Amount::from_sat(amount).to_btc()
+            )
+            .as_str(),
+        )?;
+
+        if !answer.is_empty() {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "Confiramtion",
             });
         }
 
