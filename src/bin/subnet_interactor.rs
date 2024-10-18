@@ -123,6 +123,7 @@ impl SubnetInteractor {
                             continue;
                         }
                     };
+
                     let amount: u64 = match amount.parse() {
                         Ok(a) => a,
                         Err(e) => {
@@ -130,6 +131,26 @@ impl SubnetInteractor {
                             continue;
                         }
                     };
+
+                    let answer = match get_user_input(
+                        format!(
+                            "Are you sure you want to transfer {:?} wBTC from {:?} to {:?}? (press Enter to confirm/any other key+Enter to cancel)",
+                            (amount as f64) / 100000000.0, from, to
+                        )
+                        .as_str(),
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read user input: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if !answer.is_empty() {
+                        println!("Transfer cancelled.");
+                        continue;
+                    }
+
                     match self.subnet.transfer(&from, &to, amount) {
                         Ok(_) => {}
                         Err(e) => println!("Transfer failed: {}", e),
@@ -169,6 +190,25 @@ impl SubnetInteractor {
                             continue;
                         }
                     };
+
+                    let answer = match get_user_input(
+                        format!(
+                            "Are you sure you want to withdraw {:?} BTC from the subnet? (press Enter to confirm/any other key+Enter to cancel)",
+                            (amount as f64) / 100000000.0
+                        )
+                        .as_str(),
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("Failed to read user input: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if !answer.is_empty() {
+                        println!("Withdrawal cancelled.");
+                        continue;
+                    }
 
                     let btc_address_str = match get_user_input("Enter BTC address to withdraw to:")
                     {
