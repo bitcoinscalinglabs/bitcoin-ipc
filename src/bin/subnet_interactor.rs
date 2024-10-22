@@ -1,9 +1,10 @@
+use bitcoincore_rpc::Client;
 // subnet_interactor.rs
 use thiserror::Error;
 
 use std::str::FromStr;
 
-use bitcoin_ipc::subnet_simulator::SubnetSimulator;
+use bitcoin_ipc::{bitcoin_utils, subnet_simulator::SubnetSimulator, utils};
 use clap::Parser;
 use std::io::{self};
 
@@ -36,17 +37,16 @@ impl SubnetInteractor {
         SubnetInteractor { subnet: subnet_sim }
     }
 
-    pub fn interactive_interface(&mut self) {
+    pub fn interactive_interface(&mut self, rpc: Client) {
         loop {
             let prompt = "Select an option:\n\
                                 1. Create account\n\
-                                2. Fund account\n\
-                                3. Transfer funds\n\
-                                4. Checkpoint state\n\
-                                5. Withdraw funds\n\
-                                6. Delete subnet\n\
-                                7. Print state\n\
-                                8. Exit";
+                                2. Transfer funds\n\
+                                3. Checkpoint state\n\
+                                4. Withdraw funds\n\
+                                5. Delete subnet\n\
+                                6. Print state\n\
+                                7. Exit";
 
             let choice = match get_user_input(prompt) {
                 Ok(c) => c,
@@ -75,32 +75,6 @@ impl SubnetInteractor {
                     let _ = self.subnet.create_account(&address);
                 }
                 2 => {
-                    let address = match get_user_input("Enter account address:") {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("Failed to read account address: {}", e);
-                            continue;
-                        }
-                    };
-                    let amount = match get_user_input("Enter amount to add:") {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("Failed to read amount: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let amount: u64 = match amount.parse() {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("Invalid balance amount: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let _ = self.subnet.fund_account(&address, amount);
-                }
-                3 => {
                     let from = match get_user_input("Enter from account address:") {
                         Ok(a) => a,
                         Err(e) => {
@@ -156,7 +130,7 @@ impl SubnetInteractor {
                         Err(e) => println!("Transfer failed: {}", e),
                     }
                 }
-                4 => {
+                3 => {
                     let checkpoint = match self.subnet.get_checkpoint() {
                         Ok(cp) => cp,
                         Err(e) => {
@@ -167,7 +141,7 @@ impl SubnetInteractor {
                     let str_cp = hex::encode(checkpoint);
                     println!("Checkpoint: {:?}", str_cp);
                 }
-                5 => {
+                4 => {
                     let address = match get_user_input("Enter account address:") {
                         Ok(a) => a,
                         Err(e) => {
@@ -232,15 +206,15 @@ impl SubnetInteractor {
                         Err(e) => println!("Failed to submit withdraw request: {}", e),
                     };
                 }
-                6 => match self.subnet.delete() {
+                5 => match self.subnet.delete() {
                     Ok(_) => {}
                     Err(e) => println!("Failed to submit delete subnet request: {}", e),
                 },
-                7 => match self.subnet.print_state() {
+                6 => match self.subnet.print_state(&rpc) {
                     Ok(_) => {}
                     Err(e) => println!("Failed to print subnet state: {}", e),
                 },
-                8 => break,
+                7 => break,
                 _ => println!("Invalid option. Please try again."),
             }
         }
@@ -280,5 +254,21 @@ fn main() {
     };
     let mut interactor = SubnetInteractor::new(subnet);
 
-    interactor.interactive_interface();
+    let (rpc_user, rpc_pass, rpc_url, _) = match utils::load_env() {
+        Ok(env) => env,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+
+    let rpc = match bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+
+    interactor.interactive_interface(rpc);
 }

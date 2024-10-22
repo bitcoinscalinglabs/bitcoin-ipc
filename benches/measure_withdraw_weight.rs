@@ -71,7 +71,7 @@ fn main() -> Result<(), TestWeightError> {
         let withdraws = generate_random_withdraws(number_of_withdraws);
 
         let source_subnet = &all_subnets[0];
-        let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address()?;
+        let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address();
 
         let simulator = match SubnetSimulator::new(source_subnet.get_subnet_id().as_str()) {
             Ok(s) => s,

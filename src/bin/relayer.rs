@@ -72,12 +72,7 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
         }
     };
 
-    let source_subnet_bitcoin_address = match subnet.get_bitcoin_address() {
-        Ok(a) => a,
-        Err(e) => {
-            return Err(RelayerError::IpcStateError(e));
-        }
-    };
+    let source_subnet_bitcoin_address = subnet.get_bitcoin_address();
 
     let all_subnets = IPCState::load_all()?;
 
@@ -148,7 +143,6 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
                 source_subnet_bitcoin_address.clone(),
                 subnet.get_subnet_pk(),
                 subnet.get_validators(),
-                bitcoin::Amount::from_sat(subnet.get_required_collateral()),
                 &simulator,
             )?;
 

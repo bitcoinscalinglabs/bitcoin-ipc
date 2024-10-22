@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorData {
@@ -19,10 +18,11 @@ pub struct ValidatorData {
 pub struct IPCState {
     subnet_id: String,
     ipc_address: String,
-    bitcoin_address: String,
+    bitcoin_address: Address<NetworkUnchecked>,
     subnet_pk: PublicKey,
     required_number_of_validators: u64,
     required_collateral: u64,
+    required_initial_funding: u64,
     validators: Vec<ValidatorData>,
 }
 
@@ -48,10 +48,11 @@ impl IPCState {
     pub fn new(
         subnet_id: String,
         tx_id: String,
-        bitcoin_address: String,
+        bitcoin_address: Address<NetworkUnchecked>,
         subnet_pk: PublicKey,
         required_number_of_validators: u64,
         required_collateral: u64,
+        required_initial_funding: u64,
     ) -> Self {
         IPCState {
             subnet_id,
@@ -60,6 +61,7 @@ impl IPCState {
             subnet_pk,
             required_number_of_validators,
             required_collateral,
+            required_initial_funding,
             validators: Vec::new(),
         }
     }
@@ -122,12 +124,12 @@ impl IPCState {
         self.required_collateral
     }
 
-    pub fn get_subnet_id(&self) -> String {
-        self.subnet_id.clone()
+    pub fn get_required_initial_funding(&self) -> u64 {
+        self.required_initial_funding
     }
 
-    pub fn get_bitcoin_address_str(&self) -> String {
-        self.bitcoin_address.clone()
+    pub fn get_subnet_id(&self) -> String {
+        self.subnet_id.clone()
     }
 
     pub fn get_subnet_pk(&self) -> PublicKey {
@@ -138,11 +140,8 @@ impl IPCState {
         self.validators.clone()
     }
 
-    pub fn get_bitcoin_address(&self) -> Result<Address<NetworkChecked>, IpcStateError> {
-        match Address::from_str(&self.bitcoin_address) {
-            Ok(address) => Ok(address.assume_checked()),
-            Err(_) => Err(IpcStateError::InvalidSubnetPK),
-        }
+    pub fn get_bitcoin_address(&self) -> Address<NetworkChecked> {
+        self.bitcoin_address.clone().assume_checked()
     }
 
     pub fn load_all() -> Result<Vec<Self>, IpcStateError> {
@@ -182,7 +181,7 @@ impl IPCState {
         println!("#################################");
         // print in a more organized manner:
         println!("Subnet ID: {}", self.subnet_id);
-        println!("Bitcoin Address: {}", self.bitcoin_address.clone());
+        println!("Bitcoin Address: {:?}", self.bitcoin_address.clone());
         println!("Subnet PK: {}", self.subnet_pk);
         println!("IPC Address: {}", self.ipc_address);
 
@@ -190,7 +189,10 @@ impl IPCState {
             "Required number of validators: {}",
             self.required_number_of_validators
         );
-        println!("Required collateral: {}", self.required_collateral);
+        println!(
+            "Required collateral per validator: {}",
+            self.required_collateral
+        );
         println!("Validators:");
         for validator in &self.validators {
             println!(
@@ -200,6 +202,8 @@ impl IPCState {
                 validator.address.clone().assume_checked()
             );
         }
+
+        println!();
     }
 }
 
