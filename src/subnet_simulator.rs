@@ -1,13 +1,15 @@
-use crate::bitcoin_utils;
+use crate::ipc_state::IPCState;
+use crate::{bitcoin_utils, ipc_state};
 
 use bitcoin::key::{TapTweak, TweakedKeypair};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::{Amount, TapSighashType, Transaction, TxOut};
+use bitcoincore_rpc::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, collections::BTreeSet, fs::File};
 
 use bitcoin::secp256k1::{Message, Secp256k1};
-use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
+use bitcoin::{address::NetworkUnchecked, Address};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -20,6 +22,7 @@ pub struct Account {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetState {
+    ipc_state: IPCState,
     accounts: BTreeMap<String, Account>,
     postbox: Postbox,
 }
@@ -43,8 +46,9 @@ pub struct Postbox {
 }
 
 impl SubnetState {
-    pub fn new() -> Self {
+    pub fn new(ipc_state: IPCState) -> Self {
         SubnetState {
+            ipc_state,
             accounts: BTreeMap::new(),
             postbox: Postbox {
                 transfers: BTreeMap::new(),
@@ -52,12 +56,6 @@ impl SubnetState {
                 deletes: None,
             },
         }
-    }
-}
-
-impl Default for SubnetState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -73,8 +71,18 @@ impl SubnetSimulator {
 
         let state_file_path = &format!("{}/subnet_state.json", subnet_id);
 
+        let ipc_state =
+            match ipc_state::IPCState::load_state(format!("{}/ipc_state.json", subnet_id)) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(SubnetSimulatorError::SubnetStateError(
+                        SubnetStateError::CannotLoadIpcState(e),
+                    ))
+                }
+            };
+
         if !Path::new(state_file_path).exists() {
-            let json = serde_json::to_string(&SubnetState::new())?;
+            let json = serde_json::to_string(&SubnetState::new(ipc_state.clone()))?;
 
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -91,7 +99,7 @@ impl SubnetSimulator {
 
             let state = match SubnetSimulator::load_state(subnet_id) {
                 Ok(st) => st,
-                Err(_) => SubnetState::new(),
+                Err(_) => SubnetState::new(ipc_state.clone()),
             };
 
             if let Ok(keypair) = serde_json::from_str(&json) {
@@ -105,14 +113,13 @@ impl SubnetSimulator {
 
         Ok(SubnetSimulator {
             subnet_id: String::from(subnet_id),
-            state: SubnetState::new(),
+            state: SubnetState::new(ipc_state.clone()),
             keypair: bitcoin_utils::generate_keypair(subnet_id.to_string())?,
         })
     }
 
     pub fn create_account(&mut self, address: &String) -> Result<(), SubnetStateError> {
         self.state = SubnetSimulator::load_state(&self.subnet_id)?;
-
         if self.state.accounts.contains_key(address) {
             return Err(SubnetStateError::AccountAlreadyExists);
         }
@@ -282,6 +289,7 @@ impl SubnetSimulator {
 
     pub fn get_checkpoint(&mut self) -> Result<[u8; 32], SubnetStateError> {
         println!("Computing state checkpoint...");
+
         self.state = SubnetSimulator::load_state(&self.subnet_id)?;
 
         // Disclaimer: this is not secure. It has not checked whether the serialization method and the BTreeMap
@@ -404,17 +412,75 @@ impl SubnetSimulator {
         self.keypair
     }
 
-    pub fn print_state(&mut self) -> Result<(), SubnetSimulatorError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
-        println!("#################################");
-        // print in a more organized manner:
-        println!("Subnet ID: {}", self.subnet_id);
-        println!("Subnet PK: {}", self.get_public_key());
-        let subnet_address = bitcoin_utils::get_address_from_x_only_public_key(
-            XOnlyPublicKey::from(self.get_public_key()),
-            crate::NETWORK,
+    pub fn get_withdrawable_amount(&self) -> Amount {
+        Amount::from_sat(
+            self.state
+                .accounts
+                .values()
+                .map(|account| account.balance)
+                .sum(),
+        )
+    }
+
+    pub fn get_all_amounts(&self, rpc: &Client) -> (Amount, Amount, Amount) {
+        let withdrawable_amount = self.get_withdrawable_amount();
+
+        let total_subnet_balance = match bitcoin_utils::get_balance(
+            rpc,
+            self.state.ipc_state.get_subnet_pk().x_only_public_key().0,
+        ) {
+            Ok(balance) => balance,
+            Err(_) => Amount::from_sat(0),
+        };
+
+        let total_collateral_locked = Amount::from_sat(
+            self.state.ipc_state.get_required_collateral()
+                * self.state.ipc_state.get_validators().len() as u64,
         );
-        println!("Bitcoin Address: {}", subnet_address);
+
+        (
+            withdrawable_amount,
+            total_subnet_balance,
+            total_collateral_locked,
+        )
+    }
+
+    pub fn print_state(&mut self, rpc: &Client) -> Result<(), SubnetSimulatorError> {
+        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.state.ipc_state =
+            match ipc_state::IPCState::load_state(format!("{}/ipc_state.json", self.subnet_id)) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(SubnetSimulatorError::SubnetStateError(
+                        SubnetStateError::CannotLoadIpcState(e),
+                    ))
+                }
+            };
+
+        self.state.ipc_state.print_state();
+
+        let (withdrawable_amount, total_subnet_balance, total_collateral_locked) =
+            self.get_all_amounts(rpc);
+
+        println!(
+            "Total subnet balance: {:?} BTC",
+            total_subnet_balance.to_btc()
+        );
+        println!(
+            "Total collateral locked by validators: {:?} BTC",
+            total_collateral_locked.to_btc()
+        );
+
+        println!(
+            "Total withdrawable amount by users: {:?} BTC",
+            withdrawable_amount.to_btc()
+        );
+
+        println!(
+            "Total amount left to cover fees: {:?} BTC",
+            (total_subnet_balance - total_collateral_locked - withdrawable_amount).to_btc()
+        );
+
         println!("Accounts:");
         for (address, account) in &self.state.accounts {
             println!("  {}: {} wSatoshis", address, account.balance);
@@ -498,6 +564,9 @@ pub enum SubnetStateError {
 
     #[error("account already exists")]
     AccountAlreadyExists,
+
+    #[error("error when loading IPC state")]
+    CannotLoadIpcState(#[from] crate::ipc_state::IpcStateError),
 
     #[error("cannot create account")]
     CannotCreateAccount,

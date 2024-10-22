@@ -367,7 +367,7 @@ pub fn commit_arbitrary_data(
 fn assemble_outpoints_for_target_amount(
     output: Vec<Utxo>,
     target_amount: u64,
-) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
+) -> Result<Vec<OutPoint>, BitcoinUtilsError> {
     let mut collected_outpoints = Vec::new();
     let mut total_collected: u64 = 0;
 
@@ -397,7 +397,7 @@ fn assemble_outpoints_for_target_amount(
     if total_collected >= target_amount {
         Ok(collected_outpoints)
     } else {
-        Err("Not enough funds".into())
+        Err(BitcoinUtilsError::InsufficientFunds)
     }
 }
 
@@ -405,7 +405,7 @@ pub fn collect_amount_for_wallet(
     rpc: &Client,
     amount: Amount,
     fee: Amount,
-) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
+) -> Result<Vec<OutPoint>, BitcoinUtilsError> {
     let unspent = rpc.list_unspent(None, None, None, None, None)?;
 
     let outpoints: Vec<Utxo> = unspent
@@ -444,12 +444,36 @@ pub fn collect_amount(
     amount: Amount,
     fee: Amount,
     pubkey: XOnlyPublicKey,
-) -> Result<Vec<OutPoint>, Box<dyn std::error::Error>> {
+) -> Result<Vec<OutPoint>, BitcoinUtilsError> {
     let desc = format!("tr({})", pubkey);
 
     let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
 
     assemble_outpoints_for_target_amount(result.unspents, amount.to_sat() + fee.to_sat())
+}
+
+/// Collects all UTXOs that can be spent by a specified pubkey.
+///
+/// # Arguments
+///
+/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
+/// * `pubkey` - The public key that can spend the utxos, of type `PublicKey`
+///
+/// # Returns
+///
+/// * `Amount` - The total amount of Bitcoin that the pubkey can spend
+pub fn get_balance(rpc: &Client, pubkey: XOnlyPublicKey) -> Result<Amount, BitcoinUtilsError> {
+    let desc = format!("tr({})", pubkey);
+
+    let result = rpc.scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(desc)])?;
+
+    let mut total = Amount::ZERO;
+
+    for utxo in result.unspents {
+        total += utxo.amount;
+    }
+
+    Ok(total)
 }
 
 /// Converts a given x_only_pubkey to a taproot address.
@@ -594,9 +618,17 @@ pub fn write_arbitrary_data(
         vout: 0,
     };
 
+    let script_pubkey = if pubkey.is_none() {
+        rpc.get_new_address(None, None)?
+            .assume_checked()
+            .script_pubkey()
+    } else {
+        receiver_address.script_pubkey()
+    };
+
     let output = TxOut {
         value: fee.reveal_fee,
-        script_pubkey: receiver_address.script_pubkey(),
+        script_pubkey,
     };
 
     // Reveal Transaction : Reveal the Arbitrary Data
@@ -646,12 +678,19 @@ pub fn calculate_fee(
             },
         };
 
-    let fee_rate = match estimate_fee_result.fee_rate {
+    let mut fee_rate = match estimate_fee_result.fee_rate {
         Some(fee_rate) => fee_rate,
         None => default_fee_rate,
     };
 
-    fee_rate * (total_tx_size_vbytes as u64) / 500
+    if fee_rate < Amount::from_sat(1000) {
+        fee_rate = Amount::from_sat(1000);
+    }
+    if fee_rate > Amount::from_sat(100000) {
+        fee_rate = Amount::from_sat(100000);
+    }
+
+    fee_rate * (total_tx_size_vbytes as u64) / 1000
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
@@ -705,7 +744,10 @@ pub fn create_withdraw_tx(
         script_pubkey: ScriptBuf::new_op_return(push_bytes),
     };
 
-    let mut all_txouts = vec![op_return_out, change];
+    let mut all_txouts = vec![op_return_out];
+    if change.value.to_sat() > 600 {
+        all_txouts.push(change);
+    }
     all_txouts.extend(additional_outputs);
 
     let unsigned_tx = transaction::Transaction {
@@ -1121,6 +1163,12 @@ pub enum BitcoinUtilsError {
 
     #[error("cannot generate prevouts")]
     CannotGeneratePrevouts,
+
+    #[error("cannot collect utxos")]
+    CannotCollectUtxos,
+
+    #[error("insufficient funds")]
+    InsufficientFunds,
 
     #[error("transaction could not be signed. tx: {:?}. errors: {:?}", tx, errors)]
     CannotSignTransaction {

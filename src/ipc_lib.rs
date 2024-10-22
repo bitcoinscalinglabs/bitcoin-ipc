@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use thiserror::Error;
-
+use bitcoin::ScriptBuf;
 use bitcoin::{
     address::NetworkUnchecked, secp256k1::PublicKey, Amount, Transaction, TxOut, XOnlyPublicKey,
 };
+use thiserror::Error;
 
 use crate::{
     bitcoin_utils::{
@@ -43,32 +43,25 @@ pub fn create_and_submit_create_child_tx(
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
-    let amount_to_send = Amount::from_btc(50.0)?;
-
     let commit_fee = bitcoin_utils::calculate_fee(&rpc, 2, 3, 65);
     let reveal_fee = bitcoin_utils::calculate_fee(&rpc, 1, 1, subnet_data.as_bytes().len());
 
     let fee = CommitRevealFee::new(commit_fee, reveal_fee);
 
-    let output = TxOut {
-        value: amount_to_send,
-        script_pubkey: subnet_address.script_pubkey(),
+    let op_return_out = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return([]),
     };
 
     let (commit_tx, reveal_tx) = write_arbitrary_data(
         &rpc,
-        amount_to_send,
+        Amount::ZERO,
         fee,
         subnet_data,
         subnet_address,
-        vec![output],
+        vec![op_return_out],
         None,
     )?;
-
-    println!("Commit size: {:?}", commit_tx.vsize());
-    println!("Commit fee: {:?}", commit_fee);
-    println!("Reveal size: {:?}", reveal_tx.vsize());
-    println!("Reveal fee: {:?}", reveal_fee);
 
     match test_and_submit(
         &rpc,
@@ -103,6 +96,7 @@ pub fn create_and_submit_create_child_tx(
 pub fn create_and_submit_join_child_tx(
     subnet_address: &bitcoin::Address,
     collateral: Amount,
+    initial_funding: Amount,
     validator_data: &str,
 ) -> Result<(), IpcLibError> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
@@ -110,7 +104,7 @@ pub fn create_and_submit_join_child_tx(
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
 
     let output = TxOut {
-        value: collateral,
+        value: collateral + initial_funding,
         script_pubkey: subnet_address.script_pubkey(),
     };
 
@@ -121,7 +115,7 @@ pub fn create_and_submit_join_child_tx(
 
     let (commit_tx, reveal_tx) = write_arbitrary_data(
         &rpc,
-        collateral,
+        collateral + initial_funding,
         fee,
         validator_data,
         subnet_address,
@@ -210,7 +204,6 @@ pub fn create_and_submit_delete_tx(
     source_subnet_bitcoin_address: bitcoin::Address,
     source_subnet_pk: PublicKey,
     validators: Vec<ValidatorData>,
-    collateral: Amount,
     simulator: &SubnetSimulator,
 ) -> Result<Transaction, IpcLibError> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
@@ -221,19 +214,23 @@ pub fn create_and_submit_delete_tx(
 
     let command = format!("t={}", crate::IPC_DELETE_SUBNET_TAG,);
 
+    let (_, total_subnet_balance, _) = simulator.get_all_amounts(&rpc);
+
+    let fee = bitcoin_utils::calculate_fee(&rpc, 2, 2 + tx_outs.len(), 65);
+
+    let per_validator = (total_subnet_balance - fee) / validators.len() as u64;
+
     for validator in validators.clone() {
         let tx_out = bitcoin::TxOut {
-            value: collateral,
+            value: per_validator,
             script_pubkey: validator.get_address().assume_checked().script_pubkey(),
         };
         tx_outs.push(tx_out);
     }
 
-    let fee = bitcoin_utils::calculate_fee(&rpc, 2, 2 + tx_outs.len(), 65);
-
     let delete_tx = bitcoin_utils::create_withdraw_tx(
         &rpc,
-        Amount::from_sat(collateral.to_sat() * validators.len() as u64),
+        total_subnet_balance - fee,
         fee,
         command.as_bytes(),
         tx_outs,
@@ -302,17 +299,10 @@ pub fn create_and_submit_transfer_tx(
     let mut total_value_per_subnet = HashMap::new();
 
     for (target_subnet_id, transfers) in transfer_map {
-        let map_result = match subnet_id_to_address.get(&target_subnet_id.clone()) {
-            Some(result) => result,
+        let script_pubkey = match subnet_id_to_address.get(&target_subnet_id.clone()) {
+            Some(address) => address.script_pubkey(),
             None => {
                 return Err(IpcLibError::SubnetIdNotFound);
-            }
-        };
-
-        let script_pubkey = match map_result {
-            Ok(address) => address.script_pubkey(),
-            Err(_) => {
-                return Err(IpcLibError::Internal);
             }
         };
 
@@ -362,10 +352,6 @@ pub fn create_and_submit_transfer_tx(
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(commit_tx.clone(), prevouts);
 
-    println!("Commit size: {:?}", commit_tx.vsize());
-    println!("Commit fee: {:?}", commit_fee);
-    println!("Reveal size: {:?}", reveal_tx.vsize());
-    println!("Reveal fee: {:?}", reveal_fee);
     if !submit_tx {
         return Ok((signed_transaction, reveal_tx));
     }
@@ -439,9 +425,6 @@ pub fn create_and_submit_withdraw_tx(
 
     // sign transaction with the subnetPK - the keypair of the subnet
     let signed_transaction = simulator.sign_transaction(withdraw_tx, prevouts);
-
-    println!("Size: {:?}", signed_transaction.vsize());
-    println!("Fee: {:?}", fee);
 
     if !submit_tx {
         return Ok(signed_transaction);

@@ -60,7 +60,9 @@ impl L1Manager {
                 }
             })?;
 
-        let required_collateral = get_user_input("Enter required collateral (in satoshis):")?;
+        let required_collateral = get_user_input(
+            "Enter required collateral (in satoshis - should be greater than 1000 satoshis):",
+        )?;
         let required_collateral: u64 =
             required_collateral
                 .parse()
@@ -68,24 +70,64 @@ impl L1Manager {
                     field: "collateral amount",
                 })?;
 
-        let answer = get_user_input(
+        if required_collateral < 1000 {
+            return Err(L1ManagerError::InvalidUserInputWithError {
+                field: "collateral amount",
+                error: "Amount too low. Amount must be at least 1000 satoshis",
+            });
+        }
+
+        let mut answer = get_user_input(
             format!(
-                "Are you sure you want to create a child subnet with collateral {:?} BTC? (press Enter to confirm/any other key+Enter to cancel)",
-                Amount::from_sat(required_collateral).to_btc()
+                "Are you sure you want to create a child where validators will lock {:?} BTC as collateral? (press Enter to confirm/any other key+Enter to cancel)",
+                Amount::from_sat(required_collateral).to_btc(),
             )
             .as_str(),
         )?;
 
-        if answer.is_empty() {
-            Ok(CreateChildArgs {
-                required_number_of_validators,
-                required_collateral,
-            })
-        } else {
-            Err(L1ManagerError::InvalidUserInput {
+        if !answer.is_empty() {
+            return Err(L1ManagerError::InvalidUserInput {
                 field: "Confiramtion",
-            })
+            });
         }
+
+        let required_initial_funding = get_user_input(
+            "Enter required initial subnet funding that each validator will contribute (in satoshis - should be between 1 and 50 BTC for usability reasons):",
+        )?;
+
+        let required_initial_funding: u64 =
+            required_initial_funding
+                .parse()
+                .map_err(|_| L1ManagerError::InvalidUserInput {
+                    field: "funding amount",
+                })?;
+
+        if !(100_000_000..5_000_000_000).contains(&required_initial_funding) {
+            return Err(L1ManagerError::InvalidUserInputWithError {
+                field: "funding amount",
+                error: "Amount not in specified range. Amount should be between 1 and 50 BTC",
+            });
+        }
+
+        answer = get_user_input(
+            format!(
+                "Are you sure you want to create a child with {:?} BTC required initial funding? (press Enter to confirm/any other key+Enter to cancel)",
+                Amount::from_sat(required_initial_funding).to_btc(),
+            )
+            .as_str(),
+        )?;
+
+        if !answer.is_empty() {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "Confiramtion",
+            });
+        }
+
+        Ok(CreateChildArgs {
+            required_number_of_validators,
+            required_collateral,
+            required_initial_funding,
+        })
     }
 
     pub fn create_child(&self, args: CreateChildArgs) -> Result<(), L1ManagerError> {
@@ -120,6 +162,12 @@ impl L1Manager {
         subnet_data.push_str(&format!(
             "required_collateral={}{}",
             args.required_collateral,
+            crate::DELIMITER
+        ));
+
+        subnet_data.push_str(&format!(
+            "required_initial_funding={}{}",
+            args.required_initial_funding,
             crate::DELIMITER
         ));
 
@@ -167,29 +215,55 @@ impl L1Manager {
         Ok(subnets[choice - 1].clone())
     }
 
-    pub fn join_child(&self) -> Result<(), L1ManagerError> {
+    pub fn parse_join_child_args(&self) -> Result<JoinChildArgs, L1ManagerError> {
         let ipc_state = self.choose_subnet()?;
 
         let ip = get_user_input("Enter validator's IP address:")?;
         let btc_address = get_user_input("Enter validator's btc address:")?;
         let username = get_user_input("Enter validator's name:")?;
 
+        let answer = get_user_input(format!("Are you sure that you want to join this subnet? You need to lock {:?} BTC as collateral and contribute {:?} BTC as initial funding. (press Enter to confirm/any other key+Enter to cancel)",
+            Amount::from_sat(ipc_state.get_required_collateral()).to_btc(),
+            Amount::from_sat(ipc_state.get_required_initial_funding()).to_btc(),
+        ).as_str())?;
+
+        if !answer.is_empty() {
+            return Err(L1ManagerError::InvalidUserInput {
+                field: "Confiramtion",
+            });
+        }
+
+        Ok(JoinChildArgs {
+            ip,
+            btc_address,
+            username,
+            ipc_state,
+        })
+    }
+
+    pub fn join_child(&self, args: JoinChildArgs) -> Result<(), L1ManagerError> {
         let mut validator_data = String::new();
         validator_data.push_str(crate::IPC_JOIN_SUBNET_TAG);
         validator_data.push_str(&format!(
             "{}ip={}{}",
             crate::DELIMITER,
-            ip,
+            args.ip,
             crate::DELIMITER
         ));
-        validator_data.push_str(&format!("btc_address={}{}", btc_address, crate::DELIMITER));
-        validator_data.push_str(&format!("username={}{}", username, crate::DELIMITER));
-        validator_data.push_str(&format!("subnet_id={}", ipc_state.get_subnet_id()));
 
-        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
+        validator_data.push_str(&format!(
+            "btc_address={}{}",
+            args.btc_address,
+            crate::DELIMITER
+        ));
+        validator_data.push_str(&format!("username={}{}", args.username, crate::DELIMITER));
+        validator_data.push_str(&format!("subnet_id={}", args.ipc_state.get_subnet_id()));
+
+        let subnet_bitcoin_address = &args.ipc_state.get_bitcoin_address();
         crate::ipc_lib::create_and_submit_join_child_tx(
             subnet_bitcoin_address,
-            Amount::from_sat(ipc_state.get_required_collateral()),
+            Amount::from_sat(args.ipc_state.get_required_collateral()),
+            Amount::from_sat(args.ipc_state.get_required_initial_funding()),
             &validator_data,
         )?;
 
@@ -199,15 +273,18 @@ impl L1Manager {
     pub fn deposit(&self) -> Result<(), L1ManagerError> {
         let ipc_state = self.choose_subnet()?;
 
-        let amount = get_user_input("Enter amount to deposit (in satoshis):")?;
+        let amount = get_user_input(
+            "Enter amount to deposit (in satoshis - must be more than 1000 satoshis):",
+        )?;
 
         let amount: u64 = amount
             .parse()
             .map_err(|_| L1ManagerError::InvalidUserInput { field: "amount" })?;
 
         if amount < 1000 {
-            return Err(L1ManagerError::InvalidUserInput {
-                field: "amount must be at least 1000 satoshis",
+            return Err(L1ManagerError::InvalidUserInputWithError {
+                field: "amount",
+                error: "Amount too low. Amount must be at least 1000 satoshis",
             });
         }
 
@@ -225,7 +302,7 @@ impl L1Manager {
             });
         }
 
-        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address()?;
+        let subnet_bitcoin_address = &ipc_state.get_bitcoin_address();
 
         let target_address = get_user_input("Enter target address:")?;
 
@@ -251,6 +328,14 @@ pub fn get_user_input(prompt: &str) -> Result<String, L1ManagerError> {
 pub struct CreateChildArgs {
     pub required_number_of_validators: u64,
     pub required_collateral: u64,
+    pub required_initial_funding: u64,
+}
+
+pub struct JoinChildArgs {
+    pub ip: String,
+    pub btc_address: String,
+    pub username: String,
+    pub ipc_state: IPCState,
 }
 
 #[derive(Error, Debug)]
@@ -260,6 +345,12 @@ pub enum L1ManagerError {
 
     #[error("invalid user input: {field}")]
     InvalidUserInput { field: &'static str },
+
+    #[error("invalid user input: {field}, error: {error}")]
+    InvalidUserInputWithError {
+        field: &'static str,
+        error: &'static str,
+    },
 
     #[error("no child subnet is available")]
     NoSubnetAvailable,

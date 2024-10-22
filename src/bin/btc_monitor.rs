@@ -48,7 +48,7 @@ fn parse_create_command(
 ) -> Result<IPCState, ParseIpcTransactionError> {
     let parts: Vec<&str> = witness_str.split(bitcoin_ipc::DELIMITER).collect();
 
-    if parts.len() != 4 {
+    if parts.len() != 5 {
         return Err(ParseIpcTransactionError::InvalidWitnessFormat);
     }
 
@@ -70,7 +70,14 @@ fn parse_create_command(
         .parse()
         .map_err(|_| ParseIpcTransactionError::CollateralZero)?;
 
-    let subnet_pk = match parts[3].strip_prefix("subnet_pk=") {
+    let required_initial_funding: u64 = parts[3]
+        .strip_prefix("required_initial_funding=")
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .map_err(|_| ParseIpcTransactionError::Internal)?;
+
+    let subnet_pk = match parts[4].strip_prefix("subnet_pk=") {
         Some(pk) => PublicKey::from_str(pk).map_err(|_| ParseIpcTransactionError::MissingPk)?,
         None => return Err(ParseIpcTransactionError::MissingPk),
     };
@@ -89,10 +96,11 @@ fn parse_create_command(
     let ipc_subnet_state = IPCState::new(
         subnet_id.to_string(),
         tx_in.previous_output.txid.to_string(),
-        subnet_address.to_string(),
+        subnet_address.as_unchecked().clone(),
         subnet_pk,
         required_number_of_validators,
         required_collateral,
+        required_initial_funding,
     );
 
     match ipc_subnet_state.save_state() {
@@ -187,14 +195,9 @@ fn parse_transfer_command(
             .iter()
             .find(|subnet| subnet.get_subnet_id() == target_subnet_id);
 
-        let subnet_bitcoin_address_result = match subnet {
+        let subnet_bitcoin_address = match subnet {
             Some(subnet) => subnet.get_bitcoin_address(),
             None => continue,
-        };
-
-        let subnet_bitcoin_address = match subnet_bitcoin_address_result {
-            Ok(address) => address,
-            Err(_) => continue,
         };
 
         let total_amount = transfers
@@ -247,12 +250,7 @@ fn parse_deposit_command(
     };
 
     for subnet in subnets {
-        let subnet_bitcoin_address = match subnet.get_bitcoin_address() {
-            Ok(address) => address,
-            Err(_) => return Err(ParseIpcTransactionError::CannotReadIpcState),
-        };
-
-        let script_pubkey = subnet_bitcoin_address.script_pubkey();
+        let script_pubkey = subnet.get_bitcoin_address().script_pubkey();
 
         for output in tx.clone().output {
             if script_pubkey == output.script_pubkey {

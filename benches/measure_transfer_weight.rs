@@ -1,9 +1,13 @@
 use bitcoin::Amount;
 use bitcoin::Transaction;
+use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::l1_manager::CreateChildArgs;
+use bitcoin_ipc::l1_manager::JoinChildArgs;
 use bitcoin_ipc::l1_manager::L1Manager;
 use bitcoin_ipc::subnet_simulator::SubnetSimulator;
 use bitcoin_ipc::subnet_simulator::TransferEvent;
+use bitcoin_ipc::utils;
+use bitcoincore_rpc::RpcApi;
 use core::time;
 use csv::Writer;
 use rand::{thread_rng, Rng};
@@ -55,6 +59,27 @@ fn main() -> Result<(), TestWeightError> {
 
     let mut manager = L1Manager::new()?;
 
+    let (rpc_user, rpc_pass, rpc_url, _) = match utils::load_env() {
+        Ok(env) => env,
+        Err(e) => {
+            return Err(TestWeightError::Other(Box::new(e)));
+        }
+    };
+
+    let rpc = match bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            return Err(TestWeightError::Other(Box::new(e)));
+        }
+    };
+
+    let btc_address = match rpc.get_new_address(None, None) {
+        Ok(a) => a.assume_checked(),
+        Err(e) => {
+            return Err(TestWeightError::Other(Box::new(e)));
+        }
+    };
+
     let existing_subnets: i64 = manager.update_and_get_subnets()?.len() as i64;
     let required_subnets: i64 = 10;
     if required_subnets - existing_subnets > 0 {
@@ -62,11 +87,24 @@ fn main() -> Result<(), TestWeightError> {
             let args = CreateChildArgs {
                 required_number_of_validators: 1,
                 required_collateral: 1000,
+                required_initial_funding: 5000000000,
             };
             manager.create_child(args)?;
         }
-        println!("Waiting for subnets to be created. Make sure the btc_manager is running.");
+        println!("Waiting for subnets to be created. Make sure the btc_monitor is running.");
         std::thread::sleep(time::Duration::from_secs(10));
+
+        for subnet in manager.update_and_get_subnets()? {
+            let join_args = JoinChildArgs {
+                ip: "1.1.1.1".to_string(),
+                btc_address: btc_address.to_string(),
+                username: "test".to_string(),
+                ipc_state: subnet,
+            };
+            manager.join_child(join_args)?;
+        }
+
+        println!("Waiting for subnets to be funded. Make sure the btc_monitor is running.");
     }
 
     for number_of_subnets in [1, 2, 5, 10] {
@@ -84,7 +122,8 @@ fn main() -> Result<(), TestWeightError> {
                 return Err(TestWeightError::NotEnoughSubnetsCreated);
             }
             let source_subnet = &all_subnets[0];
-            let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address()?;
+
+            let source_subnet_bitcoin_address = source_subnet.get_bitcoin_address();
             let source_subnet_simulator =
                 SubnetSimulator::new(source_subnet.get_subnet_id().as_str())?;
 

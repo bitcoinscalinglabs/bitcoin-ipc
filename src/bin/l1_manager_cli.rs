@@ -56,7 +56,10 @@ fn main() {
                 }
             },
 
-            3 => match manager.join_child() {
+            3 => match || -> Result<(), L1ManagerError> {
+                let args = manager.parse_join_child_args()?;
+                manager.join_child(args)
+            }() {
                 Ok(_) => {
                     println!("Transaction to join a child subnet has been submited to bitcoin, please wait for confirmation.");
                 }
