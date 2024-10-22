@@ -75,6 +75,10 @@ impl SubnetInteractor {
                     let _ = self.subnet.create_account(&address);
                 }
                 2 => {
+                    println!(
+                        "For simplicity, in the current stage of the prototype, L2 are set to 0.  These fees would be used by the subnet to cover the transaction fees of the Bitcoin network."
+                    );
+
                     let from = match get_user_input("Enter from account address:") {
                         Ok(a) => a,
                         Err(e) => {
@@ -142,6 +146,9 @@ impl SubnetInteractor {
                     println!("Checkpoint: {:?}", str_cp);
                 }
                 4 => {
+                    println!(
+                        "For simplicity, in the current stage of the prototype, L2 fees are set to 0. These fees would be used by the subnet to cover the transaction fees of the Bitcoin network."
+                    );
                     let address = match get_user_input("Enter account address:") {
                         Ok(a) => a,
                         Err(e) => {
