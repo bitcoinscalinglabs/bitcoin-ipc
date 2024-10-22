@@ -122,8 +122,7 @@ Whereas this plot also shows how the *amortized size* per withdraw changes as th
 
 
 ### Taking batching to the limits
-Similarly to the transfer batching, withdraw batching is also limited by the `standard transactions` size on bitcoin. To reach this limit, we increase the number of withdraws as long as the withdraw transaction fits  
-in less than 100K vB, which fits roughly 2300 withdraws. 
+Similarly to the transfer batching, withdraw batching is also limited by the `standard transactions` size on bitcoin. To reach this limit, we increase the number of withdraws as long as the withdraw transaction fits in less than 100K vB, which fits roughly 2300 withdraws. 
 
 
 From the first plot and the compression factor column we can see that even for *N=50* we reach 3-times compression, compared to standard bitcoin transfers.

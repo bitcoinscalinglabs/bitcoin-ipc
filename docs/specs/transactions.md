@@ -160,7 +160,7 @@ We model this as a functionality *transfer(transferData)*, where:
 
 It is implemented using the *writeArbitraryData(in, out, data)* functionality, where:
 - *in*: UTXO(s), spendable by the subnetPK of subnet_A
-- *out*: UTXO(s), each having a value corresponding to a certain transfer encoded in data, locked by the subnetPK of the destination subnet *subnetAddress*.
+- *out*: UTXO(s), one for each target subnet *subnetAddress*, with a value equal to the sum of all transfers to that *subnetAddress*, locked by the subnetPK of *subnetAddress*.
 - *data*: contains the *transferData*
 
 Example:
