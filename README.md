@@ -40,7 +40,7 @@ Remark: There is no need to sync with the Bitcoin network, since for the demo th
 2.2. Create or edit the `bitcoin.conf` file in the Bitcoin data directory and add the following configuration to enable regtest:
 
 ```sh
-cd ~/.bitcoin/
+cd  ~/Library/Application Support/Bitcoin/
 ```
 
 bitcoin.conf:
