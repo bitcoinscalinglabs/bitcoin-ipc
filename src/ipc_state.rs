@@ -181,7 +181,10 @@ impl IPCState {
         println!("#################################");
         // print in a more organized manner:
         println!("Subnet ID: {}", self.subnet_id);
-        println!("Bitcoin Address: {:?}", self.bitcoin_address.clone());
+        println!(
+            "Bitcoin Address: {:?}",
+            self.bitcoin_address.clone().assume_checked().to_string()
+        );
         println!("Subnet PK: {}", self.subnet_pk);
         println!("IPC Address: {}", self.ipc_address);
 
