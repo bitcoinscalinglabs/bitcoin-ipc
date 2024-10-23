@@ -144,7 +144,7 @@ pub fn submit_checkpoint(
     checkpoint_hash: [u8; 32],
     subnet_pk: PublicKey,
     simulator: SubnetSimulator,
-) -> Result<(), SubmitCheckpointError> {
+) -> Result<(), IpcLibError> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
     let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
     let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
@@ -161,11 +161,19 @@ pub fn submit_checkpoint(
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, checkpoint_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(checkpoint_tx.clone(), prevouts);
+    let (signed_transaction, signed) = simulator.sign_transaction(
+        checkpoint_tx.clone(),
+        prevouts,
+        IpcTransactionType::Checkpoint,
+    );
+
+    if !signed {
+        return Err(IpcLibError::ValidatorsDidNotSignTx);
+    }
 
     match test_and_submit(&rpc, vec![signed_transaction], miner_address) {
         Ok(_) => Ok(()),
-        Err(e) => Err(SubmitCheckpointError::BitcoinUtilsError(e)),
+        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
     }
 }
 
@@ -241,7 +249,12 @@ pub fn create_and_submit_delete_tx(
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, delete_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(delete_tx, prevouts);
+    let (signed_transaction, signed) =
+        simulator.sign_transaction(delete_tx, prevouts, IpcTransactionType::Delete);
+
+    if !signed {
+        return Err(IpcLibError::ValidatorsDidNotSignTx);
+    }
 
     match test_and_submit(&rpc, vec![signed_transaction.clone()], miner_address) {
         Ok(_) => Ok(signed_transaction),
@@ -350,7 +363,12 @@ pub fn create_and_submit_transfer_tx(
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, commit_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(commit_tx.clone(), prevouts);
+    let (signed_transaction, signed) =
+        simulator.sign_transaction(commit_tx.clone(), prevouts, IpcTransactionType::Transfer);
+
+    if !signed {
+        return Err(IpcLibError::ValidatorsDidNotSignTx);
+    }
 
     if !submit_tx {
         return Ok((signed_transaction, reveal_tx));
@@ -424,7 +442,12 @@ pub fn create_and_submit_withdraw_tx(
     let prevouts = bitcoin_utils::find_prevouts_for_tx(&rpc, withdraw_tx.clone())?;
 
     // sign transaction with the subnetPK - the keypair of the subnet
-    let signed_transaction = simulator.sign_transaction(withdraw_tx, prevouts);
+    let (signed_transaction, signed) =
+        simulator.sign_transaction(withdraw_tx, prevouts, IpcTransactionType::Withdraw);
+
+    if !signed {
+        return Err(IpcLibError::ValidatorsDidNotSignTx);
+    }
 
     if !submit_tx {
         return Ok(signed_transaction);
@@ -451,6 +474,9 @@ pub enum IpcLibError {
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error>),
 
+    #[error("Validators did not sign the transaction")]
+    ValidatorsDidNotSignTx,
+
     #[error("Subnet id not found")]
     SubnetIdNotFound,
 
@@ -458,17 +484,13 @@ pub enum IpcLibError {
     Internal,
 }
 
-#[derive(Error, Debug)]
-pub enum SubmitCheckpointError {
-    #[error("error when reading an environment variable")]
-    EnvVarError(#[from] std::env::VarError),
-
-    #[error("init rpc and wallet error")]
-    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
-
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error>),
-
-    #[error("internal error")]
-    Internal,
+#[derive(PartialEq, Eq)]
+pub enum IpcTransactionType {
+    CreateChild,
+    JoinChild,
+    Deposit,
+    Checkpoint,
+    Transfer,
+    Withdraw,
+    Delete,
 }

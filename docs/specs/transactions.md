@@ -210,5 +210,9 @@ Additionally, it has an OP_RETURN output that contains the *ipcDeleteKeyword*
 
 The OP_RETURN contains an IPC keyword *ipcWithdrawKeyword* to allow the btc_monitor to detect this transaction.
 The BTC monitor then proceeds to print a message that a particular subnet has been deleted and to delete the stored subnet state.
+If there are accounts with non-zero balance, although the delete command can be submitted to the postbox, 
+the transaction would not be sent by the relayer until all funds have been withdrawn from the network.
+Additionally, if a malicious relayer tries to gather signatures regardless of whether all funds have been withdrawn, the validators 
+would not sign the transaction under invalid conditions.
 
 

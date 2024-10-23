@@ -1,3 +1,4 @@
+use crate::ipc_lib::IpcTransactionType;
 use crate::ipc_state::IPCState;
 use crate::{bitcoin_utils, ipc_state};
 
@@ -274,23 +275,18 @@ impl SubnetSimulator {
         Ok(())
     }
 
+    pub fn check_non_zero_balances(&self) -> bool {
+        self.state
+            .accounts
+            .values()
+            .any(|account| account.balance > 0)
+    }
+
     pub fn delete(&mut self) -> Result<(), SubnetStateError> {
         self.update_states()?;
 
         if self.state.postbox.deletes.is_some() {
             println!("Delete request already submitted");
-            return Ok(());
-        }
-
-        if self
-            .state
-            .accounts
-            .values()
-            .any(|account| account.balance > 0)
-        {
-            println!(
-                "Cannot delete subnet with non-zero user balances. Wait for withdraws to complete."
-            );
             return Ok(());
         }
 
@@ -352,7 +348,17 @@ impl SubnetSimulator {
     /// # Returns
     ///
     /// * A signed transaction
-    pub fn sign_transaction(&self, mut tx: Transaction, prevouts: Vec<TxOut>) -> Transaction {
+    pub fn sign_transaction(
+        &self,
+        mut tx: Transaction,
+        prevouts: Vec<TxOut>,
+        tx_type: IpcTransactionType,
+    ) -> (Transaction, bool) {
+        if tx_type == IpcTransactionType::Delete && self.check_non_zero_balances() {
+            println!("Will not sign a delete subnet transaction when users have non-zero balances");
+            return (tx, false);
+        }
+
         let signatures: Vec<Vec<u8>> = tx
             .input
             .iter()
@@ -388,7 +394,7 @@ impl SubnetSimulator {
             println!("Signed input {}", i);
         }
 
-        tx
+        (tx, true)
     }
 
     pub fn get_postbox_transfers(&self) -> &BTreeMap<String, BTreeSet<TransferEvent>> {

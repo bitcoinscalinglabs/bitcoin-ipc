@@ -139,6 +139,10 @@ async fn check_postbox(subnet_id: &String) -> Result<(), RelayerError> {
     {
         let delete = simulator.get_postbox_delete();
         if delete.is_some() {
+            if simulator.check_non_zero_balances() {
+                println!("Can not handle delete when there are non-zero user balances, waiting for withdraws to be submitted.");
+                return Ok(());
+            }
             ipc_lib::create_and_submit_delete_tx(
                 source_subnet_bitcoin_address.clone(),
                 subnet.get_subnet_pk(),
