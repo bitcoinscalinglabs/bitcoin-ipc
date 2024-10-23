@@ -514,11 +514,14 @@ fn process_transaction(
                         println!("Executing the DELETE command...");
                         let subnet = match find_subnet_that_signed_tx(rpc, tx) {
                             Ok(subnet) => {
-                                println!("DELETE Command successfully parsed");
+                                println!(
+                                    "DELETE Command successfully parsed for subnet: {:?}",
+                                    subnet.get_subnet_id()
+                                );
                                 subnet
                             }
                             Err(e) => {
-                                println!("WITHDRAW Command could not be parsed. Error: {e}");
+                                println!("DELETE Command could not be parsed. Error: {e}");
                                 continue;
                             }
                         };
@@ -567,7 +570,7 @@ fn find_subnet_that_signed_tx(
             Err(_) => continue,
         }
     }
-    Err(BtcMonitorError::CheckpointError)
+    Err(BtcMonitorError::Internal)
 }
 
 #[derive(Error, Debug)]

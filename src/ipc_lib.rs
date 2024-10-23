@@ -214,7 +214,7 @@ pub fn create_and_submit_delete_tx(
 
     let command = format!("t={}", crate::IPC_DELETE_SUBNET_TAG,);
 
-    let (_, total_subnet_balance, _) = simulator.get_all_amounts(&rpc);
+    let (_, total_subnet_balance, _) = simulator.get_subnet_amounts(&rpc);
 
     let fee = bitcoin_utils::calculate_fee(&rpc, 2, 2 + tx_outs.len(), 65);
 

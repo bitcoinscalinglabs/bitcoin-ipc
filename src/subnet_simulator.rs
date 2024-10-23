@@ -119,7 +119,7 @@ impl SubnetSimulator {
     }
 
     pub fn create_account(&mut self, address: &String) -> Result<(), SubnetStateError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
         if self.state.accounts.contains_key(address) {
             return Err(SubnetStateError::AccountAlreadyExists);
         }
@@ -136,7 +136,7 @@ impl SubnetSimulator {
     }
 
     pub fn fund_account(&mut self, address: &String, amount: u64) -> Result<(), SubnetStateError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
 
         if !self.state.accounts.contains_key(address) {
             match self.create_account(address) {
@@ -169,7 +169,7 @@ impl SubnetSimulator {
         to: &String,
         amount: u64,
     ) -> Result<(), SubnetStateError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
 
         let from_account = match self.state.accounts.get_mut(from) {
             Some(a) => a,
@@ -242,7 +242,7 @@ impl SubnetSimulator {
         amount: u64,
         target_address: Address<NetworkUnchecked>,
     ) -> Result<(), SubnetStateError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
 
         let from_account = match self.state.accounts.get_mut(from) {
             Some(a) => a,
@@ -275,7 +275,24 @@ impl SubnetSimulator {
     }
 
     pub fn delete(&mut self) -> Result<(), SubnetStateError> {
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
+
+        if self.state.postbox.deletes.is_some() {
+            println!("Delete request already submitted");
+            return Ok(());
+        }
+
+        if self
+            .state
+            .accounts
+            .values()
+            .any(|account| account.balance > 0)
+        {
+            println!(
+                "Cannot delete subnet with non-zero user balances. Wait for withdraws to complete."
+            );
+            return Ok(());
+        }
 
         self.state.postbox.deletes = Some(DeleteEvent {
             subnet_id: self.subnet_id.clone(),
@@ -290,7 +307,7 @@ impl SubnetSimulator {
     pub fn get_checkpoint(&mut self) -> Result<[u8; 32], SubnetStateError> {
         println!("Computing state checkpoint...");
 
-        self.state = SubnetSimulator::load_state(&self.subnet_id)?;
+        self.update_states()?;
 
         // Disclaimer: this is not secure. It has not checked whether the serialization method and the BTreeMap
         // implementations avoid collisions.
@@ -412,18 +429,14 @@ impl SubnetSimulator {
         self.keypair
     }
 
-    pub fn get_withdrawable_amount(&self) -> Amount {
-        Amount::from_sat(
+    pub fn get_subnet_amounts(&self, rpc: &Client) -> (Amount, Amount, Amount) {
+        let withdrawable_amount = Amount::from_sat(
             self.state
                 .accounts
                 .values()
                 .map(|account| account.balance)
                 .sum(),
-        )
-    }
-
-    pub fn get_all_amounts(&self, rpc: &Client) -> (Amount, Amount, Amount) {
-        let withdrawable_amount = self.get_withdrawable_amount();
+        );
 
         let total_subnet_balance = match bitcoin_utils::get_balance(
             rpc,
@@ -445,22 +458,24 @@ impl SubnetSimulator {
         )
     }
 
-    pub fn print_state(&mut self, rpc: &Client) -> Result<(), SubnetSimulatorError> {
+    pub fn update_states(&mut self) -> Result<(), SubnetStateError> {
         self.state = SubnetSimulator::load_state(&self.subnet_id)?;
         self.state.ipc_state =
             match ipc_state::IPCState::load_state(format!("{}/ipc_state.json", self.subnet_id)) {
                 Ok(s) => s,
-                Err(e) => {
-                    return Err(SubnetSimulatorError::SubnetStateError(
-                        SubnetStateError::CannotLoadIpcState(e),
-                    ))
-                }
+                Err(e) => return Err(SubnetStateError::CannotLoadIpcState(e)),
             };
+
+        Ok(())
+    }
+
+    pub fn print_state(&mut self, rpc: &Client) -> Result<(), SubnetSimulatorError> {
+        self.update_states()?;
 
         self.state.ipc_state.print_state();
 
         let (withdrawable_amount, total_subnet_balance, total_collateral_locked) =
-            self.get_all_amounts(rpc);
+            self.get_subnet_amounts(rpc);
 
         println!(
             "Total subnet balance: {:?} BTC",
