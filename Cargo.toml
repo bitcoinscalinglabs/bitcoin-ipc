@@ -17,6 +17,8 @@ hex = "0.4.3"
 rand = "0.8.5"
 tokio = { version = "1.40.0", features = ["full"] }
 csv = "1.3.0"
+jsonrpc-v2 = "0.13.0"
+actix-web = "4"
 
 [[bin]]
 name = "measure_transfer_weight"
