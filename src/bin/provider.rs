@@ -46,6 +46,39 @@ async fn getblockcount(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError>
     }
 }
 
+async fn getconfirmedblock(data: Data<Arc<ServerData>>) -> Result<String, JsonRpcError> {
+    let client = data.btc_rpc.as_ref();
+
+    let confirmations = data.config.ipc_finalization_parameter;
+
+    match client.get_block_count() {
+        Ok(current_height) => {
+            if current_height < confirmations {
+                return Err(JsonRpcError::Full {
+                    code: -1,
+                    message: "Not enough blocks to have a final block".to_string(),
+                    data: None,
+                });
+            }
+
+            let final_block_height = current_height - confirmations;
+            match client.get_block_hash(final_block_height) {
+                Ok(block_hash) => Ok(block_hash.to_string()),
+                Err(e) => Err(JsonRpcError::Full {
+                    code: -1,
+                    message: e.to_string(),
+                    data: None,
+                }),
+            }
+        }
+        Err(e) => Err(JsonRpcError::Full {
+            code: -1,
+            message: e.to_string(),
+            data: None,
+        }),
+    }
+}
+
 fn make_bitcoincore_rpc() -> Arc<Client> {
     let (rpc_user, rpc_pass, rpc_url, wallet_name) = match utils::load_env() {
         Ok(env) => env,
@@ -92,6 +125,7 @@ async fn main() -> std::io::Result<()> {
         .with_data(Data::new(server_data))
         .with_method("getblockhash", getblockhash)
         .with_method("getblockcount", getblockcount)
+        .with_method("getconfirmedblock", getconfirmedblock)
         .finish();
 
     // Start up the actix-web server
