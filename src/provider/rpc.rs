@@ -4,6 +4,8 @@ use jsonrpc_v2::{Data, Error as JsonRpcError, MapRouter, Params};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
+
 #[derive(Clone)]
 pub struct ServerData {
     pub btc_rpc: Arc<Client>,
@@ -77,7 +79,7 @@ pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, 
     }
 }
 
-pub fn make_rpc_server(server_data: Arc<ServerData>) -> Arc<jsonrpc_v2::Server<MapRouter>> {
+pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
         .with_method("getblockhash", get_block_hash)
