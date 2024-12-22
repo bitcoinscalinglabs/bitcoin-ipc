@@ -87,7 +87,7 @@ impl L1Manager {
 
         if !answer.is_empty() {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "Confiramtion",
+                field: "Confirmation",
             });
         }
 
@@ -119,7 +119,7 @@ impl L1Manager {
 
         if !answer.is_empty() {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "Confiramtion",
+                field: "Confirmation",
             });
         }
 
@@ -229,7 +229,7 @@ impl L1Manager {
 
         if !answer.is_empty() {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "Confiramtion",
+                field: "Confirmation",
             });
         }
 
@@ -298,7 +298,7 @@ impl L1Manager {
 
         if !answer.is_empty() {
             return Err(L1ManagerError::InvalidUserInput {
-                field: "Confiramtion",
+                field: "Confirmation",
             });
         }
 

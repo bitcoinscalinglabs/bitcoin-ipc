@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::{env, fs::File, io::Read};
 use thiserror::Error;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub listener_interval: u64,
     pub ipc_finalization_parameter: u64,
