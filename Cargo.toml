@@ -20,11 +20,3 @@ csv = "1.3.0"
 jsonrpc-v2 = "0.13.0"
 actix-web = "4"
 actix-web-httpauth = "0.8.2"
-
-[[bin]]
-name = "measure_transfer_weight"
-path = "benches/measure_transfer_weight.rs"
-
-[[bin]]
-name = "measure_withdraw_weight"
-path = "benches/measure_withdraw_weight.rs"

@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
-use bitcoin::script::PushBytes;
+use bitcoin::script::{Instruction, PushBytes};
 use bitcoin::secp256k1::{All, Keypair, Secp256k1};
 use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{
@@ -1127,6 +1127,34 @@ pub fn verify_taproot_signature(
     Ok(false)
 }
 
+fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
+    let mut concatenated_data = Vec::new();
+
+    let script = ScriptBuf::from(witness.to_vec().clone());
+
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => {
+                concatenated_data.extend_from_slice(bytes.as_bytes());
+            }
+            Ok(Instruction::Op(op))
+                if op == bitcoin::opcodes::all::OP_DROP || op == bitcoin::opcodes::OP_TRUE =>
+            {
+                // Do nothing, ignore these opcodes
+            }
+            // Return an error if any other instruction is encountered
+            Ok(_) => {
+                return Err(BitcoinUtilsError::UnsuportedOpCode);
+            }
+            Err(_) => {
+                return Err(BitcoinUtilsError::ErrorParsingWitnessScript);
+            }
+        }
+    }
+
+    Ok(concatenated_data)
+}
+
 #[derive(Error, Debug)]
 pub enum BitcoinUtilsError {
     #[error("cannot connect to the bitcoin node")]
@@ -1148,6 +1176,12 @@ pub enum BitcoinUtilsError {
 
     #[error("an error occured when building a taproot transaction")]
     TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
+
+    #[error("unsupported opcode")]
+    UnsuportedOpCode,
+
+    #[error("error parsing witness script")]
+    ErrorParsingWitnessScript,
 
     #[error("tried to finalize a taproot transaction builder that is not ready")]
     BuilderNotFinalizable,
