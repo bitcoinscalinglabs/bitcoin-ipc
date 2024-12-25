@@ -13,7 +13,7 @@ use bitcoin::{
     amount::Amount,
     bip32::Xpriv,
     blockdata::{locktime::absolute::LockTime, script, transaction, witness::Witness},
-    key::{rand, TapTweak, TweakedPublicKey},
+    key::{TapTweak, TweakedPublicKey},
     opcodes::{self, all::OP_DROP, OP_TRUE},
     secp256k1::{schnorr::Signature, Message},
     sighash::{Prevouts, SighashCache},
@@ -68,6 +68,22 @@ pub fn create_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey 
     x_only_pubkey
 }
 
+pub fn make_rpc_client_from_env() -> Client {
+    let rpc_user = std::env::var("RPC_USER").expect("RPC_USER env var not defined");
+    let rpc_pass = std::env::var("RPC_PASS").expect("RPC_PASS env var not defined");
+    let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
+    let wallet_name = std::env::var("WALLET_NAME").expect("WALLET_NAME env var not defined");
+
+    let rpc = match init_rpc_client(rpc_user, rpc_pass, rpc_url) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            panic!("Error: {}", e);
+        }
+    };
+    let _ = rpc.load_wallet(&wallet_name);
+    rpc
+}
+
 /// This function initializes a Bitcoin RPC client.
 /// The function creates a new RPC client using the provided RPC user, RPC password,
 /// and RPC URL. The function returns the initialized RPC client
@@ -88,56 +104,6 @@ pub fn init_rpc_client(
 ) -> Result<Client, BitcoinUtilsError> {
     let rpc = Client::new(&rpc_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
-}
-
-/// This function initializes a Bitcoin wallet.
-/// If the wallet exists, the function loads the existing wallet.
-/// If the wallet doesn't exist, the function creates a new wallet using the provided wallet name and network
-/// and generates 101 blocks to fund the wallet.
-///
-/// # Arguments
-///
-/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
-/// * `network` - The Bitcoin network for which the wallet is created. This is of type `Network`
-/// * `wallet` - The name of the wallet to create or load
-///
-/// # Returns
-/// * `(Address, Option<Transaction>, u32)` - A tuple containing the wallet address, the coinbase transaction, and the vout index
-pub fn init_wallet(
-    rpc: &Client,
-    network: Network,
-    wallet: &str,
-) -> Result<(Address, Option<Transaction>, u32), BitcoinUtilsError> {
-    let random_number = rand::random::<usize>().to_string();
-    let random_label = random_number.as_str();
-
-    let mut created_wallet = false;
-
-    if rpc.create_wallet(wallet, None, None, None, None).is_ok() {
-        created_wallet = true;
-    }
-
-    let _ = rpc.load_wallet(wallet);
-    let mut coinbase_tx = None;
-
-    let address = rpc
-        .get_new_address(Some(random_label), None)?
-        .require_network(network)?;
-
-    if created_wallet {
-        rpc.generate_to_address(102, &address)?;
-
-        let coinbase_txid = rpc
-            .list_transactions(Some(random_label), Some(102), Some(101), None)?
-            .first()
-            .ok_or(BitcoinUtilsError::Internal)?
-            .info
-            .txid;
-
-        coinbase_tx = Some(rpc.get_transaction(&coinbase_txid, None)?.transaction()?);
-    }
-
-    Ok((address, coinbase_tx, 0))
 }
 
 /// This function tests and submits a set of transactions to the Bitcoin network.

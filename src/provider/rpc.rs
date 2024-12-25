@@ -92,7 +92,7 @@ pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, 
 
     match client.get_block_count() {
         Ok(current_height) => {
-            // Since BTC_CONFIRMATIONS is 0 in regtest and testnet
+            // Since BTC_CONFIRMATIONS is 0 in regtest and sigtest
             // Clippy will complain about absurd comparisons
             #[allow(clippy::absurd_extreme_comparisons)]
             if current_height < BTC_CONFIRMATIONS {
