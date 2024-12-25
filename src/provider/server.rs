@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use actix_web::middleware::Logger;
 use actix_web_httpauth::extractors::bearer::BearerAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
+use log::info;
 
 use super::rpc;
 
@@ -42,8 +44,8 @@ impl Server {
 
         let port = &self.port;
         let addr = format!("127.0.0.1:{}", port);
-        println!("Server is running on http://127.0.0.1:{}", port);
-        println!("Provider available at http://127.0.0.1:{}/api", port);
+        info!("Server is running on http://127.0.0.1:{}", port);
+        info!("Provider available at http://127.0.0.1:{}/api", port);
 
         let token = self.token.clone();
 
@@ -55,11 +57,14 @@ impl Server {
                 async move { auth_guard(req, credentials, token).await }
             });
 
-            actix_web::App::new().wrap(auth).service(
-                actix_web::web::service("/api")
-                    .guard(actix_web::guard::Post())
-                    .finish(rpc_server.into_web_service()),
-            )
+            actix_web::App::new()
+                .wrap(Logger::default())
+                .wrap(auth)
+                .service(
+                    actix_web::web::service("/api")
+                        .guard(actix_web::guard::Post())
+                        .finish(rpc_server.into_web_service()),
+                )
         })
         .bind(addr)?
         .run()

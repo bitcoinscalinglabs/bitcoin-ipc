@@ -1,4 +1,3 @@
-use dotenv::dotenv;
 use serde::Deserialize;
 use std::{env, fs::File, io::Read};
 use thiserror::Error;
@@ -17,7 +16,6 @@ pub struct Config {
 ///
 /// A tuple containing the RPC user, RPC password, RPC URL, and wallet name
 pub fn load_env() -> Result<(String, String, String, String), env::VarError> {
-    dotenv().ok();
     let rpc_user = env::var("RPC_USER")?;
     let rpc_pass = env::var("RPC_PASS")?;
     let rpc_url = env::var("RPC_URL")?;

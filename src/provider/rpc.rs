@@ -2,6 +2,7 @@ use crate::{bitcoin_utils::create_multisig_address, utils, NETWORK};
 use bitcoin::{Amount, XOnlyPublicKey};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{str::FromStr, sync::Arc};
@@ -139,8 +140,6 @@ pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<CreateSubnetParams>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
-    println!("create_subnet");
-
     if params.min_validators == 0 {
         return Err(RpcError::InvalidParams(
             "The minimum number of validators must be greater than 0".to_string(),
@@ -183,7 +182,7 @@ pub async fn create_subnet(
     // Create a multisig address from the public keys
     let multisig_address = create_multisig_address(&public_keys, required_sigs, NETWORK);
 
-    println!("multisig_address: {}", multisig_address);
+    debug!("multisig_address: {}", multisig_address);
 
     let mut params_map = std::collections::HashMap::new();
     params_map.insert(
@@ -213,7 +212,7 @@ pub async fn create_subnet(
         subnet_data.push_str(&format!("{}{}={}", crate::DELIMITER, key, value));
     }
 
-    println!("subnet_data: {}", subnet_data);
+    debug!("subnet_data: {}", subnet_data);
 
     // Create and submit the create child transaction
     let (commit_tx, _) = crate::ipc_lib::create_and_submit_create_child_tx(
@@ -228,6 +227,8 @@ pub async fn create_subnet(
 
     // Generate the subnet ID
     let subnet_id = format!("{}/{}", crate::L1_NAME, commit_tx_id);
+
+    debug!("subnet_id: {}", subnet_id);
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })

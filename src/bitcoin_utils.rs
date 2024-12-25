@@ -1,4 +1,5 @@
 use bitcoin::{BlockHash, Txid};
+use log::{debug, error};
 use std::cmp::min;
 use std::vec;
 use thiserror::Error;
@@ -159,9 +160,9 @@ pub fn test_and_submit(
     };
 
     let print_mempool_failure_message = || {
-        println!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
+        error!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
         for (i, tx) in txs.iter().enumerate() {
-            println!("Transaction #{}: {}", i + 1, tx.raw_hex());
+            error!("Transaction #{}: {}", i + 1, tx.raw_hex());
         }
     };
 
@@ -176,10 +177,9 @@ pub fn test_and_submit(
         }
     }
 
-    for (i, tx) in txs.iter().enumerate() {
-        println!(
-            "Submitting transaction #{}: {}",
-            i + 1,
+    for tx in txs {
+        debug!(
+            "send_raw_transaction: {}",
             rpc.send_raw_transaction(tx.raw_hex())?
         );
     }

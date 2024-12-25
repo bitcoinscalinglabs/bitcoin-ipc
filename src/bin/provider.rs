@@ -1,5 +1,7 @@
 use bitcoin_ipc::provider;
 use bitcoin_ipc::{bitcoin_utils, utils};
+use dotenv::dotenv;
+use log::error;
 use std::sync::Arc;
 
 use bitcoincore_rpc::{Client, RpcApi};
@@ -24,6 +26,14 @@ fn make_bitcoincore_rpc() -> Arc<Client> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Load .env file
+
+    dotenv().ok();
+
+    // Initialize the logger, configurable by the RUST_LOG env
+
+    env_logger::init();
+
     // Init the bitcoincore_rpc client
 
     let btc_rpc = make_bitcoincore_rpc();
@@ -33,7 +43,7 @@ async fn main() -> std::io::Result<()> {
     let config = match utils::load_config() {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("Couldn't load provider config: {}", e);
+            error!("Couldn't load provider config: {}", e);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Couldn't load provider config",
@@ -44,7 +54,7 @@ async fn main() -> std::io::Result<()> {
     // Load auth token from env
 
     let token = std::env::var("PROVIDER_AUTH_TOKEN").map_err(|e| {
-        eprintln!("Couldn't load PROVIDER_AUTH_TOKEN: {}", e);
+        error!("Couldn't load PROVIDER_AUTH_TOKEN: {}", e);
         std::io::Error::new(
             std::io::ErrorKind::Other,
             "Couldn't load PROVIDER_AUTH_TOKEN",
