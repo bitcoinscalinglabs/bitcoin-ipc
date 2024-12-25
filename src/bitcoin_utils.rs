@@ -40,6 +40,16 @@ impl CommitRevealFee {
     }
 }
 
+/// Returns the number of blocks to wait for before considering a
+/// confirmed in a given network.
+pub const fn confirmations(network: Network) -> u64 {
+    use Network::*;
+    match network {
+        Bitcoin | Testnet => 6,
+        Regtest | Signet | _ => 0,
+    }
+}
+
 /// This function creates an unspendable internal key. The internal key is created
 /// by generating a random secret key and deriving the corresponding public key.
 ///
@@ -798,7 +808,7 @@ pub fn create_checkpoint_tx(
         Some(&subnet_address),
     )?;
 
-    let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::DELIMITER);
+    let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::IPC_TAG_DELIMITER);
 
     let data_bytes = [data.as_bytes(), &checkpoint_hash].concat();
 
@@ -858,7 +868,7 @@ pub fn create_deposit_tx(
 
     let change = create_change_txout(rpc, &input_info, amount_to_send, fee, None)?;
 
-    let data = format!("{}{}", crate::IPC_DEPOSIT_TAG, crate::DELIMITER);
+    let data = format!("{}{}", crate::IPC_DEPOSIT_TAG, crate::IPC_TAG_DELIMITER);
 
     let target_address_bytes = deposit_address.as_bytes();
 

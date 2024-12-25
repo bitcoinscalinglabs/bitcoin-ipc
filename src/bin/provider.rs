@@ -1,5 +1,5 @@
+use bitcoin_ipc::bitcoin_utils;
 use bitcoin_ipc::provider;
-use bitcoin_ipc::{bitcoin_utils, utils};
 use dotenv::dotenv;
 use log::error;
 use std::sync::Arc;
@@ -7,12 +7,10 @@ use std::sync::Arc;
 use bitcoincore_rpc::{Client, RpcApi};
 
 fn make_bitcoincore_rpc() -> Arc<Client> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = match utils::load_env() {
-        Ok(env) => env,
-        Err(e) => {
-            panic!("Error: {}", e);
-        }
-    };
+    let rpc_user = std::env::var("RPC_USER").expect("RPC_USER env var not defined");
+    let rpc_pass = std::env::var("RPC_PASS").expect("RPC_PASS env var not defined");
+    let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
+    let wallet_name = std::env::var("WALLET_NAME").expect("WALLET_NAME env var not defined");
 
     let rpc = match bitcoin_utils::init_rpc_client(rpc_user, rpc_pass, rpc_url) {
         Ok(rpc) => rpc,
@@ -38,19 +36,6 @@ async fn main() -> std::io::Result<()> {
 
     let btc_rpc = make_bitcoincore_rpc();
 
-    // Load the provider config
-
-    let config = match utils::load_config() {
-        Ok(config) => config,
-        Err(e) => {
-            error!("Couldn't load provider config: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Couldn't load provider config",
-            ));
-        }
-    };
-
     // Load auth token from env
 
     let token = std::env::var("PROVIDER_AUTH_TOKEN").map_err(|e| {
@@ -64,7 +49,7 @@ async fn main() -> std::io::Result<()> {
     // Start up the actix-web server
     let port = std::env::var("PROVIDER_PORT").unwrap_or_else(|_| "3030".to_string());
 
-    let server_data = Arc::new(provider::ServerData { btc_rpc, config });
+    let server_data = Arc::new(provider::ServerData { btc_rpc });
 
     provider::Server::new(token, port, server_data)
         .serve()
