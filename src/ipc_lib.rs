@@ -229,7 +229,7 @@ mod tests {
         assert!(serialized.contains(&format!("{}active_validators_limit=20", IPC_TAG_DELIMITER)));
         assert!(serialized.contains(&format!("{}min_cross_msg_fee=50", IPC_TAG_DELIMITER)));
         assert!(serialized.contains(&format!(
-            "{}whitelist=[\"{}\",\"{}\"]",
+            "{}whitelist={},{}",
             IPC_TAG_DELIMITER, VALIDATOR1, VALIDATOR2
         )));
     }
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn test_ipc_create_subnet_msg_deserialize() {
         let serialized = format!(
-            "{}{}min_validator_stake=1000{}min_validators=2{}bottomup_check_period=10{}active_validators_limit=20{}min_cross_msg_fee=50{}whitelist=[\"{}\",\"{}\"]",
+            "{}{}min_validator_stake=1000{}min_validators=2{}bottomup_check_period=10{}active_validators_limit=20{}min_cross_msg_fee=50{}whitelist={},{}",
             IPC_CREATE_SUBNET_TAG,
             IPC_TAG_DELIMITER,
             IPC_TAG_DELIMITER,

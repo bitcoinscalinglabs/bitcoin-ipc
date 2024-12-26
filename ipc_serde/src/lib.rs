@@ -3,7 +3,10 @@ use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Expr, Fields};
 
 /// Derive macro for IPC serialization — a custom serialization format for IPC messages in
-/// Bitcoin transactions. Uses serde_json to serialize and deserialize individual fields.
+/// Bitcoin transactions.
+///
+/// Uses serde_json to serialize and deserialize individual fields.
+/// Differrent rules for serialization can be defined for different types.
 #[proc_macro_derive(IPCSerialize, attributes(tag))]
 pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -28,17 +31,33 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     let insert_fields = fields.iter().map(|field| {
         let field_name = &field.ident;
         let field_name_str = field_name.as_ref().unwrap().to_string();
-        quote! {
-            params_map.insert(#field_name_str, serde_json::to_string(&self.#field_name).unwrap());
+
+        // Handle Vec<String> fields separately
+        if &field.ty == &syn::parse_quote!(Vec<String>) {
+            quote! {
+                params_map.insert(#field_name_str, self.#field_name.join(","));
+            }
+        } else {
+		    quote! {
+		        params_map.insert(#field_name_str, serde_json::to_string(&self.#field_name).unwrap());
+		    }
         }
     });
 
     let deserialize_fields = fields.iter().map(|field| {
          let field_name = &field.ident;
          let field_name_str = field_name.as_ref().unwrap().to_string();
-         quote! {
-             #field_name: serde_json::from_str(&params_map.remove(#field_name_str).unwrap_or_default()).unwrap_or_default(),
-         }
+
+         // Handle Vec<String> fields separately
+         if &field.ty == &syn::parse_quote!(Vec<String>) {
+            quote! {
+                #field_name: params_map.remove(#field_name_str).unwrap_or_default().split(',').map(|s| s.to_string()).collect(),
+            }
+        } else {
+	        quote! {
+	            #field_name: serde_json::from_str(&params_map.remove(#field_name_str).unwrap_or_default()).unwrap_or_default(),
+	        }
+        }
      });
 
     let expanded = quote! {
