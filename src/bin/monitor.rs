@@ -1,4 +1,4 @@
-use bitcoin_ipc::bitcoin_utils::make_rpc_client_from_env;
+use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::BTC_CONFIRMATIONS;
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
@@ -43,6 +43,7 @@ async fn main() {
     // Wait for a termination signal (e.g., Ctrl+C) or the spawned task to complete
     tokio::select! {
         _ = signal::ctrl_c() => {
+            println!(); // print new line after ^C
             info!("Received Ctrl+C");
         }
         result = rx => {
@@ -166,7 +167,46 @@ impl Monitor {
         tx: &bitcoin::Transaction,
         _block_height: u64,
     ) -> Result<(), bitcoincore_rpc::Error> {
-        debug!("Processing transaction {}", tx.compute_txid());
+        let txid = tx.compute_txid();
+        debug!("Processing transaction {}", txid);
+
+        // Process inputs
+
+        for input in &tx.input {
+            // TODO check more efficiently if witness has IPC tag
+            for witness in input.witness.iter().filter(|w| !w.is_empty()) {
+                // Reconstruct the witness data
+                let concatenated_data = match concatenate_op_push_data(witness) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+
+                let witness_str = find_valid_utf8(&concatenated_data);
+                if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
+                    debug!(
+                        "Transaction {} contains tag '{}'. Witness: {}",
+                        txid,
+                        bitcoin_ipc::IPC_CREATE_SUBNET_TAG,
+                        &witness_str
+                    );
+                    debug!("Command: {}", witness_str);
+                }
+            }
+        }
+
         Ok(())
     }
+}
+
+fn find_valid_utf8(data: &[u8]) -> &str {
+    let mut start = 0;
+    while start < data.len() {
+        match std::str::from_utf8(&data[start..]) {
+            Ok(valid_str) => return valid_str,
+            Err(_) => start += 1,
+        }
+    }
+    ""
 }

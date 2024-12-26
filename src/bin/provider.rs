@@ -4,6 +4,8 @@ use dotenv::dotenv;
 use log::error;
 use std::sync::Arc;
 
+const DEFAULT_PROVIDER_PORT: &str = "3030";
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Load .env file
@@ -30,7 +32,7 @@ async fn main() -> std::io::Result<()> {
 
     // Start up the actix-web server
 
-    let port = std::env::var("PROVIDER_PORT").unwrap_or_else(|_| "3030".to_string());
+    let port = std::env::var("PROVIDER_PORT").unwrap_or_else(|_| DEFAULT_PROVIDER_PORT.to_string());
 
     let server_data = Arc::new(provider::ServerData { btc_rpc });
 
