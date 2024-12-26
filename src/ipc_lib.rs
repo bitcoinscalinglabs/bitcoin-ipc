@@ -1,5 +1,5 @@
-use bitcoin::ScriptBuf;
 use bitcoin::{Amount, Transaction, TxOut};
+use bitcoin::{ScriptBuf, XOnlyPublicKey};
 use ipc_serde::IPCSerialize;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -42,21 +42,35 @@ impl IPCTag {
 }
 
 impl std::str::FromStr for IPCTag {
-    type Err = ();
+    type Err = IPCSerializeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             IPC_CREATE_SUBNET_TAG => Ok(Self::CreateSubnet),
-            _ => Err(()),
+            _ => Err(IPCSerializeError::UnknownTag(s.to_string())),
         }
     }
 }
 
 // IPCSerialize trait
 
+#[derive(Debug, Error)]
+pub enum IPCSerializeError {
+    #[error("Missing field: {0}")]
+    MissingField(String),
+    #[error("Error parsing field {0}: {1}")]
+    ParseFieldError(String, String),
+    #[error("Unknown IPC tag: {0}")]
+    UnknownTag(String),
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+}
+
 pub trait IPCSerialize {
     fn ipc_serialize(&self) -> String;
-    fn ipc_deserialize(s: &str) -> Self;
+    fn ipc_deserialize(s: &str) -> Result<Self, IPCSerializeError>
+    where
+        Self: Sized;
 }
 
 // IPC Messages
@@ -77,7 +91,7 @@ pub struct IPCCreateSubnetMsg {
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub min_cross_msg_fee: Amount,
     /// The addresses of whitelisted validators
-    pub whitelist: Vec<String>,
+    pub whitelist: Vec<XOnlyPublicKey>,
 }
 
 // Define the IPCMessage enum
@@ -87,16 +101,18 @@ pub enum IPCMessage {
 }
 
 impl IPCMessage {
-    pub fn deserialize(s: &str) -> Option<Self> {
-        let tag = s.split(IPC_TAG_DELIMITER).next()?;
+    pub fn deserialize(s: &str) -> Result<Self, IPCSerializeError> {
+        let tag = s
+            .split(IPC_TAG_DELIMITER)
+            .next()
+            .ok_or_else(|| IPCSerializeError::DeserializationError("Missing tag".to_string()))?;
 
         // Temporary clippy warning because there is only one value
         #[allow(clippy::manual_map)]
-        match IPCTag::from_str(tag) {
-            Ok(IPCTag::CreateSubnet) => Some(IPCMessage::CreateSubnet(
-                IPCCreateSubnetMsg::ipc_deserialize(s),
+        match IPCTag::from_str(tag)? {
+            IPCTag::CreateSubnet => Ok(IPCMessage::CreateSubnet(
+                IPCCreateSubnetMsg::ipc_deserialize(s)?,
             )),
-            Err(_) => None,
         }
     }
 }
@@ -191,9 +207,6 @@ pub enum IpcTransactionType {
 mod tests {
     use super::*;
 
-    const VALIDATOR1: &str = "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166";
-    const VALIDATOR2: &str = "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df";
-
     #[test]
     fn test_ipc_tag_as_str() {
         assert_eq!(IPCTag::CreateSubnet.as_str(), IPC_CREATE_SUBNET_TAG);
@@ -210,13 +223,22 @@ mod tests {
 
     #[test]
     fn test_ipc_create_subnet_msg_serialize() {
+        let validator1 = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+        let validator2 = XOnlyPublicKey::from_str(
+            "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df",
+        )
+        .unwrap();
+
         let params = IPCCreateSubnetMsg {
             min_validator_stake: 1000,
             min_validators: 2,
             bottomup_check_period: 10,
             active_validators_limit: 20,
             min_cross_msg_fee: Amount::from_sat(50),
-            whitelist: vec![VALIDATOR1.to_string(), VALIDATOR2.to_string()],
+            whitelist: vec![validator1, validator2],
         };
 
         let serialized = params.ipc_serialize();
@@ -230,12 +252,21 @@ mod tests {
         assert!(serialized.contains(&format!("{}min_cross_msg_fee=50", IPC_TAG_DELIMITER)));
         assert!(serialized.contains(&format!(
             "{}whitelist={},{}",
-            IPC_TAG_DELIMITER, VALIDATOR1, VALIDATOR2
+            IPC_TAG_DELIMITER, validator1, validator2
         )));
     }
 
     #[test]
     fn test_ipc_create_subnet_msg_deserialize() {
+        let validator1 = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+        let validator2 = XOnlyPublicKey::from_str(
+            "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df",
+        )
+        .unwrap();
+
         let serialized = format!(
             "{}{}min_validator_stake=1000{}min_validators=2{}bottomup_check_period=10{}active_validators_limit=20{}min_cross_msg_fee=50{}whitelist={},{}",
             IPC_CREATE_SUBNET_TAG,
@@ -245,21 +276,18 @@ mod tests {
             IPC_TAG_DELIMITER,
             IPC_TAG_DELIMITER,
             IPC_TAG_DELIMITER,
-            VALIDATOR1,
-            VALIDATOR2,
+            validator1,
+            validator2,
         );
 
         println!("{}", serialized);
 
-        let params = IPCCreateSubnetMsg::ipc_deserialize(&serialized);
+        let params = IPCCreateSubnetMsg::ipc_deserialize(&serialized).unwrap();
         assert_eq!(params.min_validator_stake, 1000);
         assert_eq!(params.min_validators, 2);
         assert_eq!(params.bottomup_check_period, 10);
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
-        assert_eq!(
-            params.whitelist,
-            vec![VALIDATOR1.to_string(), VALIDATOR2.to_string()]
-        );
+        assert_eq!(params.whitelist, vec![validator1, validator2]);
     }
 }

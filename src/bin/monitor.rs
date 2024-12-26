@@ -187,10 +187,10 @@ impl Monitor {
                 let ipc_message = IPCMessage::deserialize(witness_str);
 
                 match ipc_message {
-                    Some(msg) => {
+                    Ok(msg) => {
                         self.process_ipc_msg(msg);
                     }
-                    None => {
+                    Err(_) => {
                         continue;
                     }
                 }

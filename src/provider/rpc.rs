@@ -2,13 +2,12 @@ use crate::{
     bitcoin_utils::create_multisig_address, IPCCreateSubnetMsg, IPCSerialize, BTC_CONFIRMATIONS,
     NETWORK,
 };
-use bitcoin::XOnlyPublicKey;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
@@ -150,21 +149,8 @@ pub async fn create_subnet(
         ))
     })?;
 
-    // Parse the whitelist addresses as XOnlyPublicKey
-    let public_keys: Result<Vec<XOnlyPublicKey>, _> = params
-        .whitelist
-        .iter()
-        .map(|addr| {
-            XOnlyPublicKey::from_str(addr)
-                .map_err(|_e| RpcError::InvalidParams(format!("Public key {} is invalid", &addr)))
-        })
-        .collect();
-
-    // TODO handle errors
-    let public_keys = public_keys?;
-
     // Create a multisig address from the public keys
-    let multisig_address = create_multisig_address(&public_keys, required_sigs, NETWORK);
+    let multisig_address = create_multisig_address(&params.whitelist, required_sigs, NETWORK);
 
     debug!("multisig_address: {}", multisig_address);
 

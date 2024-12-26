@@ -7,6 +7,8 @@ use syn::{parse_macro_input, Data, DeriveInput, Expr, Fields};
 ///
 /// Uses serde_json to serialize and deserialize individual fields.
 /// Differrent rules for serialization can be defined for different types.
+//
+// TODO Make a general way to handle different types of serialization
 #[proc_macro_derive(IPCSerialize, attributes(tag))]
 pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -28,15 +30,24 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     } else {
         panic!("Expected a struct");
     };
-    let insert_fields = fields.iter().map(|field| {
+
+    let serialize_fields = fields.iter().map(|field| {
         let field_name = &field.ident;
         let field_name_str = field_name.as_ref().unwrap().to_string();
 
-        // Handle Vec<String> fields separately
+        // Handle Vec<String>
         if &field.ty == &syn::parse_quote!(Vec<String>) {
             quote! {
                 params_map.insert(#field_name_str, self.#field_name.join(","));
             }
+
+        // Handle Vec<XOnlyPublicKey>
+        } else if &field.ty == &syn::parse_quote!(Vec<XOnlyPublicKey>) {
+            quote! {
+                params_map.insert(#field_name_str, self.#field_name.iter().map(|key| key.to_string()).collect::<Vec<_>>().join(","));
+            }
+
+        // Handle other json-serializable types
         } else {
 		    quote! {
 		        params_map.insert(#field_name_str, serde_json::to_string(&self.#field_name).unwrap());
@@ -48,14 +59,31 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
          let field_name = &field.ident;
          let field_name_str = field_name.as_ref().unwrap().to_string();
 
-         // Handle Vec<String> fields separately
+         // Handle Vec<String>
          if &field.ty == &syn::parse_quote!(Vec<String>) {
             quote! {
-                #field_name: params_map.remove(#field_name_str).unwrap_or_default().split(',').map(|s| s.to_string()).collect(),
+	            #field_name: params_map.remove(#field_name_str)
+	                .ok_or_else(|| MissingField(#field_name_str.to_string()))?
+	                .split(',')
+	                .map(|s| s.parse().map_err(|e| ParseFieldError(#field_name_str.to_string(), e.to_string())))
+	                .collect::<Result<_, _>>()?,
             }
+        // Handle Vec<XOnlyPublicKey>
+        } else if &field.ty == &syn::parse_quote!(Vec<XOnlyPublicKey>) {
+			quote! {
+	            #field_name: params_map.remove(#field_name_str)
+	                .ok_or_else(|| MissingField(#field_name_str.to_string()))?
+	                .split(',')
+	                .map(|s| XOnlyPublicKey::from_str(s).map_err(|e| ParseFieldError(#field_name_str.to_string(), e.to_string())))
+	                .collect::<Result<_, _>>()?,
+			}
+
+		// Handle other json-serializable types
         } else {
 	        quote! {
-	            #field_name: serde_json::from_str(&params_map.remove(#field_name_str).unwrap_or_default()).unwrap_or_default(),
+		        #field_name: serde_json::from_str(&params_map.remove(#field_name_str)
+		            .ok_or_else(|| MissingField(#field_name_str.to_string()))?)
+		            .map_err(|e| ParseFieldError(#field_name_str.to_string(), e.to_string()))?,
 	        }
         }
      });
@@ -63,8 +91,10 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl IPCSerialize for #name {
             fn ipc_serialize(&self) -> String {
+                use IPCSerializeError::*;
+
                 let mut params_map = std::collections::HashMap::new();
-                #(#insert_fields)*
+                #(#serialize_fields)*
 
                 let mut subnet_data = String::new();
                 subnet_data.push_str(#tag);
@@ -76,7 +106,9 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
                 subnet_data
             }
 
-            fn ipc_deserialize(s: &str) -> Self {
+            fn ipc_deserialize(s: &str) -> Result<Self, IPCSerializeError> {
+                use IPCSerializeError::*;
+
                 let mut params_map = std::collections::HashMap::new();
                 let parts: Vec<&str> = s.split(crate::IPC_TAG_DELIMITER).collect();
                 for part in parts.iter().skip(1) {
@@ -86,9 +118,9 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
                     }
                 }
 
-                Self {
+                Ok(Self {
                     #(#deserialize_fields)*
-                }
+                })
             }
         }
     };
