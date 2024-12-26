@@ -1,5 +1,8 @@
-use crate::{bitcoin_utils::create_multisig_address, BTC_CONFIRMATIONS, NETWORK};
-use bitcoin::{Amount, XOnlyPublicKey};
+use crate::{
+    bitcoin_utils::create_multisig_address, IPCCreateSubnetMsg, IPCSerialize, BTC_CONFIRMATIONS,
+    NETWORK,
+};
+use bitcoin::XOnlyPublicKey;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::debug;
@@ -116,29 +119,13 @@ pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, 
 //
 
 #[derive(Serialize, Deserialize)]
-pub struct CreateSubnetParams {
-    /// The minimum number of collateral required for validators in Satoshis
-    min_validator_stake: u64,
-    /// Minimum number of validators required to bootstrap the subnet
-    min_validators: u64,
-    /// The bottom up checkpoint period in number of blocks
-    bottomup_check_period: u64,
-    /// The max number of active validators in subnet
-    active_validators_limit: u16,
-    /// Minimum fee for cross-net messages in subnet (in Satoshis)
-    min_cross_msg_fee: Amount,
-    /// The addresses of whitelisted validators
-    whitelist: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct CreateSubnetResponse {
     subnet_id: String,
 }
 
 pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<CreateSubnetParams>,
+    Params(params): Params<IPCCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
     if params.min_validators == 0 {
         return Err(RpcError::InvalidParams(
@@ -163,9 +150,6 @@ pub async fn create_subnet(
         ))
     })?;
 
-    // Parse the min_validator_stake as Amount
-    let min_validator_stake = Amount::from_sat(params.min_validator_stake);
-
     // Parse the whitelist addresses as XOnlyPublicKey
     let public_keys: Result<Vec<XOnlyPublicKey>, _> = params
         .whitelist
@@ -184,33 +168,7 @@ pub async fn create_subnet(
 
     debug!("multisig_address: {}", multisig_address);
 
-    let mut params_map = std::collections::HashMap::new();
-    params_map.insert(
-        "min_validator_stake",
-        min_validator_stake.to_sat().to_string(),
-    );
-    params_map.insert("min_validators", params.min_validators.to_string());
-    params_map.insert(
-        "bottomup_check_period",
-        params.bottomup_check_period.to_string(),
-    );
-    params_map.insert(
-        "active_validators_limit",
-        params.active_validators_limit.to_string(),
-    );
-    params_map.insert(
-        "min_cross_msg_fee",
-        params.min_cross_msg_fee.to_sat().to_string(),
-    );
-    params_map.insert("whitelist", params.whitelist.join(","));
-
-    // Create the subnet data string
-    let mut subnet_data = String::new();
-    subnet_data.push_str(crate::IPC_CREATE_SUBNET_TAG);
-
-    for (key, value) in &params_map {
-        subnet_data.push_str(&format!("{}{}={}", crate::IPC_TAG_DELIMITER, key, value));
-    }
+    let subnet_data = params.ipc_serialize();
 
     debug!("subnet_data: {}", subnet_data);
 

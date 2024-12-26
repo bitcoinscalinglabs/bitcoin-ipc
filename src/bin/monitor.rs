@@ -1,5 +1,5 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
-use bitcoin_ipc::BTC_CONFIRMATIONS;
+use bitcoin_ipc::{IPCMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
 use log::{debug, error, info};
@@ -184,19 +184,28 @@ impl Monitor {
                 };
 
                 let witness_str = find_valid_utf8(&concatenated_data);
-                if witness_str.contains(bitcoin_ipc::IPC_CREATE_SUBNET_TAG) {
-                    debug!(
-                        "Transaction {} contains tag '{}'. Witness: {}",
-                        txid,
-                        bitcoin_ipc::IPC_CREATE_SUBNET_TAG,
-                        &witness_str
-                    );
-                    debug!("Command: {}", witness_str);
+                let ipc_message = IPCMessage::deserialize(witness_str);
+
+                match ipc_message {
+                    Some(msg) => {
+                        self.process_ipc_msg(msg);
+                    }
+                    None => {
+                        continue;
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn process_ipc_msg(&self, msg: IPCMessage) {
+        match msg {
+            IPCMessage::CreateSubnet(create_subnet_params) => {
+                debug!("{:?}", create_subnet_params);
+            }
+        }
     }
 }
 
