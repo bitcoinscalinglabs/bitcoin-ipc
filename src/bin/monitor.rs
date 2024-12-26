@@ -99,6 +99,9 @@ impl Monitor {
                 }
             }
 
+            // Refetch the latest block height
+            let latest_block_height = self.get_latest_confirmed_height()?;
+
             // Check if we are up-to-date
             if self.current_height == latest_block_height {
                 info!("Sync completed");
