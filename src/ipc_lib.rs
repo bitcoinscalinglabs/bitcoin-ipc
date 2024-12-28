@@ -73,9 +73,20 @@ pub trait IPCSerialize {
         Self: Sized;
 }
 
+// IPCValidate trait
+
+#[derive(Debug, Error)]
+pub enum IPCValidateError {
+    #[error("Invalid field {0}: {1}")]
+    InvalidField(&'static str, String),
+}
+
+pub trait IPCValidate {
+    fn validate(&self) -> Result<(), IPCValidateError>;
+}
+
 // IPC Messages
 
-// TODO implement a function to validate the message
 #[derive(Serialize, Deserialize, IPCSerialize, Debug)]
 #[tag(IPC_CREATE_SUBNET_TAG)]
 pub struct IPCCreateSubnetMsg {
@@ -92,6 +103,50 @@ pub struct IPCCreateSubnetMsg {
     pub min_cross_msg_fee: Amount,
     /// The addresses of whitelisted validators
     pub whitelist: Vec<XOnlyPublicKey>,
+}
+
+impl IPCValidate for IPCCreateSubnetMsg {
+    fn validate(&self) -> Result<(), IPCValidateError> {
+        if self.min_validators == 0 {
+            return Err(IPCValidateError::InvalidField(
+                "min_validators",
+                "The minimum number of validators must be greater than 0".to_string(),
+            )
+            .into());
+        }
+
+        if self.whitelist.len() < self.min_validators as usize {
+            return Err(IPCValidateError::InvalidField(
+                "whitelist",
+                "Number of whitelisted validators is less than the minimum required validators"
+                    .to_string(),
+            )
+            .into());
+        }
+
+        if self.bottomup_check_period == 0 {
+            return Err(IPCValidateError::InvalidField(
+                "bottomup_check_period",
+                "Must be greater than 0".to_string(),
+            ));
+        }
+
+        if (self.active_validators_limit as u64) < self.min_validators {
+            return Err(IPCValidateError::InvalidField(
+                "active_validators_limit",
+                "Must be greater than or equal to min_validators".to_string(),
+            ));
+        }
+
+        if self.min_cross_msg_fee == Amount::ZERO {
+            return Err(IPCValidateError::InvalidField(
+                "min_cross_msg_fee",
+                "Must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 // Define the IPCMessage enum
@@ -115,6 +170,14 @@ impl IPCMessage {
             )),
         }
     }
+}
+
+/// Create Subnet IPC message is sent as a commit-reveal transaction pair.
+/// Subnet ID is derived from the transaction ID of the commit transaction.
+///
+/// Creates a subnet ID from the commit txid
+pub fn subnet_id_from_txid(txid: &bitcoin::Txid) -> String {
+    format!("{}/{}", crate::L1_NAME, txid)
 }
 
 /// Creates a child subnet by attaching arbitrary data to a Bitcoin transaction.

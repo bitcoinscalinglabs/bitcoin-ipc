@@ -74,7 +74,7 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
 	            #field_name: params_map.remove(#field_name_str)
 	                .ok_or_else(|| MissingField(#field_name_str.to_string()))?
 	                .split(',')
-	                .map(|s| XOnlyPublicKey::from_str(s).map_err(|e| ParseFieldError(#field_name_str.to_string(), e.to_string())))
+	                .map(|s| bitcoin::XOnlyPublicKey::from_str(s).map_err(|e| ParseFieldError(#field_name_str.to_string(), e.to_string())))
 	                .collect::<Result<_, _>>()?,
 			}
 

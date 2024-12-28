@@ -1,4 +1,5 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
+use bitcoin_ipc::ipc_lib::{self, IPCValidate};
 use bitcoin_ipc::{IPCMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
@@ -191,7 +192,7 @@ impl Monitor {
 
                 match ipc_message {
                     Ok(msg) => {
-                        self.process_ipc_msg(msg);
+                        self.process_ipc_msg(&txid, msg);
                     }
                     Err(_) => {
                         continue;
@@ -203,10 +204,22 @@ impl Monitor {
         Ok(())
     }
 
-    fn process_ipc_msg(&self, msg: IPCMessage) {
+    fn process_ipc_msg(&self, txid: &bitcoin::Txid, msg: IPCMessage) {
         match msg {
             IPCMessage::CreateSubnet(create_subnet_params) => {
-                debug!("{:?}", create_subnet_params);
+                if let Err(e) = create_subnet_params.validate() {
+                    error!(
+                        "create_subnet msg invalid msg={:?} error={:?}",
+                        create_subnet_params, e
+                    );
+                    return;
+                }
+
+                debug!(
+                    "subnet_id={} msg={:?}",
+                    ipc_lib::subnet_id_from_txid(txid),
+                    create_subnet_params
+                );
             }
         }
     }

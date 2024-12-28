@@ -1,6 +1,7 @@
 use crate::{
-    bitcoin_utils::create_multisig_address, IPCCreateSubnetMsg, IPCSerialize, BTC_CONFIRMATIONS,
-    NETWORK,
+    bitcoin_utils::create_multisig_address,
+    ipc_lib::{self, IPCValidate},
+    IPCCreateSubnetMsg, IPCSerialize, BTC_CONFIRMATIONS, NETWORK,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -126,19 +127,8 @@ pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<IPCCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
-    if params.min_validators == 0 {
-        return Err(RpcError::InvalidParams(
-            "The minimum number of validators must be greater than 0".to_string(),
-        )
-        .into());
-    }
-
-    if params.whitelist.len() < params.min_validators as usize {
-        return Err(RpcError::InvalidParams(
-            "Number of whitelisted validators is less than the minimum required validators"
-                .to_string(),
-        )
-        .into());
+    if let Err(err) = params.validate() {
+        return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
     // TODO check the maximum size of the multisig signatures
@@ -159,18 +149,15 @@ pub async fn create_subnet(
     debug!("subnet_data: {}", subnet_data);
 
     // Create and submit the create child transaction
-    let (commit_tx, _) = crate::ipc_lib::create_and_submit_create_child_tx(
-        &data.btc_rpc,
-        &multisig_address,
-        &subnet_data,
-    )
-    .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let (commit_tx, _) =
+        ipc_lib::create_and_submit_create_child_tx(&data.btc_rpc, &multisig_address, &subnet_data)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     // Compute the transaction ID
     let commit_tx_id: bitcoin::Txid = commit_tx.compute_txid();
 
     // Generate the subnet ID
-    let subnet_id = format!("{}/{}", crate::L1_NAME, commit_tx_id);
+    let subnet_id = ipc_lib::subnet_id_from_txid(&commit_tx_id);
 
     debug!("subnet_id: {}", subnet_id);
 
