@@ -169,7 +169,7 @@ impl Monitor {
     fn process_transaction(
         &self,
         tx: &bitcoin::Transaction,
-        _block_height: u64,
+        block_height: u64,
     ) -> Result<(), bitcoincore_rpc::Error> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
@@ -192,7 +192,7 @@ impl Monitor {
 
                 match ipc_message {
                     Ok(msg) => {
-                        self.process_ipc_msg(&txid, msg);
+                        self.process_ipc_msg(block_height, &txid, msg);
                     }
                     Err(_) => {
                         continue;
@@ -204,7 +204,7 @@ impl Monitor {
         Ok(())
     }
 
-    fn process_ipc_msg(&self, txid: &bitcoin::Txid, msg: IPCMessage) {
+    fn process_ipc_msg(&self, block_height: u64, txid: &bitcoin::Txid, msg: IPCMessage) {
         match msg {
             IPCMessage::CreateSubnet(create_subnet_params) => {
                 if let Err(e) = create_subnet_params.validate() {
@@ -216,7 +216,8 @@ impl Monitor {
                 }
 
                 debug!(
-                    "subnet_id={} msg={:?}",
+                    "block={} subnet_id={} msg={:?}",
+                    block_height,
                     ipc_lib::subnet_id_from_txid(txid),
                     create_subnet_params
                 );
