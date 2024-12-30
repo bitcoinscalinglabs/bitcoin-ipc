@@ -87,7 +87,7 @@ pub trait IPCValidate {
 
 // IPC Messages
 
-#[derive(Serialize, Deserialize, IPCSerialize, Debug)]
+#[derive(Serialize, Deserialize, IPCSerialize, Debug, Clone)]
 #[tag(IPC_CREATE_SUBNET_TAG)]
 pub struct IPCCreateSubnetMsg {
     /// The minimum number of collateral required for validators in Satoshis
@@ -111,8 +111,7 @@ impl IPCValidate for IPCCreateSubnetMsg {
             return Err(IPCValidateError::InvalidField(
                 "min_validators",
                 "The minimum number of validators must be greater than 0".to_string(),
-            )
-            .into());
+            ));
         }
 
         if self.whitelist.len() < self.min_validators as usize {
@@ -120,8 +119,7 @@ impl IPCValidate for IPCCreateSubnetMsg {
                 "whitelist",
                 "Number of whitelisted validators is less than the minimum required validators"
                     .to_string(),
-            )
-            .into());
+            ));
         }
 
         if self.bottomup_check_period == 0 {

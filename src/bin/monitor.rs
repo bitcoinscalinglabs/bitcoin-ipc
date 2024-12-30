@@ -1,9 +1,11 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
+use bitcoin_ipc::db::{self, Database, Db};
 use bitcoin_ipc::ipc_lib::{self, IPCValidate};
 use bitcoin_ipc::{IPCMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
 use log::{debug, error, info};
+use thiserror::Error;
 use tokio::signal;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
@@ -21,12 +23,17 @@ async fn main() {
 
     env_logger::init();
 
+    // Initialize the database
+    let db = Db::new(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
+        .await
+        .expect("Failed to initialize database");
+
     // Init the bitcoincore_rpc client
 
     let btc_rpc = make_rpc_client_from_env();
 
     // TODO make configurable
-    let mut monitor = Monitor::new(btc_rpc, POLL_INTERVAL);
+    let mut monitor = Monitor::new(db, btc_rpc, POLL_INTERVAL);
 
     let (tx, rx) = oneshot::channel();
 
@@ -59,16 +66,18 @@ async fn main() {
     info!("Shutting down");
 }
 
-// TODO use a generic for the RPC client + add a trait for the monitor
+// TODO use generics for deps + add a trait for the monitor
 struct Monitor {
+    db: Db,
     rpc: bitcoincore_rpc::Client,
     check_interval: Duration,
     current_height: u64,
 }
 
 impl Monitor {
-    fn new(rpc: bitcoincore_rpc::Client, check_interval: Duration) -> Self {
+    fn new(db: Db, rpc: bitcoincore_rpc::Client, check_interval: Duration) -> Self {
         Self {
+            db,
             rpc,
             check_interval,
             current_height: 0,
@@ -78,6 +87,10 @@ impl Monitor {
     async fn sync(&mut self) -> Result<(), bitcoincore_rpc::Error> {
         info!("Syncing...");
 
+        // Get the last processed block from the database
+        // TODO handle errors
+        self.current_height = self.db.get_last_processed_block().await.unwrap_or(0);
+
         loop {
             // Get the latest block height
             let latest_block_height = self.get_latest_confirmed_height()?;
@@ -85,10 +98,14 @@ impl Monitor {
             // Process blocks from current_height to latest_block_height
             while self.current_height < latest_block_height {
                 let next_height = self.current_height + 1;
-                match self.process_block(next_height) {
+                match self.process_block(next_height).await {
                     Ok(_) => {
                         info!("Processed block {}", next_height);
                         self.current_height = next_height;
+                        if let Err(e) = self.db.set_last_processed_block(self.current_height).await
+                        {
+                            error!("Failed to update last processed block: {:?}", e);
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -119,10 +136,15 @@ impl Monitor {
             match self.get_latest_confirmed_height() {
                 Ok(block_count) => {
                     if block_count > self.current_height {
-                        match self.process_block(block_count) {
+                        match self.process_block(block_count).await {
                             Ok(_) => {
                                 info!("Processed block {}", block_count);
                                 self.current_height = block_count;
+                                if let Err(e) =
+                                    self.db.set_last_processed_block(self.current_height).await
+                                {
+                                    error!("Failed to update last processed block: {:?}", e);
+                                }
                             }
                             Err(e) => {
                                 error!(
@@ -154,23 +176,23 @@ impl Monitor {
         Ok(latest - BTC_CONFIRMATIONS)
     }
 
-    fn process_block(&self, block_height: u64) -> Result<(), bitcoincore_rpc::Error> {
+    async fn process_block(&self, block_height: u64) -> Result<(), MonitorError> {
         info!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
 
         for tx in block.txdata {
-            self.process_transaction(&tx, block_height)?;
+            self.process_transaction(&tx, block_height).await?;
         }
 
         Ok(())
     }
 
-    fn process_transaction(
+    async fn process_transaction(
         &self,
         tx: &bitcoin::Transaction,
         block_height: u64,
-    ) -> Result<(), bitcoincore_rpc::Error> {
+    ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
 
@@ -192,7 +214,7 @@ impl Monitor {
 
                 match ipc_message {
                     Ok(msg) => {
-                        self.process_ipc_msg(block_height, &txid, msg);
+                        self.process_ipc_msg(block_height, &txid, msg).await?;
                     }
                     Err(_) => {
                         continue;
@@ -204,7 +226,12 @@ impl Monitor {
         Ok(())
     }
 
-    fn process_ipc_msg(&self, block_height: u64, txid: &bitcoin::Txid, msg: IPCMessage) {
+    async fn process_ipc_msg(
+        &self,
+        block_height: u64,
+        txid: &bitcoin::Txid,
+        msg: IPCMessage,
+    ) -> Result<(), MonitorError> {
         match msg {
             IPCMessage::CreateSubnet(create_subnet_params) => {
                 if let Err(e) = create_subnet_params.validate() {
@@ -212,15 +239,26 @@ impl Monitor {
                         "create_subnet msg invalid msg={:?} error={:?}",
                         create_subnet_params, e
                     );
-                    return;
+                    return Ok(());
                 }
+
+                let subnet_id = ipc_lib::subnet_id_from_txid(txid);
 
                 debug!(
                     "block={} subnet_id={} msg={:?}",
-                    block_height,
-                    ipc_lib::subnet_id_from_txid(txid),
-                    create_subnet_params
+                    block_height, subnet_id, create_subnet_params
                 );
+
+                // TODO handle errors better
+                if let Err(e) = self
+                    .db
+                    .save_subnet_create_msg(block_height, &subnet_id, &create_subnet_params)
+                    .await
+                {
+                    error!("Failed to save subnet to DB: {:?}", e);
+                }
+
+                Ok(())
             }
         }
     }
@@ -235,4 +273,13 @@ fn find_valid_utf8(data: &[u8]) -> &str {
         }
     }
     ""
+}
+
+#[derive(Error, Debug)]
+pub enum MonitorError {
+    #[error(transparent)]
+    DbError(#[from] db::DbError),
+
+    #[error(transparent)]
+    BitcoinRpcError(#[from] bitcoincore_rpc::Error),
 }

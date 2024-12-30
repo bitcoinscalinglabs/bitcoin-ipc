@@ -1,4 +1,5 @@
 pub mod bitcoin_utils;
+pub mod db;
 pub mod ipc_lib;
 pub mod provider;
 
