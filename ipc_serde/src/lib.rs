@@ -9,7 +9,7 @@ use syn::{parse_macro_input, Data, DeriveInput, Expr, Fields};
 /// Differrent rules for serialization can be defined for different types.
 //
 // TODO Make a general way to handle different types of serialization
-#[proc_macro_derive(IPCSerialize, attributes(tag))]
+#[proc_macro_derive(IpcSerialize, attributes(tag))]
 pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -89,9 +89,9 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
      });
 
     let expanded = quote! {
-        impl IPCSerialize for #name {
+        impl IpcSerialize for #name {
             fn ipc_serialize(&self) -> String {
-                use IPCSerializeError::*;
+                use IpcSerializeError::*;
 
                 let mut params_map = std::collections::HashMap::new();
                 #(#serialize_fields)*
@@ -106,8 +106,8 @@ pub fn ipc_serialize_derive(input: TokenStream) -> TokenStream {
                 subnet_data
             }
 
-            fn ipc_deserialize(s: &str) -> Result<Self, IPCSerializeError> {
-                use IPCSerializeError::*;
+            fn ipc_deserialize(s: &str) -> Result<Self, IpcSerializeError> {
+                use IpcSerializeError::*;
 
                 let mut params_map = std::collections::HashMap::new();
                 let parts: Vec<&str> = s.split(crate::IPC_TAG_DELIMITER).collect();

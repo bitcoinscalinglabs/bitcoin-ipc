@@ -13,7 +13,7 @@ const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
 pub struct Subnet {
     block_height: u64,
     subnet_id: String,
-    create_subnet_msg: ipc_lib::IPCCreateSubnetMsg,
+    create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,7 +65,7 @@ pub trait Database {
         &self,
         block_height: u64,
         subnet_id: &str,
-        create_subnet_msg: &ipc_lib::IPCCreateSubnetMsg,
+        create_subnet_msg: &ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError>;
     async fn get_subnet_create_msg(&self, subnet_id: &str) -> Result<Option<Subnet>, DbError>;
 }
@@ -106,7 +106,7 @@ impl Database for Db {
         &self,
         block_height: u64,
         subnet_id: &str,
-        create_subnet_params: &ipc_lib::IPCCreateSubnetMsg,
+        create_subnet_params: &ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError> {
         let subnet = Subnet {
             block_height,

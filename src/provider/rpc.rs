@@ -1,7 +1,7 @@
 use crate::{
     bitcoin_utils::create_multisig_address,
-    ipc_lib::{self, IPCValidate},
-    IPCCreateSubnetMsg, IPCSerialize, BTC_CONFIRMATIONS, NETWORK,
+    ipc_lib::{self, IpcValidate},
+    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS, NETWORK,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -125,7 +125,7 @@ pub struct CreateSubnetResponse {
 
 pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<IPCCreateSubnetMsg>,
+    Params(params): Params<IpcCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
     if let Err(err) = params.validate() {
         return Err(RpcError::InvalidParams(err.to_string()).into());

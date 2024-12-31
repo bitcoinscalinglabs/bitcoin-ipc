@@ -1,7 +1,7 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::db::{self, Database, Db};
-use bitcoin_ipc::ipc_lib::{self, IPCValidate};
-use bitcoin_ipc::{IPCMessage, BTC_CONFIRMATIONS};
+use bitcoin_ipc::ipc_lib::{self, IpcValidate};
+use bitcoin_ipc::{IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
 use log::{debug, error, info};
@@ -210,7 +210,7 @@ impl Monitor {
                 };
 
                 let witness_str = find_valid_utf8(&concatenated_data);
-                let ipc_message = IPCMessage::deserialize(witness_str);
+                let ipc_message = IpcMessage::deserialize(witness_str);
 
                 match ipc_message {
                     Ok(msg) => {
@@ -230,10 +230,10 @@ impl Monitor {
         &self,
         block_height: u64,
         txid: &bitcoin::Txid,
-        msg: IPCMessage,
+        msg: IpcMessage,
     ) -> Result<(), MonitorError> {
         match msg {
-            IPCMessage::CreateSubnet(create_subnet_params) => {
+            IpcMessage::CreateSubnet(create_subnet_params) => {
                 if let Err(e) = create_subnet_params.validate() {
                     error!(
                         "create_subnet msg invalid msg={:?} error={:?}",
