@@ -1,5 +1,3 @@
-use actix_web;
-
 use bitcoin_ipc::provider;
 use bitcoin_ipc::{bitcoin_utils, utils};
 use std::sync::Arc;
@@ -21,8 +19,7 @@ fn make_bitcoincore_rpc() -> Arc<Client> {
         }
     };
     let _ = rpc.load_wallet(&wallet_name);
-    let rpc = Arc::new(rpc);
-    rpc
+    Arc::new(rpc)
 }
 
 #[actix_web::main]

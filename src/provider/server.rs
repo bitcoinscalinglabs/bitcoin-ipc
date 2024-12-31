@@ -1,37 +1,9 @@
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
-use thiserror::Error;
 
 use actix_web_httpauth::extractors::bearer::BearerAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
 
 use super::rpc;
-
-#[derive(Serialize, Deserialize)]
-pub enum CustomRPCErrorCode {
-    Unauthorized = -32001,
-}
-
-#[derive(Debug, Error)]
-#[error("Unauthorized: Invalid token")]
-struct UnauthorizedError;
-
-impl actix_web::error::ResponseError for UnauthorizedError {
-    fn error_response(&self) -> actix_web::HttpResponse {
-        let json_rpc_error = json!({
-            "jsonrpc": "2.0",
-            "error": {
-                "code": CustomRPCErrorCode::Unauthorized,
-                "message": "Unauthorized: Invalid token"
-            },
-            "id": null
-        });
-        actix_web::HttpResponse::Unauthorized()
-            .content_type("application/json")
-            .body(json_rpc_error.to_string())
-    }
-}
 
 async fn auth_guard(
     req: actix_web::dev::ServiceRequest,
@@ -39,14 +11,14 @@ async fn auth_guard(
     token: String,
 ) -> Result<actix_web::dev::ServiceRequest, (actix_web::Error, actix_web::dev::ServiceRequest)> {
     let Some(credentials) = credentials else {
-        return Err((UnauthorizedError.into(), req));
+        return Err((rpc::RpcError::Unauthorized.into(), req));
     };
 
     let provided_token = credentials.token();
     if provided_token == token {
         Ok(req)
     } else {
-        Err((UnauthorizedError.into(), req))
+        Err((rpc::RpcError::Unauthorized.into(), req))
     }
 }
 
@@ -103,6 +75,7 @@ mod tests {
     use actix_web::test::TestRequest;
     use actix_web::FromRequest;
     use actix_web_httpauth::extractors::bearer::BearerAuth;
+    use serde_json::json;
 
     async fn bearer_token(token: &str) -> BearerAuth {
         let req =
@@ -126,7 +99,7 @@ mod tests {
             let expected_body = json!({
                 "jsonrpc": "2.0",
                 "error": {
-                    "code": CustomRPCErrorCode::Unauthorized,
+                    "code": -32001,
                     "message": "Unauthorized: Invalid token"
                 },
                 "id": null

@@ -13,7 +13,7 @@ use bitcoin::{
     bip32::Xpriv,
     blockdata::{locktime::absolute::LockTime, script, transaction, witness::Witness},
     key::{rand, TapTweak, TweakedPublicKey},
-    opcodes::{all::OP_DROP, OP_TRUE},
+    opcodes::{self, all::OP_DROP, OP_TRUE},
     secp256k1::{schnorr::Signature, Message},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, TaprootBuilder},
@@ -146,7 +146,6 @@ pub fn init_wallet(
 pub fn test_and_submit(
     rpc: &Client,
     txs: Vec<transaction::Transaction>,
-    miner_address: Address,
 ) -> Result<(), BitcoinUtilsError> {
     let result = match rpc
         .test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())
@@ -184,10 +183,6 @@ pub fn test_and_submit(
             rpc.send_raw_transaction(tx.raw_hex())?
         );
     }
-    println!(
-        "Mined new block: {:#?}",
-        rpc.generate_to_address(1, &miner_address)?
-    );
 
     Ok(())
 }
@@ -1127,7 +1122,7 @@ pub fn verify_taproot_signature(
     Ok(false)
 }
 
-fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
+pub fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
     let mut concatenated_data = Vec::new();
 
     let script = ScriptBuf::from(witness.to_vec().clone());
@@ -1153,6 +1148,33 @@ fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError
     }
 
     Ok(concatenated_data)
+}
+
+pub fn create_multisig_address(
+    public_keys: &[XOnlyPublicKey],
+    // TODO should we accept a u8?
+    required_sigs: i64,
+    network: Network,
+) -> Address {
+    // Create a multisig script from the public keys
+    let multisig_script = public_keys
+        .iter()
+        .enumerate()
+        .fold(Builder::new(), |builder, (index, key)| {
+            let builder = builder.push_x_only_key(key);
+            if index == 0 {
+                builder.push_opcode(opcodes::all::OP_CHECKSIG)
+            } else {
+                builder.push_opcode(opcodes::all::OP_CHECKSIGADD)
+            }
+        })
+        // TODO should we fail?
+        .push_int(std::cmp::min(public_keys.len() as i64, required_sigs))
+        .push_opcode(opcodes::all::OP_GREATERTHANOREQUAL)
+        .into_script();
+
+    // TODO decide on the multisig address format: taproot, p2sh or p2wsh
+    Address::p2wsh(&multisig_script, network)
 }
 
 #[derive(Error, Debug)]
@@ -1230,4 +1252,46 @@ pub enum BitcoinUtilsError {
 
     #[error("internal error")]
     Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use bitcoin::{AddressType, Network, XOnlyPublicKey};
+
+    fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
+        let secp = Secp256k1::new();
+        (0..n)
+            .map(|_| {
+                let secret_key = SecretKey::new(&mut rand::thread_rng());
+                let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+                XOnlyPublicKey::from(public_key)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_create_multisig_address_single_key() {
+        let public_keys = generate_xonly_pubkeys(1);
+        let required_sigs = 1;
+        let network = Network::Bitcoin;
+
+        let address = create_multisig_address(&public_keys, required_sigs, network);
+
+        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+    }
+
+    #[test]
+    fn test_create_multisig_address_multiple_keys() {
+        let public_keys = generate_xonly_pubkeys(3);
+        let required_sigs = 2;
+        let network = Network::Bitcoin;
+
+        let address = create_multisig_address(&public_keys, required_sigs, network);
+
+        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+    }
+
+    // TODO more tests for create_multisig_address
 }

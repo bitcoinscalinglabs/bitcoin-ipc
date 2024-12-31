@@ -1,17 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
 use bitcoin::ScriptBuf;
-use bitcoin::{
-    address::NetworkUnchecked, secp256k1::PublicKey, Amount, Transaction, TxOut, XOnlyPublicKey,
-};
+use bitcoin::{Amount, Transaction, TxOut};
 use thiserror::Error;
 
-use crate::{
-    bitcoin_utils::{
-        self, init_rpc_client, init_wallet, test_and_submit, write_arbitrary_data, CommitRevealFee,
-    },
-    utils,
-};
+use crate::bitcoin_utils::{self, test_and_submit, write_arbitrary_data, CommitRevealFee};
 
 /// Creates a child subnet by attaching arbitrary data to a Bitcoin transaction.
 ///
@@ -34,15 +25,12 @@ use crate::{
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(Box<dyn std::error::Error>)` - If an error occurs during the process.
 pub fn create_and_submit_create_child_tx(
+    rpc: &bitcoincore_rpc::Client,
     subnet_address: &bitcoin::Address,
     subnet_data: &str,
 ) -> Result<(Transaction, Transaction), IpcLibError> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
-    let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
-    let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
-
-    let commit_fee = bitcoin_utils::calculate_fee(&rpc, 2, 3, 65);
-    let reveal_fee = bitcoin_utils::calculate_fee(&rpc, 1, 1, subnet_data.as_bytes().len());
+    let commit_fee = bitcoin_utils::calculate_fee(rpc, 2, 3, 65);
+    let reveal_fee = bitcoin_utils::calculate_fee(rpc, 1, 1, subnet_data.as_bytes().len());
 
     let fee = CommitRevealFee::new(commit_fee, reveal_fee);
 
@@ -52,7 +40,7 @@ pub fn create_and_submit_create_child_tx(
     };
 
     let (commit_tx, reveal_tx) = write_arbitrary_data(
-        &rpc,
+        rpc,
         Amount::ZERO,
         fee,
         subnet_data,
@@ -61,11 +49,7 @@ pub fn create_and_submit_create_child_tx(
         None,
     )?;
 
-    match test_and_submit(
-        &rpc,
-        vec![commit_tx.clone(), reveal_tx.clone()],
-        miner_address,
-    ) {
+    match test_and_submit(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
         Ok(_) => Ok((commit_tx, reveal_tx)),
         Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
     }
@@ -92,27 +76,24 @@ pub fn create_and_submit_create_child_tx(
 /// * `Ok(())` - If the transaction is successfully created and submitted.
 /// * `Err(JoinChildError)` - If an error occurs during the process.
 pub fn create_and_submit_join_child_tx(
+    rpc: &bitcoincore_rpc::Client,
     subnet_address: &bitcoin::Address,
     collateral: Amount,
     initial_funding: Amount,
     validator_data: &str,
 ) -> Result<(), IpcLibError> {
-    let (rpc_user, rpc_pass, rpc_url, wallet_name) = utils::load_env()?;
-    let rpc = init_rpc_client(rpc_user, rpc_pass, rpc_url)?;
-    let (miner_address, _, _) = init_wallet(&rpc, crate::NETWORK, &wallet_name)?;
-
     let output = TxOut {
         value: collateral + initial_funding,
         script_pubkey: subnet_address.script_pubkey(),
     };
 
-    let commit_fee = bitcoin_utils::calculate_fee(&rpc, 2, 3, 65);
-    let reveal_fee = bitcoin_utils::calculate_fee(&rpc, 1, 1, validator_data.as_bytes().len());
+    let commit_fee = bitcoin_utils::calculate_fee(rpc, 2, 3, 65);
+    let reveal_fee = bitcoin_utils::calculate_fee(rpc, 1, 1, validator_data.as_bytes().len());
 
     let fee = CommitRevealFee::new(commit_fee, reveal_fee);
 
     let (commit_tx, reveal_tx) = write_arbitrary_data(
-        &rpc,
+        rpc,
         collateral + initial_funding,
         fee,
         validator_data,
@@ -121,7 +102,7 @@ pub fn create_and_submit_join_child_tx(
         None,
     )?;
 
-    match test_and_submit(&rpc, vec![commit_tx, reveal_tx], miner_address) {
+    match test_and_submit(rpc, vec![commit_tx, reveal_tx]) {
         Ok(_) => Ok(()),
         Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
     }
