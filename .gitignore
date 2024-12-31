@@ -9,3 +9,4 @@ output.csv
 output-transfer.csv
 output-withdraw.csv
 outputs/*
+ipc_serde/target
