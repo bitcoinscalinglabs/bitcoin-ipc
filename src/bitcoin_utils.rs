@@ -1,4 +1,5 @@
 use bitcoin::{BlockHash, Txid};
+use log::{debug, error};
 use std::cmp::min;
 use std::vec;
 use thiserror::Error;
@@ -36,6 +37,16 @@ impl CommitRevealFee {
             commit_fee,
             reveal_fee,
         }
+    }
+}
+
+/// Returns the number of blocks to wait for before considering a
+/// confirmed in a given network.
+pub const fn confirmations(network: Network) -> u64 {
+    use Network::*;
+    match network {
+        Bitcoin | Testnet => 6,
+        Regtest | Signet | _ => 0,
     }
 }
 
@@ -159,9 +170,9 @@ pub fn test_and_submit(
     };
 
     let print_mempool_failure_message = || {
-        println!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
+        error!("Mempool acceptance test failed. Try manually testing for mempool acceptance using the bitcoin cli for more information, with the following transactions:");
         for (i, tx) in txs.iter().enumerate() {
-            println!("Transaction #{}: {}", i + 1, tx.raw_hex());
+            error!("Transaction #{}: {}", i + 1, tx.raw_hex());
         }
     };
 
@@ -176,10 +187,9 @@ pub fn test_and_submit(
         }
     }
 
-    for (i, tx) in txs.iter().enumerate() {
-        println!(
-            "Submitting transaction #{}: {}",
-            i + 1,
+    for tx in txs {
+        debug!(
+            "send_raw_transaction: {}",
             rpc.send_raw_transaction(tx.raw_hex())?
         );
     }
@@ -798,7 +808,7 @@ pub fn create_checkpoint_tx(
         Some(&subnet_address),
     )?;
 
-    let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::DELIMITER);
+    let data = format!("{}{}", crate::IPC_CHECKPOINT_TAG, crate::IPC_TAG_DELIMITER);
 
     let data_bytes = [data.as_bytes(), &checkpoint_hash].concat();
 
@@ -858,7 +868,7 @@ pub fn create_deposit_tx(
 
     let change = create_change_txout(rpc, &input_info, amount_to_send, fee, None)?;
 
-    let data = format!("{}{}", crate::IPC_DEPOSIT_TAG, crate::DELIMITER);
+    let data = format!("{}{}", crate::IPC_DEPOSIT_TAG, crate::IPC_TAG_DELIMITER);
 
     let target_address_bytes = deposit_address.as_bytes();
 

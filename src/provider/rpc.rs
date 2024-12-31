@@ -1,7 +1,8 @@
-use crate::{bitcoin_utils::create_multisig_address, utils, NETWORK};
+use crate::{bitcoin_utils::create_multisig_address, BTC_CONFIRMATIONS, NETWORK};
 use bitcoin::{Amount, XOnlyPublicKey};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{str::FromStr, sync::Arc};
@@ -54,7 +55,6 @@ impl actix_web::error::ResponseError for RpcError {
 #[derive(Clone)]
 pub struct ServerData {
     pub btc_rpc: Arc<Client>,
-    pub config: utils::Config,
 }
 
 //
@@ -90,18 +90,19 @@ pub async fn get_block_count(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpc
 pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, JsonRpcError> {
     let client = data.btc_rpc.as_ref();
 
-    let confirmations = data.config.ipc_finalization_parameter;
-
     match client.get_block_count() {
         Ok(current_height) => {
-            if current_height < confirmations {
+            // Since BTC_CONFIRMATIONS is 0 in regtest and testnet
+            // Clippy will complain about absurd comparisons
+            #[allow(clippy::absurd_extreme_comparisons)]
+            if current_height < BTC_CONFIRMATIONS {
                 return Err(JsonRpcError::internal(
-                    "Not enough blocks to have a final block",
+                    "Not enough blocks to have a confirmed block",
                 ));
             }
 
-            let final_block_height = current_height - confirmations;
-            match client.get_block_hash(final_block_height) {
+            let confirmed_block_height = current_height - BTC_CONFIRMATIONS;
+            match client.get_block_hash(confirmed_block_height) {
                 Ok(block_hash) => Ok(block_hash.to_string()),
                 Err(e) => Err(JsonRpcError::internal(e)),
             }
@@ -139,8 +140,6 @@ pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<CreateSubnetParams>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
-    println!("create_subnet");
-
     if params.min_validators == 0 {
         return Err(RpcError::InvalidParams(
             "The minimum number of validators must be greater than 0".to_string(),
@@ -183,7 +182,7 @@ pub async fn create_subnet(
     // Create a multisig address from the public keys
     let multisig_address = create_multisig_address(&public_keys, required_sigs, NETWORK);
 
-    println!("multisig_address: {}", multisig_address);
+    debug!("multisig_address: {}", multisig_address);
 
     let mut params_map = std::collections::HashMap::new();
     params_map.insert(
@@ -210,10 +209,10 @@ pub async fn create_subnet(
     subnet_data.push_str(crate::IPC_CREATE_SUBNET_TAG);
 
     for (key, value) in &params_map {
-        subnet_data.push_str(&format!("{}{}={}", crate::DELIMITER, key, value));
+        subnet_data.push_str(&format!("{}{}={}", crate::IPC_TAG_DELIMITER, key, value));
     }
 
-    println!("subnet_data: {}", subnet_data);
+    debug!("subnet_data: {}", subnet_data);
 
     // Create and submit the create child transaction
     let (commit_tx, _) = crate::ipc_lib::create_and_submit_create_child_tx(
@@ -228,6 +227,8 @@ pub async fn create_subnet(
 
     // Generate the subnet ID
     let subnet_id = format!("{}/{}", crate::L1_NAME, commit_tx_id);
+
+    debug!("subnet_id: {}", subnet_id);
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })
