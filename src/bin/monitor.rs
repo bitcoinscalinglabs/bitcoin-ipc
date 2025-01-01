@@ -7,8 +7,8 @@ use dotenv::dotenv;
 use log::{debug, error, info};
 use thiserror::Error;
 use tokio::signal;
-use tokio::sync::oneshot;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 // TODO make configurable
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -32,33 +32,37 @@ async fn main() {
 
     let btc_rpc = make_rpc_client_from_env();
 
-    // TODO make configurable
-    let mut monitor = Monitor::new(db, btc_rpc, POLL_INTERVAL);
+    // Create a cancellation token for the monitor
 
-    let (tx, rx) = oneshot::channel();
+    let cancel_token = CancellationToken::new();
+
+    let mut monitor = Monitor::new(db, btc_rpc, POLL_INTERVAL, cancel_token.clone());
+
+    // Spawn monitor task
+
+    let monitor_handle = tokio::spawn(async move { monitor.sync_and_listen().await });
+
+    // Listen for ctrl+c
 
     tokio::spawn(async move {
-        // Sync and listen for new blocks
-        if let Err(e) = monitor.sync_and_listen().await {
-            error!("Error from sync_and_listen: {:?}", e);
-            // Signal termination
-            tx.send(Err(e)).expect("Could not signal termination.");
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                println!(); // print new line after ^C
+                info!("Received Ctrl+C, initiating shutdown...");
+
+                // Send cancellation signal to the monitor
+                cancel_token.cancel();
+            }
+            Err(err) => {
+                error!("Error listening for Ctrl+C: {}", err);
+            }
         }
     });
 
-    // Wait for a termination signal (e.g., Ctrl+C) or the spawned task to complete
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            println!(); // print new line after ^C
-            info!("Received Ctrl+C");
-        }
-        result = rx => {
-            match result {
-                Ok(Ok(())) => info!("Monitor task completed"),
-                Ok(Err(e)) => error!("Monitor task failed: {:?}", e),
-                Err(_) => error!("Monitor task channel closed unexpectedly"),
-            }
-        }
+    match monitor_handle.await {
+        Ok(Ok(())) => info!("Monitor completed"),
+        Ok(Err(e)) => error!("Monitor failed: {:?}", e),
+        Err(e) => error!("Monitor panicked: {:?}", e),
     }
 
     info!("Shutting down");
@@ -70,30 +74,43 @@ struct Monitor {
     rpc: bitcoincore_rpc::Client,
     check_interval: Duration,
     current_height: u64,
+    cancel_token: CancellationToken,
 }
 
 impl Monitor {
-    fn new(db: Db, rpc: bitcoincore_rpc::Client, check_interval: Duration) -> Self {
+    fn new(
+        db: Db,
+        rpc: bitcoincore_rpc::Client,
+        check_interval: Duration,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             db,
             rpc,
             check_interval,
+            cancel_token,
             current_height: 0,
         }
     }
 
-    async fn sync(&mut self) -> Result<(), MonitorError> {
+    /// Syncs with the Bitcoin network
+    /// Returns `Ok(true)` if it finished syncing
+    async fn sync(&mut self) -> Result<bool, MonitorError> {
         info!("Syncing...");
 
         // Get the last processed block from the database
         self.current_height = self.db.get_last_processed_block().await?;
 
         loop {
+            if self.cancel_token.is_cancelled() {
+                debug!("Cancellation requested, stopping sync");
+                return Ok(false);
+            }
+
             // Get the latest block height
             let latest_block_height = self.get_latest_confirmed_height()?;
 
-            debug!("Latest block height: {}", latest_block_height);
-            debug!("Current block height: {}", self.current_height);
+            debug!("Latest confirmed block height: {}", latest_block_height);
 
             if self.current_height > latest_block_height {
                 error!("Current block height is greater than the latest block height. Aborting.");
@@ -105,6 +122,11 @@ impl Monitor {
 
             // Process blocks from current_height to latest_block_height
             while self.current_height < latest_block_height {
+                if self.cancel_token.is_cancelled() {
+                    debug!("Cancellation requested, stopping sync");
+                    return Ok(false);
+                }
+
                 let next_height = self.current_height + 1;
                 match self.process_block(next_height).await {
                     Ok(_) => {
@@ -135,12 +157,18 @@ impl Monitor {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn listen(&mut self) -> Result<(), MonitorError> {
         info!("Listening for new blocks");
+
         loop {
+            if self.cancel_token.is_cancelled() {
+                debug!("Cancellation requested, stopping listener");
+                return Ok(());
+            }
+
             match self.get_latest_confirmed_height() {
                 Ok(block_count) => {
                     if block_count > self.current_height {
@@ -167,15 +195,27 @@ impl Monitor {
                     error!("Error fetching block count: {:?}", e);
                 }
             }
+
             tokio::time::sleep(self.check_interval).await;
         }
     }
 
     async fn sync_and_listen(&mut self) -> Result<(), MonitorError> {
-        if let Err(e) = self.sync().await {
-            error!("Error syncing: {}", e);
-            return Err(e);
-        }
+        let syncing_completed = match self.sync().await {
+            Err(e) => {
+                error!("Error syncing: {}", e);
+                return Err(e);
+            }
+            Ok(r) => r,
+        };
+
+        // If sync is not completed, return early
+        // Syncing could be interrupted by a cancellation request
+        // or by an error
+        if !syncing_completed {
+            return Ok(());
+        };
+
         if let Err(e) = self.listen().await {
             error!("Error listening: {}", e);
             return Err(e);

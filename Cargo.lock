@@ -431,6 +431,7 @@ dependencies = [
  "thiserror",
  "tiny-keccak",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
