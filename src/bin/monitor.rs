@@ -38,14 +38,12 @@ async fn main() {
     let (tx, rx) = oneshot::channel();
 
     tokio::spawn(async move {
-        // Sync
-        if let Err(e) = monitor.sync().await {
-            error!("Error syncing: {:?}", e);
+        // Sync and listen for new blocks
+        if let Err(e) = monitor.sync_and_listen().await {
+            error!("Error from sync_and_listen: {:?}", e);
             // Signal termination
             tx.send(Err(e)).expect("Could not signal termination.");
         }
-        // Listen for new block
-        monitor.listen().await;
     });
 
     // Wait for a termination signal (e.g., Ctrl+C) or the spawned task to complete
@@ -84,16 +82,26 @@ impl Monitor {
         }
     }
 
-    async fn sync(&mut self) -> Result<(), bitcoincore_rpc::Error> {
+    async fn sync(&mut self) -> Result<(), MonitorError> {
         info!("Syncing...");
 
         // Get the last processed block from the database
-        // TODO handle errors
-        self.current_height = self.db.get_last_processed_block().await.unwrap_or(0);
+        self.current_height = self.db.get_last_processed_block().await?;
 
         loop {
             // Get the latest block height
             let latest_block_height = self.get_latest_confirmed_height()?;
+
+            debug!("Latest block height: {}", latest_block_height);
+            debug!("Current block height: {}", self.current_height);
+
+            if self.current_height > latest_block_height {
+                error!("Current block height is greater than the latest block height. Aborting.");
+                return Err(MonitorError::BlockHeightAheadOfTip(
+                    latest_block_height,
+                    self.current_height,
+                ));
+            }
 
             // Process blocks from current_height to latest_block_height
             while self.current_height < latest_block_height {
@@ -130,7 +138,7 @@ impl Monitor {
         Ok(())
     }
 
-    async fn listen(&mut self) {
+    async fn listen(&mut self) -> Result<(), MonitorError> {
         info!("Listening for new blocks");
         loop {
             match self.get_latest_confirmed_height() {
@@ -163,7 +171,19 @@ impl Monitor {
         }
     }
 
-    fn get_latest_confirmed_height(&self) -> Result<u64, bitcoincore_rpc::Error> {
+    async fn sync_and_listen(&mut self) -> Result<(), MonitorError> {
+        if let Err(e) = self.sync().await {
+            error!("Error syncing: {}", e);
+            return Err(e);
+        }
+        if let Err(e) = self.listen().await {
+            error!("Error listening: {}", e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn get_latest_confirmed_height(&self) -> Result<u64, MonitorError> {
         let latest = self.rpc.get_block_count()?;
 
         // Since BTC_CONFIRMATIONS is 0 in regtest and sigtest
@@ -277,6 +297,9 @@ fn find_valid_utf8(data: &[u8]) -> &str {
 
 #[derive(Error, Debug)]
 pub enum MonitorError {
+    #[error("Current block height ahead of tip. Latest: {0}. Current: {1}")]
+    BlockHeightAheadOfTip(u64, u64),
+
     #[error(transparent)]
     DbError(#[from] db::DbError),
 
