@@ -114,6 +114,17 @@ pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, 
     }
 }
 
+/// Get the balance of the wallet in Satoshis
+/// Note: Bitcoin Core RPC returns the balance in BTC (using f64)
+pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
+    let client = data.btc_rpc.as_ref();
+
+    match client.get_balance(None, None) {
+        Ok(balance) => Ok(balance.to_sat()),
+        Err(e) => Err(JsonRpcError::internal(e)),
+    }
+}
+
 //
 // IPC
 //
@@ -171,6 +182,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
         .with_method("getconfirmedblock", get_confirmed_block)
+        .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
         .finish()
 }
