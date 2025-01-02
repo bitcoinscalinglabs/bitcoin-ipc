@@ -78,11 +78,11 @@ impl Database for Db {
             Some(MonitorInfo {
                 last_processed_block,
             }) => {
-                debug!("Last Processed Block = {}", last_processed_block);
+                debug!("Last processed block = {}", last_processed_block);
                 Ok(last_processed_block)
             }
             None => {
-                debug!("No Last Processed Block record, defaulting to 0");
+                debug!("No last processed block record, defaulting to 0");
                 Ok(0)
             }
         }
