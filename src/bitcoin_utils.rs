@@ -4,6 +4,10 @@ use std::cmp::min;
 use std::vec;
 use thiserror::Error;
 
+use bitcoin::key::UntweakedPublicKey;
+use num_bigint::BigUint;
+use num_traits::ops::bytes::ToBytes;
+
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::{Instruction, PushBytes};
@@ -60,12 +64,29 @@ pub const fn confirmations(network: Network) -> u64 {
 /// # Returns
 ///
 /// * `XOnlyPublicKey` - An unspendable internal key
-pub fn create_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
+pub fn create_random_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
     let secret_key =
         bitcoin::secp256k1::SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng());
     let keypair = Keypair::from_secret_key(secp, &secret_key);
     let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
     x_only_pubkey
+}
+
+pub fn create_unspendable_internal_key() -> XOnlyPublicKey {
+    // the Gx of SECP, incremented till a valid x is found
+    // See
+    // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs,
+    // bullet 3, for a proper way to choose such a key
+    let nothing_up_my_sleeve_key = [
+        0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x99,
+    ];
+    let mut int_key = BigUint::from_bytes_be(&nothing_up_my_sleeve_key);
+    while UntweakedPublicKey::from_slice(&int_key.to_be_bytes()).is_err() {
+        int_key += 1u32;
+    }
+    UntweakedPublicKey::from_slice(&int_key.to_be_bytes()).unwrap()
 }
 
 pub fn make_rpc_client_from_env() -> Client {
@@ -281,7 +302,7 @@ pub fn commit_arbitrary_data(
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
     // this transaction can only be spent through the script path
-    let unspendable_pubkey = create_unspendable_internal_key(secp);
+    let unspendable_pubkey = create_random_unspendable_internal_key(secp);
 
     let mut builder = Builder::new();
     let mut offset = 0;
@@ -1126,12 +1147,16 @@ pub fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsE
     Ok(concatenated_data)
 }
 
-pub fn create_multisig_address(
+pub fn create_multisig_spend_info(
+    secp: &Secp256k1<All>,
     public_keys: &[XOnlyPublicKey],
-    // TODO should we accept a u8?
     required_sigs: i64,
-    network: Network,
-) -> Address {
+) -> Result<TaprootSpendInfo, BitcoinUtilsError> {
+    // check if enough public keys are provided
+    if (public_keys.len() as i64) < required_sigs {
+        return Err(BitcoinUtilsError::InsufficientPublicKeys);
+    }
+
     // Create a multisig script from the public keys
     let multisig_script = public_keys
         .iter()
@@ -1149,10 +1174,32 @@ pub fn create_multisig_address(
         .push_opcode(opcodes::all::OP_GREATERTHANOREQUAL)
         .into_script();
 
-    // TODO decide on the multisig address format: taproot, p2sh or p2wsh
-    Address::p2wsh(&multisig_script, network)
+    let builder = TaprootBuilder::with_huffman_tree(vec![(1, multisig_script)])?;
+    let internal_key = create_unspendable_internal_key();
+    let spend_info = builder
+        .finalize(secp, internal_key)
+        .map_err(|_| BitcoinUtilsError::TaprootBuilderNotFinalizable)?;
+
+    Ok(spend_info)
 }
 
+pub fn create_multisig_address(
+    secp: &Secp256k1<All>,
+    public_keys: &[XOnlyPublicKey],
+    required_sigs: i64,
+    network: Network,
+) -> Result<Address, BitcoinUtilsError> {
+    let spend_info = create_multisig_spend_info(secp, public_keys, required_sigs)?;
+
+    Ok(Address::p2tr(
+        secp,
+        spend_info.internal_key(),
+        spend_info.merkle_root(),
+        network,
+    ))
+}
+
+// TODO decouple errors
 #[derive(Error, Debug)]
 pub enum BitcoinUtilsError {
     #[error("cannot connect to the bitcoin node")]
@@ -1171,6 +1218,12 @@ pub enum BitcoinUtilsError {
 
     #[error("an error related to the BIP32 specification occured")]
     Bip32Error(#[from] bitcoin::bip32::Error),
+
+    #[error("insufficient public keys provided")]
+    InsufficientPublicKeys,
+
+    #[error("taproot builder is not finalizable")]
+    TaprootBuilderNotFinalizable,
 
     #[error("an error occured when building a taproot transaction")]
     TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
@@ -1233,8 +1286,10 @@ pub enum BitcoinUtilsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-    use bitcoin::{AddressType, Network, XOnlyPublicKey};
+    use bitcoin::{
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        AddressType,
+    };
 
     fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
         let secp = Secp256k1::new();
@@ -1249,25 +1304,42 @@ mod tests {
 
     #[test]
     fn test_create_multisig_address_single_key() {
+        let secp = Secp256k1::new();
         let public_keys = generate_xonly_pubkeys(1);
         let required_sigs = 1;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&public_keys, required_sigs, network);
+        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
+            .expect("Failed to create multisig address");
 
-        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+        assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
 
     #[test]
     fn test_create_multisig_address_multiple_keys() {
+        let secp = Secp256k1::new();
         let public_keys = generate_xonly_pubkeys(3);
         let required_sigs = 2;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&public_keys, required_sigs, network);
+        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
+            .expect("Failed to create multisig address");
 
-        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+        assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
 
-    // TODO more tests for create_multisig_address
+    #[test]
+    fn test_create_multisig_address_insufficient_keys() {
+        let secp = Secp256k1::new();
+        let public_keys = generate_xonly_pubkeys(1);
+        let required_sigs = 2; // More signatures required than keys available
+        let network = Network::Bitcoin;
+
+        let result = create_multisig_address(&secp, &public_keys, required_sigs, network);
+
+        assert!(matches!(
+            result,
+            Err(BitcoinUtilsError::InsufficientPublicKeys)
+        ));
+    }
 }

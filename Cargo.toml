@@ -24,3 +24,5 @@ ipc_serde = { path = "ipc_serde" }
 async-trait = "0.1.83"
 heed = "0.21.0"
 tokio-util = "0.7.13"
+num-traits = "0.2.19"
+num-bigint = "0.4.6"

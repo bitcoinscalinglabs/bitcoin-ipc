@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::bitcoin_utils::{self, test_and_submit, write_arbitrary_data, CommitRevealFee};
+use crate::bitcoin_utils::{
+    self, create_multisig_address, test_and_submit, write_arbitrary_data, CommitRevealFee,
+};
+use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
@@ -93,7 +96,7 @@ pub struct IpcCreateSubnetMsg {
     /// The minimum number of collateral required for validators in Satoshis
     pub min_validator_stake: u64,
     /// Minimum number of validators required to bootstrap the subnet
-    pub min_validators: u64,
+    pub min_validators: u16,
     /// The bottom up checkpoint period in number of blocks
     pub bottomup_check_period: u64,
     /// The max number of active validators in subnet
@@ -103,6 +106,21 @@ pub struct IpcCreateSubnetMsg {
     pub min_cross_msg_fee: Amount,
     /// The addresses of whitelisted validators
     pub whitelist: Vec<XOnlyPublicKey>,
+}
+
+impl IpcCreateSubnetMsg {
+    /// Creates a multisig address from the whitelisted public keys
+    pub fn multisig_address_from_whitelist(&self) -> Result<bitcoin::Address, IpcLibError> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let multisig_address = create_multisig_address(
+            &secp,
+            &self.whitelist.clone(),
+            self.min_validators.into(),
+            NETWORK,
+        )?;
+
+        Ok(multisig_address)
+    }
 }
 
 impl IpcValidate for IpcCreateSubnetMsg {
@@ -129,7 +147,7 @@ impl IpcValidate for IpcCreateSubnetMsg {
             ));
         }
 
-        if (self.active_validators_limit as u64) < self.min_validators {
+        if self.active_validators_limit < self.min_validators {
             return Err(IpcValidateError::InvalidField(
                 "active_validators_limit",
                 "Must be greater than or equal to min_validators".to_string(),
