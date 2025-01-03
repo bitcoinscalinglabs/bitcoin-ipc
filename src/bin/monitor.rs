@@ -307,6 +307,12 @@ where
 
                 let subnet_id = ipc_lib::subnet_id_from_txid(txid);
 
+                let multisig_addr = create_subnet_params
+                    .multisig_address_from_whitelist()
+                    .map_err(|e| MonitorError::IpcMsgError(e.to_string()))?;
+
+                debug!("multisig_address: {}", multisig_addr);
+
                 debug!(
                     "block={} subnet_id={} msg={:?}",
                     block_height, subnet_id, create_subnet_params
@@ -342,6 +348,10 @@ fn find_valid_utf8(data: &[u8]) -> &str {
 pub enum MonitorError {
     #[error("Current block height ahead of tip. Latest: {0}. Current: {1}")]
     BlockHeightAheadOfTip(u64, u64),
+
+    // TODO better errors
+    #[error("Error processing IPC message: {0}")]
+    IpcMsgError(String),
 
     #[error(transparent)]
     DbError(#[from] db::DbError),

@@ -1,7 +1,6 @@
 use crate::{
-    bitcoin_utils::create_multisig_address,
     ipc_lib::{self, IpcValidate},
-    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS, NETWORK,
+    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -142,17 +141,12 @@ pub async fn create_subnet(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    // TODO check the maximum size of the multisig signatures
-    let required_sigs: i64 = params.min_validators.try_into().map_err(|_| {
+    let multisig_address = params.multisig_address_from_whitelist().map_err(|e| {
         RpcError::InvalidParams(format!(
-            "The minimum number of validators must not be greater than {}",
-            i64::MAX
+            "There was an error creating the multisig address: {}",
+            e
         ))
     })?;
-
-    // Create a multisig address from the public keys
-    let multisig_address = create_multisig_address(&params.whitelist, required_sigs, NETWORK);
-
     debug!("multisig_address: {}", multisig_address);
 
     let subnet_data = params.ipc_serialize();
