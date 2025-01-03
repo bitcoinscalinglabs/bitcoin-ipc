@@ -68,18 +68,21 @@ async fn main() {
     info!("Shutting down");
 }
 
-// TODO use generics for deps + add a trait for the monitor
-struct Monitor {
-    db: Db,
+// TODO use generics for rpc + add a trait for the monitor
+struct Monitor<D: Database> {
+    db: D,
     rpc: bitcoincore_rpc::Client,
     check_interval: Duration,
     current_height: u64,
     cancel_token: CancellationToken,
 }
 
-impl Monitor {
+impl<D> Monitor<D>
+where
+    D: Database,
+{
     fn new(
-        db: Db,
+        db: D,
         rpc: bitcoincore_rpc::Client,
         check_interval: Duration,
         cancel_token: CancellationToken,
