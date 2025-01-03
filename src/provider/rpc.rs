@@ -1,13 +1,11 @@
-use crate::{
-    ipc_lib::{self, IpcValidate},
-    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS,
-};
+use crate::{ipc_lib::IpcValidate, IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK};
+use bitcoin::TxOut;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::debug;
+use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 
 pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
@@ -48,7 +46,8 @@ impl actix_web::error::ResponseError for RpcError {
             },
             "id": null
         });
-        actix_web::HttpResponse::Unauthorized()
+
+        actix_web::HttpResponse::Ok()
             .content_type("application/json")
             .body(json_rpc_error.to_string())
     }
@@ -135,39 +134,59 @@ pub struct CreateSubnetResponse {
 
 pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<IpcCreateSubnetMsg>,
+    Params(msg): Params<IpcCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
-    if let Err(err) = params.validate() {
+    if let Err(err) = msg.validate() {
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    let multisig_address = params.multisig_address_from_whitelist().map_err(|e| {
-        RpcError::InvalidParams(format!(
-            "There was an error creating the multisig address: {}",
-            e
-        ))
-    })?;
-    debug!("multisig_address: {}", multisig_address);
-
-    let subnet_data = params.ipc_serialize();
-
-    debug!("subnet_data: {}", subnet_data);
-
-    // Create and submit the create child transaction
-    let (commit_tx, _) =
-        ipc_lib::create_and_submit_create_child_tx(&data.btc_rpc, &multisig_address, &subnet_data)
-            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-
-    // Compute the transaction ID
-    let commit_tx_id: bitcoin::Txid = commit_tx.compute_txid();
-
-    // Generate the subnet ID
-    let subnet_id = ipc_lib::subnet_id_from_txid(&commit_tx_id);
-
-    debug!("subnet_id: {}", subnet_id);
+    let subnet_id = msg
+        .submit_to_bitcoin(&data.btc_rpc)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreFundSubnetParams {
+    multisig_address: String,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    amount: bitcoin::Amount,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreFundSubnetResponse {
+    tx_id: bitcoin::Txid,
+}
+
+pub async fn pre_fund(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<PreFundSubnetParams>,
+) -> Result<PreFundSubnetResponse, JsonRpcError> {
+    let multisig_address = bitcoin::Address::from_str(&params.multisig_address)
+        .map_err(|e| RpcError::InvalidParams(format!("Invalid multisig address: {}", e)))?
+        .require_network(NETWORK)
+        // TODO better error
+        .map_err(|e| RpcError::InvalidParams(format!("Multisig address network: {}", e)))?;
+
+    let outputs = vec![TxOut {
+        value: params.amount,
+        script_pubkey: multisig_address.script_pubkey(),
+    }];
+
+    let tx = crate::wallet::fund_outputs(&data.btc_rpc, outputs, None)
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    let tx = crate::wallet::sign_tx(&data.btc_rpc, tx)
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    let tx_id = tx.compute_txid();
+
+    crate::bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![tx])
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    Ok(PreFundSubnetResponse { tx_id })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
@@ -178,5 +197,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
+        .with_method("prefund", pre_fund)
         .finish()
 }
