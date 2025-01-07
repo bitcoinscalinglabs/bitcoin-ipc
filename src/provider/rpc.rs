@@ -175,7 +175,7 @@ pub async fn pre_fund(
 ) -> Result<PreFundSubnetResponse, JsonRpcError> {
     let subnet_info = data
         .db
-        .get_subnet_info(params.subnet_id)
+        .get_subnet_genesis_info(params.subnet_id)
         .await
         .map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
@@ -188,7 +188,7 @@ pub async fn pre_fund(
 
     // TODO this check should be done in the Db
     let multisig_address = &subnet_info
-        .multisig_address
+        .multisig_address()
         .require_network(NETWORK)
         .map_err(|_| {
             RpcError::InvalidParams(format!("Multisig address must be for {} network", NETWORK))

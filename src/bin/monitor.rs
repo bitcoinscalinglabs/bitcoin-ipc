@@ -324,13 +324,7 @@ where
                 // TODO handle errors better
                 if let Err(e) = self
                     .db
-                    .save_subnet_create_msg(
-                        subnet_id,
-                        block_height,
-                        // TODO remove the into_unchecked
-                        multisig_addr.clone().into_unchecked(),
-                        create_subnet_params.clone(),
-                    )
+                    .save_subnet_create_msg(subnet_id, block_height, create_subnet_params.clone())
                     .await
                 {
                     error!("Failed to save subnet to DB: {:?}", e);
