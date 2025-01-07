@@ -1,6 +1,6 @@
 use crate::ipc_lib::{self, SubnetId};
 use async_trait::async_trait;
-use bitcoin::{address::NetworkUnchecked, Address};
+use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
 use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
@@ -8,15 +8,66 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
+#[allow(dead_code)]
 const SUBNET_INFO_PREFIX: &str = "subnet_info:";
+const SUBNET_GENESIS_INFO_PREFIX: &str = "subnet_genesis_info:";
 
-// Temporary struct until the DB structure is better defined
+/// State of a validator in a subnet
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Subnet {
-    pub genesis_block_height: u64,
+pub struct SubnetValidator {
+    /// The public key of the validator
+    pub pubkey: XOnlyPublicKey,
+    /// The current balance of the validator's stake
+    pub balance: bitcoin::Amount,
+    /// The IP address of the validator, as
+    /// advertised in the subnet's join/pre-fund message
+    pub ip: std::net::SocketAddr,
+    /// The transaction ID of the join/pre-fund message
+    pub join_txid: bitcoin::Txid,
+}
+
+/// The current state of a subnet
+/// Must only exist if the subnet is bootstrapped
+///
+/// Note: many more fields will be added here
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubnetState {
+    /// Duplicate of the subnet ID, for easy access
     pub subnet_id: SubnetId,
+    /// The current list of validators, with their balances
+    pub validators: Vec<SubnetValidator>,
+    /// The subnet multisig address
     pub multisig_address: Address<NetworkUnchecked>,
+}
+
+/// Genesis info for a subnet
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubnetGenesisInfo {
+    /// The original create subnet msg, which holds
+    /// the configuration alongside the validatorsg whitelist
+    ///
+    /// The pre-boostrap multisig is constructed from the whitelist
     pub create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
+    /// Marks if the subnet is bootstrapped
+    /// The struct should never be modified after bootstrapping
+    pub bootstrapped: bool,
+    /// The height of the block where the create subnet
+    /// message was included
+    pub genesis_block_height: u64,
+    /// The height of the block where the subnet was bootstrapped
+    pub boostrap_block_height: Option<u64>,
+    /// The list of validators that boostrapped the subnet
+    /// (by pre-funding the subnet)
+    pub genesis_validators: Vec<SubnetValidator>,
+}
+
+impl SubnetGenesisInfo {
+    pub fn multisig_address(&self) -> Address<NetworkUnchecked> {
+        self.create_subnet_msg
+            .multisig_address_from_whitelist()
+            .expect("Multisig should be valid for saved subnet genesis info")
+            .into_unchecked()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -27,7 +78,9 @@ struct MonitorInfo {
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
-    subnet_db: HeedDatabase<Str, SerdeBincode<Subnet>>,
+    #[allow(dead_code)]
+    subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
+    subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
 }
 
 impl HeedDb {
@@ -76,41 +129,55 @@ impl HeedDb {
             let subnet_db = env
                 .open_database(&rtxn, Some("subnet_db"))?
                 .ok_or(DbError::DbNotFound("subnet_db".to_string()))?;
+            let subnet_genesis_db = env
+                .open_database(&rtxn, Some("subnet_genesis_db"))?
+                .ok_or(DbError::DbNotFound("subnet_genesis_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
                 env,
                 monitor_info,
                 subnet_db,
+                subnet_genesis_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
             let mut txn = env.write_txn()?;
             let monitor_info = env.create_database(&mut txn, Some("monitor_info"))?;
             let subnet_db = env.create_database(&mut txn, Some("subnet_db"))?;
+            let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
             txn.commit()?;
 
             Ok(Self {
                 env,
                 monitor_info,
                 subnet_db,
+                subnet_genesis_db,
             })
         }
     }
 }
 
+// TODO maybe split into multiple traits
 #[async_trait]
 pub trait Database {
+    // Monitor Info
     async fn get_last_processed_block(&self) -> Result<u64, DbError>;
     async fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
+
+    // Genesis Info
+    async fn get_subnet_genesis_info(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetGenesisInfo>, DbError>;
     async fn save_subnet_create_msg(
         &self,
         subnet_id: SubnetId,
         block_height: u64,
-        multisig_address: bitcoin::Address<NetworkUnchecked>,
         create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError>;
-    async fn get_subnet_info(&self, subnet_id: SubnetId) -> Result<Option<Subnet>, DbError>;
+
+    // TODO Subnet State
 }
 
 #[async_trait]
@@ -145,34 +212,39 @@ impl Database for HeedDb {
         Ok(())
     }
 
+    // Genesis Info
+
+    async fn get_subnet_genesis_info(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetGenesisInfo>, DbError> {
+        let key = format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id);
+        let txn = self.env.read_txn()?;
+        let subnet = self.subnet_genesis_db.get(&txn, &key)?;
+        Ok(subnet)
+    }
+
     async fn save_subnet_create_msg(
         &self,
         subnet_id: SubnetId,
         genesis_block_height: u64,
-        multisig_address: bitcoin::Address<NetworkUnchecked>,
         create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError> {
         // TODO check network
 
-        let subnet = Subnet {
-            genesis_block_height,
-            subnet_id,
-            multisig_address,
+        let subnet = SubnetGenesisInfo {
             create_subnet_msg,
+            bootstrapped: false,
+            genesis_block_height,
+            boostrap_block_height: None,
+            genesis_validators: Vec::with_capacity(0),
         };
-        let key = format!("{SUBNET_INFO_PREFIX}:{}", subnet_id);
+        let key = format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id);
         debug!("key={} subnet={:#?}", key, &subnet);
         let mut txn = self.env.write_txn()?;
-        self.subnet_db.put(&mut txn, &key, &subnet)?;
+        self.subnet_genesis_db.put(&mut txn, &key, &subnet)?;
         txn.commit()?;
         Ok(())
-    }
-
-    async fn get_subnet_info(&self, subnet_id: SubnetId) -> Result<Option<Subnet>, DbError> {
-        let key = format!("{SUBNET_INFO_PREFIX}:{}", subnet_id);
-        let txn = self.env.read_txn()?;
-        let subnet = self.subnet_db.get(&txn, &key)?;
-        Ok(subnet)
     }
 }
 
