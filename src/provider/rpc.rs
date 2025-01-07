@@ -1,4 +1,8 @@
-use crate::{ipc_lib::IpcValidate, IpcCreateSubnetMsg, BTC_CONFIRMATIONS};
+use crate::{
+    ipc_lib::{IpcValidate, SubnetId},
+    IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK,
+};
+use bitcoin::{address::NetworkUnchecked, TxOut};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::error;
@@ -128,7 +132,7 @@ pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcErro
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSubnetResponse {
-    subnet_id: String,
+    subnet_id: SubnetId,
 }
 
 pub async fn create_subnet(
@@ -145,6 +149,47 @@ pub async fn create_subnet(
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreFundSubnetParams {
+    multisig_address: bitcoin::Address<NetworkUnchecked>,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    amount: bitcoin::Amount,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreFundSubnetResponse {
+    tx_id: bitcoin::Txid,
+}
+
+pub async fn pre_fund(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<PreFundSubnetParams>,
+) -> Result<PreFundSubnetResponse, JsonRpcError> {
+    let multisig_address = &params
+        .multisig_address
+        .require_network(NETWORK)
+        // TODO better error
+        .map_err(|e| RpcError::InvalidParams(format!("Multisig address network: {}", e)))?;
+
+    let outputs = vec![TxOut {
+        value: params.amount,
+        script_pubkey: multisig_address.script_pubkey(),
+    }];
+
+    let tx = crate::wallet::fund_outputs(&data.btc_rpc, outputs, None)
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    let tx = crate::wallet::sign_tx(&data.btc_rpc, tx)
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    let tx_id = tx.compute_txid();
+
+    crate::bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![tx])
+        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
+
+    Ok(PreFundSubnetResponse { tx_id })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {

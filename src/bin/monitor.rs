@@ -305,7 +305,7 @@ where
                     return Ok(());
                 }
 
-                let subnet_id = ipc_lib::subnet_id_from_txid(txid);
+                let subnet_id = ipc_lib::SubnetId::from_txid(txid);
 
                 let multisig_addr = create_subnet_params
                     .multisig_address_from_whitelist()
@@ -321,7 +321,13 @@ where
                 // TODO handle errors better
                 if let Err(e) = self
                     .db
-                    .save_subnet_create_msg(block_height, &subnet_id, &create_subnet_params)
+                    .save_subnet_create_msg(
+                        subnet_id,
+                        block_height,
+                        // TODO remove the into_unchecked
+                        multisig_addr.clone().into_unchecked(),
+                        create_subnet_params.clone(),
+                    )
                     .await
                 {
                     error!("Failed to save subnet to DB: {:?}", e);
