@@ -1,8 +1,9 @@
 use crate::{
+    db::{self, Database, HeedDb},
     ipc_lib::{IpcValidate, SubnetId},
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK,
 };
-use bitcoin::{address::NetworkUnchecked, TxOut};
+use bitcoin::TxOut;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::error;
@@ -21,6 +22,9 @@ pub enum RpcError {
     #[error("Invalid params: {0}")]
     InvalidParams(String),
 
+    #[error("Database error occurred: {0}")]
+    DbError(#[from] db::DbError),
+
     #[error("Internal server error: {0}")]
     InternalError(String),
 }
@@ -30,7 +34,7 @@ impl ErrorLike for RpcError {
         match self {
             RpcError::Unauthorized => -32001,
             RpcError::InvalidParams(_) => -32602,
-            RpcError::InternalError(_) => -32603,
+            RpcError::InternalError(_) | RpcError::DbError(_) => -32603,
         }
     }
 
@@ -56,8 +60,10 @@ impl actix_web::error::ResponseError for RpcError {
     }
 }
 
+// TODO use generics
 #[derive(Clone)]
 pub struct ServerData {
+    pub db: Arc<HeedDb>,
     pub btc_rpc: Arc<Client>,
 }
 
@@ -153,7 +159,7 @@ pub async fn create_subnet(
 
 #[derive(Serialize, Deserialize)]
 pub struct PreFundSubnetParams {
-    multisig_address: bitcoin::Address<NetworkUnchecked>,
+    subnet_id: SubnetId,
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     amount: bitcoin::Amount,
 }
@@ -167,11 +173,26 @@ pub async fn pre_fund(
     data: Data<Arc<ServerData>>,
     Params(params): Params<PreFundSubnetParams>,
 ) -> Result<PreFundSubnetResponse, JsonRpcError> {
-    let multisig_address = &params
+    let subnet_info = data
+        .db
+        .get_subnet_info(params.subnet_id)
+        .await
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    // TODO this check should be done in the Db
+    let multisig_address = &subnet_info
         .multisig_address
         .require_network(NETWORK)
-        // TODO better error
-        .map_err(|e| RpcError::InvalidParams(format!("Multisig address network: {}", e)))?;
+        .map_err(|_| {
+            RpcError::InvalidParams(format!("Multisig address must be for {} network", NETWORK))
+        })?;
 
     let outputs = vec![TxOut {
         value: params.amount,
@@ -200,5 +221,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
+        .with_method("prefundsubnet", pre_fund)
         .finish()
 }

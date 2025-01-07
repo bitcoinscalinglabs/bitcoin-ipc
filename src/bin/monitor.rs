@@ -24,9 +24,12 @@ async fn main() {
     env_logger::init();
 
     // Initialize the database
-    let db = HeedDb::new(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
-        .await
-        .expect("Failed to initialize database");
+    let db = HeedDb::new(
+        &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+        false,
+    )
+    .await
+    .expect("Failed to initialize database");
 
     // Init the bitcoincore_rpc client
 
