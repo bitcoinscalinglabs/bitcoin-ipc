@@ -1,5 +1,6 @@
-use crate::ipc_lib;
+use crate::ipc_lib::{self, SubnetId};
 use async_trait::async_trait;
+use bitcoin::{address::NetworkUnchecked, Address};
 use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,9 @@ const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
 // Temporary struct until the DB structure is better defined
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Subnet {
-    block_height: u64,
-    subnet_id: String,
+    genesis_block_height: u64,
+    subnet_id: SubnetId,
+    multisig_address: Address<NetworkUnchecked>,
     create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
 }
 
@@ -63,9 +65,10 @@ pub trait Database {
     async fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
     async fn save_subnet_create_msg(
         &self,
+        subnet_id: SubnetId,
         block_height: u64,
-        subnet_id: &str,
-        create_subnet_msg: &ipc_lib::IpcCreateSubnetMsg,
+        multisig_address: bitcoin::Address<NetworkUnchecked>,
+        create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError>;
     async fn get_subnet_create_msg(&self, subnet_id: &str) -> Result<Option<Subnet>, DbError>;
 }
@@ -104,14 +107,16 @@ impl Database for Db {
 
     async fn save_subnet_create_msg(
         &self,
-        block_height: u64,
-        subnet_id: &str,
-        create_subnet_params: &ipc_lib::IpcCreateSubnetMsg,
+        subnet_id: SubnetId,
+        genesis_block_height: u64,
+        multisig_address: bitcoin::Address<NetworkUnchecked>,
+        create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
     ) -> Result<(), DbError> {
         let subnet = Subnet {
-            block_height,
-            subnet_id: subnet_id.to_string(),
-            create_subnet_msg: create_subnet_params.clone(),
+            genesis_block_height,
+            subnet_id,
+            multisig_address,
+            create_subnet_msg,
         };
         let key = format!("create_msg:{}", subnet_id);
         let mut txn = self.env.write_txn()?;

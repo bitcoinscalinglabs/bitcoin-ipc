@@ -1,4 +1,5 @@
 use bitcoin::Amount;
+use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
 use ipc_serde::IpcSerialize;
 use log::{debug, info};
@@ -124,7 +125,10 @@ impl IpcCreateSubnetMsg {
     /// Submits the create subnet message to the Bitcoin network
     /// Using commit-reveal scheme
     /// Returns the subnet id — derived from the commit txid
-    pub fn submit_to_bitcoin(&self, rpc: &bitcoincore_rpc::Client) -> Result<String, IpcLibError> {
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<SubnetId, IpcLibError> {
         let multisig_address = self.multisig_address_from_whitelist()?;
         let subnet_data = self.ipc_serialize();
 
@@ -150,7 +154,7 @@ impl IpcCreateSubnetMsg {
 
         match submit_to_mempool(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
             Ok(_) => {
-                let subnet_id = subnet_id_from_txid(&commit_txid);
+                let subnet_id = SubnetId::from_txid(&commit_txid);
                 info!("Submitted create subnet msg for subnet_id={}", subnet_id);
                 Ok(subnet_id)
             }
@@ -224,13 +228,73 @@ impl IpcMessage {
     }
 }
 
+//
+// Subnet ID
+//
+
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the commit transaction.
-///
-/// Creates a subnet ID from the commit txid
-// TODO make a new type for SubnetId
-pub fn subnet_id_from_txid(txid: &bitcoin::Txid) -> String {
-    format!("{}/{}", crate::L1_NAME, txid)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubnetId(Txid);
+
+#[derive(Debug, Error)]
+pub enum SubnetIdError {
+    #[error("Invalid Subnet Id format. Expected '{0}/<txid>', got '{1}'")]
+    InvalidFormat(&'static str, String),
+    #[error("Invalid transaction ID: {0}")]
+    InvalidTxid(#[from] bitcoin::hashes::hex::HexToArrayError),
+}
+
+impl SubnetId {
+    /// Creates a new SubnetId from a transaction ID
+    pub fn from_txid(txid: &Txid) -> Self {
+        Self(*txid)
+    }
+
+    /// Returns the transaction ID
+    pub fn txid(&self) -> &Txid {
+        &self.0
+    }
+}
+
+impl FromStr for SubnetId {
+    type Err = SubnetIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() != 2 || parts[0] != crate::L1_NAME {
+            return Err(SubnetIdError::InvalidFormat(crate::L1_NAME, s.to_string()));
+        }
+
+        let txid = Txid::from_str(parts[1])?;
+        Ok(SubnetId(txid))
+    }
+}
+
+impl std::fmt::Display for SubnetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", crate::L1_NAME, self.0)
+    }
+}
+
+impl serde::Serialize for SubnetId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as string in the format "L1_NAME/txid"
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SubnetId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        SubnetId::from_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 // pub fn create_pre_fund_tx(
@@ -381,5 +445,87 @@ mod tests {
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
         assert_eq!(params.whitelist, vec![validator1, validator2]);
+    }
+
+    //
+    // SubnetId
+    //
+
+    #[test]
+    fn test_subnet_id_creation() {
+        let txid =
+            Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                .unwrap();
+        let subnet_id = SubnetId::from_txid(&txid);
+
+        assert_eq!(subnet_id.txid(), &txid);
+    }
+
+    #[test]
+    fn test_subnet_id_from_str() {
+        let subnet_id_str = format!(
+            "{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            crate::L1_NAME
+        );
+        let subnet_id = SubnetId::from_str(&subnet_id_str).unwrap();
+
+        assert_eq!(
+            subnet_id.txid().to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+    }
+
+    #[test]
+    fn test_subnet_id_display() {
+        let txid =
+            Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                .unwrap();
+        let subnet_id = SubnetId::from_txid(&txid);
+
+        assert_eq!(
+            subnet_id.to_string(),
+            format!(
+                "{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                crate::L1_NAME
+            )
+        );
+    }
+
+    #[test]
+    fn test_invalid_subnet_id() {
+        // Test invalid txid
+        let result = SubnetId::from_str(&format!("{}/invalid-txid", crate::L1_NAME));
+        assert!(matches!(result, Err(SubnetIdError::InvalidTxid(_))));
+
+        // Test missing prefix
+        let result =
+            SubnetId::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
+        assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
+
+        // Test wrong prefix
+        let result = SubnetId::from_str(
+            "wrongchain/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+        );
+        assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
+    }
+
+    #[test]
+    fn test_subnet_id_serde() {
+        let txid =
+            Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                .unwrap();
+        let subnet_id = SubnetId::from_txid(&txid);
+
+        // Test JSON serialization
+        let serialized = serde_json::to_string(&subnet_id).unwrap();
+        let expected = format!(
+            "\"{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b\"",
+            crate::L1_NAME
+        );
+        assert_eq!(serialized, expected);
+
+        // Test JSON deserialization
+        let deserialized: SubnetId = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, subnet_id);
     }
 }

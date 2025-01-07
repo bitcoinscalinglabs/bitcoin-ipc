@@ -1,11 +1,14 @@
-use crate::{ipc_lib::IpcValidate, IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK};
-use bitcoin::TxOut;
+use crate::{
+    ipc_lib::{IpcValidate, SubnetId},
+    IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK,
+};
+use bitcoin::{address::NetworkUnchecked, TxOut};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
@@ -129,7 +132,7 @@ pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcErro
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSubnetResponse {
-    subnet_id: String,
+    subnet_id: SubnetId,
 }
 
 pub async fn create_subnet(
@@ -150,7 +153,7 @@ pub async fn create_subnet(
 
 #[derive(Serialize, Deserialize)]
 pub struct PreFundSubnetParams {
-    multisig_address: String,
+    multisig_address: bitcoin::Address<NetworkUnchecked>,
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     amount: bitcoin::Amount,
 }
@@ -164,8 +167,8 @@ pub async fn pre_fund(
     data: Data<Arc<ServerData>>,
     Params(params): Params<PreFundSubnetParams>,
 ) -> Result<PreFundSubnetResponse, JsonRpcError> {
-    let multisig_address = bitcoin::Address::from_str(&params.multisig_address)
-        .map_err(|e| RpcError::InvalidParams(format!("Invalid multisig address: {}", e)))?
+    let multisig_address = &params
+        .multisig_address
         .require_network(NETWORK)
         // TODO better error
         .map_err(|e| RpcError::InvalidParams(format!("Multisig address network: {}", e)))?;
