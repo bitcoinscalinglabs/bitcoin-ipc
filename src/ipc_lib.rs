@@ -154,7 +154,7 @@ impl IpcCreateSubnetMsg {
 
         match submit_to_mempool(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
             Ok(_) => {
-                let subnet_id = SubnetId::from_txid(&commit_txid);
+                let subnet_id = SubnetId::from_txid(&reveal_txid);
                 info!("Submitted create subnet msg for subnet_id={}", subnet_id);
                 Ok(subnet_id)
             }
@@ -233,7 +233,7 @@ impl IpcMessage {
 //
 
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
-/// Subnet ID is derived from the transaction ID of the commit transaction.
+/// Subnet ID is derived from the transaction ID of the reveal transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubnetId(Txid);
 
