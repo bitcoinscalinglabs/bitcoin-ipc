@@ -332,6 +332,8 @@ where
 
                 Ok(())
             }
+
+            IpcMessage::PrefundSubnet(_) => todo!(),
         }
     }
 }
