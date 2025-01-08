@@ -1,3 +1,4 @@
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::Amount;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
@@ -15,7 +16,7 @@ pub mod prelude {
     pub use super::{
         IpcCreateSubnetMsg, IpcMessage, IpcSerialize, IpcTag, IPC_CHECKPOINT_TAG,
         IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_JOIN_SUBNET_TAG,
-        IPC_TAG_DELIMITER, IPC_TRANSFER_TAG, IPC_WITHDRAW_TAG,
+        IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER, IPC_TRANSFER_TAG, IPC_WITHDRAW_TAG,
     };
 }
 
@@ -23,6 +24,7 @@ pub mod prelude {
 
 pub const IPC_TAG_DELIMITER: &str = "#";
 pub const IPC_CREATE_SUBNET_TAG: &str = "IPC:CREATE";
+pub const IPC_PREFUND_SUBNET_TAG: &str = "IPC:PREFUND";
 pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOIN";
 pub const IPC_DEPOSIT_TAG: &str = "IPC:DEPOSIT";
 pub const IPC_CHECKPOINT_TAG: &str = "IPC:CHECKPOINT";
@@ -34,12 +36,14 @@ pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DELETE";
 #[derive(Debug, PartialEq)]
 pub enum IpcTag {
     CreateSubnet,
+    PrefundSubnet,
 }
 
 impl IpcTag {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateSubnet => IPC_CREATE_SUBNET_TAG,
+            Self::PrefundSubnet => IPC_PREFUND_SUBNET_TAG,
         }
     }
 }
@@ -50,6 +54,7 @@ impl std::str::FromStr for IpcTag {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             IPC_CREATE_SUBNET_TAG => Ok(Self::CreateSubnet),
+            IPC_PREFUND_SUBNET_TAG => Ok(Self::PrefundSubnet),
             _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
@@ -205,10 +210,33 @@ impl IpcValidate for IpcCreateSubnetMsg {
     }
 }
 
+#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
+#[tag(IPC_PREFUND_SUBNET_TAG)]
+pub struct IpcPrefundSubnetMsg {
+    /// The subnet id of the subnet to pre-fund
+    subnet_id: SubnetId,
+    /// The amount to collateral to lock in the subnet
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    collateral: bitcoin::Amount,
+    /// The amount to receive in the subnet
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    initial_funding: bitcoin::Amount,
+    /// The IP address of the validator, as
+    /// advertised in the subnet's join/pre-fund message
+    pub ip: std::net::SocketAddr,
+    /// The bitcoin address of the validator
+    /// to receive back the collateral in case of
+    /// subnet termination.
+    btc_address: bitcoin::Address<NetworkUnchecked>,
+    /// The username of the validator
+    username: String,
+}
+
 // Define the IPCMessage enum
 #[derive(Debug)]
 pub enum IpcMessage {
     CreateSubnet(IpcCreateSubnetMsg),
+    PrefundSubnet(IpcPrefundSubnetMsg),
 }
 
 impl IpcMessage {
@@ -223,6 +251,9 @@ impl IpcMessage {
         match IpcTag::from_str(tag)? {
             IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(
                 IpcCreateSubnetMsg::ipc_deserialize(s)?,
+            )),
+            IpcTag::PrefundSubnet => Ok(IpcMessage::PrefundSubnet(
+                IpcPrefundSubnetMsg::ipc_deserialize(s)?,
             )),
         }
     }
