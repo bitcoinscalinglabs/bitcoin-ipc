@@ -233,51 +233,6 @@ pub fn subnet_id_from_txid(txid: &bitcoin::Txid) -> String {
     format!("{}/{}", crate::L1_NAME, txid)
 }
 
-// pub fn create_pre_fund_tx(
-//     rpc: &bitcoincore_rpc::Client,
-//     subnet_id: String,
-//     multisig_address: bitcoin::Address,
-//     amount: Amount,
-// ) -> Result<Transaction, IpcLibError> {
-//     // TODO explain 65 + look if other values are possible
-//     let witness_bytes = 65;
-//     let input = bitcoin_utils::collect_wallet_outpoints_for_amount(rpc, amount, witness_bytes)?;
-
-//     // Create inputs with timelock sequence
-//     // Set relative timelock of 6 blocks using BIP68
-//     let timelock_sequence = Sequence::from_height(PRE_FUND_TIMELOCK_BLOCKS);
-//     let input_vec: Vec<TxIn> = input
-//         .into_iter()
-//         .map(|input| TxIn {
-//             previous_output: input,
-//             script_sig: ScriptBuf::new(),
-//             sequence: timelock_sequence,
-//             witness: Witness::default(),
-//         })
-//         .collect();
-
-//     // Create change output
-//     let change = bitcoin_utils::create_change_txout(rpc, &input, amount, fee, None)?;
-
-//     //  Create collateral output
-//     let collateral_output = TxOut {
-//         value: amount,
-//         script_pubkey: multisig_address.script_pubkey(),
-//     };
-
-//     let tx = Transaction {
-//         version: transaction::Version::TWO,
-//         lock_time: LockTime::ZERO,
-//         input: input_vec,
-//         output: vec![collateral_output, change],
-//     };
-
-//     // 8. Sign the transaction
-//     let signed_tx = bitcoin_utils::sign_transaction_safe(rpc, tx)?;
-
-//     Ok(signed_tx)
-// }
-
 #[derive(Error, Debug)]
 pub enum IpcLibError {
     #[error(transparent)]
