@@ -278,9 +278,11 @@ where
                 let witness_str = find_valid_utf8(&concatenated_data);
                 let ipc_message = IpcMessage::deserialize(witness_str);
 
+                // debug!("IPC message: {:?}", ipc_message);
+
                 match ipc_message {
                     Ok(msg) => {
-                        self.process_ipc_msg(block_height, &txid, msg).await?;
+                        self.process_ipc_msg(block_height, &tx, &txid, msg).await?;
                     }
                     Err(_) => {
                         continue;
@@ -295,22 +297,23 @@ where
     async fn process_ipc_msg(
         &self,
         block_height: u64,
+        tx: &bitcoin::Transaction,
         txid: &bitcoin::Txid,
         msg: IpcMessage,
     ) -> Result<(), MonitorError> {
         match msg {
-            IpcMessage::CreateSubnet(create_subnet_params) => {
-                if let Err(e) = create_subnet_params.validate() {
+            IpcMessage::CreateSubnet(create_subnet_msg) => {
+                if let Err(e) = create_subnet_msg.validate() {
                     error!(
-                        "create_subnet msg invalid msg={:?} error={:?}",
-                        create_subnet_params, e
+                        "create_subnet_msg invalid {:?} error={:?}",
+                        create_subnet_msg, e
                     );
                     return Ok(());
                 }
 
                 let subnet_id = ipc_lib::SubnetId::from_txid(txid);
 
-                let multisig_addr = create_subnet_params
+                let multisig_addr = create_subnet_msg
                     .multisig_address_from_whitelist()
                     .map_err(|e| MonitorError::IpcMsgError(e.to_string()))?;
 
@@ -318,13 +321,13 @@ where
 
                 debug!(
                     "block={} subnet_id={} msg={:?}",
-                    block_height, subnet_id, create_subnet_params
+                    block_height, subnet_id, create_subnet_msg
                 );
 
                 // TODO handle errors better
                 if let Err(e) = self
                     .db
-                    .save_subnet_create_msg(subnet_id, block_height, create_subnet_params.clone())
+                    .save_subnet_create_msg(subnet_id, block_height, create_subnet_msg.clone())
                     .await
                 {
                     error!("Failed to save subnet to DB: {:?}", e);
@@ -333,7 +336,28 @@ where
                 Ok(())
             }
 
-            IpcMessage::PrefundSubnet(_) => todo!(),
+            IpcMessage::JoinSubnet(mut join_subnet_msg) => {
+                join_subnet_msg.collateral = match tx.output.first() {
+                    Some(output) => output.value,
+                    None => {
+                        return Err(MonitorError::IpcMsgError(
+                            "Collaterall must be non zero".to_string(),
+                        ))
+                    }
+                };
+
+                if let Err(e) = join_subnet_msg.validate() {
+                    error!(
+                        "join_subnet_msg invalid {:?} error={:?}",
+                        join_subnet_msg, e
+                    );
+                    return Ok(());
+                }
+
+                info!("{:?}", join_subnet_msg);
+
+                Ok(())
+            }
         }
     }
 }

@@ -18,12 +18,23 @@ pub struct SubnetValidator {
     /// The public key of the validator
     pub pubkey: XOnlyPublicKey,
     /// The current balance of the validator's stake
-    pub balance: bitcoin::Amount,
+    pub collateral: bitcoin::Amount,
     /// The IP address of the validator, as
-    /// advertised in the subnet's join/pre-fund message
+    /// advertised in the subnet's join message
     pub ip: std::net::SocketAddr,
-    /// The transaction ID of the join/pre-fund message
+    /// The transaction ID of the join message
     pub join_txid: bitcoin::Txid,
+}
+
+/// The committee of a subnet
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubnetCommittee {
+    /// The threshold for the multisig
+    pub threshold: u16,
+    /// The current list of validators, with their balances
+    pub validators: Vec<SubnetValidator>,
+    /// The subnet multisig address
+    pub multisig_address: Address<NetworkUnchecked>,
 }
 
 /// The current state of a subnet
@@ -34,10 +45,10 @@ pub struct SubnetValidator {
 pub struct SubnetState {
     /// Duplicate of the subnet ID, for easy access
     pub subnet_id: SubnetId,
-    /// The current list of validators, with their balances
-    pub validators: Vec<SubnetValidator>,
-    /// The subnet multisig address
-    pub multisig_address: Address<NetworkUnchecked>,
+    /// The current committee number
+    pub committee_number: u64,
+    /// The current commitee
+    pub committee: SubnetCommittee,
 }
 
 /// Genesis info for a subnet
@@ -57,7 +68,6 @@ pub struct SubnetGenesisInfo {
     /// The height of the block where the subnet was bootstrapped
     pub boostrap_block_height: Option<u64>,
     /// The list of validators that boostrapped the subnet
-    /// (by pre-funding the subnet)
     pub genesis_validators: Vec<SubnetValidator>,
 }
 

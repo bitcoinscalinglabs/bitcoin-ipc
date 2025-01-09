@@ -1,9 +1,8 @@
 use crate::{
     db::{self, Database, HeedDb},
-    ipc_lib::{IpcValidate, SubnetId},
+    ipc_lib::{IpcJoinSubnetMsg, IpcValidate, SubnetId},
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK,
 };
-use bitcoin::TxOut;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::error;
@@ -158,24 +157,21 @@ pub async fn create_subnet(
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PreFundSubnetParams {
-    subnet_id: SubnetId,
-    #[serde(with = "bitcoin::amount::serde::as_sat")]
-    amount: bitcoin::Amount,
+pub struct JoinSubnetResponse {
+    join_txid: bitcoin::Txid,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct PreFundSubnetResponse {
-    tx_id: bitcoin::Txid,
-}
-
-pub async fn pre_fund(
+pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<PreFundSubnetParams>,
-) -> Result<PreFundSubnetResponse, JsonRpcError> {
+    Params(msg): Params<IpcJoinSubnetMsg>,
+) -> Result<JoinSubnetResponse, JsonRpcError> {
+    if let Err(err) = msg.validate() {
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
     let subnet_info = data
         .db
-        .get_subnet_genesis_info(params.subnet_id)
+        .get_subnet_genesis_info(msg.subnet_id)
         .await
         .map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
@@ -183,8 +179,27 @@ pub async fn pre_fund(
         })?
         .ok_or(RpcError::InvalidParams(format!(
             "Subnet {} not found.",
-            params.subnet_id
+            msg.subnet_id
         )))?;
+
+    // Check if the subnet is already bootstrapped
+    if subnet_info.bootstrapped {
+        return Err(RpcError::InvalidParams(format!(
+            "Subnet {} is already bootstrapped.",
+            msg.subnet_id
+        ))
+        .into());
+    }
+
+    if subnet_info.create_subnet_msg.min_validator_stake < msg.collateral {
+        return Err(RpcError::InvalidParams(format!(
+            "Collateral must be at least {}",
+            subnet_info.create_subnet_msg.min_validator_stake
+        ))
+        .into());
+    }
+
+    // check already prefunded
 
     // TODO this check should be done in the Db
     let multisig_address = &subnet_info
@@ -194,23 +209,11 @@ pub async fn pre_fund(
             RpcError::InvalidParams(format!("Multisig address must be for {} network", NETWORK))
         })?;
 
-    let outputs = vec![TxOut {
-        value: params.amount,
-        script_pubkey: multisig_address.script_pubkey(),
-    }];
+    let join_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
-    let tx = crate::wallet::fund_outputs(&data.btc_rpc, outputs, None)
-        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
-
-    let tx = crate::wallet::sign_tx(&data.btc_rpc, tx)
-        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
-
-    let tx_id = tx.compute_txid();
-
-    crate::bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![tx])
-        .map_err(|e| RpcError::InternalError(format!("Error creating transaction: {}", e)))?;
-
-    Ok(PreFundSubnetResponse { tx_id })
+    Ok(JoinSubnetResponse { join_txid })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
@@ -221,6 +224,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
-        .with_method("prefundsubnet", pre_fund)
+        .with_method("joinsubnet", join_subnet)
         .finish()
 }

@@ -1,4 +1,5 @@
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::hashes::Hash;
 use bitcoin::Amount;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
@@ -36,14 +37,14 @@ pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DELETE";
 #[derive(Debug, PartialEq)]
 pub enum IpcTag {
     CreateSubnet,
-    PrefundSubnet,
+    JoinSubnet,
 }
 
 impl IpcTag {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateSubnet => IPC_CREATE_SUBNET_TAG,
-            Self::PrefundSubnet => IPC_PREFUND_SUBNET_TAG,
+            Self::JoinSubnet => IPC_JOIN_SUBNET_TAG,
         }
     }
 }
@@ -54,7 +55,7 @@ impl std::str::FromStr for IpcTag {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             IPC_CREATE_SUBNET_TAG => Ok(Self::CreateSubnet),
-            IPC_PREFUND_SUBNET_TAG => Ok(Self::PrefundSubnet),
+            IPC_JOIN_SUBNET_TAG => Ok(Self::JoinSubnet),
             _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
@@ -85,6 +86,9 @@ pub trait IpcSerialize {
 
 #[derive(Debug, Error)]
 pub enum IpcValidateError {
+    #[error("Invalid message: {0}")]
+    InvalidMsg(String),
+
     #[error("Invalid field {0}: {1}")]
     InvalidField(&'static str, String),
 }
@@ -99,7 +103,8 @@ pub trait IpcValidate {
 #[tag(IPC_CREATE_SUBNET_TAG)]
 pub struct IpcCreateSubnetMsg {
     /// The minimum number of collateral required for validators in Satoshis
-    pub min_validator_stake: u64,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub min_validator_stake: Amount,
     /// Minimum number of validators required to bootstrap the subnet
     pub min_validators: u16,
     /// The bottom up checkpoint period in number of blocks
@@ -148,6 +153,7 @@ impl IpcCreateSubnetMsg {
             &secp,
             &multisig_address,
             subnet_data.as_bytes(),
+            None,
         )?;
 
         let commit_txid = commit_tx.compute_txid();
@@ -211,32 +217,107 @@ impl IpcValidate for IpcCreateSubnetMsg {
 }
 
 #[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
-#[tag(IPC_PREFUND_SUBNET_TAG)]
-pub struct IpcPrefundSubnetMsg {
-    /// The subnet id of the subnet to pre-fund
-    subnet_id: SubnetId,
+#[tag(IPC_JOIN_SUBNET_TAG)]
+pub struct IpcJoinSubnetMsg {
+    /// The subnet id of the subnet to join
+    pub subnet_id: SubnetId,
     /// The amount to collateral to lock in the subnet
+    #[ipc_serde(skip)]
     #[serde(with = "bitcoin::amount::serde::as_sat")]
-    collateral: bitcoin::Amount,
-    /// The amount to receive in the subnet
-    #[serde(with = "bitcoin::amount::serde::as_sat")]
-    initial_funding: bitcoin::Amount,
+    pub collateral: bitcoin::Amount,
     /// The IP address of the validator, as
-    /// advertised in the subnet's join/pre-fund message
+    /// advertised in the subnet's join message
     pub ip: std::net::SocketAddr,
     /// The bitcoin address of the validator
     /// to receive back the collateral in case of
     /// subnet termination.
-    btc_address: bitcoin::Address<NetworkUnchecked>,
-    /// The username of the validator
-    username: String,
+    pub backup_address: bitcoin::Address<NetworkUnchecked>,
+    /// The pubkey of the validator
+    pub pubkey: bitcoin::XOnlyPublicKey,
+}
+
+impl IpcJoinSubnetMsg {
+    /// Submits the prefund subnet message to the Bitcoin network
+    /// Using commit-reveal scheme
+    /// And sends the collateral to the subnet multisig address
+    ///
+    /// Returns the prefund txid — the txid of the reveal transaction
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Txid, IpcLibError> {
+        let subnet_data = self.ipc_serialize();
+
+        info!(
+            "Submitting join subnet msg to bitcoin. Multisig address = {}. Data={}",
+            multisig_address, subnet_data
+        );
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
+            rpc,
+            &secp,
+            multisig_address,
+            subnet_data.as_bytes(),
+            Some(self.collateral),
+        )?;
+
+        let commit_txid = commit_tx.compute_txid();
+        let reveal_txid = reveal_tx.compute_txid();
+        debug!(
+            "Join subnet commit_txid={} reveal_txid={}",
+            commit_txid, reveal_txid
+        );
+
+        match submit_to_mempool(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
+            Ok(_) => {
+                info!(
+                    "Submitted join subnet msg for subnet_id={} join_txid={}",
+                    self.subnet_id, reveal_txid,
+                );
+                Ok(reveal_txid)
+            }
+            Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+        }
+    }
+}
+
+impl IpcValidate for IpcJoinSubnetMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        // Check subnet_id is not all zeros
+        if self.subnet_id == SubnetId::default() {
+            return Err(IpcValidateError::InvalidField(
+                "subnet_id",
+                "Subnet ID cannot be all zeros".to_string(),
+            ));
+        }
+
+        // Check collateral is not zero
+        if self.collateral == Amount::ZERO {
+            return Err(IpcValidateError::InvalidField(
+                "collateral",
+                "Collateral amount must be greater than zero".to_string(),
+            ));
+        }
+
+        // Check backup address
+        if !self.backup_address.is_valid_for_network(NETWORK) {
+            return Err(IpcValidateError::InvalidField(
+                "backup_address",
+                format!("Bitcoin address must be for {}", NETWORK),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 // Define the IPCMessage enum
 #[derive(Debug)]
 pub enum IpcMessage {
     CreateSubnet(IpcCreateSubnetMsg),
-    PrefundSubnet(IpcPrefundSubnetMsg),
+    JoinSubnet(IpcJoinSubnetMsg),
 }
 
 impl IpcMessage {
@@ -252,9 +333,9 @@ impl IpcMessage {
             IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(
                 IpcCreateSubnetMsg::ipc_deserialize(s)?,
             )),
-            IpcTag::PrefundSubnet => Ok(IpcMessage::PrefundSubnet(
-                IpcPrefundSubnetMsg::ipc_deserialize(s)?,
-            )),
+            IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::ipc_deserialize(
+                s,
+            )?)),
         }
     }
 }
@@ -285,6 +366,12 @@ impl SubnetId {
     /// Returns the transaction ID
     pub fn txid(&self) -> &Txid {
         &self.0
+    }
+}
+
+impl Default for SubnetId {
+    fn default() -> Self {
+        Self(Txid::all_zeros())
     }
 }
 
@@ -363,6 +450,10 @@ mod tests {
         assert!(IpcTag::from_str("INVALID_TAG").is_err());
     }
 
+    //
+    // Create subnet
+    //
+
     #[test]
     fn test_ipc_create_subnet_msg_serialize() {
         let validator1 = XOnlyPublicKey::from_str(
@@ -375,7 +466,7 @@ mod tests {
         .unwrap();
 
         let params = IpcCreateSubnetMsg {
-            min_validator_stake: 1000,
+            min_validator_stake: Amount::from_sat(1000),
             min_validators: 2,
             bottomup_check_period: 10,
             active_validators_limit: 20,
@@ -425,12 +516,124 @@ mod tests {
         println!("{}", serialized);
 
         let params = IpcCreateSubnetMsg::ipc_deserialize(&serialized).unwrap();
-        assert_eq!(params.min_validator_stake, 1000);
+        assert_eq!(params.min_validator_stake, Amount::from_sat(1000));
         assert_eq!(params.min_validators, 2);
         assert_eq!(params.bottomup_check_period, 10);
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
         assert_eq!(params.whitelist, vec![validator1, validator2]);
+    }
+
+    //
+    // Join subnet
+    //
+
+    #[test]
+    fn test_ipc_join_subnet_msg_validate() {
+        let pubkey = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+
+        let valid_msg = IpcJoinSubnetMsg {
+            subnet_id: SubnetId::from_txid(
+                &Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                    .unwrap(),
+            ),
+            collateral: Amount::from_sat(1000),
+            ip: "127.0.0.1:8080".parse().unwrap(),
+            backup_address: bitcoin::Address::from_str(
+                "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+            )
+            .unwrap(),
+            pubkey,
+        };
+        assert!(valid_msg.validate().is_ok());
+
+        // Test invalid subnet_id
+        let mut invalid_msg = valid_msg.clone();
+        invalid_msg.subnet_id = SubnetId::default();
+        assert!(matches!(
+            invalid_msg.validate(),
+            Err(IpcValidateError::InvalidField("subnet_id", _))
+        ));
+
+        // Test zero collateral
+        let mut invalid_msg = valid_msg.clone();
+        invalid_msg.collateral = Amount::ZERO;
+        assert!(matches!(
+            invalid_msg.validate(),
+            Err(IpcValidateError::InvalidField("collateral", _))
+        ));
+
+        // Test wrong network address
+        let mut invalid_msg = valid_msg.clone();
+        invalid_msg.backup_address =
+            bitcoin::Address::from_str("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
+        assert!(matches!(
+            invalid_msg.validate(),
+            Err(IpcValidateError::InvalidField("backup_address", _))
+        ));
+    }
+
+    #[test]
+    fn test_ipc_join_subnet_msg_serialize_deserialize() {
+        let pubkey = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+
+        let create_txid =
+            &Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                .unwrap();
+
+        let msg = IpcJoinSubnetMsg {
+            subnet_id: SubnetId::from_txid(create_txid),
+            collateral: Amount::from_sat(1000),
+            ip: "127.0.0.1:8080".parse().unwrap(),
+            backup_address: bitcoin::Address::from_str(
+                "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+            )
+            .unwrap(),
+            pubkey,
+        };
+
+        let serialized = msg.ipc_serialize();
+
+        println!("{}", serialized);
+
+        // Check serialization
+        assert!(serialized.starts_with(IPC_PREFUND_SUBNET_TAG));
+        // collateral should not be in serialized, it's included in the output
+        assert!(!serialized.contains("collateral"));
+
+        assert!(serialized.contains(&format!("{}ip=127.0.0.1:8080", IPC_TAG_DELIMITER)));
+        assert!(serialized.contains(&format!(
+            "{}backup_address=bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+            IPC_TAG_DELIMITER
+        )));
+        assert!(serialized.contains(&format!(
+            "{}pubkey=18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+            IPC_TAG_DELIMITER
+        )));
+        assert!(serialized.contains(&format!(
+            "{}subnet_id=BTC/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            IPC_TAG_DELIMITER
+        )));
+
+        // Test deserialization
+        let deserialized = IpcJoinSubnetMsg::ipc_deserialize(&serialized).unwrap();
+
+        // Skipped fields should be default values
+        assert_eq!(deserialized.subnet_id, SubnetId::from_txid(create_txid));
+        assert_eq!(deserialized.collateral, Amount::from_sat(0));
+        // Other fields should match
+        assert_eq!(deserialized.ip, msg.ip);
+        assert_eq!(deserialized.backup_address, msg.backup_address);
+        assert_eq!(deserialized.pubkey, msg.pubkey);
+
+        // It should be invalid because it's missing collateral and subnet_id
+        assert!(deserialized.validate().is_err());
     }
 
     //

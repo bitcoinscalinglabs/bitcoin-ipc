@@ -19,7 +19,7 @@ use bitcoin::{
     script::{Instruction, PushBytes},
     secp256k1::{All, Secp256k1},
     taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
-    Address, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
+    Address, Amount, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
 };
 
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
@@ -170,6 +170,7 @@ pub fn create_commit_reveal_txs(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     final_address: &Address,
     data: &[u8],
+    amount_to_send: Option<Amount>,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
     trace!(
         "Creating commit-reveal tx for addres={}, data={:02x?}",
@@ -184,6 +185,8 @@ pub fn create_commit_reveal_txs(
 
     // this transaction can only be spent through the script path
     let unspendable_pubkey = create_unspendable_internal_key();
+
+    let amount_to_send = amount_to_send.unwrap_or(Amount::ZERO);
 
     let builder = TaprootBuilder::new().add_leaf(0, commit_script.clone())?;
     let commit_spend_info = builder
@@ -203,7 +206,7 @@ pub fn create_commit_reveal_txs(
         input: Vec::with_capacity(0),
         output: vec![TxOut {
             // This will be increased by the value needed for the reveal tx fee
-            value: commit_script_pubkey.minimal_non_dust_custom(fee_rate),
+            value: commit_script_pubkey.minimal_non_dust_custom(fee_rate) + amount_to_send,
             script_pubkey: commit_script_pubkey.clone(),
         }],
     };
@@ -215,6 +218,12 @@ pub fn create_commit_reveal_txs(
     let control_block = commit_spend_info
         .control_block(&(commit_script.clone(), LeafVersion::TapScript))
         .ok_or(BitcoinUtilsError::CannotConstructControlBlock)?;
+
+    // Provide at least the minimal value for the output
+    let reveal_output_value = std::cmp::max(
+        commit_script_pubkey.minimal_non_dust_custom(fee_rate),
+        amount_to_send,
+    );
 
     let mut reveal_tx = Transaction {
         version: transaction::Version::TWO,
@@ -235,8 +244,7 @@ pub fn create_commit_reveal_txs(
             ..Default::default()
         }],
         output: vec![TxOut {
-            // Provide the minimal value for the output
-            value: commit_script_pubkey.minimal_non_dust_custom(fee_rate),
+            value: reveal_output_value,
             // Send to the final address specified
             script_pubkey: final_address.script_pubkey(),
         }],
