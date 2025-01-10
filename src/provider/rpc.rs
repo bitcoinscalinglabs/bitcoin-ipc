@@ -1,7 +1,7 @@
 use crate::{
     db::{self, Database, HeedDb},
     ipc_lib::{IpcJoinSubnetMsg, IpcValidate, SubnetId},
-    IpcCreateSubnetMsg, BTC_CONFIRMATIONS, NETWORK,
+    IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -169,10 +169,9 @@ pub async fn join_subnet(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    let subnet_info = data
+    let genesis_info = data
         .db
         .get_subnet_genesis_info(msg.subnet_id)
-        .await
         .map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
             RpcError::DbError(e)
@@ -182,32 +181,13 @@ pub async fn join_subnet(
             msg.subnet_id
         )))?;
 
-    // Check if the subnet is already bootstrapped
-    if subnet_info.bootstrapped {
-        return Err(RpcError::InvalidParams(format!(
-            "Subnet {} is already bootstrapped.",
-            msg.subnet_id
-        ))
-        .into());
-    }
-
-    if subnet_info.create_subnet_msg.min_validator_stake < msg.collateral {
-        return Err(RpcError::InvalidParams(format!(
-            "Collateral must be at least {}",
-            subnet_info.create_subnet_msg.min_validator_stake
-        ))
-        .into());
-    }
-
-    // check already prefunded
+    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
+        error!("Error validating join msg for subnet info: {}", e);
+        RpcError::InvalidParams(e.to_string())
+    })?;
 
     // TODO this check should be done in the Db
-    let multisig_address = &subnet_info
-        .multisig_address()
-        .require_network(NETWORK)
-        .map_err(|_| {
-            RpcError::InvalidParams(format!("Multisig address must be for {} network", NETWORK))
-        })?;
+    let multisig_address = &genesis_info.multisig_address();
 
     let join_txid = msg
         .submit_to_bitcoin(&data.btc_rpc, multisig_address)

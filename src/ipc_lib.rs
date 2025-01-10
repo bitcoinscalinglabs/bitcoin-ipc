@@ -4,12 +4,14 @@ use bitcoin::Amount;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
 use ipc_serde::IpcSerialize;
+use log::trace;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
 use crate::bitcoin_utils::{self, create_multisig_address, submit_to_mempool};
+use crate::db;
 use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
@@ -172,6 +174,29 @@ impl IpcCreateSubnetMsg {
             Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
         }
     }
+
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        subnet_id: SubnetId,
+        genesis_block_height: u64,
+    ) -> Result<(), IpcLibError> {
+        let genesis_info = db::SubnetGenesisInfo {
+            create_subnet_msg: self.clone(),
+            bootstrapped: false,
+            genesis_block_height,
+            boostrap_block_height: None,
+            genesis_validators: Vec::with_capacity(0),
+        };
+
+        trace!("Saving {self:?} to DB, genesis_info={genesis_info:?}");
+
+        let mut wtxn = db.write_txn()?;
+        db.save_subnet_genesis_info(&mut wtxn, subnet_id, genesis_info)?;
+        wtxn.commit()?;
+
+        Ok(())
+    }
 }
 
 impl IpcValidate for IpcCreateSubnetMsg {
@@ -237,11 +262,54 @@ pub struct IpcJoinSubnetMsg {
 }
 
 impl IpcJoinSubnetMsg {
-    /// Submits the prefund subnet message to the Bitcoin network
+    /// Validates the join subnet message, for the given genesis info
+    pub fn validate_for_genesis_info(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+    ) -> Result<(), IpcLibError> {
+        // Check if the subnet is already bootstrapped
+        if genesis_info.bootstrapped {
+            // TODO handle when subnet already bootstrapped
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is already bootstrapped.",
+                self.subnet_id
+            ))
+            .into());
+        }
+
+        // Check if the collateral is at least the minimum validator stake
+        if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
+            return Err(IpcValidateError::InvalidField(
+                "collateral",
+                format!(
+                    "Collateral must be at least {}, supplied {}",
+                    genesis_info.create_subnet_msg.min_validator_stake, self.collateral,
+                ),
+            )
+            .into());
+        }
+
+        // Check if the validator with this public key is already registered
+        if genesis_info
+            .genesis_validators
+            .iter()
+            .any(|v| v.pubkey == self.pubkey)
+        {
+            return Err(IpcValidateError::InvalidField(
+                "pubkey",
+                "Validator with this public key already registered in subnet".to_string(),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    /// Submits the join subnet message to the Bitcoin network
     /// Using commit-reveal scheme
     /// And sends the collateral to the subnet multisig address
     ///
-    /// Returns the prefund txid — the txid of the reveal transaction
+    /// Returns the join txid — the txid of the reveal transaction
     pub fn submit_to_bitcoin(
         &self,
         rpc: &bitcoincore_rpc::Client,
@@ -280,6 +348,35 @@ impl IpcJoinSubnetMsg {
             }
             Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
         }
+    }
+
+    /// Modifies the database to account for the join subnet message
+    pub fn save_to_db<D: db::Database>(&self, db: &D, join_txid: Txid) -> Result<(), IpcLibError> {
+        let mut genesis_info =
+            db.get_subnet_genesis_info(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} does not exist",
+                    self.subnet_id
+                )))?;
+
+        self.validate_for_genesis_info(&genesis_info)?;
+
+        let new_validator = db::SubnetValidator {
+            pubkey: self.pubkey,
+            collateral: self.collateral,
+            ip: self.ip,
+            join_txid,
+        };
+
+        trace!("Processing {self:?}, adding new validator {new_validator:?}");
+
+        genesis_info.genesis_validators.push(new_validator);
+
+        let mut wtxn = db.write_txn()?;
+        db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+        wtxn.commit()?;
+
+        Ok(())
     }
 }
 
@@ -418,18 +515,16 @@ impl<'de> serde::Deserialize<'de> for SubnetId {
 #[derive(Error, Debug)]
 pub enum IpcLibError {
     #[error(transparent)]
-    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
-}
+    IpcValidateError(#[from] IpcValidateError),
 
-#[derive(PartialEq, Eq)]
-pub enum IpcTransactionType {
-    CreateChild,
-    JoinChild,
-    Deposit,
-    Checkpoint,
-    Transfer,
-    Withdraw,
-    Delete,
+    #[error(transparent)]
+    DbError(#[from] crate::db::DbError),
+
+    #[error(transparent)]
+    HeedError(#[from] heed::Error),
+
+    #[error(transparent)]
+    BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
 }
 
 #[cfg(test)]
@@ -603,7 +698,7 @@ mod tests {
         println!("{}", serialized);
 
         // Check serialization
-        assert!(serialized.starts_with(IPC_PREFUND_SUBNET_TAG));
+        assert!(serialized.starts_with(IPC_JOIN_SUBNET_TAG));
         // collateral should not be in serialized, it's included in the output
         assert!(!serialized.contains("collateral"));
 

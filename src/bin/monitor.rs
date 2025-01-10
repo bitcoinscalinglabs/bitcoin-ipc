@@ -105,7 +105,7 @@ where
         info!("Syncing...");
 
         // Get the last processed block from the database
-        self.current_height = self.db.get_last_processed_block().await?;
+        self.current_height = self.db.get_last_processed_block()?;
 
         loop {
             if self.cancel_token.is_cancelled() {
@@ -138,8 +138,7 @@ where
                     Ok(_) => {
                         info!("Processed block {}", next_height);
                         self.current_height = next_height;
-                        if let Err(e) = self.db.set_last_processed_block(self.current_height).await
-                        {
+                        if let Err(e) = self.db.set_last_processed_block(self.current_height) {
                             error!("Failed to update last processed block: {:?}", e);
                         }
                     }
@@ -183,7 +182,7 @@ where
                                 info!("Processed block {}", block_count);
                                 self.current_height = block_count;
                                 if let Err(e) =
-                                    self.db.set_last_processed_block(self.current_height).await
+                                    self.db.set_last_processed_block(self.current_height)
                                 {
                                     error!("Failed to update last processed block: {:?}", e);
                                 }
@@ -282,7 +281,7 @@ where
 
                 match ipc_message {
                     Ok(msg) => {
-                        self.process_ipc_msg(block_height, &tx, &txid, msg).await?;
+                        self.process_ipc_msg(block_height, tx, txid, msg).await?;
                     }
                     Err(_) => {
                         continue;
@@ -298,7 +297,7 @@ where
         &self,
         block_height: u64,
         tx: &bitcoin::Transaction,
-        txid: &bitcoin::Txid,
+        txid: bitcoin::Txid,
         msg: IpcMessage,
     ) -> Result<(), MonitorError> {
         match msg {
@@ -311,7 +310,7 @@ where
                     return Ok(());
                 }
 
-                let subnet_id = ipc_lib::SubnetId::from_txid(txid);
+                let subnet_id = ipc_lib::SubnetId::from_txid(&txid);
 
                 let multisig_addr = create_subnet_msg
                     .multisig_address_from_whitelist()
@@ -325,14 +324,9 @@ where
                 );
 
                 // TODO handle errors better
-                if let Err(e) = self
-                    .db
-                    .save_subnet_create_msg(subnet_id, block_height, create_subnet_msg.clone())
-                    .await
-                {
+                if let Err(e) = create_subnet_msg.save_to_db(&self.db, subnet_id, block_height) {
                     error!("Failed to save subnet to DB: {:?}", e);
                 }
-
                 Ok(())
             }
 
@@ -352,6 +346,10 @@ where
                         join_subnet_msg, e
                     );
                     return Ok(());
+                }
+
+                if let Err(e) = join_subnet_msg.save_to_db(&self.db, txid) {
+                    error!("Failed to save join subnet msg to DB: {:?}", e);
                 }
 
                 info!("{:?}", join_subnet_msg);

@@ -1,16 +1,26 @@
 use crate::ipc_lib::{self, SubnetId};
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
-use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions};
+use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RwTxn};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
 use thiserror::Error;
 
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
-#[allow(dead_code)]
 const SUBNET_INFO_PREFIX: &str = "subnet_info:";
 const SUBNET_GENESIS_INFO_PREFIX: &str = "subnet_genesis_info:";
+
+pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
+
+#[allow(dead_code)]
+fn subnet_info_key(subnet_id: SubnetId) -> String {
+    format!("{SUBNET_INFO_PREFIX}:{}", subnet_id)
+}
+
+fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
+    format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id)
+}
 
 /// State of a validator in a subnet
 #[derive(Serialize, Deserialize, Debug)]
@@ -72,11 +82,10 @@ pub struct SubnetGenesisInfo {
 }
 
 impl SubnetGenesisInfo {
-    pub fn multisig_address(&self) -> Address<NetworkUnchecked> {
+    pub fn multisig_address(&self) -> Address {
         self.create_subnet_msg
             .multisig_address_from_whitelist()
             .expect("Multisig should be valid for saved subnet genesis info")
-            .into_unchecked()
     }
 }
 
@@ -168,31 +177,34 @@ impl HeedDb {
     }
 }
 
-// TODO maybe split into multiple traits
-#[async_trait]
 pub trait Database {
+    fn write_txn(&self) -> Result<RwTxn, DbError>;
+
     // Monitor Info
-    async fn get_last_processed_block(&self) -> Result<u64, DbError>;
-    async fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
+    fn get_last_processed_block(&self) -> Result<u64, DbError>;
+    fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
 
     // Genesis Info
-    async fn get_subnet_genesis_info(
+    fn get_subnet_genesis_info(
         &self,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetGenesisInfo>, DbError>;
-    async fn save_subnet_create_msg(
+    fn save_subnet_genesis_info(
         &self,
+        txn: &mut RwTxn,
         subnet_id: SubnetId,
-        block_height: u64,
-        create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
+        genesis_info: SubnetGenesisInfo,
     ) -> Result<(), DbError>;
-
-    // TODO Subnet State
 }
 
 #[async_trait]
 impl Database for HeedDb {
-    async fn get_last_processed_block(&self) -> Result<u64, DbError> {
+    fn write_txn(&self) -> Result<RwTxn, DbError> {
+        self.env.write_txn().map_err(|e| e.into())
+    }
+
+    // Monitor Info
+    fn get_last_processed_block(&self) -> Result<u64, DbError> {
         let txn = self.env.read_txn()?;
         match self.monitor_info.get(&txn, LAST_PROCESSED_BLOCK_KEY)? {
             Some(MonitorInfo {
@@ -208,7 +220,7 @@ impl Database for HeedDb {
         }
     }
 
-    async fn set_last_processed_block(&self, block_height: u64) -> Result<(), DbError> {
+    fn set_last_processed_block(&self, block_height: u64) -> Result<(), DbError> {
         trace!("Set last processed block = {}", block_height);
         let mut txn = self.env.write_txn()?;
         self.monitor_info.put(
@@ -224,36 +236,25 @@ impl Database for HeedDb {
 
     // Genesis Info
 
-    async fn get_subnet_genesis_info(
+    fn get_subnet_genesis_info(
         &self,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetGenesisInfo>, DbError> {
-        let key = format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id);
+        let key = subnet_genesis_info_key(subnet_id);
         let txn = self.env.read_txn()?;
         let subnet = self.subnet_genesis_db.get(&txn, &key)?;
         Ok(subnet)
     }
 
-    async fn save_subnet_create_msg(
+    fn save_subnet_genesis_info(
         &self,
+        txn: &mut RwTxn,
         subnet_id: SubnetId,
-        genesis_block_height: u64,
-        create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
+        subnet_genesis_info: SubnetGenesisInfo,
     ) -> Result<(), DbError> {
-        // TODO check network
-
-        let subnet = SubnetGenesisInfo {
-            create_subnet_msg,
-            bootstrapped: false,
-            genesis_block_height,
-            boostrap_block_height: None,
-            genesis_validators: Vec::with_capacity(0),
-        };
-        let key = format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id);
-        debug!("key={} subnet={:#?}", key, &subnet);
-        let mut txn = self.env.write_txn()?;
-        self.subnet_genesis_db.put(&mut txn, &key, &subnet)?;
-        txn.commit()?;
+        let key = subnet_genesis_info_key(subnet_id);
+        self.subnet_genesis_db
+            .put(txn, &key, &subnet_genesis_info)?;
         Ok(())
     }
 }
@@ -267,6 +268,12 @@ pub enum DbError {
     /// LMDB database not found and cannot be created in read-only mode
     #[error("Database {0} not found and cannot be created in read-only mode")]
     DbNotFound(String),
+
+    #[error("Value not found for key {0}")]
+    KeyValueNotFound(String),
+
+    #[error("Key {0} could not be modified: {1}")]
+    KeyModificationError(String, String),
 
     #[error(transparent)]
     IoError(#[from] io::Error),
