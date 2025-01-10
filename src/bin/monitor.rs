@@ -146,11 +146,9 @@ where
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Error processing block {}: {:?}. Retrying...",
-                            next_height, e
-                        );
+                        error!("Error processing block {}: {:?}.", next_height, e);
                         // Retry logic can be added here if needed
+                        return Err(e);
                     }
                 }
             }
@@ -191,10 +189,9 @@ where
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "Error processing block {}: {:?}. Retrying...",
-                                    block_count, e
-                                );
+                                error!("Error processing block {}: {:?}.", block_count, e);
+                                // Retry logic can be added here if needed
+                                return Err(e);
                             }
                         }
                     }
@@ -344,7 +341,7 @@ where
                 };
 
                 join_subnet_msg.validate()?;
-                join_subnet_msg.save_to_db(&self.db, txid)?;
+                join_subnet_msg.save_to_db(&self.db, block_height, txid)?;
                 Ok(())
             }
         }
