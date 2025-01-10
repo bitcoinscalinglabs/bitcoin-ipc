@@ -353,7 +353,12 @@ impl IpcJoinSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
-    pub fn save_to_db<D: db::Database>(&self, db: &D, join_txid: Txid) -> Result<(), IpcLibError> {
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        txid: Txid,
+    ) -> Result<(), IpcLibError> {
         let mut genesis_info =
             db.get_subnet_genesis_info(self.subnet_id)?
                 .ok_or(IpcValidateError::InvalidMsg(format!(
@@ -366,13 +371,23 @@ impl IpcJoinSubnetMsg {
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
             collateral: self.collateral,
+            backup_address: self.backup_address.clone(),
             ip: self.ip,
-            join_txid,
+            join_txid: txid,
         };
-
         trace!("Processing {self:?}, adding new validator {new_validator:?}");
-
         genesis_info.genesis_validators.push(new_validator);
+
+        //
+        // Check if the subnet is bootstrapped
+        //
+        if genesis_info.genesis_validators.len() as u16
+            >= genesis_info.create_subnet_msg.min_validators
+        {
+            trace!("Subnet {} bootstrapped", self.subnet_id);
+            genesis_info.bootstrapped = true;
+            genesis_info.boostrap_block_height = Some(block_height);
+        }
 
         let mut wtxn = db.write_txn()?;
         db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;

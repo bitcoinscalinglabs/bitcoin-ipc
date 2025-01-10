@@ -29,6 +29,8 @@ pub struct SubnetValidator {
     pub pubkey: XOnlyPublicKey,
     /// The current balance of the validator's stake
     pub collateral: bitcoin::Amount,
+    /// Validator backup address
+    pub backup_address: Address<NetworkUnchecked>,
     /// The IP address of the validator, as
     /// advertised in the subnet's join message
     pub ip: std::net::SocketAddr,
@@ -65,7 +67,7 @@ pub struct SubnetState {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubnetGenesisInfo {
     /// The original create subnet msg, which holds
-    /// the configuration alongside the validatorsg whitelist
+    /// the configuration alongside the validator whitelist
     ///
     /// The pre-boostrap multisig is constructed from the whitelist
     pub create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
