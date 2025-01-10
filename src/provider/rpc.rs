@@ -196,6 +196,30 @@ pub async fn join_subnet(
     Ok(JoinSubnetResponse { join_txid })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GetGenesisInfoParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_genesis_info(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<GetGenesisInfoParams>,
+) -> Result<db::SubnetGenesisInfo, JsonRpcError> {
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    Ok(genesis_info)
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -205,5 +229,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
+        .with_method("getgenesisinfo", get_genesis_info)
         .finish()
 }
