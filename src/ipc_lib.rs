@@ -178,13 +178,15 @@ impl IpcCreateSubnetMsg {
     pub fn save_to_db<D: db::Database>(
         &self,
         db: &D,
-        subnet_id: SubnetId,
-        genesis_block_height: u64,
+        block_height: u64,
+        txid: bitcoin::Txid,
     ) -> Result<(), IpcLibError> {
+        let subnet_id = SubnetId::from_txid(&txid);
+
         let genesis_info = db::SubnetGenesisInfo {
             create_subnet_msg: self.clone(),
             bootstrapped: false,
-            genesis_block_height,
+            genesis_block_height: block_height,
             boostrap_block_height: None,
             genesis_validators: Vec::with_capacity(0),
         };
@@ -266,7 +268,7 @@ impl IpcJoinSubnetMsg {
     pub fn validate_for_genesis_info(
         &self,
         genesis_info: &db::SubnetGenesisInfo,
-    ) -> Result<(), IpcLibError> {
+    ) -> Result<(), IpcValidateError> {
         // Check if the subnet is already bootstrapped
         if genesis_info.bootstrapped {
             // TODO handle when subnet already bootstrapped
