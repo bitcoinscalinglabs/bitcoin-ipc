@@ -1,4 +1,8 @@
-use crate::ipc_lib::{self, SubnetId};
+use crate::{
+    bitcoin_utils::{create_multisig_address, multisig_threshold},
+    ipc_lib::{self, SubnetId},
+    NETWORK,
+};
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
 use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RwTxn};
@@ -23,7 +27,7 @@ fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
 }
 
 /// State of a validator in a subnet
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetValidator {
     /// The public key of the validator
     pub pubkey: XOnlyPublicKey,
@@ -36,6 +40,38 @@ pub struct SubnetValidator {
     pub ip: std::net::SocketAddr,
     /// The transaction ID of the join message
     pub join_txid: bitcoin::Txid,
+}
+
+trait SubnetValidators {
+    fn multisig_address(&self) -> Address<NetworkUnchecked>;
+    fn threshold(&self) -> u16;
+    fn to_committee(&self) -> SubnetCommittee;
+}
+
+impl SubnetValidators for Vec<SubnetValidator> {
+    fn multisig_address(&self) -> Address<NetworkUnchecked> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let pubkeys = self.iter().map(|v| v.pubkey).collect::<Vec<_>>();
+        // TODO remove as 16
+        let threshold = multisig_threshold(pubkeys.len() as u16);
+        let multisig_address = create_multisig_address(&secp, &pubkeys, threshold.into(), NETWORK)
+            .expect("Multisig address should be valid");
+
+        multisig_address.into_unchecked()
+    }
+
+    fn threshold(&self) -> u16 {
+        // TODO remove as 16
+        multisig_threshold(self.len() as u16)
+    }
+
+    fn to_committee(&self) -> SubnetCommittee {
+        SubnetCommittee {
+            threshold: self.threshold() as u16,
+            validators: self.to_vec(),
+            multisig_address: self.multisig_address(),
+        }
+    }
 }
 
 /// The committee of a subnet
@@ -56,11 +92,17 @@ pub struct SubnetCommittee {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubnetState {
     /// Duplicate of the subnet ID, for easy access
-    pub subnet_id: SubnetId,
+    pub id: SubnetId,
     /// The current committee number
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
+}
+
+impl SubnetState {
+    pub fn stake(&self) -> bitcoin::Amount {
+        self.committee.validators.iter().map(|v| v.collateral).sum()
+    }
 }
 
 /// Genesis info for a subnet
@@ -88,6 +130,14 @@ impl SubnetGenesisInfo {
         self.create_subnet_msg
             .multisig_address_from_whitelist()
             .expect("Multisig should be valid for saved subnet genesis info")
+    }
+
+    pub fn into_subnet(self, subnet_id: SubnetId) -> SubnetState {
+        SubnetState {
+            id: subnet_id,
+            committee_number: 1,
+            committee: self.genesis_validators.to_committee(),
+        }
     }
 }
 

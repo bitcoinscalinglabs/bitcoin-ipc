@@ -435,6 +435,11 @@ pub fn create_multisig_address(
     ))
 }
 
+pub fn multisig_threshold(participants: u16) -> u16 {
+    // TODO figure out threshold
+    (participants / 2) + 1
+}
+
 // TODO decouple errors
 #[derive(Error, Debug)]
 pub enum BitcoinUtilsError {

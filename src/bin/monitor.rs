@@ -108,7 +108,7 @@ where
         self.current_height = self
             .db
             .get_last_processed_block()
-            .map_err(|e| MonitorError::CannotGetMonitorInfo(e))?;
+            .map_err(MonitorError::CannotGetMonitorInfo)?;
 
         loop {
             if self.cancel_token.is_cancelled() {

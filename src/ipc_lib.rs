@@ -275,8 +275,7 @@ impl IpcJoinSubnetMsg {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Subnet {} is already bootstrapped.",
                 self.subnet_id
-            ))
-            .into());
+            )));
         }
 
         // Check if the collateral is at least the minimum validator stake
@@ -287,8 +286,7 @@ impl IpcJoinSubnetMsg {
                     "Collateral must be at least {}, supplied {}",
                     genesis_info.create_subnet_msg.min_validator_stake, self.collateral,
                 ),
-            )
-            .into());
+            ));
         }
 
         // Check if the validator with this public key is already registered
@@ -300,8 +298,7 @@ impl IpcJoinSubnetMsg {
             return Err(IpcValidateError::InvalidField(
                 "pubkey",
                 "Validator with this public key already registered in subnet".to_string(),
-            )
-            .into());
+            ));
         }
 
         Ok(())
@@ -387,6 +384,8 @@ impl IpcJoinSubnetMsg {
             trace!("Subnet {} bootstrapped", self.subnet_id);
             genesis_info.bootstrapped = true;
             genesis_info.boostrap_block_height = Some(block_height);
+
+            // TODO create subnet in db
         }
 
         let mut wtxn = db.write_txn()?;
