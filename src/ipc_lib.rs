@@ -1,6 +1,6 @@
 use bitcoin::{Amount, Transaction, TxOut};
 use bitcoin::{ScriptBuf, XOnlyPublicKey};
-use ipc_serde::IPCSerialize;
+use ipc_serde::IpcSerialize;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
@@ -10,7 +10,7 @@ use crate::bitcoin_utils::{self, test_and_submit, write_arbitrary_data, CommitRe
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
     pub use super::{
-        IPCCreateSubnetMsg, IPCMessage, IPCSerialize, IPCTag, IPC_CHECKPOINT_TAG,
+        IpcCreateSubnetMsg, IpcMessage, IpcSerialize, IpcTag, IPC_CHECKPOINT_TAG,
         IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_JOIN_SUBNET_TAG,
         IPC_TAG_DELIMITER, IPC_TRANSFER_TAG, IPC_WITHDRAW_TAG,
     };
@@ -29,11 +29,11 @@ pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DELETE";
 
 // Define the IPC tags enum
 #[derive(Debug, PartialEq)]
-pub enum IPCTag {
+pub enum IpcTag {
     CreateSubnet,
 }
 
-impl IPCTag {
+impl IpcTag {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateSubnet => IPC_CREATE_SUBNET_TAG,
@@ -41,13 +41,13 @@ impl IPCTag {
     }
 }
 
-impl std::str::FromStr for IPCTag {
-    type Err = IPCSerializeError;
+impl std::str::FromStr for IpcTag {
+    type Err = IpcSerializeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             IPC_CREATE_SUBNET_TAG => Ok(Self::CreateSubnet),
-            _ => Err(IPCSerializeError::UnknownTag(s.to_string())),
+            _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
 }
@@ -55,7 +55,7 @@ impl std::str::FromStr for IPCTag {
 // IPCSerialize trait
 
 #[derive(Debug, Error)]
-pub enum IPCSerializeError {
+pub enum IpcSerializeError {
     #[error("Missing field: {0}")]
     MissingField(String),
     #[error("Error parsing field {0}: {1}")]
@@ -66,9 +66,9 @@ pub enum IPCSerializeError {
     DeserializationError(String),
 }
 
-pub trait IPCSerialize {
+pub trait IpcSerialize {
     fn ipc_serialize(&self) -> String;
-    fn ipc_deserialize(s: &str) -> Result<Self, IPCSerializeError>
+    fn ipc_deserialize(s: &str) -> Result<Self, IpcSerializeError>
     where
         Self: Sized;
 }
@@ -76,20 +76,20 @@ pub trait IPCSerialize {
 // IPCValidate trait
 
 #[derive(Debug, Error)]
-pub enum IPCValidateError {
+pub enum IpcValidateError {
     #[error("Invalid field {0}: {1}")]
     InvalidField(&'static str, String),
 }
 
-pub trait IPCValidate {
-    fn validate(&self) -> Result<(), IPCValidateError>;
+pub trait IpcValidate {
+    fn validate(&self) -> Result<(), IpcValidateError>;
 }
 
 // IPC Messages
 
-#[derive(Serialize, Deserialize, IPCSerialize, Debug)]
+#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
 #[tag(IPC_CREATE_SUBNET_TAG)]
-pub struct IPCCreateSubnetMsg {
+pub struct IpcCreateSubnetMsg {
     /// The minimum number of collateral required for validators in Satoshis
     pub min_validator_stake: u64,
     /// Minimum number of validators required to bootstrap the subnet
@@ -105,41 +105,39 @@ pub struct IPCCreateSubnetMsg {
     pub whitelist: Vec<XOnlyPublicKey>,
 }
 
-impl IPCValidate for IPCCreateSubnetMsg {
-    fn validate(&self) -> Result<(), IPCValidateError> {
+impl IpcValidate for IpcCreateSubnetMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
         if self.min_validators == 0 {
-            return Err(IPCValidateError::InvalidField(
+            return Err(IpcValidateError::InvalidField(
                 "min_validators",
                 "The minimum number of validators must be greater than 0".to_string(),
-            )
-            .into());
+            ));
         }
 
         if self.whitelist.len() < self.min_validators as usize {
-            return Err(IPCValidateError::InvalidField(
+            return Err(IpcValidateError::InvalidField(
                 "whitelist",
                 "Number of whitelisted validators is less than the minimum required validators"
                     .to_string(),
-            )
-            .into());
+            ));
         }
 
         if self.bottomup_check_period == 0 {
-            return Err(IPCValidateError::InvalidField(
+            return Err(IpcValidateError::InvalidField(
                 "bottomup_check_period",
                 "Must be greater than 0".to_string(),
             ));
         }
 
         if (self.active_validators_limit as u64) < self.min_validators {
-            return Err(IPCValidateError::InvalidField(
+            return Err(IpcValidateError::InvalidField(
                 "active_validators_limit",
                 "Must be greater than or equal to min_validators".to_string(),
             ));
         }
 
         if self.min_cross_msg_fee == Amount::ZERO {
-            return Err(IPCValidateError::InvalidField(
+            return Err(IpcValidateError::InvalidField(
                 "min_cross_msg_fee",
                 "Must be greater than 0".to_string(),
             ));
@@ -151,22 +149,22 @@ impl IPCValidate for IPCCreateSubnetMsg {
 
 // Define the IPCMessage enum
 #[derive(Debug)]
-pub enum IPCMessage {
-    CreateSubnet(IPCCreateSubnetMsg),
+pub enum IpcMessage {
+    CreateSubnet(IpcCreateSubnetMsg),
 }
 
-impl IPCMessage {
-    pub fn deserialize(s: &str) -> Result<Self, IPCSerializeError> {
+impl IpcMessage {
+    pub fn deserialize(s: &str) -> Result<Self, IpcSerializeError> {
         let tag = s
             .split(IPC_TAG_DELIMITER)
             .next()
-            .ok_or_else(|| IPCSerializeError::DeserializationError("Missing tag".to_string()))?;
+            .ok_or_else(|| IpcSerializeError::DeserializationError("Missing tag".to_string()))?;
 
         // Temporary clippy warning because there is only one value
         #[allow(clippy::manual_map)]
-        match IPCTag::from_str(tag)? {
-            IPCTag::CreateSubnet => Ok(IPCMessage::CreateSubnet(
-                IPCCreateSubnetMsg::ipc_deserialize(s)?,
+        match IpcTag::from_str(tag)? {
+            IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(
+                IpcCreateSubnetMsg::ipc_deserialize(s)?,
             )),
         }
     }
@@ -272,16 +270,16 @@ mod tests {
 
     #[test]
     fn test_ipc_tag_as_str() {
-        assert_eq!(IPCTag::CreateSubnet.as_str(), IPC_CREATE_SUBNET_TAG);
+        assert_eq!(IpcTag::CreateSubnet.as_str(), IPC_CREATE_SUBNET_TAG);
     }
 
     #[test]
     fn test_ipc_tag_from_str() {
         assert_eq!(
-            IPCTag::from_str(IPC_CREATE_SUBNET_TAG).unwrap(),
-            IPCTag::CreateSubnet
+            IpcTag::from_str(IPC_CREATE_SUBNET_TAG).unwrap(),
+            IpcTag::CreateSubnet
         );
-        assert!(IPCTag::from_str("INVALID_TAG").is_err());
+        assert!(IpcTag::from_str("INVALID_TAG").is_err());
     }
 
     #[test]
@@ -295,7 +293,7 @@ mod tests {
         )
         .unwrap();
 
-        let params = IPCCreateSubnetMsg {
+        let params = IpcCreateSubnetMsg {
             min_validator_stake: 1000,
             min_validators: 2,
             bottomup_check_period: 10,
@@ -345,7 +343,7 @@ mod tests {
 
         println!("{}", serialized);
 
-        let params = IPCCreateSubnetMsg::ipc_deserialize(&serialized).unwrap();
+        let params = IpcCreateSubnetMsg::ipc_deserialize(&serialized).unwrap();
         assert_eq!(params.min_validator_stake, 1000);
         assert_eq!(params.min_validators, 2);
         assert_eq!(params.bottomup_check_period, 10);
