@@ -1,5 +1,5 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
-use bitcoin_ipc::db::{self, Database, Db};
+use bitcoin_ipc::db::{self, Database, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcValidate};
 use bitcoin_ipc::{IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
@@ -24,7 +24,7 @@ async fn main() {
     env_logger::init();
 
     // Initialize the database
-    let db = Db::new(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
+    let db = HeedDb::new(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
         .await
         .expect("Failed to initialize database");
 

@@ -21,13 +21,13 @@ struct MonitorInfo {
     last_processed_block: u64,
 }
 
-pub struct Db {
+pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<Subnet>>,
 }
 
-impl Db {
+impl HeedDb {
     pub async fn new(database_path: &str) -> Result<Self, DbError> {
         let database_path = Path::new(&database_path);
 
@@ -71,7 +71,7 @@ pub trait Database {
 }
 
 #[async_trait]
-impl Database for Db {
+impl Database for HeedDb {
     async fn get_last_processed_block(&self) -> Result<u64, DbError> {
         let txn = self.env.read_txn()?;
         match self.monitor_info.get(&txn, LAST_PROCESSED_BLOCK_KEY)? {
