@@ -322,8 +322,8 @@ pub fn get_current_fee_rate(
             fee_rate: Some(fee_rate),
             ..
         }) => {
-            trace!("Got fee rate from rpc (BTC/kb): {}", fee_rate);
-            let fee_rate = fee_rate.to_sat() / 250; // Convert to sats/kWU
+            trace!("Got fee rate from rpc (BTC/kVB): {}", fee_rate);
+            let fee_rate = fee_rate.to_sat() / 4; // Convert to sats/kWU
             FeeRate::from_sat_per_kwu(fee_rate)
         }
         // In any other case, error or none, we use the default fee rate
