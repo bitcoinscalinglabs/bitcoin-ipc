@@ -315,7 +315,7 @@ pub fn get_current_fee_rate(
     let mode = mode.or(Some(EstimateMode::Economical));
     let target = target.unwrap_or(6);
 
-    // Estimate fee rate in BTC/kB.
+    // Estimate fee rate in BTC/kvB.
     let fee_rate = match rpc.estimate_smart_fee(target, mode) {
         // We use the fee rate if returned by the RPC
         Ok(EstimateSmartFeeResult {
@@ -323,8 +323,10 @@ pub fn get_current_fee_rate(
             ..
         }) => {
             trace!("Got fee rate from rpc (BTC/kVB): {}", fee_rate);
-            let fee_rate = fee_rate.to_sat() / 4; // Convert to sats/kWU
-            FeeRate::from_sat_per_kwu(fee_rate)
+            match FeeRate::from_sat_per_vb(fee_rate.to_sat() / 1000) {
+                Some(fee_rate) => fee_rate,
+                None => DEFAULT_BTC_FEE_RATE,
+            }
         }
         // In any other case, error or none, we use the default fee rate
         _ => DEFAULT_BTC_FEE_RATE,
