@@ -289,6 +289,18 @@ impl IpcJoinSubnetMsg {
             ));
         }
 
+        // Check if the validator's public key is whitelisted
+        if !genesis_info
+            .create_subnet_msg
+            .whitelist
+            .contains(&self.pubkey)
+        {
+            return Err(IpcValidateError::InvalidField(
+                "pubkey",
+                "Validator public key not whitelisted".to_string(),
+            ));
+        }
+
         // Check if the validator with this public key is already registered
         if genesis_info
             .genesis_validators
