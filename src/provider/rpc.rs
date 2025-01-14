@@ -1,7 +1,6 @@
 use crate::{
-    bitcoin_utils::create_multisig_address,
     ipc_lib::{self, IpcValidate},
-    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS, NETWORK,
+    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -114,6 +113,17 @@ pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, 
     }
 }
 
+/// Get the balance of the wallet in Satoshis
+/// Note: Bitcoin Core RPC returns the balance in BTC (using f64)
+pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
+    let client = data.btc_rpc.as_ref();
+
+    match client.get_balance(None, None) {
+        Ok(balance) => Ok(balance.to_sat()),
+        Err(e) => Err(JsonRpcError::internal(e)),
+    }
+}
+
 //
 // IPC
 //
@@ -131,17 +141,12 @@ pub async fn create_subnet(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    // TODO check the maximum size of the multisig signatures
-    let required_sigs: i64 = params.min_validators.try_into().map_err(|_| {
+    let multisig_address = params.multisig_address_from_whitelist().map_err(|e| {
         RpcError::InvalidParams(format!(
-            "The minimum number of validators must not be greater than {}",
-            i64::MAX
+            "There was an error creating the multisig address: {}",
+            e
         ))
     })?;
-
-    // Create a multisig address from the public keys
-    let multisig_address = create_multisig_address(&params.whitelist, required_sigs, NETWORK);
-
     debug!("multisig_address: {}", multisig_address);
 
     let subnet_data = params.ipc_serialize();
@@ -171,6 +176,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
         .with_method("getconfirmedblock", get_confirmed_block)
+        .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
         .finish()
 }

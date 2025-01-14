@@ -4,6 +4,10 @@ use std::cmp::min;
 use std::vec;
 use thiserror::Error;
 
+use bitcoin::key::UntweakedPublicKey;
+use num_bigint::BigUint;
+use num_traits::ops::bytes::ToBytes;
+
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use bitcoin::script::{Instruction, PushBytes};
@@ -60,12 +64,29 @@ pub const fn confirmations(network: Network) -> u64 {
 /// # Returns
 ///
 /// * `XOnlyPublicKey` - An unspendable internal key
-pub fn create_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
+pub fn create_random_unspendable_internal_key(secp: &Secp256k1<All>) -> XOnlyPublicKey {
     let secret_key =
         bitcoin::secp256k1::SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng());
     let keypair = Keypair::from_secret_key(secp, &secret_key);
     let (x_only_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
     x_only_pubkey
+}
+
+pub fn create_unspendable_internal_key() -> XOnlyPublicKey {
+    // the Gx of SECP, incremented till a valid x is found
+    // See
+    // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs,
+    // bullet 3, for a proper way to choose such a key
+    let nothing_up_my_sleeve_key = [
+        0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x99,
+    ];
+    let mut int_key = BigUint::from_bytes_be(&nothing_up_my_sleeve_key);
+    while UntweakedPublicKey::from_slice(&int_key.to_be_bytes()).is_err() {
+        int_key += 1u32;
+    }
+    UntweakedPublicKey::from_slice(&int_key.to_be_bytes()).unwrap()
 }
 
 pub fn make_rpc_client_from_env() -> Client {
@@ -281,7 +302,7 @@ pub fn commit_arbitrary_data(
     secp: &Secp256k1<All>,
 ) -> Result<(Transaction, ScriptBuf, TaprootSpendInfo), BitcoinUtilsError> {
     // this transaction can only be spent through the script path
-    let unspendable_pubkey = create_unspendable_internal_key(secp);
+    let unspendable_pubkey = create_random_unspendable_internal_key(secp);
 
     let mut builder = Builder::new();
     let mut offset = 0;
@@ -1126,14 +1147,16 @@ pub fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsE
     Ok(concatenated_data)
 }
 
-pub fn create_multisig_address(
+pub fn create_multisig_script(
     public_keys: &[XOnlyPublicKey],
-    // TODO should we accept a u8?
     required_sigs: i64,
-    network: Network,
-) -> Address {
-    // Create a multisig script from the public keys
-    let multisig_script = public_keys
+) -> Result<ScriptBuf, BitcoinUtilsError> {
+    // check if enough public keys are provided
+    if (public_keys.len() as i64) < required_sigs {
+        return Err(BitcoinUtilsError::InsufficientPublicKeys);
+    }
+
+    Ok(public_keys
         .iter()
         .enumerate()
         .fold(Builder::new(), |builder, (index, key)| {
@@ -1144,15 +1167,44 @@ pub fn create_multisig_address(
                 builder.push_opcode(opcodes::all::OP_CHECKSIGADD)
             }
         })
-        // TODO should we fail?
-        .push_int(std::cmp::min(public_keys.len() as i64, required_sigs))
+        .push_int(required_sigs)
         .push_opcode(opcodes::all::OP_GREATERTHANOREQUAL)
-        .into_script();
-
-    // TODO decide on the multisig address format: taproot, p2sh or p2wsh
-    Address::p2wsh(&multisig_script, network)
+        .into_script())
 }
 
+pub fn create_multisig_spend_info(
+    secp: &Secp256k1<All>,
+    public_keys: &[XOnlyPublicKey],
+    required_sigs: i64,
+) -> Result<TaprootSpendInfo, BitcoinUtilsError> {
+    let multisig_script = create_multisig_script(public_keys, required_sigs)?;
+
+    let builder = TaprootBuilder::with_huffman_tree(vec![(1, multisig_script)])?;
+    let internal_key = create_unspendable_internal_key();
+    let spend_info = builder
+        .finalize(secp, internal_key)
+        .map_err(|_| BitcoinUtilsError::TaprootBuilderNotFinalizable)?;
+
+    Ok(spend_info)
+}
+
+pub fn create_multisig_address(
+    secp: &Secp256k1<All>,
+    public_keys: &[XOnlyPublicKey],
+    required_sigs: i64,
+    network: Network,
+) -> Result<Address, BitcoinUtilsError> {
+    let spend_info = create_multisig_spend_info(secp, public_keys, required_sigs)?;
+
+    Ok(Address::p2tr(
+        secp,
+        spend_info.internal_key(),
+        spend_info.merkle_root(),
+        network,
+    ))
+}
+
+// TODO decouple errors
 #[derive(Error, Debug)]
 pub enum BitcoinUtilsError {
     #[error("cannot connect to the bitcoin node")]
@@ -1171,6 +1223,12 @@ pub enum BitcoinUtilsError {
 
     #[error("an error related to the BIP32 specification occured")]
     Bip32Error(#[from] bitcoin::bip32::Error),
+
+    #[error("insufficient public keys provided")]
+    InsufficientPublicKeys,
+
+    #[error("taproot builder is not finalizable")]
+    TaprootBuilderNotFinalizable,
 
     #[error("an error occured when building a taproot transaction")]
     TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
@@ -1233,8 +1291,53 @@ pub enum BitcoinUtilsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-    use bitcoin::{AddressType, Network, XOnlyPublicKey};
+    use bitcoin::consensus::encode;
+    use bitcoin::hashes::Hash;
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::taproot::LeafVersion;
+    use bitcoin::{
+        absolute::LockTime,
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+        AddressType, Amount, Network, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    /// Verifies that this transaction is able to spend its inputs.
+    ///
+    /// The `spent` closure should return the [`TxOut`] for the given [`OutPoint`] (the ones we're spending).
+    /// The `spent` closure should not return the same [`TxOut`] twice!
+    pub fn verify_transaction<S>(
+        tx: &Transaction,
+        mut spent: S,
+    ) -> Result<(), bitcoinconsensus::Error>
+    where
+        S: FnMut(&OutPoint) -> Option<TxOut>,
+    {
+        let serialized_tx = encode::serialize(tx);
+        for (idx, input) in tx.input.iter().enumerate() {
+            if let Some(output) = spent(&input.previous_output) {
+                // duplicating the same output because bitcoinconsensus is weird
+                // this is needed for taproot verification
+                let spent_utxo = bitcoinconsensus::Utxo {
+                    script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
+                    script_pubkey_len: output.script_pubkey.len() as u32,
+                    value: output.value.to_sat() as i64,
+                };
+
+                bitcoinconsensus::verify_with_flags(
+                    &output.script_pubkey.as_bytes(),
+                    output.value.to_sat(),
+                    serialized_tx.as_slice(),
+                    Some(&vec![spent_utxo]),
+                    idx,
+                    bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
+                )?;
+            } else {
+                println!("Unknown spent output: {:?}", input.previous_output);
+                panic!("Unknown spent output");
+            }
+        }
+        Ok(())
+    }
 
     fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
         let secp = Secp256k1::new();
@@ -1247,27 +1350,294 @@ mod tests {
             .collect()
     }
 
+    fn generate_keypairs(n: usize) -> Vec<Keypair> {
+        let secp = Secp256k1::new();
+        (0..n)
+            .map(|_| {
+                let secret_key = SecretKey::new(&mut rand::thread_rng());
+                Keypair::from_secret_key(&secp, &secret_key)
+            })
+            .collect()
+    }
+
     #[test]
     fn test_create_multisig_address_single_key() {
+        let secp = Secp256k1::new();
         let public_keys = generate_xonly_pubkeys(1);
         let required_sigs = 1;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&public_keys, required_sigs, network);
+        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
+            .expect("Failed to create multisig address");
 
-        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+        assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
 
     #[test]
     fn test_create_multisig_address_multiple_keys() {
+        let secp = Secp256k1::new();
         let public_keys = generate_xonly_pubkeys(3);
         let required_sigs = 2;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&public_keys, required_sigs, network);
+        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
+            .expect("Failed to create multisig address");
 
-        assert_eq!(address.address_type(), Some(AddressType::P2wsh));
+        assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
 
-    // TODO more tests for create_multisig_address
+    #[test]
+    fn test_create_multisig_address_insufficient_keys() {
+        let secp = Secp256k1::new();
+        let public_keys = generate_xonly_pubkeys(1);
+        let required_sigs = 2; // More signatures required than keys available
+        let network = Network::Bitcoin;
+
+        let result = create_multisig_address(&secp, &public_keys, required_sigs, network);
+
+        assert!(matches!(
+            result,
+            Err(BitcoinUtilsError::InsufficientPublicKeys)
+        ));
+    }
+
+    //
+    // Test spending
+    //
+
+    #[test]
+    fn test_spend_multisig_script() {
+        let secp = Secp256k1::new();
+
+        //
+        // Setup: Create 3-of-5 multisig
+        //
+
+        let keypairs = generate_keypairs(5);
+        let public_keys: Vec<XOnlyPublicKey> =
+            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+
+        let required_sigs = 3;
+        let network = Network::Regtest;
+
+        let script = create_multisig_script(&public_keys, required_sigs)
+            .expect("Failed to create multisig script");
+
+        let spend_info = create_multisig_spend_info(&secp, &public_keys, required_sigs)
+            .expect("Failed to create multisig spend info");
+
+        let control_block = spend_info
+            .control_block(&(script.clone(), LeafVersion::TapScript))
+            .expect("Should create control block");
+
+        let multisig_address = create_multisig_address(&secp, &public_keys, required_sigs, network)
+            .expect("Failed to create multisig address");
+
+        //
+        // Create funding transaction
+        //
+
+        let funding_amount = Amount::from_sat(100_000);
+        let funding_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_amount,
+                script_pubkey: multisig_address.script_pubkey(),
+            }],
+        };
+        let funding_txid = funding_tx.compute_txid();
+
+        //
+        // Create spending transaction
+        //
+
+        let spending_amount = Amount::from_sat(90_000);
+        let spending_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: funding_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: spending_amount,
+                script_pubkey: ScriptBuf::new_op_return(&[1]),
+            }],
+        };
+
+        //
+        //  Create sighash for signing
+        //
+
+        let mut sighash_cache = SighashCache::new(&spending_tx);
+        let leaf_hash = script.tapscript_leaf_hash();
+        let sighash = sighash_cache
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(&[funding_tx.output[0].clone()]),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .expect("Failed to create sighash");
+
+        //
+        // Case 1: Not enough signatures (only 2)
+        //
+
+        {
+            let mut tx_insufficient = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Sign with only 2 keys
+            for keypair in keypairs.iter().take(2) {
+                let msg =
+                    Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+                let sig = secp.sign_schnorr(&msg, keypair);
+                witness.push(sig.serialize());
+            }
+
+            // Push empty signatures for the remaining keys
+            for _ in 2..keypairs.len() {
+                witness.push(&[]); // Empty signature slots for unused keys
+            }
+
+            witness.push(&script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_insufficient.input[0].witness = witness;
+
+            let verify_result =
+                verify_transaction(&tx_insufficient, |_| Some(funding_tx.output[0].clone()));
+
+            dbg!(&verify_result);
+
+            assert!(
+                verify_result.is_err(),
+                "Transaction with insufficient signatures should fail"
+            );
+        }
+
+        //
+        // Case 2: Valid spend with required signatures (3 of 3)
+        //
+        {
+            let mut tx_valid = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Sign with 3 keys
+            for (idx, keypair) in keypairs.iter().rev().enumerate() {
+                // Skip keys 4 and 5, pushing empty signatures
+                if idx > 2 {
+                    witness.push(&[]);
+                    continue;
+                }
+                let msg =
+                    Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+                let sig = secp.sign_schnorr(&msg, keypair);
+                witness.push(sig.serialize());
+            }
+
+            witness.push(&script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_valid.input[0].witness = witness;
+
+            let verify_result =
+                verify_transaction(&tx_valid, |_| Some(funding_tx.output[0].clone()));
+
+            dbg!(&verify_result);
+
+            assert!(
+                verify_result.is_ok(),
+                "Transaction with sufficient signatures should pass"
+            );
+        }
+
+        //
+        // Case 3: Valid spend with all signatures
+        //
+        {
+            let mut tx_all = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Sign with all keys
+            for keypair in keypairs.iter().rev() {
+                let msg =
+                    Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+                let sig = secp.sign_schnorr(&msg, keypair);
+                witness.push(sig.serialize());
+            }
+
+            witness.push(&script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_all.input[0].witness = witness;
+
+            let verify_result = verify_transaction(&tx_all, |_| Some(funding_tx.output[0].clone()));
+
+            dbg!(&verify_result);
+
+            assert!(
+                verify_result.is_ok(),
+                "Transaction with all signatures should pass"
+            );
+        }
+
+        //
+        // Case 4: Wrong signature order
+        //
+        {
+            let mut tx_wrong_order = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Sign with 3 keys but push signatures in wrong order
+            for keypair in keypairs.iter().take(3).rev() {
+                // Reverse order
+                let msg =
+                    Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+                let sig = secp.sign_schnorr(&msg, keypair);
+                witness.push(sig.serialize());
+            }
+
+            // Push empty signatures for the remaining keys
+            for _ in 3..keypairs.len() {
+                witness.push(&[]); // Empty signature slots for unused keys
+            }
+
+            witness.push(&script.to_bytes());
+            witness.push(
+                spend_info
+                    .control_block(&(script.clone(), LeafVersion::TapScript))
+                    .unwrap()
+                    .serialize(),
+            );
+
+            tx_wrong_order.input[0].witness = witness;
+
+            let verify_result =
+                verify_transaction(&tx_wrong_order, |_| Some(funding_tx.output[0].clone()));
+
+            dbg!(&verify_result);
+
+            assert!(
+                verify_result.is_err(),
+                "Transaction with wrong signature order should fail"
+            );
+        }
+    }
 }
