@@ -1,13 +1,12 @@
-use bitcoin::{Amount, Transaction, TxOut};
-use bitcoin::{ScriptBuf, XOnlyPublicKey};
+use bitcoin::Amount;
+use bitcoin::XOnlyPublicKey;
 use ipc_serde::IpcSerialize;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::bitcoin_utils::{
-    self, create_multisig_address, test_and_submit, write_arbitrary_data, CommitRevealFee,
-};
+use crate::bitcoin_utils::{self, create_multisig_address, submit_to_mempool};
 use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
@@ -121,6 +120,43 @@ impl IpcCreateSubnetMsg {
 
         Ok(multisig_address)
     }
+
+    /// Submits the create subnet message to the Bitcoin network
+    /// Using commit-reveal scheme
+    /// Returns the subnet id — derived from the commit txid
+    pub fn submit_to_bitcoin(&self, rpc: &bitcoincore_rpc::Client) -> Result<String, IpcLibError> {
+        let multisig_address = self.multisig_address_from_whitelist()?;
+        let subnet_data = self.ipc_serialize();
+
+        info!(
+            "Submitting create subnet msg to bitcoin. Multisig address = {}. Data={}",
+            multisig_address, subnet_data
+        );
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
+            rpc,
+            &secp,
+            &multisig_address,
+            subnet_data.as_bytes(),
+        )?;
+
+        let commit_txid = commit_tx.compute_txid();
+        let reveal_txid = reveal_tx.compute_txid();
+        debug!(
+            "Create subnet commit_txid={} reveal_txid={}",
+            commit_txid, reveal_txid
+        );
+
+        match submit_to_mempool(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
+            Ok(_) => {
+                let subnet_id = subnet_id_from_txid(&commit_txid);
+                info!("Submitted create subnet msg for subnet_id={}", subnet_id);
+                Ok(subnet_id)
+            }
+            Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+        }
+    }
 }
 
 impl IpcValidate for IpcCreateSubnetMsg {
@@ -192,83 +228,15 @@ impl IpcMessage {
 /// Subnet ID is derived from the transaction ID of the commit transaction.
 ///
 /// Creates a subnet ID from the commit txid
+// TODO make a new type for SubnetId
 pub fn subnet_id_from_txid(txid: &bitcoin::Txid) -> String {
     format!("{}/{}", crate::L1_NAME, txid)
 }
 
-/// Creates a child subnet by attaching arbitrary data to a Bitcoin transaction.
-///
-/// This function creates a Bitcoin transaction that includes specified arbitrary data and
-/// submits it to the Bitcoin network. The transaction involves creating and revealing
-/// a script containing the data using the Taproot script-path. This process ensures
-/// the data is embedded in the blockchain.
-///
-/// # Arguments
-///
-/// * `subnet_address` - A reference to a `bitcoin::Address` that represents the subnet's multisig address.
-/// * `subnet_data` - A string slice that holds the data to be embedded in the transaction. This data should contain:
-///     - A known tag indicating the creation of a new IPC Subnet.
-///     - The subnet name.
-///     - Any additional arbitrary data.
-///
-/// # Returns
-///
-/// This function returns a `Result`:
-/// * `Ok(())` - If the transaction is successfully created and submitted.
-/// * `Err(Box<dyn std::error::Error>)` - If an error occurs during the process.
-pub fn create_and_submit_create_child_tx(
-    rpc: &bitcoincore_rpc::Client,
-    subnet_address: &bitcoin::Address,
-    subnet_data: &str,
-) -> Result<(Transaction, Transaction), IpcLibError> {
-    let commit_fee = bitcoin_utils::calculate_fee(rpc, 2, 3, 65);
-    let reveal_fee = bitcoin_utils::calculate_fee(rpc, 1, 1, subnet_data.as_bytes().len());
-
-    let fee = CommitRevealFee::new(commit_fee, reveal_fee);
-
-    let op_return_out = TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::new_op_return([]),
-    };
-
-    let (commit_tx, reveal_tx) = write_arbitrary_data(
-        rpc,
-        Amount::ZERO,
-        fee,
-        subnet_data,
-        subnet_address,
-        vec![op_return_out],
-        None,
-    )?;
-
-    match test_and_submit(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
-        Ok(_) => Ok((commit_tx, reveal_tx)),
-        Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum IpcLibError {
-    #[error("error when reading an environment variable")]
-    EnvVarError(#[from] std::env::VarError),
-
-    #[error("cannot parse the given amount")]
-    AmountError(#[from] bitcoin::amount::ParseAmountError),
-
     #[error(transparent)]
     BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
-
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error>),
-
-    #[error("Validators did not sign the transaction")]
-    ValidatorsDidNotSignTx,
-
-    #[error("Subnet id not found")]
-    SubnetIdNotFound,
-
-    #[error("internal error")]
-    Internal,
 }
 
 #[derive(PartialEq, Eq)]

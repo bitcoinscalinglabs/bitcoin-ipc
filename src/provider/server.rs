@@ -97,7 +97,7 @@ mod tests {
 
         if let Err((err, _)) = result {
             let response = err.error_response();
-            assert_eq!(response.status(), actix_web::http::StatusCode::UNAUTHORIZED);
+            assert_eq!(response.status(), actix_web::http::StatusCode::OK);
             let body = response.into_body();
             let body_bytes = actix_web::body::to_bytes(body).await.unwrap();
             let body_str = std::str::from_utf8(&body_bytes).unwrap();

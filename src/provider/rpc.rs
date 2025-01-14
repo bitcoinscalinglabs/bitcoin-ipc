@@ -1,10 +1,7 @@
-use crate::{
-    ipc_lib::{self, IpcValidate},
-    IpcCreateSubnetMsg, IpcSerialize, BTC_CONFIRMATIONS,
-};
+use crate::{ipc_lib::IpcValidate, IpcCreateSubnetMsg, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::debug;
+use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -48,7 +45,8 @@ impl actix_web::error::ResponseError for RpcError {
             },
             "id": null
         });
-        actix_web::HttpResponse::Unauthorized()
+
+        actix_web::HttpResponse::Ok()
             .content_type("application/json")
             .body(json_rpc_error.to_string())
     }
@@ -135,36 +133,15 @@ pub struct CreateSubnetResponse {
 
 pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<IpcCreateSubnetMsg>,
+    Params(msg): Params<IpcCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
-    if let Err(err) = params.validate() {
+    if let Err(err) = msg.validate() {
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    let multisig_address = params.multisig_address_from_whitelist().map_err(|e| {
-        RpcError::InvalidParams(format!(
-            "There was an error creating the multisig address: {}",
-            e
-        ))
-    })?;
-    debug!("multisig_address: {}", multisig_address);
-
-    let subnet_data = params.ipc_serialize();
-
-    debug!("subnet_data: {}", subnet_data);
-
-    // Create and submit the create child transaction
-    let (commit_tx, _) =
-        ipc_lib::create_and_submit_create_child_tx(&data.btc_rpc, &multisig_address, &subnet_data)
-            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-
-    // Compute the transaction ID
-    let commit_tx_id: bitcoin::Txid = commit_tx.compute_txid();
-
-    // Generate the subnet ID
-    let subnet_id = ipc_lib::subnet_id_from_txid(&commit_tx_id);
-
-    debug!("subnet_id: {}", subnet_id);
+    let subnet_id = msg
+        .submit_to_bitcoin(&data.btc_rpc)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })
