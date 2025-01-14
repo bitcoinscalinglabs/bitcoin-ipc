@@ -19,6 +19,6 @@ pub const NETWORK: Network = Network::Regtest;
 /// Number of blocks to wait for before considering a block confirmed
 pub const BTC_CONFIRMATIONS: u64 = bitcoin_utils::confirmations(NETWORK);
 
-pub const DEFAULT_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(10_000);
-pub const MINIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(1_000);
-pub const MAXIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(100_000);
+pub const DEFAULT_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(10);
+pub const MINIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(1);
+pub const MAXIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(100);
