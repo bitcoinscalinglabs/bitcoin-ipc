@@ -26,3 +26,6 @@ heed = "0.21.0"
 tokio-util = "0.7.13"
 num-traits = "0.2.19"
 num-bigint = "0.4.6"
+
+[dev-dependencies]
+bitcoinconsensus = "0.106.0"
