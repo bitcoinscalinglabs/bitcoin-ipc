@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use bitcoin::{
     blockdata::script::Builder,
+    hashes::Hash,
     opcodes,
     secp256k1::{All, Secp256k1},
     taproot::{TaprootBuilder, TaprootSpendInfo},
@@ -12,6 +13,8 @@ use bitcoin::{
 };
 
 use crate::bitcoin_utils::create_unspendable_internal_key;
+
+use crate::SubnetId;
 
 pub fn create_multisig_script(
     public_keys: &[XOnlyPublicKey],
@@ -38,14 +41,30 @@ pub fn create_multisig_script(
         .into_script())
 }
 
-pub fn create_multisig_spend_info(
+/// Creates an unspendable script that includes the subnet id
+/// This is to ensure that the multisig is unique per subnet regardless
+/// of the validator public keys.
+///
+/// Different subnets will have different multisig addresses, even if the
+/// public keys are the same.
+fn create_unspendable_subnet_id_script(subnet_id: &SubnetId) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(opcodes::all::OP_RETURN)
+        .push_slice(subnet_id.txid().as_byte_array())
+        .into_script()
+}
+
+pub fn create_subnet_multisig_spend_info(
     secp: &Secp256k1<All>,
+    subnet_id: &SubnetId,
     public_keys: &[XOnlyPublicKey],
     required_sigs: i64,
 ) -> Result<TaprootSpendInfo, MultisigError> {
     let multisig_script = create_multisig_script(public_keys, required_sigs)?;
+    let subnet_id_script = create_unspendable_subnet_id_script(subnet_id);
 
-    let builder = TaprootBuilder::with_huffman_tree(vec![(1, multisig_script)])?;
+    let builder =
+        TaprootBuilder::with_huffman_tree(vec![(1, multisig_script), (0, subnet_id_script)])?;
     let internal_key = create_unspendable_internal_key();
     let spend_info = builder
         .finalize(secp, internal_key)
@@ -54,13 +73,15 @@ pub fn create_multisig_spend_info(
     Ok(spend_info)
 }
 
-pub fn create_multisig_address(
+pub fn create_subnet_multisig_address(
     secp: &Secp256k1<All>,
+    subnet_id: &SubnetId,
     public_keys: &[XOnlyPublicKey],
     required_sigs: i64,
     network: Network,
 ) -> Result<Address, MultisigError> {
-    let spend_info = create_multisig_spend_info(secp, public_keys, required_sigs)?;
+    let spend_info =
+        create_subnet_multisig_spend_info(secp, subnet_id, public_keys, required_sigs)?;
 
     Ok(Address::p2tr(
         secp,
@@ -162,6 +183,10 @@ mod tests {
             .collect()
     }
 
+    fn generate_subnet_id() -> SubnetId {
+        SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
+    }
+
     #[test]
     fn test_create_multisig_address_single_key() {
         let secp = Secp256k1::new();
@@ -169,8 +194,14 @@ mod tests {
         let required_sigs = 1;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
-            .expect("Failed to create multisig address");
+        let address = create_subnet_multisig_address(
+            &secp,
+            &generate_subnet_id(),
+            &public_keys,
+            required_sigs,
+            network,
+        )
+        .expect("Failed to create multisig address");
 
         assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
@@ -182,8 +213,14 @@ mod tests {
         let required_sigs = 2;
         let network = Network::Bitcoin;
 
-        let address = create_multisig_address(&secp, &public_keys, required_sigs, network)
-            .expect("Failed to create multisig address");
+        let address = create_subnet_multisig_address(
+            &secp,
+            &generate_subnet_id(),
+            &public_keys,
+            required_sigs,
+            network,
+        )
+        .expect("Failed to create multisig address");
 
         assert_eq!(address.address_type(), Some(AddressType::P2tr));
     }
@@ -195,7 +232,13 @@ mod tests {
         let required_sigs = 2; // More signatures required than keys available
         let network = Network::Bitcoin;
 
-        let result = create_multisig_address(&secp, &public_keys, required_sigs, network);
+        let result = create_subnet_multisig_address(
+            &secp,
+            &generate_subnet_id(),
+            &public_keys,
+            required_sigs,
+            network,
+        );
 
         assert!(matches!(result, Err(MultisigError::InsufficientPublicKeys)));
     }
@@ -219,18 +262,22 @@ mod tests {
         let required_sigs = 3;
         let network = Network::Regtest;
 
+        let subnet_id = generate_subnet_id();
+
         let script = create_multisig_script(&public_keys, required_sigs)
             .expect("Failed to create multisig script");
 
-        let spend_info = create_multisig_spend_info(&secp, &public_keys, required_sigs)
-            .expect("Failed to create multisig spend info");
+        let spend_info =
+            create_subnet_multisig_spend_info(&secp, &subnet_id, &public_keys, required_sigs)
+                .expect("Failed to create multisig spend info");
 
         let control_block = spend_info
             .control_block(&(script.clone(), LeafVersion::TapScript))
             .expect("Should create control block");
 
-        let multisig_address = create_multisig_address(&secp, &public_keys, required_sigs, network)
-            .expect("Failed to create multisig address");
+        let multisig_address =
+            create_subnet_multisig_address(&secp, &subnet_id, &public_keys, required_sigs, network)
+                .expect("Failed to create multisig address");
 
         //
         // Create funding transaction
@@ -438,5 +485,41 @@ mod tests {
                 "Transaction with wrong signature order should fail"
             );
         }
+    }
+
+    #[test]
+    fn test_multisig_addresses_different_subnet_id() {
+        let secp = Secp256k1::new();
+        let public_keys = generate_xonly_pubkeys(3);
+        let required_sigs = 2;
+        let network = Network::Bitcoin;
+
+        let subnet_id_1 = generate_subnet_id();
+        let subnet_id_2 = generate_subnet_id();
+
+        let address_1 = create_subnet_multisig_address(
+            &secp,
+            &subnet_id_1,
+            &public_keys,
+            required_sigs,
+            network,
+        )
+        .expect("Failed to create first multisig address");
+        dbg!(&address_1);
+
+        let address_2 = create_subnet_multisig_address(
+            &secp,
+            &subnet_id_2,
+            &public_keys,
+            required_sigs,
+            network,
+        )
+        .expect("Failed to create second multisig address");
+        dbg!(&address_2);
+
+        assert_ne!(
+            address_1, address_2,
+            "Addresses should be different with different subnet IDs"
+        );
     }
 }

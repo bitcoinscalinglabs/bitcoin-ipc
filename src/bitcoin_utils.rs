@@ -199,6 +199,12 @@ pub fn create_commit_reveal_txs(
         commit_spend_info.merkle_root(),
     );
 
+    let commit_output_value = std::cmp::max(
+        // Provide at least the minimal value for the output
+        commit_script_pubkey.minimal_non_dust_custom(fee_rate),
+        amount_to_send,
+    );
+
     let mut commit_tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -206,7 +212,7 @@ pub fn create_commit_reveal_txs(
         input: Vec::with_capacity(0),
         output: vec![TxOut {
             // This will be increased by the value needed for the reveal tx fee
-            value: commit_script_pubkey.minimal_non_dust_custom(fee_rate) + amount_to_send,
+            value: commit_output_value,
             script_pubkey: commit_script_pubkey.clone(),
         }],
     };
@@ -218,12 +224,6 @@ pub fn create_commit_reveal_txs(
     let control_block = commit_spend_info
         .control_block(&(commit_script.clone(), LeafVersion::TapScript))
         .ok_or(BitcoinUtilsError::CannotConstructControlBlock)?;
-
-    // Provide at least the minimal value for the output
-    let reveal_output_value = std::cmp::max(
-        commit_script_pubkey.minimal_non_dust_custom(fee_rate),
-        amount_to_send,
-    );
 
     let mut reveal_tx = Transaction {
         version: transaction::Version::TWO,
@@ -244,7 +244,8 @@ pub fn create_commit_reveal_txs(
             ..Default::default()
         }],
         output: vec![TxOut {
-            value: reveal_output_value,
+            // Forward the value sent by the commit tx
+            value: commit_output_value,
             // Send to the final address specified
             script_pubkey: final_address.script_pubkey(),
         }],
