@@ -1,7 +1,6 @@
 use crate::{
-    bitcoin_utils::{create_multisig_address, multisig_threshold},
-    ipc_lib::{self, SubnetId},
-    NETWORK,
+    multisig::{create_multisig_address, multisig_threshold},
+    IpcCreateSubnetMsg, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
@@ -114,7 +113,7 @@ pub struct SubnetGenesisInfo {
     /// the configuration alongside the validator whitelist
     ///
     /// The pre-boostrap multisig is constructed from the whitelist
-    pub create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
+    pub create_subnet_msg: IpcCreateSubnetMsg,
     /// Marks if the subnet is bootstrapped
     /// The struct should never be modified after bootstrapping
     pub bootstrapped: bool,

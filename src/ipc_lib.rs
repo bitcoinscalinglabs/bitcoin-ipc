@@ -10,17 +10,19 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::bitcoin_utils::{self, create_multisig_address, submit_to_mempool};
+use crate::bitcoin_utils::{self, submit_to_mempool};
 use crate::db;
 use crate::eth_utils::eth_addr_from_x_only_pubkey;
+use crate::multisig::create_multisig_address;
 use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
     pub use super::{
-        IpcCreateSubnetMsg, IpcMessage, IpcSerialize, IpcTag, IPC_CHECKPOINT_TAG,
-        IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_JOIN_SUBNET_TAG,
-        IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER, IPC_TRANSFER_TAG, IPC_WITHDRAW_TAG,
+        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcMessage, IpcSerialize, IpcTag, SubnetId,
+        IPC_CHECKPOINT_TAG, IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG,
+        IPC_JOIN_SUBNET_TAG, IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER, IPC_TRANSFER_TAG,
+        IPC_WITHDRAW_TAG,
     };
 }
 
@@ -557,6 +559,9 @@ pub enum IpcLibError {
 
     #[error(transparent)]
     BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
+
+    #[error(transparent)]
+    MultisigError(#[from] crate::multisig::MultisigError),
 }
 
 #[cfg(test)]
