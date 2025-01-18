@@ -25,7 +25,11 @@ pub fn create_multisig_script(
         return Err(MultisigError::InsufficientPublicKeys);
     }
 
-    Ok(public_keys
+    // Public keys need to be sorted for consistent scriptPubKey
+    let mut sorted_public_keys = public_keys.to_vec();
+    sorted_public_keys.sort();
+
+    Ok(sorted_public_keys
         .iter()
         .enumerate()
         .fold(Builder::new(), |builder, (index, key)| {
@@ -175,12 +179,15 @@ mod tests {
 
     fn generate_keypairs(n: usize) -> Vec<Keypair> {
         let secp = Secp256k1::new();
-        (0..n)
+        let mut keypairs: Vec<Keypair> = (0..n)
             .map(|_| {
                 let secret_key = SecretKey::new(&mut rand::thread_rng());
                 Keypair::from_secret_key(&secp, &secret_key)
             })
-            .collect()
+            .collect();
+        // sort keypairs by x-only public key
+        keypairs.sort_by_key(|k| k.x_only_public_key());
+        keypairs
     }
 
     fn generate_subnet_id() -> SubnetId {
@@ -267,6 +274,8 @@ mod tests {
         let script = create_multisig_script(&public_keys, required_sigs)
             .expect("Failed to create multisig script");
 
+        dbg!(&script);
+
         let spend_info =
             create_subnet_multisig_spend_info(&secp, &subnet_id, &public_keys, required_sigs)
                 .expect("Failed to create multisig spend info");
@@ -278,6 +287,8 @@ mod tests {
         let multisig_address =
             create_subnet_multisig_address(&secp, &subnet_id, &public_keys, required_sigs, network)
                 .expect("Failed to create multisig address");
+
+        dbg!(&multisig_address);
 
         //
         // Create funding transaction
