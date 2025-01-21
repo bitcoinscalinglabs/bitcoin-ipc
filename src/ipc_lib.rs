@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::bitcoin_utils::{self, create_multisig_address, submit_to_mempool};
 use crate::db;
+use crate::eth_utils::eth_addr_from_x_only_pubkey;
 use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
@@ -377,8 +378,11 @@ impl IpcJoinSubnetMsg {
 
         self.validate_for_genesis_info(&genesis_info)?;
 
+        let eth_address = eth_addr_from_x_only_pubkey(self.pubkey);
+
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
+            eth_address,
             collateral: self.collateral,
             backup_address: self.backup_address.clone(),
             ip: self.ip,
