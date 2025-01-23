@@ -720,6 +720,7 @@ mod tests {
         // Test wrong network address
         let mut invalid_msg = valid_msg.clone();
         invalid_msg.backup_address =
+        	// TODO make this work with any network type
             bitcoin::Address::from_str("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
         assert!(matches!(
             invalid_msg.validate(),
