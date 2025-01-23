@@ -1,4 +1,8 @@
-use crate::{ipc_lib::IpcValidate, IpcCreateSubnetMsg, BTC_CONFIRMATIONS};
+use crate::{
+    db::{self, Database, HeedDb},
+    ipc_lib::{IpcJoinSubnetMsg, IpcValidate, SubnetId},
+    IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
+};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::error;
@@ -17,6 +21,9 @@ pub enum RpcError {
     #[error("Invalid params: {0}")]
     InvalidParams(String),
 
+    #[error("Database error occurred: {0}")]
+    DbError(#[from] db::DbError),
+
     #[error("Internal server error: {0}")]
     InternalError(String),
 }
@@ -26,7 +33,7 @@ impl ErrorLike for RpcError {
         match self {
             RpcError::Unauthorized => -32001,
             RpcError::InvalidParams(_) => -32602,
-            RpcError::InternalError(_) => -32603,
+            RpcError::InternalError(_) | RpcError::DbError(_) => -32603,
         }
     }
 
@@ -52,8 +59,10 @@ impl actix_web::error::ResponseError for RpcError {
     }
 }
 
+// TODO use generics
 #[derive(Clone)]
 pub struct ServerData {
+    pub db: Arc<HeedDb>,
     pub btc_rpc: Arc<Client>,
 }
 
@@ -128,7 +137,7 @@ pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcErro
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSubnetResponse {
-    subnet_id: String,
+    subnet_id: SubnetId,
 }
 
 pub async fn create_subnet(
@@ -147,6 +156,70 @@ pub async fn create_subnet(
     Ok(CreateSubnetResponse { subnet_id })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct JoinSubnetResponse {
+    join_txid: bitcoin::Txid,
+}
+
+pub async fn join_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcJoinSubnetMsg>,
+) -> Result<JoinSubnetResponse, JsonRpcError> {
+    if let Err(err) = msg.validate() {
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
+        error!("Error validating join msg for subnet info: {}", e);
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    // TODO this check should be done in the Db
+    let multisig_address = &genesis_info.multisig_address();
+
+    let join_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(JoinSubnetResponse { join_txid })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetGenesisInfoParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_genesis_info(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<GetGenesisInfoParams>,
+) -> Result<db::SubnetGenesisInfo, JsonRpcError> {
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    Ok(genesis_info)
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -155,5 +228,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
         .with_method("createsubnet", create_subnet)
+        .with_method("joinsubnet", join_subnet)
+        .with_method("getgenesisinfo", get_genesis_info)
         .finish()
 }

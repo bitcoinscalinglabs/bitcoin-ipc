@@ -1,10 +1,10 @@
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::db::{self, Database, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcValidate};
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
 use bitcoin_ipc::{IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use dotenv::dotenv;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use thiserror::Error;
 use tokio::signal;
 use tokio::time::Duration;
@@ -24,9 +24,12 @@ async fn main() {
     env_logger::init();
 
     // Initialize the database
-    let db = HeedDb::new(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
-        .await
-        .expect("Failed to initialize database");
+    let db = HeedDb::new(
+        &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+        false,
+    )
+    .await
+    .expect("Failed to initialize database");
 
     // Init the bitcoincore_rpc client
 
@@ -102,7 +105,10 @@ where
         info!("Syncing...");
 
         // Get the last processed block from the database
-        self.current_height = self.db.get_last_processed_block().await?;
+        self.current_height = self
+            .db
+            .get_last_processed_block()
+            .map_err(MonitorError::CannotGetMonitorInfo)?;
 
         loop {
             if self.cancel_token.is_cancelled() {
@@ -135,17 +141,14 @@ where
                     Ok(_) => {
                         info!("Processed block {}", next_height);
                         self.current_height = next_height;
-                        if let Err(e) = self.db.set_last_processed_block(self.current_height).await
-                        {
+                        if let Err(e) = self.db.set_last_processed_block(self.current_height) {
                             error!("Failed to update last processed block: {:?}", e);
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Error processing block {}: {:?}. Retrying...",
-                            next_height, e
-                        );
+                        error!("Error processing block {}: {:?}.", next_height, e);
                         // Retry logic can be added here if needed
+                        return Err(e);
                     }
                 }
             }
@@ -180,16 +183,15 @@ where
                                 info!("Processed block {}", block_count);
                                 self.current_height = block_count;
                                 if let Err(e) =
-                                    self.db.set_last_processed_block(self.current_height).await
+                                    self.db.set_last_processed_block(self.current_height)
                                 {
                                     error!("Failed to update last processed block: {:?}", e);
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "Error processing block {}: {:?}. Retrying...",
-                                    block_count, e
-                                );
+                                error!("Error processing block {}: {:?}.", block_count, e);
+                                // Retry logic can be added here if needed
+                                return Err(e);
                             }
                         }
                     }
@@ -275,12 +277,37 @@ where
                 let witness_str = find_valid_utf8(&concatenated_data);
                 let ipc_message = IpcMessage::deserialize(witness_str);
 
-                match ipc_message {
-                    Ok(msg) => {
-                        self.process_ipc_msg(block_height, &txid, msg).await?;
-                    }
-                    Err(_) => {
+                let ipc_message = match ipc_message {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        trace!("Error deserializing IPC message: {:?}", e);
                         continue;
+                    }
+                };
+
+                debug!("Found IPC message: {:?}", ipc_message);
+
+                match self
+                    .process_ipc_msg(block_height, tx, txid, ipc_message)
+                    .await
+                {
+                    Ok(_) => {}
+                    // Ignorable
+                    Err(MonitorError::IpcMsgInvalid(e)) => {
+                        error!("Invalid IPC message: {:?}", e);
+                    }
+                    // Ignorable
+                    Err(MonitorError::IpcTxInvalid(e)) => {
+                        error!("Invalid IPC message transaction: {:?}", e);
+                    }
+                    // Ignorable
+                    Err(MonitorError::IpcMsgProcessingError(IpcLibError::IpcValidateError(e))) => {
+                        error!("Invalid IPC message: {:?}", e);
+                    }
+                    // Panicable, all other errors
+                    Err(e) => {
+                        error!("Fatal error processing IPC message: {:?}", e);
+                        return Err(e);
                     }
                 }
             }
@@ -292,41 +319,29 @@ where
     async fn process_ipc_msg(
         &self,
         block_height: u64,
-        txid: &bitcoin::Txid,
+        tx: &bitcoin::Transaction,
+        txid: bitcoin::Txid,
         msg: IpcMessage,
     ) -> Result<(), MonitorError> {
         match msg {
-            IpcMessage::CreateSubnet(create_subnet_params) => {
-                if let Err(e) = create_subnet_params.validate() {
-                    error!(
-                        "create_subnet msg invalid msg={:?} error={:?}",
-                        create_subnet_params, e
-                    );
-                    return Ok(());
-                }
+            IpcMessage::CreateSubnet(create_subnet_msg) => {
+                create_subnet_msg.validate()?;
+                create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+                Ok(())
+            }
 
-                let subnet_id = ipc_lib::subnet_id_from_txid(txid);
+            IpcMessage::JoinSubnet(mut join_subnet_msg) => {
+                join_subnet_msg.collateral = match tx.output.first() {
+                    Some(output) => output.value,
+                    None => {
+                        return Err(MonitorError::IpcTxInvalid(
+                            "Transaction output must be non zero".to_string(),
+                        ))
+                    }
+                };
 
-                let multisig_addr = create_subnet_params
-                    .multisig_address_from_whitelist()
-                    .map_err(|e| MonitorError::IpcMsgError(e.to_string()))?;
-
-                debug!("multisig_address: {}", multisig_addr);
-
-                debug!(
-                    "block={} subnet_id={} msg={:?}",
-                    block_height, subnet_id, create_subnet_params
-                );
-
-                // TODO handle errors better
-                if let Err(e) = self
-                    .db
-                    .save_subnet_create_msg(block_height, &subnet_id, &create_subnet_params)
-                    .await
-                {
-                    error!("Failed to save subnet to DB: {:?}", e);
-                }
-
+                join_subnet_msg.validate()?;
+                join_subnet_msg.save_to_db(&self.db, block_height, txid)?;
                 Ok(())
             }
         }
@@ -349,12 +364,23 @@ pub enum MonitorError {
     #[error("Current block height ahead of tip. Latest: {0}. Current: {1}")]
     BlockHeightAheadOfTip(u64, u64),
 
-    // TODO better errors
-    #[error("Error processing IPC message: {0}")]
-    IpcMsgError(String),
+    #[error("IPC message error: {0}")]
+    IpcTxInvalid(String),
 
+    /// Returned when an IPC message is invalid
+    /// The message is ignored
     #[error(transparent)]
-    DbError(#[from] db::DbError),
+    IpcMsgInvalid(#[from] ipc_lib::IpcValidateError),
+
+    /// Returned when there was an error processing
+    /// an IPC message
+    ///
+    /// All variants of this error are fatal, except for `IpcValidateError`
+    #[error(transparent)]
+    IpcMsgProcessingError(#[from] IpcLibError),
+
+    #[error("Cannot get last processed block: {0}")]
+    CannotGetMonitorInfo(db::DbError),
 
     #[error(transparent)]
     BitcoinRpcError(#[from] bitcoincore_rpc::Error),
