@@ -378,11 +378,11 @@ impl IpcJoinSubnetMsg {
 
         self.validate_for_genesis_info(&genesis_info)?;
 
-        let eth_address = eth_addr_from_x_only_pubkey(self.pubkey);
+        let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
-            eth_address,
+            subnet_address,
             collateral: self.collateral,
             backup_address: self.backup_address.clone(),
             ip: self.ip,

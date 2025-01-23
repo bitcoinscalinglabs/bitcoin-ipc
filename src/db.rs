@@ -32,7 +32,7 @@ pub struct SubnetValidator {
     /// The public key of the validator
     pub pubkey: XOnlyPublicKey,
     /// The ethereum address of the validator pubkey
-    pub eth_address: alloy_primitives::Address,
+    pub subnet_address: alloy_primitives::Address,
     /// The current balance of the validator's stake
     pub collateral: bitcoin::Amount,
     /// Validator backup address
