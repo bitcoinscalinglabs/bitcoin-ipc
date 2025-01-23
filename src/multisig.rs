@@ -181,7 +181,10 @@ mod tests {
         let secp = Secp256k1::new();
         let mut keypairs: Vec<Keypair> = (0..n)
             .map(|_| {
-                let secret_key = SecretKey::new(&mut rand::thread_rng());
+                let mut secret_key = SecretKey::new(&mut rand::thread_rng());
+                if secret_key.x_only_public_key(&secp).1 == bitcoin::key::Parity::Odd {
+                    secret_key = secret_key.negate();
+                }
                 Keypair::from_secret_key(&secp, &secret_key)
             })
             .collect();
@@ -263,6 +266,21 @@ mod tests {
         //
 
         let keypairs = generate_keypairs(5);
+
+        for keypair in keypairs.iter() {
+            let (x_only, parity) = keypair.x_only_public_key();
+            println!(
+                "PK = {}\nP = {:?}\nXPK = {}\nSK = {}\nADDR = {}\n\n",
+                keypair.public_key(),
+                parity,
+                x_only,
+                keypair.secret_key().display_secret(),
+                alloy_primitives::Address::from_raw_public_key(
+                    &keypair.public_key().serialize_uncompressed()[1..]
+                ),
+            );
+        }
+
         let public_keys: Vec<XOnlyPublicKey> =
             keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
 
