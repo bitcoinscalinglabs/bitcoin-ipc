@@ -10,17 +10,20 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::bitcoin_utils::{self, create_multisig_address, submit_to_mempool};
+use crate::bitcoin_utils::{self, submit_to_mempool};
 use crate::db;
 use crate::eth_utils::eth_addr_from_x_only_pubkey;
+use crate::multisig::create_subnet_multisig_address;
+use crate::wallet;
 use crate::NETWORK;
 
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
     pub use super::{
-        IpcCreateSubnetMsg, IpcMessage, IpcSerialize, IpcTag, IPC_CHECKPOINT_TAG,
-        IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG, IPC_JOIN_SUBNET_TAG,
-        IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER, IPC_TRANSFER_TAG, IPC_WITHDRAW_TAG,
+        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcMessage, IpcSerialize, IpcTag, SubnetId,
+        IPC_CHECKPOINT_TAG, IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_DEPOSIT_TAG,
+        IPC_JOIN_SUBNET_TAG, IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER, IPC_TRANSFER_TAG,
+        IPC_WITHDRAW_TAG,
     };
 }
 
@@ -123,10 +126,14 @@ pub struct IpcCreateSubnetMsg {
 
 impl IpcCreateSubnetMsg {
     /// Creates a multisig address from the whitelisted public keys
-    pub fn multisig_address_from_whitelist(&self) -> Result<bitcoin::Address, IpcLibError> {
+    pub fn multisig_address_from_whitelist(
+        &self,
+        subnet_id: &SubnetId,
+    ) -> Result<bitcoin::Address, IpcLibError> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
-        let multisig_address = create_multisig_address(
+        let multisig_address = create_subnet_multisig_address(
             &secp,
+            subnet_id,
             &self.whitelist.clone(),
             self.min_validators.into(),
             NETWORK,
@@ -142,19 +149,21 @@ impl IpcCreateSubnetMsg {
         &self,
         rpc: &bitcoincore_rpc::Client,
     ) -> Result<SubnetId, IpcLibError> {
-        let multisig_address = self.multisig_address_from_whitelist()?;
         let subnet_data = self.ipc_serialize();
 
         info!(
-            "Submitting create subnet msg to bitcoin. Multisig address = {}. Data={}",
-            multisig_address, subnet_data
+            "Submitting create subnet msg to bitcoin. Data={}",
+            subnet_data
         );
+
+        // The address to return any non-dust values
+        let return_address = wallet::get_new_address(rpc)?;
 
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
             rpc,
             &secp,
-            &multisig_address,
+            &return_address,
             subnet_data.as_bytes(),
             None,
         )?;
@@ -185,6 +194,7 @@ impl IpcCreateSubnetMsg {
         let subnet_id = SubnetId::from_txid(&txid);
 
         let genesis_info = db::SubnetGenesisInfo {
+            subnet_id,
             create_subnet_msg: self.clone(),
             bootstrapped: false,
             genesis_block_height: block_height,
@@ -557,6 +567,12 @@ pub enum IpcLibError {
 
     #[error(transparent)]
     BitcoinUtilsError(#[from] crate::bitcoin_utils::BitcoinUtilsError),
+
+    #[error(transparent)]
+    WalletError(#[from] crate::wallet::WalletError),
+
+    #[error(transparent)]
+    MultisigError(#[from] crate::multisig::MultisigError),
 }
 
 #[cfg(test)]

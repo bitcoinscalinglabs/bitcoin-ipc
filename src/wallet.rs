@@ -99,6 +99,10 @@ pub fn sign_tx(rpc: &Client, unsigned_tx: Transaction) -> Result<Transaction, Wa
     Ok(signed_raw_transaction.transaction()?)
 }
 
+pub fn get_new_address(rpc: &Client) -> Result<bitcoin::Address, WalletError> {
+    Ok(rpc.get_new_address(None, None)?.assume_checked())
+}
+
 #[derive(Error, Debug)]
 pub enum WalletError {
     #[error(transparent)]

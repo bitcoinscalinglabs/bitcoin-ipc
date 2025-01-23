@@ -4,6 +4,7 @@ pub mod bitcoin_utils;
 pub mod db;
 pub mod eth_utils;
 pub mod ipc_lib;
+pub mod multisig;
 pub mod provider;
 pub mod wallet;
 

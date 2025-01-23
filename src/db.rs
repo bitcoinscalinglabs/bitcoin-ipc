@@ -1,7 +1,6 @@
 use crate::{
-    bitcoin_utils::{create_multisig_address, multisig_threshold},
-    ipc_lib::{self, SubnetId},
-    NETWORK,
+    multisig::{create_subnet_multisig_address, multisig_threshold},
+    IpcCreateSubnetMsg, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
@@ -45,19 +44,20 @@ pub struct SubnetValidator {
 }
 
 trait SubnetValidators {
-    fn multisig_address(&self) -> Address<NetworkUnchecked>;
+    fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked>;
     fn threshold(&self) -> u16;
-    fn to_committee(&self) -> SubnetCommittee;
+    fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee;
 }
 
 impl SubnetValidators for Vec<SubnetValidator> {
-    fn multisig_address(&self) -> Address<NetworkUnchecked> {
+    fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let pubkeys = self.iter().map(|v| v.pubkey).collect::<Vec<_>>();
         // TODO remove as 16
         let threshold = multisig_threshold(pubkeys.len() as u16);
-        let multisig_address = create_multisig_address(&secp, &pubkeys, threshold.into(), NETWORK)
-            .expect("Multisig address should be valid");
+        let multisig_address =
+            create_subnet_multisig_address(&secp, subnet_id, &pubkeys, threshold.into(), NETWORK)
+                .expect("Multisig address should be valid");
 
         multisig_address.into_unchecked()
     }
@@ -67,11 +67,11 @@ impl SubnetValidators for Vec<SubnetValidator> {
         multisig_threshold(self.len() as u16)
     }
 
-    fn to_committee(&self) -> SubnetCommittee {
+    fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee {
         SubnetCommittee {
-            threshold: self.threshold() as u16,
+            threshold: self.threshold(),
             validators: self.to_vec(),
-            multisig_address: self.multisig_address(),
+            multisig_address: self.multisig_address(subnet_id),
         }
     }
 }
@@ -110,11 +110,13 @@ impl SubnetState {
 /// Genesis info for a subnet
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubnetGenesisInfo {
+    /// Duplicate of the subnet ID, for easy access
+    pub subnet_id: SubnetId,
     /// The original create subnet msg, which holds
     /// the configuration alongside the validator whitelist
     ///
     /// The pre-boostrap multisig is constructed from the whitelist
-    pub create_subnet_msg: ipc_lib::IpcCreateSubnetMsg,
+    pub create_subnet_msg: IpcCreateSubnetMsg,
     /// Marks if the subnet is bootstrapped
     /// The struct should never be modified after bootstrapping
     pub bootstrapped: bool,
@@ -130,15 +132,15 @@ pub struct SubnetGenesisInfo {
 impl SubnetGenesisInfo {
     pub fn multisig_address(&self) -> Address {
         self.create_subnet_msg
-            .multisig_address_from_whitelist()
+            .multisig_address_from_whitelist(&self.subnet_id)
             .expect("Multisig should be valid for saved subnet genesis info")
     }
 
-    pub fn into_subnet(self, subnet_id: SubnetId) -> SubnetState {
+    pub fn into_subnet(self) -> SubnetState {
         SubnetState {
-            id: subnet_id,
+            id: self.subnet_id,
             committee_number: 1,
-            committee: self.genesis_validators.to_committee(),
+            committee: self.genesis_validators.to_committee(&self.subnet_id),
         }
     }
 }
