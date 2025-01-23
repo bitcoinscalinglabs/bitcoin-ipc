@@ -518,8 +518,14 @@ impl FromStr for SubnetId {
     type Err = SubnetIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // check if it starts with /
+        if !s.starts_with('/') {
+            return Err(SubnetIdError::InvalidFormat(crate::L1_NAME, s.to_string()));
+        }
+        let s = &s[1..];
+
         let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 2 || parts[0] != crate::L1_NAME {
+        if parts.len() != 2 || parts[0] != &crate::L1_NAME[1..] {
             return Err(SubnetIdError::InvalidFormat(crate::L1_NAME, s.to_string()));
         }
 
@@ -577,6 +583,8 @@ pub enum IpcLibError {
 
 #[cfg(test)]
 mod tests {
+    use crate::L1_NAME;
+
     use super::*;
 
     #[test]
@@ -760,8 +768,8 @@ mod tests {
             IPC_TAG_DELIMITER
         )));
         assert!(serialized.contains(&format!(
-            "{}subnet_id=BTC/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-            IPC_TAG_DELIMITER
+            "{}subnet_id={}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            IPC_TAG_DELIMITER, L1_NAME
         )));
 
         // Test deserialization
