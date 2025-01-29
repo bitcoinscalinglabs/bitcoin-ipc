@@ -197,8 +197,8 @@ impl IpcCreateSubnetMsg {
             subnet_id,
             create_subnet_msg: self.clone(),
             bootstrapped: false,
-            genesis_block_height: block_height,
-            boostrap_block_height: None,
+            create_msg_block_height: block_height,
+            genesis_block_height: None,
             genesis_validators: Vec::with_capacity(0),
         };
 
@@ -409,7 +409,7 @@ impl IpcJoinSubnetMsg {
         {
             trace!("Subnet {} bootstrapped", self.subnet_id);
             genesis_info.bootstrapped = true;
-            genesis_info.boostrap_block_height = Some(block_height);
+            genesis_info.genesis_block_height = Some(block_height);
 
             // TODO create subnet in db
         }

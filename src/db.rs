@@ -117,14 +117,14 @@ pub struct SubnetGenesisInfo {
     ///
     /// The pre-boostrap multisig is constructed from the whitelist
     pub create_subnet_msg: IpcCreateSubnetMsg,
+    /// The height of the block where the create subnet
+    /// message was included
+    pub create_msg_block_height: u64,
     /// Marks if the subnet is bootstrapped
     /// The struct should never be modified after bootstrapping
     pub bootstrapped: bool,
-    /// The height of the block where the create subnet
-    /// message was included
-    pub genesis_block_height: u64,
     /// The height of the block where the subnet was bootstrapped
-    pub boostrap_block_height: Option<u64>,
+    pub genesis_block_height: Option<u64>,
     /// The list of validators that boostrapped the subnet
     pub genesis_validators: Vec<SubnetValidator>,
 }
