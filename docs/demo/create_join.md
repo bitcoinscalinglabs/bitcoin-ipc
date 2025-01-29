@@ -11,7 +11,7 @@ curl -X POST http://localhost:3030/api \
 	    "min_validator_stake": 100000000,
 	    "min_validators": 3,
 	    "bottomup_check_period": 5,
-	    "active_validators_limit": 2,
+	    "active_validators_limit": 4,
 	    "min_cross_msg_fee": 200,
 	    "whitelist": [
 		    "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
@@ -30,7 +30,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/bip122:0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206/de1ceedc2c8b847c9f94aa37f6e18b569e66d6c9d0320644f4534f3c052d0276",
+			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -46,7 +46,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/bip122:0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206/de1ceedc2c8b847c9f94aa37f6e18b569e66d6c9d0320644f4534f3c052d0276",
+			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
 			"collateral": 110000000,
 			"ip": "66.222.44.55:8081",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -62,7 +62,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/bip122:0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206/de1ceedc2c8b847c9f94aa37f6e18b569e66d6c9d0320644f4534f3c052d0276",
+			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
 			"collateral": 150000000,
 			"ip": "66.222.44.55:8082",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -78,7 +78,7 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "BTC/4467317d030d3bcac27b897d05e7c1ad2aa138d669d017e512131852ccfbf287"
+		"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni"
 	},
 	"id": 1
 }' | jq

@@ -27,6 +27,8 @@ pub mod prelude {
     };
 }
 
+pub type FvmAddress = fvm_shared::address::Address;
+
 // Tag
 
 pub const IPC_TAG_DELIMITER: &str = "#";
@@ -190,7 +192,7 @@ impl IpcCreateSubnetMsg {
         db: &D,
         block_height: u64,
         txid: bitcoin::Txid,
-    ) -> Result<(), IpcLibError> {
+    ) -> Result<SubnetId, IpcLibError> {
         let subnet_id = SubnetId::from_txid(&txid);
 
         let genesis_info = db::SubnetGenesisInfo {
@@ -208,7 +210,7 @@ impl IpcCreateSubnetMsg {
         db.save_subnet_genesis_info(&mut wtxn, subnet_id, genesis_info)?;
         wtxn.commit()?;
 
-        Ok(())
+        Ok(subnet_id)
     }
 }
 
@@ -483,34 +485,50 @@ impl IpcMessage {
 // Subnet ID
 //
 
+pub const L1_DELEGATED_NAMESPACE: u64 = 20;
+
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the reveal transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubnetId(Txid);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubnetId(FvmAddress);
 
 #[derive(Debug, Error)]
 pub enum SubnetIdError {
-    #[error("Invalid Subnet Id format. Expected '{0}/<txid>', got '{1}'")]
+    #[error("Invalid Subnet Id format. Expected '{0}/<addr>', got '{1}'")]
     InvalidFormat(&'static str, String),
-    #[error("Invalid transaction ID: {0}")]
-    InvalidTxid(#[from] bitcoin::hashes::hex::HexToArrayError),
+    #[error("Invalid delegated address: {0}")]
+    InvalidFvmAddress(#[from] fvm_shared::address::Error),
 }
 
 impl SubnetId {
     /// Creates a new SubnetId from a transaction ID
     pub fn from_txid(txid: &Txid) -> Self {
-        Self(*txid)
+        let addr = FvmAddress::new_delegated(L1_DELEGATED_NAMESPACE, txid.as_ref())
+            .expect("txid is longer than 32 bytes, unreachable");
+        Self(addr)
     }
 
-    /// Returns the transaction ID
-    pub fn txid(&self) -> &Txid {
+    pub fn addr(&self) -> &FvmAddress {
         &self.0
+    }
+
+    // Getting the txid from the delegated address
+    // It's impossible to create other types of addresses or with other data
+    // So it's safe to panic to handle errors
+    pub fn txid(&self) -> Txid {
+        let payload = self.0.payload();
+        let sub_address = match payload {
+            fvm_shared::address::Payload::Delegated(del_addr) => del_addr.subaddress(),
+            _ => panic!("SubnetId doesn't have a delegated address"),
+        };
+
+        Txid::from_slice(sub_address).expect("SubnetId subaddress is an invalid txid")
     }
 }
 
 impl Default for SubnetId {
     fn default() -> Self {
-        Self(Txid::all_zeros())
+        Self::from_txid(&Txid::all_zeros())
     }
 }
 
@@ -529,8 +547,8 @@ impl FromStr for SubnetId {
             return Err(SubnetIdError::InvalidFormat(crate::L1_NAME, s.to_string()));
         }
 
-        let txid = Txid::from_str(parts[1])?;
-        Ok(SubnetId(txid))
+        let addr = FvmAddress::from_str(parts[1])?;
+        Ok(SubnetId(addr))
     }
 }
 
@@ -769,7 +787,7 @@ mod tests {
             IPC_TAG_DELIMITER
         )));
         assert!(serialized.contains(&format!(
-            "{}subnet_id={}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            "{}subnet_id={}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
             IPC_TAG_DELIMITER, L1_NAME
         )));
 
@@ -798,14 +816,17 @@ mod tests {
             Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
                 .unwrap();
         let subnet_id = SubnetId::from_txid(&txid);
+        let addr = subnet_id.addr();
 
-        assert_eq!(subnet_id.txid(), &txid);
+        println!("{subnet_id} {addr}");
+
+        assert_eq!(subnet_id.txid(), txid);
     }
 
     #[test]
     fn test_subnet_id_from_str() {
         let subnet_id_str = format!(
-            "{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            "{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
             crate::L1_NAME
         );
         let subnet_id = SubnetId::from_str(&subnet_id_str).unwrap();
@@ -826,7 +847,7 @@ mod tests {
         assert_eq!(
             subnet_id.to_string(),
             format!(
-                "{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                "{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
                 crate::L1_NAME
             )
         );
@@ -836,16 +857,21 @@ mod tests {
     fn test_invalid_subnet_id() {
         // Test invalid txid
         let result = SubnetId::from_str(&format!("{}/invalid-txid", crate::L1_NAME));
-        assert!(matches!(result, Err(SubnetIdError::InvalidTxid(_))));
+        assert!(matches!(result, Err(SubnetIdError::InvalidFvmAddress(_))));
 
         // Test missing prefix
         let result =
             SubnetId::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
         assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
 
+        // Test missing prefix
+        let result =
+            SubnetId::from_str("f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m");
+        assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
+
         // Test wrong prefix
         let result = SubnetId::from_str(
-            "wrongchain/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            "wrongchain/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
         );
         assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
     }
@@ -860,7 +886,7 @@ mod tests {
         // Test JSON serialization
         let serialized = serde_json::to_string(&subnet_id).unwrap();
         let expected = format!(
-            "\"{}/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b\"",
+            "\"{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m\"",
             crate::L1_NAME
         );
         assert_eq!(serialized, expected);

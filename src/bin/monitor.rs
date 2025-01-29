@@ -326,7 +326,8 @@ where
         match msg {
             IpcMessage::CreateSubnet(create_subnet_msg) => {
                 create_subnet_msg.validate()?;
-                create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+                let subnet_id = create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+                info!("Processed CreateSubnet for Subnet ID: {}", subnet_id);
                 Ok(())
             }
 
