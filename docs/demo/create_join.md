@@ -1,5 +1,5 @@
 ```sh
-ipc-cli subnet create --parent /bip122:0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 --min-validators 3 --bottomup-check-period 300 btc --min-validator-stake 10000000 --min-cross-msg-fee 10 --validator-whitelist 18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166,6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df,1dc9a71014974bcf298f71fbcfffa42e891d3f5376baa712f7379909a05b6be7,d789c59be13d8f0fe3e2a22ed062c821399c9486c3789d1fa2ca1b43c8246195
+ipc-cli subnet create --parent /b4 --min-validators 3 --bottomup-check-period 300 btc --min-validator-stake 10000000 --min-cross-msg-fee 10 --validator-whitelist 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
 
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
@@ -9,15 +9,15 @@ curl -X POST http://localhost:3030/api \
     "method": "createsubnet",
     "params": {
 	    "min_validator_stake": 100000000,
-	    "min_validators": 3,
+	    "min_validators": 4,
 	    "bottomup_check_period": 5,
 	    "active_validators_limit": 4,
 	    "min_cross_msg_fee": 200,
 	    "whitelist": [
-		    "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
-		    "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df",
-		    "1dc9a71014974bcf298f71fbcfffa42e891d3f5376baa712f7379909a05b6be7",
-				"d789c59be13d8f0fe3e2a22ed062c821399c9486c3789d1fa2ca1b43c8246195"
+		    "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268",
+		    "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
+		    "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
+				"b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
 	    ]
     },
     "id": 1
@@ -30,11 +30,11 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
-			"collateral": 20000000,
+			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"collateral": 200000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-			"pubkey": "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166"
+			"pubkey": "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268"
     },
     "id": 1
 }' | jq
@@ -46,11 +46,11 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
+			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
 			"collateral": 110000000,
 			"ip": "66.222.44.55:8081",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-			"pubkey": "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df"
+			"pubkey": "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
     },
     "id": 1
 }' | jq
@@ -62,11 +62,27 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni",
+			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
 			"collateral": 150000000,
 			"ip": "66.222.44.55:8082",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-			"pubkey": "d789c59be13d8f0fe3e2a22ed062c821399c9486c3789d1fa2ca1b43c8246195"
+			"pubkey": "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "joinsubnet",
+    "params": {
+			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"collateral": 180000000,
+			"ip": "66.222.44.55:8082",
+			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+			"pubkey": "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
     },
     "id": 1
 }' | jq
@@ -78,7 +94,7 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "/b4/f420fmn6fjcnhimmv47z7gzbhkegwckny6jlcnqcxppzsizxueab3huo6lczeni"
+		"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su"
 	},
 	"id": 1
 }' | jq

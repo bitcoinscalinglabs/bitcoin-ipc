@@ -554,6 +554,17 @@ impl FromStr for SubnetId {
 
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // fvm_shared rellies on this global current_network variable
+        // to format the address correctly
+        //
+        // if the address is not formatted correctly
+        // ipc will not be able to parse it back
+        use fvm_shared::address::{set_current_network, Network as FvmNetwork};
+        set_current_network(if crate::NETWORK == bitcoin::Network::Bitcoin {
+            FvmNetwork::Mainnet
+        } else {
+            FvmNetwork::Testnet
+        });
         write!(f, "{}/{}", crate::L1_NAME, self.0)
     }
 }
@@ -787,7 +798,7 @@ mod tests {
             IPC_TAG_DELIMITER
         )));
         assert!(serialized.contains(&format!(
-            "{}subnet_id={}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+            "{}subnet_id={}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
             IPC_TAG_DELIMITER, L1_NAME
         )));
 
@@ -826,7 +837,7 @@ mod tests {
     #[test]
     fn test_subnet_id_from_str() {
         let subnet_id_str = format!(
-            "{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+            "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
             crate::L1_NAME
         );
         let subnet_id = SubnetId::from_str(&subnet_id_str).unwrap();
@@ -847,7 +858,7 @@ mod tests {
         assert_eq!(
             subnet_id.to_string(),
             format!(
-                "{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+                "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
                 crate::L1_NAME
             )
         );
@@ -866,12 +877,12 @@ mod tests {
 
         // Test missing prefix
         let result =
-            SubnetId::from_str("f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m");
+            SubnetId::from_str("t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m");
         assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
 
         // Test wrong prefix
         let result = SubnetId::from_str(
-            "wrongchain/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+            "wrongchain/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
         );
         assert!(matches!(result, Err(SubnetIdError::InvalidFormat(_, _))));
     }
@@ -886,7 +897,7 @@ mod tests {
         // Test JSON serialization
         let serialized = serde_json::to_string(&subnet_id).unwrap();
         let expected = format!(
-            "\"{}/f420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m\"",
+            "\"{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m\"",
             crate::L1_NAME
         );
         assert_eq!(serialized, expected);
