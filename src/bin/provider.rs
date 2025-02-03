@@ -1,17 +1,37 @@
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use bitcoin_ipc::bitcoin_utils::make_rpc_client_from_env;
 use bitcoin_ipc::db::HeedDb;
 use bitcoin_ipc::provider;
-use dotenv::dotenv;
+use clap::Parser;
 use log::error;
-use std::sync::Arc;
 
 const DEFAULT_PROVIDER_PORT: &str = "3030";
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to env file
+    #[arg(long, default_value = ".env")]
+    env: String,
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Parse command line arguments
+
+    let args = Args::parse();
+
     // Load .env file
 
-    dotenv().ok();
+    let env_path: PathBuf = env::current_dir()
+        .and_then(|a| Ok(a.join(&args.env)))
+        .unwrap();
+
+    dotenv::from_path(env_path.as_path())
+        .unwrap_or_else(|_| panic!("Failed to load env file: {}", args.env));
 
     // Initialize the logger, configurable by the RUST_LOG env
 

@@ -7,6 +7,7 @@ default-run = "bitcoin-ipc"
 [dependencies]
 bitcoin = { version = "0.32.5", features = ["serde"] }
 bitcoincore-rpc = "0.19.0"
+clap = { version = "4.5.27", features = ["derive"] }
 dotenv = "0.15.0"
 serde = "1.0.203"
 thiserror = "1.0.61"
