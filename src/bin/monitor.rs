@@ -1,9 +1,12 @@
+use std::env;
+use std::path::PathBuf;
+
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::db::{self, Database, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
 use bitcoin_ipc::{IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
-use dotenv::dotenv;
+use clap::Parser;
 use log::{debug, error, info, trace};
 use thiserror::Error;
 use tokio::signal;
@@ -13,11 +16,28 @@ use tokio_util::sync::CancellationToken;
 // TODO make configurable
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to env file
+    #[arg(long, default_value = ".env")]
+    env: String,
+}
+
 #[tokio::main]
 async fn main() {
+    // Parse command line arguments
+
+    let args = Args::parse();
+
     // Load .env file
 
-    dotenv().ok();
+    let env_path: PathBuf = env::current_dir()
+        .and_then(|a| Ok(a.join(&args.env)))
+        .unwrap();
+
+    dotenv::from_path(env_path.as_path())
+        .unwrap_or_else(|_| panic!("Failed to load env file: {}", args.env));
 
     // Initialize the logger, configurable by the RUST_LOG env
 
@@ -285,8 +305,6 @@ where
                     }
                 };
 
-                debug!("Found IPC message: {:?}", ipc_message);
-
                 match self
                     .process_ipc_msg(block_height, tx, txid, ipc_message)
                     .await
@@ -325,6 +343,7 @@ where
     ) -> Result<(), MonitorError> {
         match msg {
             IpcMessage::CreateSubnet(create_subnet_msg) => {
+                debug!("Found IPC message: {:?}", create_subnet_msg);
                 create_subnet_msg.validate()?;
                 let subnet_id = create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
                 info!("Processed CreateSubnet for Subnet ID: {}", subnet_id);
@@ -335,14 +354,20 @@ where
                 join_subnet_msg.collateral = match tx.output.first() {
                     Some(output) => output.value,
                     None => {
+                        debug!("Found IPC message: {:?}", join_subnet_msg);
                         return Err(MonitorError::IpcTxInvalid(
                             "Transaction output must be non zero".to_string(),
-                        ))
+                        ));
                     }
                 };
+                debug!("Found IPC message: {:?}", join_subnet_msg);
 
                 join_subnet_msg.validate()?;
                 join_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+                info!(
+                    "Processed JoinSubnet for Subnet ID: {}",
+                    join_subnet_msg.subnet_id
+                );
                 Ok(())
             }
         }
