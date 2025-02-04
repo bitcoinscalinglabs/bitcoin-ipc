@@ -28,4 +28,28 @@ alias ipc-cli="cargo run -q -p ipc-cli --release --"
 alias fendermint="cargo run -q -p fendermint --release --"
 ```
 
+Let's generate a default IPC configuration file:
+
+```sh
+mkdir -p ~/.ipc
+ipc-cli config init
+```
+
+One final thing is to build the fendermint local docker image:
+
+```sh
+# in ipc repo, navigate to fendermint subdirectory
+cd fendermint
+# make sure docker is running
+make docker-build
+# wait a few minutes
+```
+
+To verify the image is available:
+
+```sh
+docker images | grep fendermint
+# fendermint                                latest    c1db79694970   4 seconds ago     236MB
+```
+
 You now have all of the necessary tools to [deploy a local subnet](./deploy-local.md).
