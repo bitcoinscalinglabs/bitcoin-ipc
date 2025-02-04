@@ -26,9 +26,13 @@ async fn main() -> std::io::Result<()> {
 
     // Load .env file
 
-    let env_path: PathBuf = env::current_dir()
-        .and_then(|a| Ok(a.join(&args.env)))
-        .unwrap();
+    let env_path = if args.env.starts_with('/') {
+        PathBuf::from(&args.env)
+    } else {
+        env::current_dir()
+            .and_then(|a| Ok(a.join(&args.env)))
+            .unwrap()
+    };
 
     dotenv::from_path(env_path.as_path())
         .unwrap_or_else(|_| panic!("Failed to load env file: {}", args.env));
