@@ -37,10 +37,10 @@ All wallets should have at least 100 BTC.
 Navigate to bitcoin-ipc directory and run the following commands:
 
 ```sh
-mkdir ~/.ipc/validator1/
-mkdir ~/.ipc/validator2/
-mkdir ~/.ipc/validator3/
-mkdir ~/.ipc/validator4/
+mkdir -p ~/.ipc/validator1/
+mkdir -p ~/.ipc/validator2/
+mkdir -p ~/.ipc/validator3/
+mkdir -p ~/.ipc/validator4/
 
 cp .env.example ~/.ipc/validator1/.env
 cp .env.example ~/.ipc/validator2/.env
