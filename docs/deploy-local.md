@@ -189,11 +189,11 @@ Replace the `--from` field with validator IPC wallet addresses we created in Ste
 ```sh
 ipc-cli --config-path ~/.ipc/validator1/config.toml subnet join --from 0x27B60D9f71D6806cCa7D5A92b391093FE100f8e8 --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=200000000 --ip 66.222.44.55:8080 --backup-address "$(bitcoin-cli --rpcwallet=validator1 getnewaddress)"
 
-ipc-cli --config-path ~/.ipc/validator1/config.toml subnet join --from 0xd9c4C92CA843a53bff146C79B5D32Ca4b9321414 --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=110000000 --ip 66.222.44.55:8081 --backup-address "$(bitcoin-cli --rpcwallet=validator2 getnewaddress)"
+ipc-cli --config-path ~/.ipc/validator2/config.toml subnet join --from 0xd9c4C92CA843a53bff146C79B5D32Ca4b9321414 --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=110000000 --ip 66.222.44.55:8081 --backup-address "$(bitcoin-cli --rpcwallet=validator2 getnewaddress)"
 
-ipc-cli --config-path ~/.ipc/validator1/config.toml subnet join --from 0x646Aed5404567ae15648E9b9B0004cbAfb126949 --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=150000000 --ip 66.222.44.55:8082 --backup-address "$(bitcoin-cli --rpcwallet=validator3 getnewaddress)"
+ipc-cli --config-path ~/.ipc/validator3/config.toml subnet join --from 0x646Aed5404567ae15648E9b9B0004cbAfb126949 --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=150000000 --ip 66.222.44.55:8082 --backup-address "$(bitcoin-cli --rpcwallet=validator3 getnewaddress)"
 
-ipc-cli --config-path ~/.ipc/validator1/config.toml subnet join --from 0xBcE2f194e9628E6ae06fa0D85DD57Cd5579213bf --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=180000000 --ip 66.222.44.55:8083 --backup-address "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
+ipc-cli --config-path ~/.ipc/validator4/config.toml subnet join --from 0xBcE2f194e9628E6ae06fa0D85DD57Cd5579213bf --subnet=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e btc --collateral=180000000 --ip 66.222.44.55:8083 --backup-address "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
 ```
 
 Let's include the join transactions in the blockchain by mining a block.
