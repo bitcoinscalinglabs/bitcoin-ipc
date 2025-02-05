@@ -554,17 +554,6 @@ impl FromStr for SubnetId {
 
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // fvm_shared rellies on this global current_network variable
-        // to format the address correctly
-        //
-        // if the address is not formatted correctly
-        // ipc will not be able to parse it back
-        use fvm_shared::address::{set_current_network, Network as FvmNetwork};
-        set_current_network(if crate::NETWORK == bitcoin::Network::Bitcoin {
-            FvmNetwork::Mainnet
-        } else {
-            FvmNetwork::Testnet
-        });
         write!(f, "{}/{}", crate::L1_NAME, self.0)
     }
 }

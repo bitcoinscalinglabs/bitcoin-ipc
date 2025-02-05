@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::db::{self, Database, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
-use bitcoin_ipc::{IpcMessage, BTC_CONFIRMATIONS};
+use bitcoin_ipc::{eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 use clap::Parser;
 use log::{debug, error, info, trace};
@@ -35,9 +35,7 @@ async fn main() {
     let env_path = if args.env.starts_with('/') {
         PathBuf::from(&args.env)
     } else {
-        env::current_dir()
-            .and_then(|a| Ok(a.join(&args.env)))
-            .unwrap()
+        env::current_dir().map(|a| a.join(&args.env)).unwrap()
     };
 
     dotenv::from_path(env_path.as_path())
@@ -58,6 +56,10 @@ async fn main() {
     // Init the bitcoincore_rpc client
 
     let btc_rpc = make_rpc_client_from_env();
+
+    // Set correct fvm network
+
+    eth_utils::set_fvm_network();
 
     // Create a cancellation token for the monitor
 

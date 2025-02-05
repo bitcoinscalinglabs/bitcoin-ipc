@@ -1,3 +1,19 @@
+// fvm_shared rellies on this global current_network variable
+// to format the address correctly
+//
+// if the address is not formatted correctly
+// ipc will not be able to parse it back
+pub fn set_fvm_network() {
+    use fvm_shared::address::{set_current_network, Network as FvmNetwork};
+    let network = if crate::NETWORK == bitcoin::Network::Bitcoin {
+        FvmNetwork::Mainnet
+    } else {
+        FvmNetwork::Testnet
+    };
+    log::debug!("Set fvm network to {network:?}");
+    set_current_network(network);
+}
+
 /// Derives the Ethereum address from a Bitcoin x-only public key
 // TODO from_raw_public_key could panic if pubkey.len() is not 64
 pub fn eth_addr_from_x_only_pubkey(pubkey: bitcoin::XOnlyPublicKey) -> alloy_primitives::Address {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bitcoin_ipc::bitcoin_utils::make_rpc_client_from_env;
 use bitcoin_ipc::db::HeedDb;
-use bitcoin_ipc::provider;
+use bitcoin_ipc::{eth_utils, provider};
 use clap::Parser;
 use log::error;
 
@@ -29,9 +29,7 @@ async fn main() -> std::io::Result<()> {
     let env_path = if args.env.starts_with('/') {
         PathBuf::from(&args.env)
     } else {
-        env::current_dir()
-            .and_then(|a| Ok(a.join(&args.env)))
-            .unwrap()
+        env::current_dir().map(|a| a.join(&args.env)).unwrap()
     };
 
     dotenv::from_path(env_path.as_path())
@@ -65,6 +63,10 @@ async fn main() -> std::io::Result<()> {
     // Init the bitcoincore_rpc client
 
     let btc_rpc = Arc::new(make_rpc_client_from_env());
+
+    // Set correct fvm network
+
+    eth_utils::set_fvm_network();
 
     // Start up the actix-web server
 
