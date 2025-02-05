@@ -70,7 +70,7 @@ bitcoin-cli loadwallet "default"
 3.4 Generate 102 blocks
 
 ```sh
-bitcoin-cli generatetoaddress 102 "$(bitcoin-cli getnewaddress)"
+bitcoin-cli generatetoaddress 102 "$(bitcoin-cli -rpcwallet=default getnewaddress)"
 ```
 
 3.5 Verify block generation

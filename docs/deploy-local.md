@@ -139,7 +139,7 @@ For each validator's config file, modify the `provider_http` port and `auth_toke
 > `/b4` is the identifier for the Bitcoin regtest network.
 
 
-## Step 5: Set up IPC wallets for each validators
+## Step 5: Set up IPC wallets for each validator
 
 Now that each validator has personal funds on Bitcoin, and the monitor and provider are running, we can set up IPC wallets for each validator. These wallets will be used to interact with the subnet and sign multisig transactions.
 
@@ -175,7 +175,7 @@ You should see the subnet ID printed to the console. Let's save the subnet ID fo
 The create transaction was sent to the mempool, so let's mine a block to include it in the blockchain, afterwhich it'll be picked up by our monitors.
 
 ```sh
-bitcoin-cli generatetoaddress 1 "$(bitcoin-cli getnewaddress)"
+bitcoin-cli generatetoaddress 1 "$(bitcoin-cli --rpcwallet=default getnewaddress)"
 ```
 
 If everything went well, all monitors should have printed the subnet create message to the console.
@@ -199,7 +199,7 @@ ipc-cli --config-path ~/.ipc/validator1/config.toml subnet join --from 0xBcE2f19
 Let's include the join transactions in the blockchain by mining a block.
 
 ```sh
-bitcoin-cli generatetoaddress 1 "$(bitcoin-cli getnewaddress)"
+bitcoin-cli generatetoaddress 1 "$(bitcoin-cli --rpcwallet=default getnewaddress)"
 ```
 
 We should see the monitors print the join messages to the console.
