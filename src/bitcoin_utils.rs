@@ -46,7 +46,11 @@ pub fn make_rpc_client_from_env() -> Client {
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
     let wallet_name = std::env::var("WALLET_NAME").expect("WALLET_NAME env var not defined");
 
-    let rpc = match init_rpc_client(rpc_user, rpc_pass, rpc_url) {
+    // Append the wallet name into the URL.
+    // Ensure there is no trailing slash, then add "/wallet/<wallet_name>".
+    let full_url = format!("{}/wallet/{}", rpc_url.trim_end_matches('/'), wallet_name);
+
+    let rpc = match init_rpc_client(rpc_user, rpc_pass, full_url) {
         Ok(rpc) => rpc,
         Err(e) => {
             panic!("Error: {}", e);
