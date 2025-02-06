@@ -1,5 +1,7 @@
 # Bitcoin Ipc — Overview
 
+> [Video guide](https://drive.google.com/file/d/1LsLhgd2fWXCRSVqy8Cmh_TUnsvo9l-cS/view?usp=share_link) is available.
+
 Now that we got the [bitcoin environment setup and ready](./env.md), let's discuss the components that interact with the Bitcoin Network. To generate the executable files, run the following command from the root of the project:
 
 ```sh

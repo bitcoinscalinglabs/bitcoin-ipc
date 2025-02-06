@@ -1,5 +1,7 @@
 # Bitcoin Ipc — Development Environment Setup
 
+> [Video guide](https://drive.google.com/file/d/1Wk72BGeeZwhWXtPVthu3UU7E3cJ7GcTT/view?usp=share_link) is available.
+
 This guide will walk you through the necessary steps needed to setup the environment to be able to run the bitcoin-ipc locally.
 
 ### 1. Install Bitcoin Core

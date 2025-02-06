@@ -1,5 +1,7 @@
 # Bitcoin Ipc — Local Subnet Deployment
 
+> [Video guides](https://drive.google.com/drive/folders/18pXSpI9XcmK7AVLoEj4-Krb6HDPGc3cG?usp=sharing) are available. See step `03_deploy_subnet` videos.
+
 We'll now create a local subnet with 4 validators. This guide will loosly follow the official [quickstart guide](https://docs.ipc.space/quickstarts/deploy-a-subnet), with some bitcoin-specific changes we will note.
 
 ## Step 1: Prepare and install `ipc-cli`
@@ -220,7 +222,7 @@ Let's start our first validator which the rest of the validators will bootstrap 
 ```sh
 cargo make --makefile infra/fendermint/Makefile.toml \
     -e NODE_NAME=validator-1 \
-    -e SUBNET_ID=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e \
+    -e SUBNET_ID=<SUBNET_ID> \
     -e PRIVATE_KEY_PATH=$HOME/.ipc/validator1/validator.sk \
     -e CMT_P2P_HOST_PORT=26656 \
     -e CMT_RPC_HOST_PORT=26657 \
@@ -287,7 +289,7 @@ Now, let's start the rest of the validators:
 # Run second validator
 cargo make --makefile infra/fendermint/Makefile.toml \
 	-e NODE_NAME=validator-2 \
-	-e SUBNET_ID=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e \
+	-e SUBNET_ID=<SUBNET_ID> \
 	-e PRIVATE_KEY_PATH=$HOME/.ipc/validator2/validator.sk \
 	-e CMT_P2P_HOST_PORT=26756 \
 	-e CMT_RPC_HOST_PORT=26757 \
@@ -303,7 +305,7 @@ cargo make --makefile infra/fendermint/Makefile.toml \
 # Run third validator
 cargo make --makefile infra/fendermint/Makefile.toml \
 	-e NODE_NAME=validator-3 \
-	-e SUBNET_ID=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e \
+	-e SUBNET_ID=<SUBNET_ID> \
 	-e PRIVATE_KEY_PATH=$HOME/.ipc/validator3/validator.sk \
 	-e CMT_P2P_HOST_PORT=26856 \
 	-e CMT_RPC_HOST_PORT=26857 \
@@ -319,7 +321,7 @@ cargo make --makefile infra/fendermint/Makefile.toml \
 # Run fourth validator
 cargo make --makefile infra/fendermint/Makefile.toml \
 	-e NODE_NAME=validator-4 \
-	-e SUBNET_ID=/b4/t420fdvyrihvwxp5m4ppz2jlwhzq35jaxi4fyints7dwni22fqjz2ftevhzr24e \
+	-e SUBNET_ID=<SUBNET_ID> \
 	-e PRIVATE_KEY_PATH=$HOME/.ipc/validator4/validator.sk \
 	-e CMT_P2P_HOST_PORT=26956 \
 	-e CMT_RPC_HOST_PORT=26957 \
