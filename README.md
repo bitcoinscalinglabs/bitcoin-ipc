@@ -17,3 +17,5 @@ Monitors the Bitcoin network for new blocks and transactions. It processes trans
 ## Guides
 
 - [Development Environment Setup](./docs/env.md)
+- [Running Monitor and Provider](./docs/bitcoin-ipc.md)
+- [Running `ipc-cli`](./docs/bitcoin-ipc.md)
