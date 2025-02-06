@@ -1,7 +1,5 @@
 # `ipc-cli`
 
-> TBD better explain what is ipc-cli
-
 For information about what `ipc-cli` is and how to use it, see the [ipc docs](https://docs.ipc.space/).
 
 Clone the [bitcoinscalinglabs/ipc repo](https://github.com/bitcoinscalinglabs/ipc/tree/bitcoin) and checkout the `bitcoin` branch.

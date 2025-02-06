@@ -1,5 +1,5 @@
 ```sh
-ipc-cli subnet create --parent /b4 --min-validators 3 --bottomup-check-period 300 btc --min-validator-stake 10000000 --min-cross-msg-fee 10 --validator-whitelist 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
+ipc-cli subnet create --parent /b4 --min-validators 4 --bottomup-check-period 300 btc --min-validator-stake 10000000 --min-cross-msg-fee 10 --validator-whitelist 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
 
 # mine a block
 
