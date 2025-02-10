@@ -92,7 +92,7 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha"
+		"subnet_id": "/b4/t420feejlnrllx3nr4tqfl5iuvwllwnazdiwehluntld6lc2z6w6ypffau6qppq"
 	},
 	"id": 1
 }' | jq
@@ -107,7 +107,7 @@ curl -X POST http://localhost:3030/api \
     "method": "prefundsubnet",
     "params": {
 			"subnet_id": "/b4/t420feejlnrllx3nr4tqfl5iuvwllwnazdiwehluntld6lc2z6w6ypffau6qppq",
-			"value": 40000000,
+			"amount": 40000000,
 			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
     },
     "id": 1

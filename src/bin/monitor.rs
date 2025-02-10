@@ -379,7 +379,7 @@ where
             IpcMessage::PrefundSubnet(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
-                // msg.save_to_db(&self.db, block_height, txid)?;
+                msg.save_to_db(&self.db, block_height, txid)?;
                 info!("Processed PrefundSubnet for Subnet ID: {}", msg.subnet_id);
                 Ok(())
             }

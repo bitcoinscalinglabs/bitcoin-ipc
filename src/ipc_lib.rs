@@ -206,6 +206,7 @@ impl IpcCreateSubnetMsg {
             create_msg_block_height: block_height,
             genesis_block_height: None,
             genesis_validators: Vec::with_capacity(0),
+            genesis_balance_entries: Vec::with_capacity(0),
         };
 
         trace!("Saving {self:?} to DB, genesis_info={genesis_info:?}");
@@ -469,14 +470,14 @@ pub struct IpcPrefundSubnetMsg {
     /// The amount to deposit in the subnet
     #[ipc_serde(skip)]
     #[serde(with = "bitcoin::amount::serde::as_sat")]
-    pub value: bitcoin::Amount,
+    pub amount: bitcoin::Amount,
     /// The address to prefund in the subnet
     pub address: alloy_primitives::Address,
 }
 
 impl IpcValidate for IpcPrefundSubnetMsg {
     fn validate(&self) -> Result<(), IpcValidateError> {
-        if self.value == bitcoin::Amount::MIN {
+        if self.amount == bitcoin::Amount::MIN {
             return Err(IpcValidateError::InvalidField(
                 "value",
                 "Value must be greater than 0".to_string(),
@@ -572,11 +573,11 @@ impl IpcPrefundSubnetMsg {
         let address = alloy_primitives::Address::from_slice(addr_bytes);
 
         // Get value from second output
-        let value = tx.output[1].value;
+        let amount = tx.output[1].value;
 
         Ok(Self {
             subnet_id,
-            value,
+            amount,
             address,
         })
     }
@@ -626,7 +627,7 @@ impl IpcPrefundSubnetMsg {
             Self::RELEASE_LOCKTIME,
         )?;
         let prefund_tx_out = bitcoin::TxOut {
-            value: self.value,
+            value: self.amount,
             script_pubkey: prefund_script,
         };
 
@@ -646,7 +647,7 @@ impl IpcPrefundSubnetMsg {
     ) -> Result<Txid, IpcLibError> {
         info!(
             "Submitting pre-fund subnet msg to bitcoin. Multisig address = {}. Amount={}",
-            multisig_address, self.value
+            multisig_address, self.amount
         );
 
         let release_address = wallet::get_new_address(rpc)?;
@@ -673,6 +674,33 @@ impl IpcPrefundSubnetMsg {
             }
             Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
         }
+    }
+
+    /// Modifies the database to account for the join subnet message
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        txid: Txid,
+    ) -> Result<(), IpcLibError> {
+        let mut genesis_info =
+            db.get_subnet_genesis_info(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} does not exist",
+                    self.subnet_id
+                )))?;
+
+        self.validate_for_genesis_info(&genesis_info)?;
+
+        trace!("Processing {self:?}, adding new genesis_balance entry");
+
+        genesis_info.add_genesis_balance_entry(self.address, self.amount, txid, block_height);
+
+        let mut wtxn = db.write_txn()?;
+        db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+        wtxn.commit()?;
+
+        Ok(())
     }
 }
 
@@ -1141,7 +1169,7 @@ mod prefund_msg_tests {
 
         IpcPrefundSubnetMsg {
             subnet_id,
-            value: Amount::from_sat(1000),
+            amount: Amount::from_sat(1000),
             address: eth_addr,
         }
     }
@@ -1213,7 +1241,7 @@ mod prefund_msg_tests {
 
         // Verify all fields match
         assert_eq!(parsed_msg.subnet_id, original_msg.subnet_id);
-        assert_eq!(parsed_msg.value, original_msg.value);
+        assert_eq!(parsed_msg.amount, original_msg.amount);
         assert_eq!(parsed_msg.address, original_msg.address);
     }
 
