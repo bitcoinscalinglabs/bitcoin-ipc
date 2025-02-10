@@ -15,7 +15,10 @@ use bitcoin::{
     },
     hashes::Hash,
     key::UntweakedPublicKey,
-    opcodes::{all::OP_DROP, OP_TRUE},
+    opcodes::{
+        all::{OP_CSV, OP_DROP},
+        OP_TRUE,
+    },
     script::{Instruction, PushBytes},
     secp256k1::Secp256k1,
     taproot::{LeafVersion, TaprootBuilder},
@@ -153,6 +156,14 @@ pub fn make_push_data_script(data: &[u8]) -> ScriptBuf {
     builder = builder.push_opcode(OP_TRUE);
 
     builder.into_script()
+}
+
+/// Makes a simple OP_RETURN script
+pub fn make_op_return_script<T: AsRef<PushBytes>>(data: T) -> ScriptBuf {
+    Builder::new()
+        .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+        .push_slice(data)
+        .into_script()
 }
 
 /// Creates and submits two transactions to the Bitcoin network:
@@ -381,6 +392,55 @@ pub fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsE
     }
 
     Ok(concatenated_data)
+}
+
+pub fn create_send_with_timelock_release_tx_script(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    receive_address: &Address,
+    release_address: &Address,
+    release_blocks: u32,
+) -> Result<ScriptBuf, BitcoinUtilsError> {
+    // Script 1. Send to the receive address
+    let send_script = receive_address.script_pubkey();
+
+    // Script 2. Release after n blocks
+    let release_timelock_script = Builder::new()
+        .push_int(release_blocks.into()) // Push the relative timelock value
+        .push_opcode(OP_CSV) // Enforce relative timelock
+        .push_opcode(OP_DROP) // Drop the timelock value
+        .into_script();
+
+    // Merge the release address with a timelock
+    let mut release_script_bytes = release_timelock_script.into_bytes();
+    release_script_bytes.extend(release_address.script_pubkey().to_bytes());
+    let release_script = ScriptBuf::from_bytes(release_script_bytes);
+
+    // Create the taproot output
+
+    let taproot_builder = TaprootBuilder::new()
+        .add_leaf(1, send_script)?
+        .add_leaf(1, release_script)?;
+
+    let unspendable_pubkey = create_unspendable_internal_key();
+
+    let spend_info = taproot_builder
+        .finalize(secp, unspendable_pubkey)
+        .map_err(|_| BitcoinUtilsError::TaprootBuilderNotFinalizable)?;
+
+    let script_pubkey =
+        ScriptBuf::new_p2tr(secp, spend_info.internal_key(), spend_info.merkle_root());
+
+    // TODO return both scripts and their control blocks
+    Ok(script_pubkey)
+}
+
+pub fn create_tx_from_txouts(txouts: Vec<TxOut>) -> Transaction {
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: Vec::with_capacity(0),
+        output: txouts,
+    }
 }
 
 #[derive(Error, Debug)]

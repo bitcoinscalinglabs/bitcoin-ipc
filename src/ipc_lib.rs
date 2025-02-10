@@ -46,6 +46,7 @@ pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DELETE";
 pub enum IpcTag {
     CreateSubnet,
     JoinSubnet,
+    PrefundSubnet,
 }
 
 impl IpcTag {
@@ -53,6 +54,7 @@ impl IpcTag {
         match self {
             Self::CreateSubnet => IPC_CREATE_SUBNET_TAG,
             Self::JoinSubnet => IPC_JOIN_SUBNET_TAG,
+            Self::PrefundSubnet => IPC_PREFUND_SUBNET_TAG,
         }
     }
 }
@@ -64,6 +66,7 @@ impl std::str::FromStr for IpcTag {
         match s {
             IPC_CREATE_SUBNET_TAG => Ok(Self::CreateSubnet),
             IPC_JOIN_SUBNET_TAG => Ok(Self::JoinSubnet),
+            IPC_PREFUND_SUBNET_TAG => Ok(Self::PrefundSubnet),
             _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
@@ -454,11 +457,118 @@ impl IpcValidate for IpcJoinSubnetMsg {
     }
 }
 
+#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
+#[tag(IPC_PREFUND_SUBNET_TAG)]
+pub struct IpcPrefundSubnetMsg {
+    /// The subnet id of the subnet to prefund
+    /// This is derived from 2nd output
+    /// that is sent to the subnet multisig address
+    #[ipc_serde(skip)]
+    pub subnet_id: SubnetId,
+    /// The amount to deposit in the subnet
+    #[ipc_serde(skip)]
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub value: bitcoin::Amount,
+    /// The address to prefund in the subnet
+    pub address: alloy_primitives::Address,
+}
+
+impl IpcValidate for IpcPrefundSubnetMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        if self.value == bitcoin::Amount::MIN {
+            return Err(IpcValidateError::InvalidField(
+                "value",
+                "Value must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl IpcPrefundSubnetMsg {
+    // Locktime for the pre-release script
+    const PREFUND_LOCKTIME: u32 = 6;
+
+    /// Validates the join subnet message, for the given genesis info
+    pub fn validate_for_genesis_info(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+    ) -> Result<(), IpcValidateError> {
+        // Check if the subnet is already bootstrapped
+        if genesis_info.bootstrapped {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is already bootstrapped.",
+                self.subnet_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Txid, IpcLibError> {
+        info!(
+            "Submitting pre-fund subnet msg to bitcoin. Multisig address = {}. Amount={}",
+            multisig_address, self.value
+        );
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        //
+        // Create first output: pre-fund + pre-release script
+        //
+
+        let release_address = wallet::get_new_address(&rpc)?;
+        let prefund_script = bitcoin_utils::create_send_with_timelock_release_tx_script(
+            &secp,
+            &multisig_address,
+            &release_address,
+            Self::PREFUND_LOCKTIME,
+        )?;
+        let prefund_tx_out = bitcoin::TxOut {
+            value: self.value,
+            script_pubkey: prefund_script,
+        };
+
+        //
+        // Create the second output: op_return with subnet_id and user's subnet address to fund
+        //
+
+        let subnet_id_txid: [u8; 32] = self.subnet_id.txid().as_raw_hash().to_byte_array();
+        let subnet_addr: [u8; 20] = self.address.into_array();
+
+        // Construct op_return data
+        let mut op_return_data = [0u8; 32 + 20];
+        op_return_data[..subnet_id_txid.len()].copy_from_slice(&subnet_id_txid);
+        op_return_data[subnet_id_txid.len()..].copy_from_slice(&subnet_addr);
+        // Make op_return script and txout
+        let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let data_tx_out = bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: op_return_script,
+        };
+
+        let tx_outs = vec![prefund_tx_out, data_tx_out];
+        let prefund_tx = bitcoin_utils::create_tx_from_txouts(tx_outs);
+        println!("prefund_tx: {prefund_tx:#?}");
+        let prefund_tx = crate::wallet::fund_tx(rpc, prefund_tx, None)?;
+        println!("prefund_tx: {prefund_tx:#?}");
+        let prefund_tx = crate::wallet::sign_tx(rpc, prefund_tx)?;
+        println!("prefund_tx: {prefund_tx:#?}");
+
+        return Ok(prefund_tx.compute_txid());
+    }
+}
+
 // Define the IPCMessage enum
 #[derive(Debug)]
 pub enum IpcMessage {
     CreateSubnet(IpcCreateSubnetMsg),
     JoinSubnet(IpcJoinSubnetMsg),
+    PrefundSubnet(IpcPrefundSubnetMsg),
 }
 
 impl IpcMessage {
@@ -477,6 +587,9 @@ impl IpcMessage {
             IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::ipc_deserialize(
                 s,
             )?)),
+            IpcTag::PrefundSubnet => Ok(IpcMessage::PrefundSubnet(
+                IpcPrefundSubnetMsg::ipc_deserialize(s)?,
+            )),
         }
     }
 }

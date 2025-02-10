@@ -1,6 +1,6 @@
 use crate::{
     db::{self, Database, HeedDb},
-    ipc_lib::{IpcJoinSubnetMsg, IpcValidate, SubnetId},
+    ipc_lib::{IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
@@ -145,6 +145,7 @@ pub async fn create_subnet(
     Params(msg): Params<IpcCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
     if let Err(err) = msg.validate() {
+        error!("Invalid create message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
@@ -166,6 +167,7 @@ pub async fn join_subnet(
     Params(msg): Params<IpcJoinSubnetMsg>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
     if let Err(err) = msg.validate() {
+        error!("Invalid join message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
@@ -220,6 +222,47 @@ pub async fn get_genesis_info(
     Ok(genesis_info)
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct PrefundSubnetResponse {
+    prefund_txid: bitcoin::Txid,
+}
+
+pub async fn prefund_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcPrefundSubnetMsg>,
+) -> Result<PrefundSubnetResponse, JsonRpcError> {
+    if let Err(err) = msg.validate() {
+        error!("Invalid prefund message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
+        error!("Error validating prefund msg for subnet info: {}", e);
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    // TODO this check should be done in the Db
+    let multisig_address = &genesis_info.multisig_address();
+
+    let prefund_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(PrefundSubnetResponse { prefund_txid })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -230,5 +273,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
+        .with_method("prefundsubnet", prefund_subnet)
         .finish()
 }

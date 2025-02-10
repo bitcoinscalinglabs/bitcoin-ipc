@@ -376,6 +376,17 @@ where
                 );
                 Ok(())
             }
+
+            IpcMessage::PrefundSubnet(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+                msg.validate()?;
+                // msg.save_to_db(&self.db, block_height, txid)?;
+                info!(
+                    "TODO Processed PrefundSubnet for Subnet ID: {}",
+                    msg.subnet_id
+                );
+                Ok(())
+            }
         }
     }
 }
