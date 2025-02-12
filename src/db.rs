@@ -177,7 +177,7 @@ impl SubnetGenesisInfo {
         for entry in &self.genesis_balance_entries {
             balance
                 .entry(entry.subnet_address)
-                .and_modify(|amount| *amount = *amount + entry.amount)
+                .and_modify(|amount| *amount += entry.amount)
                 .or_insert(entry.amount);
         }
         balance

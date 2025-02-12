@@ -1285,7 +1285,7 @@ mod prefund_msg_tests {
         wrong_data.extend_from_slice(&[0u8; 32]); // txid
         wrong_data.extend_from_slice(&[0u8; 20]); // address
         let wrong_data: [u8; IpcPrefundSubnetMsg::DATA_LEN] = wrong_data.try_into().unwrap();
-        wrong_tag_tx.output[0].script_pubkey = bitcoin_utils::make_op_return_script(&wrong_data);
+        wrong_tag_tx.output[0].script_pubkey = bitcoin_utils::make_op_return_script(wrong_data);
         assert!(matches!(
             IpcPrefundSubnetMsg::from_tx(&wrong_tag_tx),
             Err(IpcLibError::MsgParseError(IPC_PREFUND_SUBNET_TAG, _))
