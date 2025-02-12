@@ -434,6 +434,19 @@ pub fn create_send_with_timelock_release_tx_script(
     Ok(script_pubkey)
 }
 
+pub fn create_send_with_timelock_release_tx_desc(
+    receive_address: &Address,
+    release_address: &Address,
+    release_blocks: u32,
+) -> Result<(ScriptBuf, String), BitcoinUtilsError> {
+    // Script 1. Send to the reeive address
+    let send_fragment = format!("addr({})", receive_address);
+
+    // Script 2. Release after n blocks
+    let release_addr_fragment = format!("addr({})", release_address);
+    let release_fragment = format!("and({},older({}))", release_addr_fragment, release_blocks);
+}
+
 pub fn create_tx_from_txouts(txouts: Vec<TxOut>) -> Transaction {
     Transaction {
         version: transaction::Version::TWO,

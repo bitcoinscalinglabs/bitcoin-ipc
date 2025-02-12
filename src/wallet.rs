@@ -10,7 +10,7 @@ use bitcoin::{
 };
 
 use bitcoincore_rpc::{
-    json::{EstimateMode, FundRawTransactionOptions},
+    json::{EstimateMode, FundRawTransactionOptions, ImportDescriptors},
     Client, RawTx, RpcApi,
 };
 
@@ -103,6 +103,31 @@ pub fn get_new_address(rpc: &Client) -> Result<bitcoin::Address, WalletError> {
     Ok(rpc.get_new_address(None, None)?.assume_checked())
 }
 
+/// Imports a descriptor into the wallet
+pub fn import_descriptor(
+    rpc: &Client,
+    descriptor: &str,
+    label: Option<String>,
+    active: bool,
+) -> Result<(), WalletError> {
+    let import_result = rpc.import_descriptors(ImportDescriptors {
+        descriptor: descriptor.to_string(),
+        timestamp: bitcoincore_rpc::json::Timestamp::Now,
+        active: Some(active),
+        range: None,
+        next_index: None,
+        internal: Some(false),
+        label,
+    })?;
+
+    // Check if import was successful
+    if import_result.iter().any(|result| !result.success) {
+        return Err(WalletError::ImportDescriptorError(descriptor.to_string()));
+    }
+
+    Ok(())
+}
+
 #[derive(Error, Debug)]
 pub enum WalletError {
     #[error(transparent)]
@@ -116,4 +141,7 @@ pub enum WalletError {
 
     #[error("transaction signed but not complete {0}")]
     IncompleteSignature(String),
+
+    #[error("failed to import descriptor: {0}")]
+    ImportDescriptorError(String),
 }

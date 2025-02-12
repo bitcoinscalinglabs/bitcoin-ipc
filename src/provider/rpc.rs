@@ -263,6 +263,61 @@ pub async fn prefund_subnet(
     Ok(PrefundSubnetResponse { prefund_txid })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct PrereleaseSubnetRequest {
+    subnet_id: SubnetId,
+    prefund_txid: bitcoin::Txid,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PrereleaseSubnetResponse {
+    prerelease_txid: bitcoin::Txid,
+}
+
+pub async fn prerelease_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(req): Params<PrereleaseSubnetRequest>,
+) -> Result<PrereleaseSubnetResponse, JsonRpcError> {
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(req.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            req.subnet_id
+        )))?;
+
+    // Check if the subnet is already bootstrapped
+    if genesis_info.bootstrapped {
+        return Err(RpcError::InvalidParams(format!(
+            "Subnet {} is already bootstrapped.",
+            req.subnet_id
+        )));
+    }
+
+    let genesis_balance_entry = match genesis_info.get_genesis_balance_entry(&req.prefund_txid) {
+        Some(entry) => entry,
+        None => {
+            return Err(RpcError::InvalidParams(format!(
+                "Txid {} not found in genesis balance entries.",
+                txid
+            )));
+        }
+    };
+
+    // TODO this check should be done in the Db
+    let multisig_address = &genesis_info.multisig_address();
+
+    let prefund_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(PrereleaseSubnetResponse { prefund_txid })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -274,5 +329,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("joinsubnet", join_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
+        .with_method("prerelease", prefund_subnet)
         .finish()
 }

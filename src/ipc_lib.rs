@@ -513,6 +513,41 @@ impl IpcPrefundSubnetMsg {
         Ok(())
     }
 
+    /// Creates the taproot script and descriptor for the prefund transaction
+    /// with two spending paths:
+    /// 1. Direct spend to multisig (key spend path)
+    /// 2. Time-locked spend to release address (script spend path)
+    fn create_timelock_script_and_descriptor(
+        multisig_address: &bitcoin::Address,
+        release_address: &bitcoin::Address,
+    ) -> Result<(ScriptBuf, String), IpcLibError> {
+        // Convert addresses to descriptor fragments
+        let multisig_fragment = format!("addr({})", multisig_address);
+        let release_fragment = format!("addr({})", release_address);
+
+        // Create the timelock script using miniscript policy
+        let timelock_policy = format!(
+            "and({},older({}))",
+            release_fragment,
+            Self::RELEASE_LOCKTIME
+        );
+
+        // Create the full taproot policy with both spend paths
+        let policy = format!("tr({},{{{}}})", multisig_fragment, timelock_policy);
+
+        // Convert policy to descriptor
+        let descriptor =
+            miniscript::Descriptor::<miniscript::DescriptorPublicKey>::from_str(&policy)
+                .map_err(|e| BitcoinUtilsError::MiniscriptError(e.to_string()))?;
+
+        // Get the script pubkey
+        let script = descriptor
+            .script_pubkey()
+            .map_err(|e| BitcoinUtilsError::MiniscriptError(e.to_string()))?;
+
+        Ok((script, policy))
+    }
+
     /// Reconstructs an IpcPrefundSubnetMsg from a bitcoin::Transaction.
     ///
     /// Given that:

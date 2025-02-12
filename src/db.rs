@@ -183,6 +183,12 @@ impl SubnetGenesisInfo {
         balance
     }
 
+    pub fn get_genesis_balance_entry(&self, txid: &bitcoin::Txid) -> Option<&GenesisBalanceEntry> {
+        self.genesis_balance_entries
+            .iter()
+            .find(|entry| &entry.prefund_txid == txid)
+    }
+
     /// Adds a genesis balance entry to the genesis info
     pub fn add_genesis_balance_entry(
         &mut self,
