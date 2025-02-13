@@ -151,10 +151,10 @@ mod tests {
                 };
 
                 bitcoinconsensus::verify_with_flags(
-                    &output.script_pubkey.as_bytes(),
+                    output.script_pubkey.as_bytes(),
                     output.value.to_sat(),
                     serialized_tx.as_slice(),
-                    Some(&vec![spent_utxo]),
+                    Some(&[spent_utxo]),
                     idx,
                     bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
                 )?;
@@ -351,7 +351,7 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: spending_amount,
-                script_pubkey: ScriptBuf::new_op_return(&[1]),
+                script_pubkey: ScriptBuf::new_op_return([1]),
             }],
         };
 
@@ -388,10 +388,10 @@ mod tests {
 
             // Push empty signatures for the remaining keys
             for _ in 2..keypairs.len() {
-                witness.push(&[]); // Empty signature slots for unused keys
+                witness.push([]); // Empty signature slots for unused keys
             }
 
-            witness.push(&script.to_bytes());
+            witness.push(script.to_bytes());
             witness.push(control_block.serialize());
 
             tx_insufficient.input[0].witness = witness;
@@ -418,7 +418,7 @@ mod tests {
             for (idx, keypair) in keypairs.iter().rev().enumerate() {
                 // Skip keys 4 and 5, pushing empty signatures
                 if idx > 2 {
-                    witness.push(&[]);
+                    witness.push([]);
                     continue;
                 }
                 let msg =
@@ -427,7 +427,7 @@ mod tests {
                 witness.push(sig.serialize());
             }
 
-            witness.push(&script.to_bytes());
+            witness.push(script.to_bytes());
             witness.push(control_block.serialize());
 
             tx_valid.input[0].witness = witness;
@@ -458,7 +458,7 @@ mod tests {
                 witness.push(sig.serialize());
             }
 
-            witness.push(&script.to_bytes());
+            witness.push(script.to_bytes());
             witness.push(control_block.serialize());
 
             tx_all.input[0].witness = witness;
@@ -491,10 +491,10 @@ mod tests {
 
             // Push empty signatures for the remaining keys
             for _ in 3..keypairs.len() {
-                witness.push(&[]); // Empty signature slots for unused keys
+                witness.push([]); // Empty signature slots for unused keys
             }
 
-            witness.push(&script.to_bytes());
+            witness.push(script.to_bytes());
             witness.push(
                 spend_info
                     .control_block(&(script.clone(), LeafVersion::TapScript))

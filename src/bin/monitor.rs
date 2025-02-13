@@ -316,24 +316,23 @@ where
                     .await
                 {
                     Ok(_) => {}
-                    // Ignorable
-                    Err(MonitorError::IpcMsgInvalid(e)) => {
-                        error!("Invalid IPC message: {:?}", e);
-                    }
-                    // Ignorable
-                    Err(MonitorError::IpcTxInvalid(e)) => {
-                        error!("Invalid IPC message transaction: {:?}", e);
-                    }
-                    // Ignorable
-                    Err(MonitorError::IpcMsgProcessingError(IpcLibError::IpcValidateError(e))) => {
-                        error!("Invalid IPC message: {:?}", e);
-                    }
-                    // Panicable, all other errors
-                    Err(e) => {
-                        error!("Fatal error processing IPC message: {:?}", e);
-                        return Err(e);
-                    }
+                    Err(e) => self.handle_ipc_msg_error(e)?,
                 }
+            }
+        }
+
+        // Process outputs
+
+        // TODO make a general way to find messages in outputs or from entire tx
+        if let Ok(prefund_msg) = ipc_lib::IpcPrefundSubnetMsg::from_tx(tx) {
+            let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
+
+            match self
+                .process_ipc_msg(block_height, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
             }
         }
 
@@ -375,6 +374,38 @@ where
                     join_subnet_msg.subnet_id
                 );
                 Ok(())
+            }
+
+            IpcMessage::PrefundSubnet(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, txid)?;
+                info!("Processed PrefundSubnet for Subnet ID: {}", msg.subnet_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Helper function to handle IPC message processing errors
+    fn handle_ipc_msg_error(&self, error: MonitorError) -> Result<(), MonitorError> {
+        match error {
+            // Ignorable errors
+            MonitorError::IpcMsgInvalid(e) => {
+                error!("Invalid IPC message: {:?}", e);
+                Ok(())
+            }
+            MonitorError::IpcTxInvalid(e) => {
+                error!("Invalid IPC message transaction: {:?}", e);
+                Ok(())
+            }
+            MonitorError::IpcMsgProcessingError(IpcLibError::IpcValidateError(e)) => {
+                error!("Invalid IPC message: {:?}", e);
+                Ok(())
+            }
+            // Propagate all other errors
+            e => {
+                error!("Fatal error processing IPC message: {:?}", e);
+                Err(e)
             }
         }
     }
