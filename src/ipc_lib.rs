@@ -774,9 +774,10 @@ impl IpcFundSubnetMsg {
 
         trace!("Processing {self:?}, adding new rootnet message");
 
-        let mut wtxn = db.write_txn()?;
         // Get next nonce
-        let nonce = db.get_last_msg_nonce(self.subnet_id)? + 1;
+
+        let nonce = db.get_last_rootnet_msg_nonce(self.subnet_id)? + 1;
+        let mut wtxn = db.write_txn()?;
         // Construct rootnet message
         let rootnet_msg = self.to_rootnet_message(nonce, block_height);
         debug!("New rootnet message: {rootnet_msg:?}");

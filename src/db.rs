@@ -37,6 +37,11 @@ fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
     format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
 }
 
+#[derive(Serialize, Deserialize)]
+struct MonitorInfo {
+    pub last_processed_block: u64,
+}
+
 /// State of a validator in a subnet
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetValidator {
@@ -230,7 +235,9 @@ impl SubnetGenesisInfo {
 
 /// State of a validator in a subnet
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
 pub enum RootnetMessage {
+    #[serde(rename = "fund")]
     FundSubnet {
         msg: IpcFundSubnetMsg,
         block_height: u64,
@@ -246,17 +253,14 @@ impl RootnetMessage {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct MonitorInfo {
-    pub last_processed_block: u64,
-}
-
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
-    rootnet_msgs_db: HeedDatabase<Str, SerdeBincode<RootnetMessage>>,
+    // TODO use SerdeBincode for this as well
+    // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
+    rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
 }
 
 impl HeedDb {
@@ -375,7 +379,7 @@ pub trait Database {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
-    fn get_last_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
@@ -518,15 +522,15 @@ impl Database for HeedDb {
         Ok(msgs)
     }
 
-    fn get_last_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
+    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
         let prefix = rootnet_msgs_prefix(subnet_id);
         let txn = self.env.read_txn()?;
         let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
-        let last_msg = msgs_iter.last();
-        match last_msg {
-            Some(Ok((_, msg))) => Ok(msg.nonce()),
-            _ => Ok(0),
-        }
+        let count: u64 = msgs_iter
+            .count()
+            .try_into()
+            .map_err(|_| DbError::TypeConversionError("max roonet messages reached".to_string()))?;
+        Ok(count)
     }
 
     fn get_rootnet_msg(

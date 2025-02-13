@@ -300,17 +300,40 @@ pub async fn fund_subnet(
     Ok(FundSubnetResponse { fund_txid })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GetRootnetMessagesParams {
+    subnet_id: SubnetId,
+    block_height: u64,
+}
+
+pub async fn get_rootnet_messages(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetRootnetMessagesParams>,
+) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
+    return data
+        .db
+        .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
+        .map_err(|e| {
+            error!("Error getting rootnet messages from Db: {}", e);
+            RpcError::DbError(e).into()
+        });
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
+        // btc info
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
+        // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
+        // rootnet messages
+        .with_method("getrootnetmessages", get_rootnet_messages)
         .finish()
 }

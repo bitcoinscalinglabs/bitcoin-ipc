@@ -124,4 +124,17 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getrootnetmessages",
+    "params": {
+			"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha",
+			"block_height": 229
+    },
+    "id": 1
+}' | jq
 ```
