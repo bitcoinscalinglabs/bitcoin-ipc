@@ -1,3 +1,6 @@
+// The length of the ethereum address - helper
+pub const ETH_ADDR_LEN: usize = alloy_primitives::Address::len_bytes();
+
 // fvm_shared rellies on this global current_network variable
 // to format the address correctly
 //

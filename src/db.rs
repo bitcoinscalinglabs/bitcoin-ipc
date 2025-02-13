@@ -11,14 +11,14 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
-const SUBNET_INFO_PREFIX: &str = "subnet_info:";
+const SUBNET_STATE_KEY: &str = "subnet_state:";
 const SUBNET_GENESIS_INFO_PREFIX: &str = "subnet_genesis_info:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
 #[allow(dead_code)]
-fn subnet_info_key(subnet_id: SubnetId) -> String {
-    format!("{SUBNET_INFO_PREFIX}:{}", subnet_id)
+fn subnet_state_key(subnet_id: SubnetId) -> String {
+    format!("{SUBNET_STATE_KEY}:{}", subnet_id)
 }
 
 fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
@@ -102,8 +102,18 @@ pub struct SubnetState {
 }
 
 impl SubnetState {
+    /// Returns the total stake of the current committee
     pub fn stake(&self) -> bitcoin::Amount {
         self.committee.validators.iter().map(|v| v.collateral).sum()
+    }
+
+    /// Returns the multisig address of the current committee
+    pub fn multisig_address(&self) -> Address {
+        self.committee
+            .multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid for saved subnet genesis info")
     }
 }
 
@@ -161,7 +171,7 @@ impl SubnetGenesisInfo {
             .expect("Multisig should be valid for saved subnet genesis info")
     }
 
-    pub fn into_subnet(self) -> SubnetState {
+    pub fn to_subnet(&self) -> SubnetState {
         SubnetState {
             id: self.subnet_id,
             committee_number: 1,
@@ -312,6 +322,15 @@ pub trait Database {
         subnet_id: SubnetId,
         genesis_info: SubnetGenesisInfo,
     ) -> Result<(), DbError>;
+
+    // Subnet State
+    fn get_subnet_state(&self, subnet_id: SubnetId) -> Result<Option<SubnetState>, DbError>;
+    fn save_subnet_state(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        subnet_state: SubnetState,
+    ) -> Result<(), DbError>;
 }
 
 #[async_trait]
@@ -372,6 +391,26 @@ impl Database for HeedDb {
         let key = subnet_genesis_info_key(subnet_id);
         self.subnet_genesis_db
             .put(txn, &key, &subnet_genesis_info)?;
+        Ok(())
+    }
+
+    // Subnet State
+
+    fn get_subnet_state(&self, subnet_id: SubnetId) -> Result<Option<SubnetState>, DbError> {
+        let key = subnet_state_key(subnet_id);
+        let txn = self.env.read_txn()?;
+        let subnet = self.subnet_db.get(&txn, &key)?;
+        Ok(subnet)
+    }
+
+    fn save_subnet_state(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        subnet_state: SubnetState,
+    ) -> Result<(), DbError> {
+        let key = subnet_state_key(subnet_id);
+        self.subnet_db.put(txn, &key, &subnet_state)?;
         Ok(())
     }
 }

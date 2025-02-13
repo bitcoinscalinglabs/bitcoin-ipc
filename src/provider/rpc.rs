@@ -1,6 +1,6 @@
 use crate::{
     db::{self, Database, HeedDb},
-    ipc_lib::{IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
+    ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
@@ -254,13 +254,50 @@ pub async fn prefund_subnet(
     })?;
 
     // TODO this check should be done in the Db
-    let multisig_address = &genesis_info.multisig_address();
+    let multisig_address = genesis_info.multisig_address();
 
     let prefund_txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     Ok(PrefundSubnetResponse { prefund_txid })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FundSubnetResponse {
+    fund_txid: bitcoin::Txid,
+}
+
+pub async fn fund_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcFundSubnetMsg>,
+) -> Result<FundSubnetResponse, JsonRpcError> {
+    if let Err(err) = msg.validate() {
+        error!("Invalid prefund message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    println!("subnet multisig = {multisig_address:?}");
+
+    let fund_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(FundSubnetResponse { fund_txid })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
@@ -274,5 +311,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("joinsubnet", join_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
+        .with_method("fundsubnet", fund_subnet)
         .finish()
 }
