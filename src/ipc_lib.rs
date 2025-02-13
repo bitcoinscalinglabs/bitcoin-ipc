@@ -734,6 +734,127 @@ impl IpcValidate for IpcFundSubnetMsg {
 impl IpcFundSubnetMsg {
     // The length of the subnet tag - helper
     const FUND_TAG_LEN: usize = IPC_FUND_SUBNET_TAG.len();
+    // The total length of the op_return data - helper
+    const DATA_LEN: usize = Self::FUND_TAG_LEN + Txid::LEN + ETH_ADDR_LEN;
+
+    /// Validates the fund msg for the given subnet
+    pub fn validate_for_subnet(
+        &self,
+        _subnet_state: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
+        // For now no need to validate anything, the subnet must exist
+
+        Ok(())
+    }
+
+    // Create a rootnet message from the fund subnet message
+    pub fn to_rootnet_message(&self, nonce: u64, block_height: u64) -> db::RootnetMessage {
+        db::RootnetMessage::FundSubnet {
+            msg: self.clone(),
+            nonce,
+            block_height,
+        }
+    }
+
+    /// Modifies the database to account for the join subnet message
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        _txid: Txid,
+    ) -> Result<(), IpcLibError> {
+        let subnet_state =
+            db.get_subnet_state(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} does not exist",
+                    self.subnet_id
+                )))?;
+
+        self.validate_for_subnet(&subnet_state)?;
+
+        trace!("Processing {self:?}, adding new rootnet message");
+
+        let mut wtxn = db.write_txn()?;
+        // Get next nonce
+        let nonce = db.get_last_msg_nonce(self.subnet_id)? + 1;
+        // Construct rootnet message
+        let rootnet_msg = self.to_rootnet_message(nonce, block_height);
+        debug!("New rootnet message: {rootnet_msg:?}");
+        // save message
+        db.add_rootnet_msg(&mut wtxn, self.subnet_id, rootnet_msg)?;
+        wtxn.commit()?;
+
+        Ok(())
+    }
+
+    /// Reconstructs an IpcFundSubnetMsg from a bitcoin::Transaction.
+    ///
+    /// Given that:
+    ///   • The first output is an OP_RETURN containing our custom pushdata,
+    ///     whose layout is:
+    ///         [fund tag | 32-byte txid | 20-byte alloy address]
+    ///   • The second output is the funding output with nonzero value.
+    ///
+    /// Returns an error if any expected data is missing or malformed.
+    pub fn from_tx(tx: &Transaction) -> Result<Self, IpcLibError> {
+        use bitcoin::blockdata::script::Instruction;
+
+        // Helper closure for error creation
+        let err = |msg: String| IpcLibError::MsgParseError(IPC_FUND_SUBNET_TAG, msg);
+
+        // Verify we have both required outputs
+        if tx.output.len() < 2 {
+            return Err(err("Transaction must have at least 2 outputs".into()));
+        }
+        // Get OP_RETURN data from first output
+        let op_return_data = tx.output[0]
+            .script_pubkey
+            .instructions_minimal()
+            .find_map(|ins| match ins {
+                Ok(Instruction::PushBytes(data)) => Some(data.as_bytes()),
+                _ => None,
+            })
+            .ok_or_else(|| err("First output must be OP_RETURN with pushdata".into()))?;
+
+        // Check total length matches our expected format
+        if op_return_data.len() != Self::DATA_LEN {
+            return Err(err(format!(
+                "OP_RETURN data length mismatch: got {}, expected {}",
+                op_return_data.len(),
+                Self::DATA_LEN
+            )));
+        }
+
+        // Split data into its components
+        let (tag, rest) = op_return_data.split_at(Self::FUND_TAG_LEN);
+        let (txid_bytes, addr_bytes) = rest.split_at(Txid::LEN);
+
+        // Verify tag
+        if tag != IPC_FUND_SUBNET_TAG.as_bytes() {
+            return Err(err(format!(
+                "Invalid tag: got '{}', expected '{}'",
+                String::from_utf8_lossy(tag),
+                IPC_FUND_SUBNET_TAG
+            )));
+        }
+
+        // Convert txid bytes to Txid
+        let txid =
+            Txid::from_slice(txid_bytes).map_err(|e| err(format!("Invalid txid bytes: {}", e)))?;
+        let subnet_id = SubnetId::from_txid(&txid);
+
+        // Convert address bytes to alloy Address
+        let address = alloy_primitives::Address::from_slice(addr_bytes);
+
+        // Get value from second output
+        let amount = tx.output[1].value;
+
+        Ok(Self {
+            subnet_id,
+            amount,
+            address,
+        })
+    }
 
     pub fn to_tx(&self, multisig_address: &bitcoin::Address) -> Result<Transaction, IpcLibError> {
         //

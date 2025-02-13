@@ -1,6 +1,7 @@
 use crate::{
+    ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
     multisig::{create_subnet_multisig_address, multisig_threshold},
-    IpcCreateSubnetMsg, SubnetId, NETWORK,
+    SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
@@ -11,18 +12,29 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
+// subnet_genesis_info:<subnet_id>
+const SUBNET_GENESIS_INFO_KEY: &str = "subnet_genesis_info:";
+// subnet_state:<subnet_id>
 const SUBNET_STATE_KEY: &str = "subnet_state:";
-const SUBNET_GENESIS_INFO_PREFIX: &str = "subnet_genesis_info:";
+// rootnet_msgs:<subnet_id>:<nonce>
+const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
-#[allow(dead_code)]
 fn subnet_state_key(subnet_id: SubnetId) -> String {
     format!("{SUBNET_STATE_KEY}:{}", subnet_id)
 }
 
 fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
-    format!("{SUBNET_GENESIS_INFO_PREFIX}:{}", subnet_id)
+    format!("{SUBNET_GENESIS_INFO_KEY}:{}", subnet_id)
+}
+
+fn rootnet_msgs_prefix(subnet_id: SubnetId) -> String {
+    format!("{ROOTNET_MSGS_KEY}:{}", subnet_id)
+}
+
+fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
+    format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
 }
 
 /// State of a validator in a subnet
@@ -216,6 +228,24 @@ impl SubnetGenesisInfo {
     }
 }
 
+/// State of a validator in a subnet
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum RootnetMessage {
+    FundSubnet {
+        msg: IpcFundSubnetMsg,
+        block_height: u64,
+        nonce: u64,
+    },
+}
+
+impl RootnetMessage {
+    pub fn nonce(&self) -> u64 {
+        match self {
+            RootnetMessage::FundSubnet { nonce, .. } => *nonce,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct MonitorInfo {
     pub last_processed_block: u64,
@@ -224,9 +254,9 @@ struct MonitorInfo {
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
-    #[allow(dead_code)]
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
+    rootnet_msgs_db: HeedDatabase<Str, SerdeBincode<RootnetMessage>>,
 }
 
 impl HeedDb {
@@ -278,6 +308,9 @@ impl HeedDb {
             let subnet_genesis_db = env
                 .open_database(&rtxn, Some("subnet_genesis_db"))?
                 .ok_or(DbError::DbNotFound("subnet_genesis_db".to_string()))?;
+            let rootnet_msgs_db = env
+                .open_database(&rtxn, Some("rootnet_msgs_db"))?
+                .ok_or(DbError::DbNotFound("rootnet_msgs_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -285,6 +318,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                rootnet_msgs_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -292,6 +326,7 @@ impl HeedDb {
             let monitor_info = env.create_database(&mut txn, Some("monitor_info"))?;
             let subnet_db = env.create_database(&mut txn, Some("subnet_db"))?;
             let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
+            let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -299,6 +334,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                rootnet_msgs_db,
             })
         }
     }
@@ -330,6 +366,26 @@ pub trait Database {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         subnet_state: SubnetState,
+    ) -> Result<(), DbError>;
+
+    // Rootnet Messages
+    fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError>;
+    fn get_rootnet_msgs_by_height(
+        &self,
+        subnet_id: SubnetId,
+        block_height: u64,
+    ) -> Result<Vec<RootnetMessage>, DbError>;
+    fn get_last_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+    fn get_rootnet_msg(
+        &self,
+        subnet_id: SubnetId,
+        nonce: u64,
+    ) -> Result<Option<RootnetMessage>, DbError>;
+    fn add_rootnet_msg(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        msg: RootnetMessage,
     ) -> Result<(), DbError>;
 }
 
@@ -411,6 +467,88 @@ impl Database for HeedDb {
     ) -> Result<(), DbError> {
         let key = subnet_state_key(subnet_id);
         self.subnet_db.put(txn, &key, &subnet_state)?;
+        Ok(())
+    }
+
+    // Rootnet Messages
+
+    /// Note: Potentially returns a large number of messages,
+    /// see `get_rootnet_msgs_by_height` for a more efficient way to get messages
+    fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError> {
+        let prefix = rootnet_msgs_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+
+        let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
+
+        let msgs = msgs_iter
+            .map(|res| res.map(|(_, msg)| msg))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(msgs)
+    }
+
+    fn get_rootnet_msgs_by_height(
+        &self,
+        subnet_id: SubnetId,
+        block_height: u64,
+    ) -> Result<Vec<RootnetMessage>, DbError> {
+        let prefix = rootnet_msgs_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+
+        let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
+
+        let msgs = msgs_iter
+            .map(|res| res.map(|(_, msg)| msg))
+            .filter_map(|res| match res {
+                Ok(msg) => {
+                    let height = match &msg {
+                        RootnetMessage::FundSubnet { block_height, .. } => *block_height,
+                    };
+                    // Only include messages within the specified height range
+                    if height == block_height {
+                        Some(Ok(msg))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(msgs)
+    }
+
+    fn get_last_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
+        let prefix = rootnet_msgs_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+        let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
+        let last_msg = msgs_iter.last();
+        match last_msg {
+            Some(Ok((_, msg))) => Ok(msg.nonce()),
+            _ => Ok(0),
+        }
+    }
+
+    fn get_rootnet_msg(
+        &self,
+        subnet_id: SubnetId,
+        nonce: u64,
+    ) -> Result<Option<RootnetMessage>, DbError> {
+        let key = rootnet_msgs_key(subnet_id, nonce);
+        let txn = self.env.read_txn()?;
+        let msg = self.rootnet_msgs_db.get(&txn, &key)?;
+        Ok(msg)
+    }
+
+    fn add_rootnet_msg(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        msg: RootnetMessage,
+    ) -> Result<(), DbError> {
+        let key = rootnet_msgs_key(subnet_id, msg.nonce());
+        trace!("Add rootnet msg: {msg:#?}");
+        self.rootnet_msgs_db.put(txn, &key, &msg)?;
         Ok(())
     }
 }

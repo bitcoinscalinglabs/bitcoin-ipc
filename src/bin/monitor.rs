@@ -334,6 +334,16 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
+        } else if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
+            let ipc_message = IpcMessage::FundSubnet(fund_msg);
+
+            match self
+                .process_ipc_msg(block_height, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
         }
 
         Ok(())
@@ -381,6 +391,14 @@ where
                 msg.validate()?;
                 msg.save_to_db(&self.db, block_height, txid)?;
                 info!("Processed PrefundSubnet for Subnet ID: {}", msg.subnet_id);
+                Ok(())
+            }
+
+            IpcMessage::FundSubnet(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, txid)?;
+                info!("Processed FundSubnet for Subnet ID: {}", msg.subnet_id);
                 Ok(())
             }
         }
