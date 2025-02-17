@@ -310,6 +310,18 @@ pub async fn get_rootnet_messages(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetRootnetMessagesParams>,
 ) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
     return data
         .db
         .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
