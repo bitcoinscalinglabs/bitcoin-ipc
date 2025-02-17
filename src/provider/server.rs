@@ -43,9 +43,9 @@ impl Server {
         let rpc_server = rpc::make_rpc_server(self.server_data.clone());
 
         let port = &self.port;
-        let addr = format!("127.0.0.1:{}", port);
-        info!("Server is running on http://127.0.0.1:{}", port);
-        info!("Provider available at http://127.0.0.1:{}/api", port);
+        let addr = format!("0.0.0.0:{}", port);
+        info!("Server is running on http://{}", addr);
+        info!("Provider available at http://{}/api", addr);
 
         let token = self.token.clone();
 
