@@ -748,11 +748,19 @@ impl IpcFundSubnetMsg {
     }
 
     // Create a rootnet message from the fund subnet message
-    pub fn to_rootnet_message(&self, nonce: u64, block_height: u64) -> db::RootnetMessage {
+    pub fn to_rootnet_message(
+        &self,
+        nonce: u64,
+        block_height: u64,
+        block_hash: bitcoin::BlockHash,
+        txid: Txid,
+    ) -> db::RootnetMessage {
         db::RootnetMessage::FundSubnet {
             msg: self.clone(),
             nonce,
             block_height,
+            block_hash,
+            txid,
         }
     }
 
@@ -761,7 +769,8 @@ impl IpcFundSubnetMsg {
         &self,
         db: &D,
         block_height: u64,
-        _txid: Txid,
+        block_hash: bitcoin::BlockHash,
+        txid: Txid,
     ) -> Result<(), IpcLibError> {
         let subnet_state =
             db.get_subnet_state(self.subnet_id)?
@@ -779,7 +788,7 @@ impl IpcFundSubnetMsg {
         let nonce = db.get_last_rootnet_msg_nonce(self.subnet_id)? + 1;
         let mut wtxn = db.write_txn()?;
         // Construct rootnet message
-        let rootnet_msg = self.to_rootnet_message(nonce, block_height);
+        let rootnet_msg = self.to_rootnet_message(nonce, block_height, block_hash, txid);
         debug!("New rootnet message: {rootnet_msg:?}");
         // save message
         db.add_rootnet_msg(&mut wtxn, self.subnet_id, rootnet_msg)?;

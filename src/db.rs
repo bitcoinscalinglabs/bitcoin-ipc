@@ -4,7 +4,7 @@ use crate::{
     SubnetId, NETWORK,
 };
 use async_trait::async_trait;
-use bitcoin::{address::NetworkUnchecked, Address, XOnlyPublicKey};
+use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid, XOnlyPublicKey};
 use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RwTxn};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,9 @@ pub enum RootnetMessage {
     FundSubnet {
         msg: IpcFundSubnetMsg,
         block_height: u64,
+        block_hash: BlockHash,
         nonce: u64,
+        txid: Txid,
     },
 }
 

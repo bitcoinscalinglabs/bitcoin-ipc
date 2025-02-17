@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use bitcoin::BlockHash;
 use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
 use bitcoin_ipc::db::{self, Database, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
@@ -273,7 +274,8 @@ where
         let block = self.rpc.get_block(&block_hash)?;
 
         for tx in block.txdata {
-            self.process_transaction(&tx, block_height).await?;
+            self.process_transaction(&tx, block_height, block_hash)
+                .await?;
         }
 
         Ok(())
@@ -283,6 +285,7 @@ where
         &self,
         tx: &bitcoin::Transaction,
         block_height: u64,
+        block_hash: BlockHash,
     ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
@@ -312,7 +315,7 @@ where
                 };
 
                 match self
-                    .process_ipc_msg(block_height, tx, txid, ipc_message)
+                    .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
                     .await
                 {
                     Ok(_) => {}
@@ -328,7 +331,7 @@ where
             let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
 
             match self
-                .process_ipc_msg(block_height, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -338,7 +341,7 @@ where
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
 
             match self
-                .process_ipc_msg(block_height, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -352,6 +355,7 @@ where
     async fn process_ipc_msg(
         &self,
         block_height: u64,
+        block_hash: BlockHash,
         tx: &bitcoin::Transaction,
         txid: bitcoin::Txid,
         msg: IpcMessage,
@@ -397,7 +401,7 @@ where
             IpcMessage::FundSubnet(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
-                msg.save_to_db(&self.db, block_height, txid)?;
+                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
                 info!("Processed FundSubnet for Subnet ID: {}", msg.subnet_id);
                 Ok(())
             }
