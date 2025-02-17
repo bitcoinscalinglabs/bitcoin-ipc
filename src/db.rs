@@ -233,9 +233,9 @@ impl SubnetGenesisInfo {
     }
 }
 
-/// State of a validator in a subnet
+/// Message emmited on the Bitcoin chain
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "kind")]
 pub enum RootnetMessage {
     #[serde(rename = "fund")]
     FundSubnet {
@@ -455,7 +455,6 @@ impl Database for HeedDb {
     }
 
     // Subnet State
-
     fn get_subnet_state(&self, subnet_id: SubnetId) -> Result<Option<SubnetState>, DbError> {
         let key = subnet_state_key(subnet_id);
         let txn = self.env.read_txn()?;
