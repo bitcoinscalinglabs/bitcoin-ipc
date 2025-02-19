@@ -28,7 +28,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"collateral": 200000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -44,7 +44,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"collateral": 110000000,
 			"ip": "66.222.44.55:8081",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -60,7 +60,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"collateral": 150000000,
 			"ip": "66.222.44.55:8082",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -76,7 +76,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fepbcc2ait3aclq2exb3nmwmi4wmd5gfixnktv36mxmax5lmhpdr6qge5su",
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"collateral": 180000000,
 			"ip": "66.222.44.55:8083",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -92,9 +92,21 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha"
+		"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm"
 	},
 	"id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getsubnet",
+    "params": {
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm"
+    },
+    "id": 1
 }' | jq
 
 curl -X POST http://localhost:3030/api \
@@ -118,7 +130,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "fundsubnet",
     "params": {
-			"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha",
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"amount": 40000000,
 			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
     },
@@ -132,8 +144,8 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "getrootnetmessages",
     "params": {
-			"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha",
-			"block_height": 229
+			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"block_height": 235
     },
     "id": 1
 }' | jq

@@ -5,7 +5,7 @@ use crate::{
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::error;
+use log::{error, trace};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -223,6 +223,33 @@ pub async fn get_genesis_info(
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct GetSubnetParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetSubnetParams>,
+) -> Result<db::SubnetState, JsonRpcError> {
+    trace!("getsubnet: {}", params.subnet_id);
+
+    // Check subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or_else(|| {
+            error!("Subnet {} not found.", params.subnet_id);
+            RpcError::InvalidParams(format!("Subnet {} not found.", params.subnet_id))
+        })?;
+
+    Ok(subnet)
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct PrefundSubnetResponse {
     prefund_txid: bitcoin::Txid,
 }
@@ -322,13 +349,12 @@ pub async fn get_rootnet_messages(
             params.subnet_id
         )))?;
 
-    return data
-        .db
+    data.db
         .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
         .map_err(|e| {
             error!("Error getting rootnet messages from Db: {}", e);
             RpcError::DbError(e).into()
-        });
+        })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
@@ -342,6 +368,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
+        .with_method("getsubnet", get_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
