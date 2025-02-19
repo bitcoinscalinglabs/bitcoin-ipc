@@ -1,7 +1,8 @@
 use crate::{
+    bitcoin_utils::get_confirmed_from_height,
     db::{self, Database, HeedDb},
     ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
-    IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
+    IpcCreateSubnetMsg,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
@@ -96,37 +97,21 @@ pub async fn get_block_count(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpc
     }
 }
 
-pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, JsonRpcError> {
+pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
     let client = data.btc_rpc.as_ref();
 
     match client.get_block_count() {
         Ok(current_height) => {
-            // Since BTC_CONFIRMATIONS is 0 in regtest and sigtest
-            // Clippy will complain about absurd comparisons
-            #[allow(clippy::absurd_extreme_comparisons)]
-            if current_height < BTC_CONFIRMATIONS {
-                return Err(JsonRpcError::internal(
-                    "Not enough blocks to have a confirmed block",
-                ));
-            }
-
-            let confirmed_block_height = current_height - BTC_CONFIRMATIONS;
-            match client.get_block_hash(confirmed_block_height) {
-                Ok(block_hash) => Ok(block_hash.to_string()),
-                Err(e) => Err(JsonRpcError::internal(e)),
-            }
+            let confirmed_block_height = match get_confirmed_from_height(current_height) {
+                Some(height) => height,
+                None => {
+                    return Err(JsonRpcError::internal(
+                        "Not enough blocks to have a confirmed block",
+                    ))
+                }
+            };
+            Ok(confirmed_block_height)
         }
-        Err(e) => Err(JsonRpcError::internal(e)),
-    }
-}
-
-/// Get the balance of the wallet in Satoshis
-/// Note: Bitcoin Core RPC returns the balance in BTC (using f64)
-pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
-    let client = data.btc_rpc.as_ref();
-
-    match client.get_balance(None, None) {
-        Ok(balance) => Ok(balance.to_sat()),
         Err(e) => Err(JsonRpcError::internal(e)),
     }
 }
@@ -363,8 +348,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // btc info
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
-        .with_method("getconfirmedblock", get_confirmed_block)
-        .with_method("getbalance", get_balance)
+        .with_method("getconfirmedcount", get_confirmed_block_height)
         // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
