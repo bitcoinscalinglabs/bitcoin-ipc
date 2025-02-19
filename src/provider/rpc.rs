@@ -223,6 +223,26 @@ pub async fn get_genesis_info(
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct GetLastCheckpointHeightParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_last_checkpoint_height(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<GetLastCheckpointHeightParams>,
+) -> Result<db::LastCheckpointHeight, JsonRpcError> {
+    let last_checkpoint_height =
+        data.db
+            .get_last_checkpoint_height(msg.subnet_id)
+            .map_err(|e| {
+                error!("Error getting last checkpoint height from Db: {}", e);
+                RpcError::DbError(e)
+            })?;
+
+    Ok(last_checkpoint_height)
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct PrefundSubnetResponse {
     prefund_txid: bitcoin::Txid,
 }
@@ -347,5 +367,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("fundsubnet", fund_subnet)
         // rootnet messages
         .with_method("getrootnetmessages", get_rootnet_messages)
+        .with_method("getlastcheckpointheight", get_last_checkpoint_height)
         .finish()
 }

@@ -18,6 +18,8 @@ const SUBNET_GENESIS_INFO_KEY: &str = "subnet_genesis_info:";
 const SUBNET_STATE_KEY: &str = "subnet_state:";
 // rootnet_msgs:<subnet_id>:<nonce>
 const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
+// last_checkpoint_height:<subnet_id>
+const LAST_CHECKPOINT_HEIGHT_KEY: &str = "last_checkpoint_height:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -35,6 +37,10 @@ fn rootnet_msgs_prefix(subnet_id: SubnetId) -> String {
 
 fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
     format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
+}
+
+fn last_checkpoint_height_key(subnet_id: SubnetId) -> String {
+    format!("{LAST_CHECKPOINT_HEIGHT_KEY}:{}", subnet_id)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,6 +261,12 @@ impl RootnetMessage {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LastCheckpointHeight {
+    pub subnet_id: SubnetId,
+    pub height: Option<u64>,
+}
+
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
@@ -263,6 +275,7 @@ pub struct HeedDb {
     // TODO use SerdeBincode for this as well
     // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
+    last_checkpoint_height_db: HeedDatabase<Str, SerdeBincode<u64>>,
 }
 
 impl HeedDb {
@@ -317,6 +330,9 @@ impl HeedDb {
             let rootnet_msgs_db = env
                 .open_database(&rtxn, Some("rootnet_msgs_db"))?
                 .ok_or(DbError::DbNotFound("rootnet_msgs_db".to_string()))?;
+            let last_checkpoint_height_db = env
+                .open_database(&rtxn, Some("last_checkpoint_height_db"))?
+                .ok_or(DbError::DbNotFound("last_checkpoint_height_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -325,6 +341,7 @@ impl HeedDb {
                 subnet_db,
                 subnet_genesis_db,
                 rootnet_msgs_db,
+                last_checkpoint_height_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -333,6 +350,8 @@ impl HeedDb {
             let subnet_db = env.create_database(&mut txn, Some("subnet_db"))?;
             let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
+            let last_checkpoint_height_db =
+                env.create_database(&mut txn, Some("last_checkpoint_height_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -341,6 +360,7 @@ impl HeedDb {
                 subnet_db,
                 subnet_genesis_db,
                 rootnet_msgs_db,
+                last_checkpoint_height_db,
             })
         }
     }
@@ -393,6 +413,11 @@ pub trait Database {
         subnet_id: SubnetId,
         msg: RootnetMessage,
     ) -> Result<(), DbError>;
+
+    fn get_last_checkpoint_height(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<LastCheckpointHeight, DbError>;
 }
 
 #[async_trait]
@@ -555,6 +580,16 @@ impl Database for HeedDb {
         trace!("Add rootnet msg: {msg:#?}");
         self.rootnet_msgs_db.put(txn, &key, &msg)?;
         Ok(())
+    }
+
+    fn get_last_checkpoint_height(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<LastCheckpointHeight, DbError> {
+        let key = last_checkpoint_height_key(subnet_id);
+        let txn = self.env.read_txn()?;
+        let height = self.last_checkpoint_height_db.get(&txn, &key)?;
+        Ok(LastCheckpointHeight { subnet_id, height })
     }
 }
 
