@@ -1,6 +1,6 @@
 use crate::{
     db::{self, Database, HeedDb},
-    ipc_lib::{IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
+    ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
@@ -254,25 +254,98 @@ pub async fn prefund_subnet(
     })?;
 
     // TODO this check should be done in the Db
-    let multisig_address = &genesis_info.multisig_address();
+    let multisig_address = genesis_info.multisig_address();
 
     let prefund_txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     Ok(PrefundSubnetResponse { prefund_txid })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct FundSubnetResponse {
+    fund_txid: bitcoin::Txid,
+}
+
+pub async fn fund_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcFundSubnetMsg>,
+) -> Result<FundSubnetResponse, JsonRpcError> {
+    if let Err(err) = msg.validate() {
+        error!("Invalid prefund message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    println!("subnet multisig = {multisig_address:?}");
+
+    let fund_txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(FundSubnetResponse { fund_txid })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetRootnetMessagesParams {
+    subnet_id: SubnetId,
+    block_height: u64,
+}
+
+pub async fn get_rootnet_messages(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetRootnetMessagesParams>,
+) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    return data
+        .db
+        .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
+        .map_err(|e| {
+            error!("Error getting rootnet messages from Db: {}", e);
+            RpcError::DbError(e).into()
+        });
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
+        // btc info
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
         .with_method("getconfirmedblock", get_confirmed_block)
         .with_method("getbalance", get_balance)
+        // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
+        .with_method("fundsubnet", fund_subnet)
+        // rootnet messages
+        .with_method("getrootnetmessages", get_rootnet_messages)
         .finish()
 }

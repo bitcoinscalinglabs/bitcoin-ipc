@@ -92,12 +92,10 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "/b4/t420feejlnrllx3nr4tqfl5iuvwllwnazdiwehluntld6lc2z6w6ypffau6qppq"
+		"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha"
 	},
 	"id": 1
 }' | jq
-
-
 
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
@@ -109,6 +107,33 @@ curl -X POST http://localhost:3030/api \
 			"subnet_id": "/b4/t420feejlnrllx3nr4tqfl5iuvwllwnazdiwehluntld6lc2z6w6ypffau6qppq",
 			"amount": 40000000,
 			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "fundsubnet",
+    "params": {
+			"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha",
+			"amount": 40000000,
+			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getrootnetmessages",
+    "params": {
+			"subnet_id": "/b4/t420f7gmk32wp44h5kxcc2sbonm6iysmmkvfscmxr74kx4cqrofc4len4quzaha",
+			"block_height": 229
     },
     "id": 1
 }' | jq
