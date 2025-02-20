@@ -375,8 +375,17 @@ where
                 debug!("Found IPC message: {:?}", create_subnet_msg);
                 create_subnet_msg.validate()?;
                 // Save to db
-                let subnet_id = create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
-                info!("Processed CreateSubnet for Subnet ID: {}", subnet_id);
+                let subnet_genesis_info =
+                    create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+
+                // TODO think about how to handle side-effects in monitor
+                subnet_genesis_info.import_whitelist_address_to_wallet(&self.watchonly_rpc)?;
+
+                info!(
+                    "Processed CreateSubnet for Subnet ID: {}",
+                    subnet_genesis_info.subnet_id
+                );
+
                 Ok(())
             }
 

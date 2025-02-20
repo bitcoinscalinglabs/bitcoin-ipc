@@ -134,24 +134,49 @@ pub struct IpcCreateSubnetMsg {
     pub whitelist: Vec<XOnlyPublicKey>,
 }
 
-impl IpcCreateSubnetMsg {
-    /// Creates a multisig address from the whitelisted public keys
-    pub fn multisig_address_from_whitelist(
-        &self,
-        subnet_id: &SubnetId,
-    ) -> Result<bitcoin::Address, IpcLibError> {
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let multisig_address = create_subnet_multisig_address(
-            &secp,
-            subnet_id,
-            &self.whitelist.clone(),
-            self.min_validators.into(),
-            NETWORK,
-        )?;
+impl IpcValidate for IpcCreateSubnetMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        if self.min_validators == 0 {
+            return Err(IpcValidateError::InvalidField(
+                "min_validators",
+                "The minimum number of validators must be greater than 0".to_string(),
+            ));
+        }
 
-        Ok(multisig_address)
+        if self.whitelist.len() < self.min_validators as usize {
+            return Err(IpcValidateError::InvalidField(
+                "whitelist",
+                "Number of whitelisted validators is less than the minimum required validators"
+                    .to_string(),
+            ));
+        }
+
+        if self.bottomup_check_period == 0 {
+            return Err(IpcValidateError::InvalidField(
+                "bottomup_check_period",
+                "Must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.active_validators_limit < self.min_validators {
+            return Err(IpcValidateError::InvalidField(
+                "active_validators_limit",
+                "Must be greater than or equal to min_validators".to_string(),
+            ));
+        }
+
+        if self.min_cross_msg_fee == Amount::ZERO {
+            return Err(IpcValidateError::InvalidField(
+                "min_cross_msg_fee",
+                "Must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(())
     }
+}
 
+impl IpcCreateSubnetMsg {
     /// Submits the create subnet message to the Bitcoin network
     /// Using commit-reveal scheme
     /// Returns the subnet id — derived from the commit txid
@@ -195,12 +220,16 @@ impl IpcCreateSubnetMsg {
         }
     }
 
+    /// Saves the create subnet message to the database
+    /// by creating a new subnet genesis info
+    ///
+    /// Returns the subnet id and the multisig address
     pub fn save_to_db<D: db::Database>(
         &self,
         db: &D,
         block_height: u64,
         txid: bitcoin::Txid,
-    ) -> Result<SubnetId, IpcLibError> {
+    ) -> Result<db::SubnetGenesisInfo, IpcLibError> {
         let subnet_id = SubnetId::from_txid(&txid);
 
         let genesis_info = db::SubnetGenesisInfo {
@@ -214,54 +243,29 @@ impl IpcCreateSubnetMsg {
         };
 
         trace!("Saving {self:?} to DB, genesis_info={genesis_info:?}");
-
         let mut wtxn = db.write_txn()?;
-        db.save_subnet_genesis_info(&mut wtxn, subnet_id, genesis_info)?;
+        db.save_subnet_genesis_info(&mut wtxn, subnet_id, &genesis_info)?;
         wtxn.commit()?;
 
-        Ok(subnet_id)
+        Ok(genesis_info)
     }
-}
 
-impl IpcValidate for IpcCreateSubnetMsg {
-    fn validate(&self) -> Result<(), IpcValidateError> {
-        if self.min_validators == 0 {
-            return Err(IpcValidateError::InvalidField(
-                "min_validators",
-                "The minimum number of validators must be greater than 0".to_string(),
-            ));
-        }
+    /// Creates a multisig address from the whitelisted public keys
+    /// and the subnet id
+    pub fn multisig_address_from_whitelist(
+        &self,
+        subnet_id: &SubnetId,
+    ) -> Result<bitcoin::Address, IpcLibError> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let multisig_address = create_subnet_multisig_address(
+            &secp,
+            subnet_id,
+            &self.whitelist.clone(),
+            self.min_validators.into(),
+            NETWORK,
+        )?;
 
-        if self.whitelist.len() < self.min_validators as usize {
-            return Err(IpcValidateError::InvalidField(
-                "whitelist",
-                "Number of whitelisted validators is less than the minimum required validators"
-                    .to_string(),
-            ));
-        }
-
-        if self.bottomup_check_period == 0 {
-            return Err(IpcValidateError::InvalidField(
-                "bottomup_check_period",
-                "Must be greater than 0".to_string(),
-            ));
-        }
-
-        if self.active_validators_limit < self.min_validators {
-            return Err(IpcValidateError::InvalidField(
-                "active_validators_limit",
-                "Must be greater than or equal to min_validators".to_string(),
-            ));
-        }
-
-        if self.min_cross_msg_fee == Amount::ZERO {
-            return Err(IpcValidateError::InvalidField(
-                "min_cross_msg_fee",
-                "Must be greater than 0".to_string(),
-            ));
-        }
-
-        Ok(())
+        Ok(multisig_address)
     }
 }
 
@@ -419,21 +423,19 @@ impl IpcJoinSubnetMsg {
         //
         // Check if the subnet is bootstrapped
         //
-        if genesis_info.genesis_validators.len() as u16
-            >= genesis_info.create_subnet_msg.min_validators
-        {
+        if genesis_info.enough_to_bootstrap() {
             trace!("Subnet {} bootstrapped", self.subnet_id);
             genesis_info.bootstrapped = true;
             genesis_info.genesis_block_height = Some(block_height);
 
             // Save the newly create subnet state
             let subnet_state = genesis_info.to_subnet();
-            db.save_subnet_state(&mut wtxn, self.subnet_id, subnet_state.clone())?;
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+            db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
+            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
             wtxn.commit()?;
             Ok(Some(subnet_state))
         } else {
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
             wtxn.commit()?;
             Ok(None)
         }
@@ -703,7 +705,7 @@ impl IpcPrefundSubnetMsg {
         genesis_info.add_genesis_balance_entry(self.address, self.amount, txid, block_height);
 
         let mut wtxn = db.write_txn()?;
-        db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+        db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
         wtxn.commit()?;
 
         Ok(())

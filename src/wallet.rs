@@ -1,4 +1,4 @@
-use log::{error, trace};
+use log::{debug, error, trace};
 use thiserror::Error;
 
 use bitcoin::{
@@ -117,6 +117,11 @@ pub fn import_address(
     addr: &bitcoin::Address,
     label: String,
 ) -> Result<(), bitcoincore_rpc::Error> {
+    debug!(
+        "Importing watch-only address {} to bitcoincore wallet with label {}",
+        addr, label
+    );
+
     let raw_descriptor = format!("addr({})", addr);
     let descriptor_info = rpc.get_descriptor_info(&raw_descriptor)?;
     let descriptor = descriptor_info.descriptor;
