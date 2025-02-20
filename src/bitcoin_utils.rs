@@ -28,7 +28,7 @@ use bitcoin::{
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 
-use crate::{DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE};
+use crate::{BTC_CONFIRMATIONS, DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE};
 
 /// Returns the number of blocks to wait for before considering a
 /// confirmed in a given network.
@@ -40,8 +40,19 @@ pub const fn confirmations(network: Network) -> u64 {
     }
 }
 
+pub fn get_confirmed_from_height(height: u64) -> Option<u64> {
+    // Since BTC_CONFIRMATIONS is 0 in regtest and sigtest
+    // Clippy will complain about absurd comparisons
+    #[allow(clippy::absurd_extreme_comparisons)]
+    if height < BTC_CONFIRMATIONS {
+        return None;
+    }
+    Some(height - BTC_CONFIRMATIONS)
+}
+
 //
 // BitcoinCore RPC
+//
 
 pub fn make_rpc_client_from_env() -> Client {
     let rpc_user = std::env::var("RPC_USER").expect("RPC_USER env var not defined");

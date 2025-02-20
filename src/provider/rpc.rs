@@ -1,11 +1,12 @@
 use crate::{
+    bitcoin_utils::get_confirmed_from_height,
     db::{self, Database, HeedDb},
     ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
-    IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
+    IpcCreateSubnetMsg,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::error;
+use log::{error, trace};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -96,37 +97,21 @@ pub async fn get_block_count(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpc
     }
 }
 
-pub async fn get_confirmed_block(data: Data<Arc<ServerData>>) -> Result<String, JsonRpcError> {
+pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
     let client = data.btc_rpc.as_ref();
 
     match client.get_block_count() {
         Ok(current_height) => {
-            // Since BTC_CONFIRMATIONS is 0 in regtest and sigtest
-            // Clippy will complain about absurd comparisons
-            #[allow(clippy::absurd_extreme_comparisons)]
-            if current_height < BTC_CONFIRMATIONS {
-                return Err(JsonRpcError::internal(
-                    "Not enough blocks to have a confirmed block",
-                ));
-            }
-
-            let confirmed_block_height = current_height - BTC_CONFIRMATIONS;
-            match client.get_block_hash(confirmed_block_height) {
-                Ok(block_hash) => Ok(block_hash.to_string()),
-                Err(e) => Err(JsonRpcError::internal(e)),
-            }
+            let confirmed_block_height = match get_confirmed_from_height(current_height) {
+                Some(height) => height,
+                None => {
+                    return Err(JsonRpcError::internal(
+                        "Not enough blocks to have a confirmed block",
+                    ))
+                }
+            };
+            Ok(confirmed_block_height)
         }
-        Err(e) => Err(JsonRpcError::internal(e)),
-    }
-}
-
-/// Get the balance of the wallet in Satoshis
-/// Note: Bitcoin Core RPC returns the balance in BTC (using f64)
-pub async fn get_balance(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
-    let client = data.btc_rpc.as_ref();
-
-    match client.get_balance(None, None) {
-        Ok(balance) => Ok(balance.to_sat()),
         Err(e) => Err(JsonRpcError::internal(e)),
     }
 }
@@ -220,6 +205,33 @@ pub async fn get_genesis_info(
         )))?;
 
     Ok(genesis_info)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetSubnetParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetSubnetParams>,
+) -> Result<db::SubnetState, JsonRpcError> {
+    trace!("getsubnet: {}", params.subnet_id);
+
+    // Check subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or_else(|| {
+            error!("Subnet {} not found.", params.subnet_id);
+            RpcError::InvalidParams(format!("Subnet {} not found.", params.subnet_id))
+        })?;
+
+    Ok(subnet)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -322,13 +334,12 @@ pub async fn get_rootnet_messages(
             params.subnet_id
         )))?;
 
-    return data
-        .db
+    data.db
         .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
         .map_err(|e| {
             error!("Error getting rootnet messages from Db: {}", e);
             RpcError::DbError(e).into()
-        });
+        })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
@@ -337,11 +348,11 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // btc info
         .with_method("getblockhash", get_block_hash)
         .with_method("getblockcount", get_block_count)
-        .with_method("getconfirmedblock", get_confirmed_block)
-        .with_method("getbalance", get_balance)
+        .with_method("getconfirmedcount", get_confirmed_block_height)
         // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
+        .with_method("getsubnet", get_subnet)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
