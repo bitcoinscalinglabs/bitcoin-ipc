@@ -28,7 +28,10 @@ use bitcoin::{
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 
-use crate::{BTC_CONFIRMATIONS, DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE};
+use crate::{
+    BTC_CONFIRMATIONS, DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE,
+    WATCHONLY_WALLET_NAME,
+};
 
 /// Returns the number of blocks to wait for before considering a
 /// confirmed in a given network.
@@ -60,17 +63,37 @@ pub fn make_rpc_client_from_env() -> Client {
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
     let wallet_name = std::env::var("WALLET_NAME").expect("WALLET_NAME env var not defined");
 
-    // Append the wallet name into the URL.
-    // Ensure there is no trailing slash, then add "/wallet/<wallet_name>".
-    let full_url = format!("{}/wallet/{}", rpc_url.trim_end_matches('/'), wallet_name);
-
-    let rpc = match init_rpc_client(rpc_user, rpc_pass, full_url) {
+    let rpc = match init_rpc_client(rpc_user, rpc_pass, rpc_url, wallet_name.clone()) {
         Ok(rpc) => rpc,
         Err(e) => {
-            panic!("Error: {}", e);
+            panic!("Error making bitcoincore rpc client: {}", e);
         }
     };
+    // Ignore any errors by loadwallet, as the wallet may already be loaded
     let _ = rpc.load_wallet(&wallet_name);
+    rpc
+}
+
+pub fn make_watchonly_rpc_client_from_env() -> Client {
+    let rpc_user = std::env::var("RPC_USER").expect("RPC_USER env var not defined");
+    let rpc_pass = std::env::var("RPC_PASS").expect("RPC_PASS env var not defined");
+    let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
+
+    let rpc = match init_rpc_client(
+        rpc_user,
+        rpc_pass,
+        rpc_url,
+        WATCHONLY_WALLET_NAME.to_string(),
+    ) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            panic!("Error making bitcoincore rpc client: {}", e);
+        }
+    };
+
+    create_or_load_wallet(&rpc, WATCHONLY_WALLET_NAME, true)
+        .unwrap_or_else(|_| panic!("Error creating {}", WATCHONLY_WALLET_NAME));
+
     rpc
 }
 
@@ -78,8 +101,12 @@ pub fn init_rpc_client(
     rpc_user: String,
     rpc_pass: String,
     rpc_url: String,
+    wallet_name: String,
 ) -> Result<Client, BitcoinUtilsError> {
-    let rpc = Client::new(&rpc_url, Auth::UserPass(rpc_user, rpc_pass))?;
+    // Append the wallet name into the URL.
+    // Ensure there is no trailing slash, then add "/wallet/<wallet_name>".
+    let full_url = format!("{}/wallet/{}", rpc_url.trim_end_matches('/'), wallet_name);
+    let rpc = Client::new(&full_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
 }
 
@@ -199,7 +226,7 @@ pub fn create_commit_reveal_txs(
     amount_to_send: Option<Amount>,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
     trace!(
-        "Creating commit-reveal tx for addres={}, data={:02x?}",
+        "Creating commit-reveal tx for address={}, data={:02x?}",
         &final_address,
         &data
     );
@@ -370,6 +397,47 @@ pub fn get_current_fee_rate(
     trace!("Current fee rate is {}", fee_rate);
 
     FeeRate::clamp(fee_rate, MINIMUM_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE)
+}
+
+pub fn create_or_load_wallet(
+    rpc: &Client,
+    wallet_name: &str,
+    disable_private_keys: bool,
+) -> Result<(), BitcoinUtilsError> {
+    let wallet = rpc.create_wallet(wallet_name, Some(disable_private_keys), None, None, None);
+    if wallet.is_ok() {
+        let wallet_info = wallet.unwrap();
+        trace!("Created wallet '{}': {:?}", wallet_name, wallet_info);
+        return Ok(());
+    }
+
+    let create_err = wallet.unwrap_err();
+    if !create_err.to_string().contains("already exists") {
+        error!("Error creating wallet '{}': {}", wallet_name, create_err);
+        return Err(BitcoinUtilsError::BitcoinRpcError(create_err));
+    }
+
+    trace!(
+        "Wallet '{}' already exists. Attempting to load it.",
+        wallet_name
+    );
+    let loaded = rpc.load_wallet(wallet_name);
+
+    match loaded {
+        Ok(_) => {
+            trace!("Loaded wallet '{}'", wallet_name);
+            Ok(())
+        }
+        Err(e) => {
+            if !e.to_string().contains("already loaded") {
+                error!("Error loading wallet '{}': {}", wallet_name, e);
+                Err(BitcoinUtilsError::BitcoinRpcError(e))
+            } else {
+                trace!("Wallet already loaded '{}'", wallet_name);
+                Ok(())
+            }
+        }
+    }
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {

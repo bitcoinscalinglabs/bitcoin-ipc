@@ -2,9 +2,8 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bitcoin_ipc::bitcoin_utils::make_rpc_client_from_env;
 use bitcoin_ipc::db::HeedDb;
-use bitcoin_ipc::{eth_utils, provider};
+use bitcoin_ipc::{bitcoin_utils, eth_utils, provider};
 use clap::Parser;
 use log::error;
 
@@ -62,7 +61,8 @@ async fn main() -> std::io::Result<()> {
 
     // Init the bitcoincore_rpc client
 
-    let btc_rpc = Arc::new(make_rpc_client_from_env());
+    let btc_rpc = Arc::new(bitcoin_utils::make_rpc_client_from_env());
+    let btc_watchonly_rpc = Arc::new(bitcoin_utils::make_watchonly_rpc_client_from_env());
 
     // Set correct fvm network
 
@@ -72,7 +72,11 @@ async fn main() -> std::io::Result<()> {
 
     let port = std::env::var("PROVIDER_PORT").unwrap_or_else(|_| DEFAULT_PROVIDER_PORT.to_string());
 
-    let server_data = Arc::new(provider::ServerData { db, btc_rpc });
+    let server_data = Arc::new(provider::ServerData {
+        db,
+        btc_rpc,
+        btc_watchonly_rpc,
+    });
 
     provider::Server::new(token, port, server_data)
         .serve()

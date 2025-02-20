@@ -1,7 +1,7 @@
 use crate::{
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
     multisig::{create_subnet_multisig_address, multisig_threshold},
-    SubnetId, NETWORK,
+    wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid, XOnlyPublicKey};
@@ -94,7 +94,7 @@ impl SubnetValidators for Vec<SubnetValidator> {
 }
 
 /// The committee of a subnet
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCommittee {
     /// The threshold for the multisig
     pub threshold: u16,
@@ -104,11 +104,25 @@ pub struct SubnetCommittee {
     pub multisig_address: Address<NetworkUnchecked>,
 }
 
+impl SubnetCommittee {
+    pub fn get_unspent(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<Vec<bitcoincore_rpc::json::ListUnspentResultEntry>, wallet::WalletError> {
+        let address = self
+            .multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid for saved subnet genesis info");
+        wallet::get_unspent_for_address(rpc, &address)
+    }
+}
+
 /// The current state of a subnet
 /// Must only exist if the subnet is bootstrapped
 ///
 /// Note: many more fields will be added here
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetState {
     /// Duplicate of the subnet ID, for easy access
     pub id: SubnetId,
@@ -131,6 +145,22 @@ impl SubnetState {
             .clone()
             .require_network(NETWORK)
             .expect("Multisig should be valid for saved subnet genesis info")
+    }
+
+    /// Imports the subnet multisig address to Bitcoin Core
+    /// as a watch-only address. Bitcoincore will monitor the UTXOs.
+    pub fn import_current_address_to_wallet(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<(), bitcoincore_rpc::Error> {
+        let address = self.multisig_address();
+        let label = format!("{}-{}", self.id, self.committee_number);
+        debug!(
+            "Importing watch-only address {} to bitcoincore wallet with label {}",
+            address, label
+        );
+        wallet::import_address(rpc, &address, label)?;
+        Ok(())
     }
 }
 

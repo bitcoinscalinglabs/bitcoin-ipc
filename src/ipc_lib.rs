@@ -384,12 +384,13 @@ impl IpcJoinSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
+    /// Returning SubnetState if the subnet is bootstrapped
     pub fn save_to_db<D: db::Database>(
         &self,
         db: &D,
         block_height: u64,
         txid: Txid,
-    ) -> Result<(), IpcLibError> {
+    ) -> Result<Option<db::SubnetState>, IpcLibError> {
         let mut genesis_info =
             db.get_subnet_genesis_info(self.subnet_id)?
                 .ok_or(IpcValidateError::InvalidMsg(format!(
@@ -427,12 +428,15 @@ impl IpcJoinSubnetMsg {
 
             // Save the newly create subnet state
             let subnet_state = genesis_info.to_subnet();
-            db.save_subnet_state(&mut wtxn, self.subnet_id, subnet_state)?;
+            db.save_subnet_state(&mut wtxn, self.subnet_id, subnet_state.clone())?;
+            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+            wtxn.commit()?;
+            Ok(Some(subnet_state))
+        } else {
+            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
+            wtxn.commit()?;
+            Ok(None)
         }
-        db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, genesis_info)?;
-        wtxn.commit()?;
-
-        Ok(())
     }
 }
 
