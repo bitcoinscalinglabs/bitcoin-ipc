@@ -1,18 +1,19 @@
 use std::vec;
 
-use log::error;
+use log::{error, trace};
 use thiserror::Error;
 
 use bitcoin::{
+    absolute::LockTime,
     blockdata::script::Builder,
     hashes::Hash,
     opcodes,
     secp256k1::{All, Secp256k1},
     taproot::{TaprootBuilder, TaprootSpendInfo},
-    Address, Network, ScriptBuf, XOnlyPublicKey,
+    Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, XOnlyPublicKey,
 };
 
-use crate::bitcoin_utils::create_unspendable_internal_key;
+use crate::bitcoin_utils::unspenable_internal_key;
 
 use crate::SubnetId;
 
@@ -69,7 +70,7 @@ pub fn create_subnet_multisig_spend_info(
 
     let builder =
         TaprootBuilder::with_huffman_tree(vec![(1, multisig_script), (0, subnet_id_script)])?;
-    let internal_key = create_unspendable_internal_key();
+    let internal_key = unspenable_internal_key();
     let spend_info = builder
         .finalize(secp, internal_key)
         .map_err(|_| MultisigError::TaprootBuilderNotFinalizable)?;

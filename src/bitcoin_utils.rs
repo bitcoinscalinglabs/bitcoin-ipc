@@ -111,7 +111,7 @@ pub fn init_rpc_client(
 }
 
 /// Returns a provably unspendable internal key
-pub fn create_unspendable_internal_key() -> XOnlyPublicKey {
+pub fn unspenable_internal_key() -> XOnlyPublicKey {
     // the Gx of SECP, incremented till a valid x is found
     // See
     // https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs,
@@ -237,7 +237,7 @@ pub fn create_commit_reveal_txs(
     let commit_script = make_push_data_script(data);
 
     // this transaction can only be spent through the script path
-    let unspendable_pubkey = create_unspendable_internal_key();
+    let unspendable_pubkey = unspenable_internal_key();
 
     let amount_to_send = amount_to_send.unwrap_or(Amount::ZERO);
 
@@ -500,7 +500,7 @@ pub fn create_send_with_timelock_release_tx_script(
         .add_leaf(1, send_script)?
         .add_leaf(1, release_script)?;
 
-    let unspendable_pubkey = create_unspendable_internal_key();
+    let unspendable_pubkey = unspenable_internal_key();
 
     let spend_info = taproot_builder
         .finalize(secp, unspendable_pubkey)
@@ -553,4 +553,19 @@ pub enum BitcoinUtilsError {
 
     #[error("cannot construct control block for the given script")]
     CannotConstructControlBlock,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unspendable_internal_key_does_not_change() {
+        let key = unspenable_internal_key();
+        assert_eq!(key, unspenable_internal_key());
+        assert_eq!(
+            format!("{key}"),
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81799"
+        );
+    }
 }
