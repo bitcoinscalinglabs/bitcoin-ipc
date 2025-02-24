@@ -2,7 +2,7 @@
 set -e
 
 # Load environment variables from the .env file in the root of the project
-ENV_FILE="../.env"
+ENV_FILE=".env"
 if [ ! -f "$ENV_FILE" ]; then
   echo "Error: $ENV_FILE not found!"
   exit 1
