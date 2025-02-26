@@ -1,18 +1,18 @@
 use std::env;
 use std::path::PathBuf;
 
-use bitcoin::BlockHash;
-use bitcoin_ipc::bitcoin_utils::{concatenate_op_push_data, make_rpc_client_from_env};
-use bitcoin_ipc::db::{self, Database, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
-use bitcoin_ipc::{eth_utils, IpcMessage, BTC_CONFIRMATIONS};
-use bitcoincore_rpc::RpcApi;
 use clap::Parser;
 use log::{debug, error, info, trace};
 use thiserror::Error;
 use tokio::signal;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+use bitcoin::BlockHash;
+use bitcoin_ipc::db::{self, Database, HeedDb};
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
+use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
+use bitcoincore_rpc::RpcApi;
 
 // TODO make configurable
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -56,7 +56,8 @@ async fn main() {
 
     // Init the bitcoincore_rpc client
 
-    let btc_rpc = make_rpc_client_from_env();
+    let btc_rpc = bitcoin_utils::make_rpc_client_from_env();
+    let btc_watchonly_rpc = bitcoin_utils::make_watchonly_rpc_client_from_env();
 
     // Set correct fvm network
 
@@ -66,7 +67,13 @@ async fn main() {
 
     let cancel_token = CancellationToken::new();
 
-    let mut monitor = Monitor::new(db, btc_rpc, POLL_INTERVAL, cancel_token.clone());
+    let mut monitor = Monitor::new(
+        db,
+        btc_rpc,
+        btc_watchonly_rpc,
+        POLL_INTERVAL,
+        cancel_token.clone(),
+    );
 
     // Spawn monitor task
 
@@ -102,6 +109,7 @@ async fn main() {
 struct Monitor<D: Database> {
     db: D,
     rpc: bitcoincore_rpc::Client,
+    watchonly_rpc: bitcoincore_rpc::Client,
     check_interval: Duration,
     current_height: u64,
     cancel_token: CancellationToken,
@@ -114,12 +122,14 @@ where
     fn new(
         db: D,
         rpc: bitcoincore_rpc::Client,
+        watchonly_rpc: bitcoincore_rpc::Client,
         check_interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
             db,
             rpc,
+            watchonly_rpc,
             check_interval,
             cancel_token,
             current_height: 0,
@@ -296,7 +306,7 @@ where
             // TODO check more efficiently if witness has IPC tag
             for witness in input.witness.iter().filter(|w| !w.is_empty()) {
                 // Reconstruct the witness data
-                let concatenated_data = match concatenate_op_push_data(witness) {
+                let concatenated_data = match bitcoin_utils::concatenate_op_push_data(witness) {
                     Ok(data) => data,
                     Err(_) => {
                         continue;
@@ -364,8 +374,18 @@ where
             IpcMessage::CreateSubnet(create_subnet_msg) => {
                 debug!("Found IPC message: {:?}", create_subnet_msg);
                 create_subnet_msg.validate()?;
-                let subnet_id = create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
-                info!("Processed CreateSubnet for Subnet ID: {}", subnet_id);
+                // Save to db
+                let subnet_genesis_info =
+                    create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+
+                // TODO think about how to handle side-effects in monitor
+                subnet_genesis_info.import_whitelist_address_to_wallet(&self.watchonly_rpc)?;
+
+                info!(
+                    "Processed CreateSubnet for Subnet ID: {}",
+                    subnet_genesis_info.subnet_id
+                );
+
                 Ok(())
             }
 
@@ -382,7 +402,12 @@ where
                 debug!("Found IPC message: {:?}", join_subnet_msg);
 
                 join_subnet_msg.validate()?;
-                join_subnet_msg.save_to_db(&self.db, block_height, txid)?;
+                if let Some(subnet) = join_subnet_msg.save_to_db(&self.db, block_height, txid)? {
+                    // TODO think about how to handle side-effects in monitor
+                    // Subnet bootstrapped
+                    subnet.import_current_address_to_wallet(&self.watchonly_rpc)?;
+                }
+
                 info!(
                     "Processed JoinSubnet for Subnet ID: {}",
                     join_subnet_msg.subnet_id

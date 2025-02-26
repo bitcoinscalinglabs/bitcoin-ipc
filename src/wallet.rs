@@ -1,4 +1,4 @@
-use log::{error, trace};
+use log::{debug, error, trace};
 use thiserror::Error;
 
 use bitcoin::{
@@ -10,7 +10,7 @@ use bitcoin::{
 };
 
 use bitcoincore_rpc::{
-    json::{EstimateMode, FundRawTransactionOptions},
+    json::{EstimateMode, FundRawTransactionOptions, ListUnspentResultEntry},
     Client, RawTx, RpcApi,
 };
 
@@ -101,6 +101,42 @@ pub fn sign_tx(rpc: &Client, unsigned_tx: Transaction) -> Result<Transaction, Wa
 
 pub fn get_new_address(rpc: &Client) -> Result<bitcoin::Address, WalletError> {
     Ok(rpc.get_new_address(None, None)?.assume_checked())
+}
+
+pub fn get_unspent_for_address(
+    rpc: &Client,
+    addr: &bitcoin::Address,
+) -> Result<Vec<ListUnspentResultEntry>, WalletError> {
+    let unspent = rpc.list_unspent(None, None, Some(&[addr]), None, None)?;
+    Ok(unspent)
+}
+
+/// Imports an address descriptor into the wallet
+pub fn import_address(
+    rpc: &Client,
+    addr: &bitcoin::Address,
+    label: String,
+) -> Result<(), bitcoincore_rpc::Error> {
+    debug!(
+        "Importing watch-only address {} to bitcoincore wallet with label {}",
+        addr, label
+    );
+
+    let raw_descriptor = format!("addr({})", addr);
+    let descriptor_info = rpc.get_descriptor_info(&raw_descriptor)?;
+    let descriptor = descriptor_info.descriptor;
+
+    let req = bitcoincore_rpc::json::ImportDescriptors {
+        descriptor,
+        label: Some(label),
+        timestamp: bitcoincore_rpc::json::Timestamp::Now,
+        active: None,
+        range: None,
+        next_index: None,
+        internal: None,
+    };
+    rpc.import_descriptors(req)?;
+    Ok(())
 }
 
 #[derive(Error, Debug)]

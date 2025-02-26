@@ -65,6 +65,7 @@ impl actix_web::error::ResponseError for RpcError {
 pub struct ServerData {
     pub db: Arc<HeedDb>,
     pub btc_rpc: Arc<Client>,
+    pub btc_watchonly_rpc: Arc<Client>,
 }
 
 //

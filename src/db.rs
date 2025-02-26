@@ -1,7 +1,7 @@
 use crate::{
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
     multisig::{create_subnet_multisig_address, multisig_threshold},
-    SubnetId, NETWORK,
+    wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid, XOnlyPublicKey};
@@ -94,7 +94,7 @@ impl SubnetValidators for Vec<SubnetValidator> {
 }
 
 /// The committee of a subnet
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCommittee {
     /// The threshold for the multisig
     pub threshold: u16,
@@ -104,11 +104,25 @@ pub struct SubnetCommittee {
     pub multisig_address: Address<NetworkUnchecked>,
 }
 
+impl SubnetCommittee {
+    pub fn get_unspent(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<Vec<bitcoincore_rpc::json::ListUnspentResultEntry>, wallet::WalletError> {
+        let address = self
+            .multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid for saved subnet genesis info");
+        wallet::get_unspent_for_address(rpc, &address)
+    }
+}
+
 /// The current state of a subnet
 /// Must only exist if the subnet is bootstrapped
 ///
 /// Note: many more fields will be added here
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetState {
     /// Duplicate of the subnet ID, for easy access
     pub id: SubnetId,
@@ -131,6 +145,18 @@ impl SubnetState {
             .clone()
             .require_network(NETWORK)
             .expect("Multisig should be valid for saved subnet genesis info")
+    }
+
+    /// Imports the subnet multisig address to Bitcoin Core
+    /// as a watch-only address. Bitcoincore will monitor the UTXOs.
+    pub fn import_current_address_to_wallet(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<(), bitcoincore_rpc::Error> {
+        let address = self.multisig_address();
+        let label = format!("{}-{}", self.id, self.committee_number);
+        wallet::import_address(rpc, &address, label)?;
+        Ok(())
     }
 }
 
@@ -182,10 +208,37 @@ pub struct SubnetGenesisInfo {
 }
 
 impl SubnetGenesisInfo {
+    /// Returns if the subnet has enough validators to bootstrap
+    pub fn enough_to_bootstrap(&self) -> bool {
+        self.genesis_validators.len() as u16 >= self.create_subnet_msg.min_validators
+    }
+
     pub fn multisig_address(&self) -> Address {
-        self.create_subnet_msg
-            .multisig_address_from_whitelist(&self.subnet_id)
-            .expect("Multisig should be valid for saved subnet genesis info")
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        create_subnet_multisig_address(
+            &secp,
+            &self.subnet_id,
+            &self.create_subnet_msg.whitelist.clone(),
+            self.create_subnet_msg.min_validators.into(),
+            NETWORK,
+        )
+        // TODO think about this expect, maybe return a Result
+        .expect("Multisig should be valid for saved subnet genesis info")
+    }
+
+    /// Imports the whitelist multisig address to Bitcoin Core
+    /// as a watch-only address. Bitcoincore will monitor the UTXOs.
+    pub fn import_whitelist_address_to_wallet(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+    ) -> Result<(), bitcoincore_rpc::Error> {
+        let address = self.multisig_address();
+        // Import the subnet whitelist address to the wallet
+        // with a committee number 0
+        let label = format!("{}-{}", self.subnet_id, 0);
+        wallet::import_address(rpc, &address, label)?;
+        Ok(())
     }
 
     pub fn to_subnet(&self) -> SubnetState {
@@ -362,7 +415,7 @@ pub trait Database {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
-        genesis_info: SubnetGenesisInfo,
+        genesis_info: &SubnetGenesisInfo,
     ) -> Result<(), DbError>;
 
     // Subnet State
@@ -371,7 +424,7 @@ pub trait Database {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
-        subnet_state: SubnetState,
+        subnet_state: &SubnetState,
     ) -> Result<(), DbError>;
 
     // Rootnet Messages
@@ -448,11 +501,10 @@ impl Database for HeedDb {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
-        subnet_genesis_info: SubnetGenesisInfo,
+        subnet_genesis_info: &SubnetGenesisInfo,
     ) -> Result<(), DbError> {
         let key = subnet_genesis_info_key(subnet_id);
-        self.subnet_genesis_db
-            .put(txn, &key, &subnet_genesis_info)?;
+        self.subnet_genesis_db.put(txn, &key, subnet_genesis_info)?;
         Ok(())
     }
 
@@ -468,10 +520,10 @@ impl Database for HeedDb {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
-        subnet_state: SubnetState,
+        subnet_state: &SubnetState,
     ) -> Result<(), DbError> {
         let key = subnet_state_key(subnet_id);
-        self.subnet_db.put(txn, &key, &subnet_state)?;
+        self.subnet_db.put(txn, &key, subnet_state)?;
         Ok(())
     }
 
