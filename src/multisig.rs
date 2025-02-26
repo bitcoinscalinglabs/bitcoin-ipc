@@ -224,7 +224,7 @@ pub fn select_coins(
     ))
 }
 
-pub fn construct_multisig_spend_transaction(
+pub fn construct_spend_unsigned_transaction(
     to: &Address,
     amount: Amount,
     unspent: &Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
@@ -297,6 +297,95 @@ pub fn construct_multisig_spend_transaction(
     }
 
     Ok(spend_tx)
+}
+
+/// Constructs a PSBT for spending a multisig output
+pub fn construct_spend_psbt(
+    to: &Address,
+    amount: Amount,
+    unspent: &Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+    committee_change_address: &Address,
+    committee_size: u16,
+    committee_threshold: u16,
+    fee_rate: &FeeRate,
+    subnet_id: &SubnetId,
+    public_keys: &[XOnlyPublicKey],
+) -> Result<bitcoin::Psbt, MultisigError> {
+    trace!(
+        "Creating multisig spend PSBT for address={}, amount={}",
+        &to,
+        &amount
+    );
+
+    let secp = Secp256k1::new();
+
+    // First construct the unsigned transaction
+    let unsigned_tx = construct_spend_unsigned_transaction(
+        to,
+        amount,
+        unspent,
+        committee_change_address,
+        committee_size,
+        committee_threshold,
+        fee_rate,
+    )?;
+
+    // Create the PSBT from the unsigned transaction
+    let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(unsigned_tx.clone())
+        .map_err(|e| MultisigError::CoinSelectionFailed(format!("Failed to create PSBT: {}", e)))?;
+
+    // Create the script that will be used for spending
+    let required_sigs = committee_threshold as i64;
+    let script = create_multisig_script(public_keys, required_sigs)?;
+    let leaf_version = bitcoin::taproot::LeafVersion::TapScript;
+
+    // Get the spend info for the multisig
+    let spend_info =
+        create_subnet_multisig_spend_info(&secp, subnet_id, public_keys, required_sigs)?;
+
+    // Create the control block
+    let control_block = spend_info
+        .control_block(&(script.clone(), leaf_version))
+        .ok_or_else(|| MultisigError::TaprootBuilderNotFinalizable)?;
+
+    psbt.inputs = psbt
+        .inputs
+        .into_iter()
+        .enumerate()
+        .map(|(psbt_input_index, mut psbt_input)| {
+            // Find the matching UTXO from our list
+            let utxo = unspent
+                .iter()
+                .find(|u| {
+                    u.txid == unsigned_tx.input[psbt_input_index].previous_output.txid
+                        && u.vout == unsigned_tx.input[psbt_input_index].previous_output.vout
+                })
+                .ok_or_else(|| format!("Failed to find UTXO for input {}", psbt_input_index))
+                // temp expect
+                .expect("Should find matching UTXO");
+
+            // 1. Witnessable script (the tapscript)
+            psbt_input.witness_script = Some(script.clone());
+
+            // 2. Taproot-specific fields
+            psbt_input.tap_script_sigs = Default::default();
+            let mut tap_scripts = std::collections::BTreeMap::new();
+            tap_scripts.insert(control_block.clone(), (script.clone(), leaf_version));
+            psbt_input.tap_scripts = tap_scripts;
+            psbt_input.tap_merkle_root = spend_info.merkle_root();
+            psbt_input.tap_internal_key = Some(spend_info.internal_key());
+
+            // 3. Previous UTXO information
+            psbt_input.witness_utxo = Some(TxOut {
+                value: utxo.amount,
+                script_pubkey: utxo.script_pub_key.clone(),
+            });
+
+            psbt_input
+        })
+        .collect();
+
+    Ok(psbt)
 }
 
 #[derive(Error, Debug)]

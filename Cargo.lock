@@ -634,6 +634,7 @@ dependencies = [
  "actix-web-httpauth",
  "alloy-primitives",
  "async-trait",
+ "base64 0.22.1",
  "bitcoin",
  "bitcoinconsensus",
  "bitcoincore-rpc",

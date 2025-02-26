@@ -2,8 +2,9 @@ use crate::{
     bitcoin_utils::get_confirmed_from_height,
     db::{self, Database, HeedDb},
     ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
-    IpcCreateSubnetMsg,
+    IpcCreateSubnetMsg, NETWORK,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::{error, trace};
@@ -343,6 +344,62 @@ pub async fn get_rootnet_messages(
         })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GenMultisigSpendPsbtParams {
+    subnet_id: SubnetId,
+    recipient: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    amount: bitcoin::Amount,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GenMultisigSpendPsbtResponse {
+    psbt: bitcoin::Psbt,
+    psbt_base64: String,
+}
+
+pub async fn gen_multisig_spend_psbt(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GenMultisigSpendPsbtParams>,
+) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
+    // Check subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    let recipient = params.recipient.require_network(NETWORK).map_err(|_| {
+        RpcError::InvalidParams(format!("Invalid address network, required {NETWORK}"))
+    })?;
+
+    let psbt = subnet
+        .committee
+        .construct_spend_psbt(
+            &data.btc_watchonly_rpc,
+            &params.subnet_id,
+            &recipient,
+            params.amount,
+        )
+        .map_err(|e| {
+            error!(
+                "Error generating multisig spend psbt for subnet_id={}: {}",
+                &params.subnet_id, e
+            );
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    let psbt_base64 = BASE64_STANDARD.encode(psbt.serialize());
+
+    Ok(GenMultisigSpendPsbtResponse { psbt, psbt_base64 })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -359,5 +416,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("fundsubnet", fund_subnet)
         // rootnet messages
         .with_method("getrootnetmessages", get_rootnet_messages)
+        // multisig
+        .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         .finish()
 }
