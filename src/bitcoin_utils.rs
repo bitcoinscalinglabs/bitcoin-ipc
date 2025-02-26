@@ -231,7 +231,7 @@ pub fn create_commit_reveal_txs(
         &data
     );
 
-    let fee_rate = get_current_fee_rate(rpc, None, None);
+    let fee_rate = get_fee_rate(rpc, None, None);
 
     // construct the script that will contain the data
     let commit_script = make_push_data_script(data);
@@ -369,11 +369,7 @@ pub fn create_commit_reveal_txs(
     Ok((commit_tx, reveal_tx))
 }
 
-pub fn get_current_fee_rate(
-    rpc: &Client,
-    mode: Option<EstimateMode>,
-    target: Option<u16>,
-) -> FeeRate {
+pub fn get_fee_rate(rpc: &Client, mode: Option<EstimateMode>, target: Option<u16>) -> FeeRate {
     let mode = mode.or(Some(EstimateMode::Economical));
     let target = target.unwrap_or(6);
 
@@ -394,7 +390,12 @@ pub fn get_current_fee_rate(
         _ => DEFAULT_BTC_FEE_RATE,
     };
 
-    trace!("Current fee rate is {}", fee_rate);
+    trace!(
+        "Fee rate is {} with mode={:?} and target={}",
+        fee_rate,
+        mode,
+        target
+    );
 
     FeeRate::clamp(fee_rate, MINIMUM_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE)
 }

@@ -10,7 +10,8 @@ use bitcoin::{
     opcodes,
     secp256k1::{All, Secp256k1},
     taproot::{TaprootBuilder, TaprootSpendInfo},
-    Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, XOnlyPublicKey,
+    Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxIn, TxOut, VarInt, Weight,
+    Witness, XOnlyPublicKey,
 };
 
 use crate::bitcoin_utils::unspenable_internal_key;
@@ -101,10 +102,210 @@ pub fn multisig_threshold(participants: u16) -> u16 {
     (participants / 2) + 1
 }
 
+/// Calculates the size in bytes of witness elements for spending a multisig utxo
+/// Useful for fee calculations.
+pub fn multisig_spend_witness_size(committee_size: u16, committee_threshold: u16) -> usize {
+    // Each required signature
+    let signatures_size =
+        bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE * committee_threshold as usize;
+
+    // For each unused key position, we need an empty signature (represented as empty vector with 1 byte length)
+    // In witness format, an empty element still takes 1 byte (the length byte indicating zero-length data)
+    let empty_sigs_size = (committee_size - committee_threshold) as usize;
+
+    // Script size: all x-only public keys (32 bytes each) plus opcodes
+    // - Each key needs 1 byte push operation (for the 32-byte key) = 33 bytes per key
+    // - 1 byte for each OP_CHECKSIG or OP_CHECKSIGADD
+    // - 1 byte for integer push (required_sigs)
+    // - 1 byte for OP_GREATERTHANOREQUAL
+    let script_size =
+        (bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE + 2) * committee_size as usize + 2;
+
+    // Control block calculation:
+    // - TAPROOT_CONTROL_BASE_SIZE (33 bytes: 1 byte version + 32 bytes internal key)
+    // - TAPROOT_CONTROL_NODE_SIZE (32 bytes for the merkle node)
+    let control_block_content_size =
+        bitcoin::taproot::TAPROOT_CONTROL_BASE_SIZE + bitcoin::taproot::TAPROOT_CONTROL_NODE_SIZE;
+
+    let var_ints =
+	    // varint for the number of witnesses, which is a signature for each committee member + script + control block
+	    bitcoin::VarInt::from(committee_size + 2).size()
+	    // each schnorr sig
+        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * committee_threshold as usize
+        // script size
+        + VarInt::from(script_size).size()
+        // control block size
+        + VarInt::from(control_block_content_size).size();
+
+    signatures_size + empty_sigs_size + script_size + control_block_content_size + var_ints
+}
+
+/// Selects UTXOs to spend for a transaction
+/// Returns the selected UTXOs and the change output if any
+///
+/// It uses the largest utxos first
+// TODO improve coin selection algorithm
+pub fn select_coins(
+    target: Amount,
+    mut utxos: Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+    fee_rate: FeeRate,
+    base_tx_weight: Weight,
+    satisfaction_weight_per_input: Weight,
+    change_address: &Address,
+) -> Result<
+    (
+        // The list of selected UTXOs
+        Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+        // Optional change output
+        Option<TxOut>,
+    ),
+    MultisigError,
+> {
+    // Sort UTXOs deterministically by amount, txid and vout
+    utxos.sort_by(|a, b| {
+        b.amount
+            .cmp(&a.amount)
+            .then(a.txid.cmp(&b.txid))
+            .then(a.vout.cmp(&b.vout))
+    });
+
+    trace!(
+        "Selecting coins for target amount {}. Unspent: {:?}",
+        target,
+        utxos
+    );
+
+    let non_dust_change_tx_out = bitcoin::TxOut::minimal_non_dust(change_address.script_pubkey());
+
+    let mut selected = Vec::with_capacity(utxos.len());
+    let mut total_amount = Amount::ZERO;
+    let mut total_weight = base_tx_weight;
+
+    for utxo in utxos {
+        // Append the utxo
+        selected.push(utxo.clone());
+
+        total_amount += utxo.amount;
+        total_weight += satisfaction_weight_per_input;
+
+        let total_fee = fee_rate
+            .fee_wu(total_weight)
+            .expect("fee rate shouldn't overflow");
+
+        if total_amount >= target + total_fee {
+            let change = total_amount - target - total_fee;
+            trace!(
+                "Selected coins for target amount {}. Total amount: {}, total fee: {}, change: {}",
+                target,
+                total_amount,
+                total_fee,
+                change
+            );
+            dbg!(
+                "change is {change}, min dust is {}",
+                non_dust_change_tx_out.value
+            );
+
+            // if change is non-dust, return it
+            if change > non_dust_change_tx_out.value {
+                let change_tx_out = bitcoin::TxOut {
+                    value: change,
+                    script_pubkey: change_address.script_pubkey(),
+                };
+                return Ok((selected, Some(change_tx_out)));
+            } else {
+                return Ok((selected, None));
+            }
+        }
+    }
+
+    Err(MultisigError::CoinSelectionFailed(
+        "Insufficient funds".to_string(),
+    ))
+}
+
+pub fn construct_multisig_spend_transaction(
+    to: &Address,
+    amount: Amount,
+    unspent: &Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+    committee_change_address: &Address,
+    committee_size: u16,
+    committee_threshold: u16,
+    fee_rate: &FeeRate,
+) -> Result<Transaction, MultisigError> {
+    trace!(
+        "Creating multisig spend tx for address={}, amount={}",
+        &to,
+        &amount
+    );
+
+    // size of the witness data when spending a multisig utxo
+    let spend_witness_size = multisig_spend_witness_size(committee_size, committee_threshold);
+    // base input size
+    let spend_txin_size = bitcoin::TxIn::default().base_size();
+    // weight of spending one input
+    let spending_weight_per_input = Weight::from_non_witness_data_size(spend_txin_size as u64)
+        + Weight::from_witness_data_size(spend_witness_size as u64);
+
+    let tx_out = bitcoin::TxOut {
+        value: amount,
+        script_pubkey: to.script_pubkey(),
+    };
+    let non_dust_change_tx_out =
+        bitcoin::TxOut::minimal_non_dust(committee_change_address.script_pubkey());
+
+    // base transaction, assume a change output
+    let base_tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![tx_out.clone(), non_dust_change_tx_out],
+    };
+    let base_tx_weight = base_tx.weight();
+
+    // coin selection from utxos
+    let (selected_utxos, change) = select_coins(
+        amount,
+        unspent.clone(),
+        *fee_rate,
+        base_tx_weight,
+        spending_weight_per_input,
+        committee_change_address,
+    )?;
+
+    let inputs = selected_utxos
+        .iter()
+        .map(|utxo| TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: utxo.txid,
+                vout: utxo.vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: Witness::new(),
+        })
+        .collect::<Vec<TxIn>>();
+
+    let mut spend_tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: inputs,
+        output: vec![tx_out],
+    };
+    if let Some(change_tx_out) = change {
+        spend_tx.output.push(change_tx_out);
+    }
+
+    Ok(spend_tx)
+}
+
 #[derive(Error, Debug)]
 pub enum MultisigError {
     #[error("insufficient public keys provided")]
     InsufficientPublicKeys,
+
+    #[error("error during coin selection: {0}")]
+    CoinSelectionFailed(String),
 
     #[error("taproot builder is not finalizable")]
     TaprootBuilderNotFinalizable,
@@ -303,6 +504,8 @@ mod tests {
             .control_block(&(script.clone(), LeafVersion::TapScript))
             .expect("Should create control block");
 
+        dbg!(&control_block.size());
+
         let multisig_address =
             create_subnet_multisig_address(&secp, &subnet_id, &public_keys, required_sigs, network)
                 .expect("Failed to create multisig address");
@@ -409,7 +612,7 @@ mod tests {
         }
 
         //
-        // Case 2: Valid spend with required signatures (3 of 3)
+        // Case 2: Valid spend with required signatures (3 of 5)
         //
         {
             let mut tx_valid = spending_tx.clone();
@@ -430,6 +633,10 @@ mod tests {
 
             witness.push(script.to_bytes());
             witness.push(control_block.serialize());
+
+            // Test the spend witness size calculation
+            let spend_witness_size = multisig_spend_witness_size(5, 3);
+            assert_eq!(witness.size(), spend_witness_size);
 
             tx_valid.input[0].witness = witness;
 
@@ -551,5 +758,323 @@ mod tests {
             address_1, address_2,
             "Addresses should be different with different subnet IDs"
         );
+    }
+
+    #[test]
+    fn test_witness_size_calculation() {
+        let committee_configs: [(u16, u16); 7] =
+            [(1, 1), (2, 3), (3, 5), (5, 7), (7, 10), (11, 15), (14, 20)];
+
+        // Create a 2-of-3 multisig setup
+        let secp = Secp256k1::new();
+
+        for (required_sigs, committee_size) in committee_configs {
+            let keypairs = generate_keypairs(committee_size as usize);
+            let public_keys: Vec<XOnlyPublicKey> =
+                keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+
+            let subnet_id = generate_subnet_id();
+            let script = create_multisig_script(&public_keys, required_sigs as i64).unwrap();
+
+            let spend_info = create_subnet_multisig_spend_info(
+                &secp,
+                &subnet_id,
+                &public_keys,
+                required_sigs as i64,
+            )
+            .unwrap();
+            let control_block = spend_info
+                .control_block(&(script.clone(), LeafVersion::TapScript))
+                .unwrap();
+
+            // Create a witness
+            let mut witness = Witness::new();
+
+            // Add 2 signatures
+            let dummy_sig = [1u8; bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE];
+            for _ in 0..required_sigs {
+                witness.push(&dummy_sig[..]);
+            }
+            // Add empty signatures for unused keys
+            for _ in required_sigs..committee_size {
+                witness.push([]);
+            }
+            // Add the script and control block
+            witness.push(script.to_bytes());
+            witness.push(control_block.serialize());
+
+            // Calculate the actual size
+            let actual_size = witness.size();
+
+            // Calculate using our function
+            let calculated_size = multisig_spend_witness_size(committee_size, required_sigs);
+
+            // They should match
+            assert_eq!(calculated_size, actual_size);
+            println!(
+                "{required_sigs}-of-{committee_size} Witness Size: Actual={}, Calculated={}",
+                actual_size, calculated_size
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod coin_selection_tests {
+    use std::str::FromStr;
+
+    use super::*;
+    use bitcoin::Amount;
+    use bitcoincore_rpc::json::ListUnspentResultEntry;
+
+    fn create_test_utxo(amount: u64, txid: &str, vout: u32) -> ListUnspentResultEntry {
+        ListUnspentResultEntry {
+            txid: txid.parse().unwrap(),
+            vout,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: ScriptBuf::new(),
+            amount: Amount::from_sat(amount),
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        }
+    }
+
+    #[test]
+    fn test_basic() {
+        let target = Amount::from_sat(1000);
+        let utxos = vec![
+            create_test_utxo(
+                500,
+                "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+                0,
+            ),
+            create_test_utxo(
+                1000,
+                "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+                0,
+            ),
+        ];
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let (selected, change) = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 2);
+        assert!(change.is_some());
+        assert_eq!(change.unwrap().value, Amount::from_sat(450));
+    }
+
+    #[test]
+    fn test_change_below_dust() {
+        let target = Amount::from_sat(1000);
+        let utxos = vec![create_test_utxo(
+            1050,
+            "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+            0,
+        )];
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let (selected, change) = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert!(change.is_none()); // No change expected for exact match
+    }
+
+    #[test]
+    fn test_insufficient_funds() {
+        let target = Amount::from_sat(2000);
+        let utxos = vec![
+            create_test_utxo(
+                500,
+                "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+                0,
+            ),
+            create_test_utxo(
+                1000,
+                "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+                0,
+            ),
+        ];
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let result = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        );
+
+        assert!(result.is_err());
+        match result {
+            Err(MultisigError::CoinSelectionFailed(_)) => {}
+            _ => panic!("Expected CoinSelectionFailed error"),
+        }
+    }
+
+    #[test]
+    fn test_largest_sort() {
+        let target = Amount::from_sat(1500);
+        let utxos = vec![
+            create_test_utxo(
+                500,
+                "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+                0,
+            ),
+            create_test_utxo(
+                2000,
+                "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+                0,
+            ),
+            create_test_utxo(
+                1000,
+                "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+                0,
+            ),
+        ];
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let (selected, _) = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        )
+        .unwrap();
+
+        // Algorithm should select the 2000 sat UTXO first since it's the largest
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].amount, Amount::from_sat(2000));
+    }
+
+    #[test]
+    fn test_high_fee() {
+        let target = Amount::from_sat(1000);
+        let utxos = vec![create_test_utxo(
+            1500,
+            "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+            0,
+        )];
+        // Very high fee rate
+        let fee_rate = FeeRate::from_sat_per_vb(100).expect("works");
+        let base_weight = Weight::from_wu(1000); // Large tx
+        let input_weight = Weight::from_wu(500); // Heavy input
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let result = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        );
+
+        assert!(result.is_err());
+        match result {
+            Err(MultisigError::CoinSelectionFailed(_)) => {}
+            _ => panic!("Expected CoinSelectionFailed error"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_utxos_needed() {
+        let target = Amount::from_sat(3000);
+        let utxos = vec![
+            create_test_utxo(
+                1000,
+                "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+                0,
+            ),
+            create_test_utxo(
+                1200,
+                "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+                0,
+            ),
+            create_test_utxo(
+                1500,
+                "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+                0,
+            ),
+        ];
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        let (selected, change) = select_coins(
+            target,
+            utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+        )
+        .unwrap();
+
+        // We should select at least 2 UTXOs to meet the target
+        assert!(selected.len() >= 2);
+
+        // Verify the total amount is sufficient
+        let total_selected = selected
+            .iter()
+            .fold(Amount::ZERO, |acc, utxo| acc + utxo.amount);
+        let total_fee = fee_rate
+            .fee_wu(base_weight + input_weight * selected.len() as u64)
+            .unwrap();
+        assert!(total_selected >= target + total_fee);
+
+        // Verify change if present
+        let change_out = change.unwrap();
+        assert_eq!(change_out.script_pubkey, change_address.script_pubkey());
+        assert_eq!(change_out.value, total_selected - target - total_fee);
     }
 }
