@@ -791,7 +791,7 @@ impl IpcFundSubnetMsg {
 
         // Get next nonce
 
-        let nonce = db.get_last_rootnet_msg_nonce(self.subnet_id)? + 1;
+        let nonce = db.get_next_rootnet_msg_nonce(self.subnet_id)?;
         let mut wtxn = db.write_txn()?;
         // Construct rootnet message
         let rootnet_msg = self.to_rootnet_message(nonce, block_height, block_hash, txid);

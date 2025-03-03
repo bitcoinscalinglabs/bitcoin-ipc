@@ -434,7 +434,8 @@ pub trait Database {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError>;
+    fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
@@ -575,15 +576,31 @@ impl Database for HeedDb {
         Ok(msgs)
     }
 
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
+    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError> {
         let prefix = rootnet_msgs_prefix(subnet_id);
         let txn = self.env.read_txn()?;
         let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
-        let count: u64 = msgs_iter
-            .count()
-            .try_into()
-            .map_err(|_| DbError::TypeConversionError("max roonet messages reached".to_string()))?;
-        Ok(count)
+        let count: u64 = msgs_iter.count().try_into().map_err(|_| {
+            DbError::TypeConversionError("max rootnet messages reached".to_string())
+        })?;
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(count - 1))
+    }
+
+    fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
+        let nonce = self.get_last_rootnet_msg_nonce(subnet_id)?;
+        let nonce = match nonce {
+            // If there is a nonce, increment it
+            Some(n) => n + 1,
+            // Otherwise start from 0
+            None => 0,
+        };
+
+        Ok(nonce)
     }
 
     fn get_rootnet_msg(
