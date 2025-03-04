@@ -108,6 +108,7 @@ pub fn get_unspent_for_address(
     addr: &bitcoin::Address,
 ) -> Result<Vec<ListUnspentResultEntry>, WalletError> {
     let unspent = rpc.list_unspent(None, None, Some(&[addr]), None, None)?;
+    debug!("get_unspent_for_address {addr}: {unspent:?}");
     Ok(unspent)
 }
 

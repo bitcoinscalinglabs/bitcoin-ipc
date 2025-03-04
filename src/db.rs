@@ -1,6 +1,7 @@
 use crate::{
+    bitcoin_utils,
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
-    multisig::{create_subnet_multisig_address, multisig_threshold},
+    multisig::{self, create_subnet_multisig_address, multisig_threshold},
     wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
@@ -115,6 +116,38 @@ impl SubnetCommittee {
             .require_network(NETWORK)
             .expect("Multisig should be valid for saved subnet genesis info");
         wallet::get_unspent_for_address(rpc, &address)
+    }
+
+    pub fn construct_spend_psbt(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        subnet_id: &SubnetId,
+        to: &Address,
+        amount: bitcoin::Amount,
+    ) -> Result<bitcoin::Psbt, multisig::MultisigError> {
+        let address = self
+            .multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid for saved subnet genesis info");
+
+        let unspent = wallet::get_unspent_for_address(rpc, &address).expect("temp expect");
+        let fee_rate = bitcoin_utils::get_fee_rate(&rpc, None, None);
+        let public_keys = self.validators.iter().map(|v| v.pubkey).collect::<Vec<_>>();
+
+        let psbt = multisig::construct_spend_psbt(
+            to,
+            amount,
+            &unspent,
+            &address,
+            self.validators.len() as u16,
+            self.threshold,
+            &fee_rate,
+            &subnet_id,
+            &public_keys,
+        )?;
+
+        Ok(psbt)
     }
 }
 

@@ -1117,9 +1117,13 @@ pub enum IpcLibError {
 
 #[cfg(test)]
 mod tests {
-    use crate::L1_NAME;
-
     use super::*;
+    use crate::L1_NAME;
+    use fvm_shared::address::{set_current_network, Network as FvmNetwork};
+
+    fn set_test_fvm_network() {
+        set_current_network(FvmNetwork::Testnet);
+    }
 
     #[test]
     fn test_ipc_tag_as_str() {
@@ -1141,6 +1145,7 @@ mod tests {
 
     #[test]
     fn test_ipc_create_subnet_msg_serialize() {
+        set_test_fvm_network();
         let validator1 = XOnlyPublicKey::from_str(
             "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
         )
@@ -1176,6 +1181,8 @@ mod tests {
 
     #[test]
     fn test_ipc_create_subnet_msg_deserialize() {
+        set_test_fvm_network();
+
         let validator1 = XOnlyPublicKey::from_str(
             "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
         )
@@ -1215,6 +1222,8 @@ mod tests {
 
     #[test]
     fn test_ipc_join_subnet_msg_validate() {
+        set_test_fvm_network();
+
         let pubkey = XOnlyPublicKey::from_str(
             "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
         )
@@ -1264,6 +1273,8 @@ mod tests {
 
     #[test]
     fn test_ipc_join_subnet_msg_serialize_deserialize() {
+        set_test_fvm_network();
+
         let pubkey = XOnlyPublicKey::from_str(
             "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
         )
@@ -1341,6 +1352,7 @@ mod tests {
 
     #[test]
     fn test_subnet_id_from_str() {
+        set_test_fvm_network();
         let subnet_id_str = format!(
             "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
             crate::L1_NAME
@@ -1355,6 +1367,7 @@ mod tests {
 
     #[test]
     fn test_subnet_id_display() {
+        set_test_fvm_network();
         let txid =
             Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
                 .unwrap();
@@ -1371,6 +1384,8 @@ mod tests {
 
     #[test]
     fn test_invalid_subnet_id() {
+        set_test_fvm_network();
+
         // Test invalid txid
         let result = SubnetId::from_str(&format!("{}/invalid-txid", crate::L1_NAME));
         assert!(matches!(result, Err(SubnetIdError::InvalidFvmAddress(_))));
@@ -1394,6 +1409,8 @@ mod tests {
 
     #[test]
     fn test_subnet_id_serde() {
+        set_test_fvm_network();
+
         let txid =
             Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
                 .unwrap();

@@ -149,4 +149,18 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "genmultisigspendpsbt",
+    "params": {
+			"subnet_id": "/b4/t420fxm3vljgrnt4az4nbhwo74ih3b4lce2ecfzfrytqtzfnulhjfuagct52yci",
+			"recipient": "bcrt1q3pw5xfrph88qgd4uwmwgw5xh60np6mdcdd2h5k",
+			"amount": 20000000
+    },
+    "id": 1
+}' | jq
 ```
