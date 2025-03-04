@@ -9,12 +9,12 @@ use bitcoin::{
     hashes::Hash,
     opcodes,
     secp256k1::{All, Secp256k1},
-    taproot::{TaprootBuilder, TaprootSpendInfo},
+    taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
     Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxIn, TxOut, VarInt, Weight,
     Witness, XOnlyPublicKey,
 };
 
-use crate::{bitcoin_utils::unspenable_internal_key, NETWORK};
+use crate::bitcoin_utils::unspenable_internal_key;
 
 use crate::SubnetId;
 
@@ -147,7 +147,7 @@ pub fn multisig_spend_witness_size(committee_size: u16, committee_threshold: u16
 // TODO improve coin selection algorithm
 pub fn select_coins(
     target: Amount,
-    mut utxos: Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+    utxos: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     fee_rate: FeeRate,
     base_tx_weight: Weight,
     satisfaction_weight_per_input: Weight,
@@ -161,6 +161,7 @@ pub fn select_coins(
     ),
     MultisigError,
 > {
+    let mut utxos = utxos.to_vec();
     // Sort UTXOs deterministically by amount, txid and vout
     utxos.sort_by(|a, b| {
         b.amount
@@ -222,12 +223,12 @@ pub fn select_coins(
 }
 
 pub fn construct_spend_unsigned_transaction(
-    to: &Address,
-    amount: Amount,
-    unspent: &Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
-    committee_change_address: &Address,
     committee_size: u16,
     committee_threshold: u16,
+    committee_change_address: &Address,
+    unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
+    to: &Address,
+    amount: Amount,
     fee_rate: &FeeRate,
 ) -> Result<Transaction, MultisigError> {
     trace!(
@@ -263,7 +264,7 @@ pub fn construct_spend_unsigned_transaction(
     // coin selection from utxos
     let (selected_utxos, change) = select_coins(
         amount,
-        unspent.clone(),
+        unspent,
         *fee_rate,
         base_tx_weight,
         spending_weight_per_input,
@@ -297,16 +298,17 @@ pub fn construct_spend_unsigned_transaction(
 }
 
 /// Constructs a PSBT for spending a multisig output
+#[allow(clippy::too_many_arguments)]
 pub fn construct_spend_psbt(
+    secp: &Secp256k1<All>,
+    subnet_id: &SubnetId,
+    committee_keys: &[XOnlyPublicKey],
+    committee_threshold: u16,
+    committee_change_address: &Address,
+    unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     to: &Address,
     amount: Amount,
-    unspent: &Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
-    committee_change_address: &Address,
-    committee_size: u16,
-    committee_threshold: u16,
     fee_rate: &FeeRate,
-    subnet_id: &SubnetId,
-    public_keys: &[XOnlyPublicKey],
 ) -> Result<bitcoin::Psbt, MultisigError> {
     trace!(
         "Creating multisig spend PSBT for address={}, amount={}",
@@ -314,16 +316,19 @@ pub fn construct_spend_psbt(
         &amount
     );
 
-    let secp = Secp256k1::new();
+    let committee_size: u16 = committee_keys
+        .len()
+        .try_into()
+        .map_err(|_| MultisigError::PsbtError("Committee size too large".to_string()))?;
 
     // First construct the unsigned transaction
     let unsigned_tx = construct_spend_unsigned_transaction(
-        to,
-        amount,
-        unspent,
-        committee_change_address,
         committee_size,
         committee_threshold,
+        committee_change_address,
+        unspent,
+        to,
+        amount,
         fee_rate,
     )?;
 
@@ -331,129 +336,186 @@ pub fn construct_spend_psbt(
     let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(unsigned_tx.clone())
         .map_err(|e| MultisigError::CoinSelectionFailed(format!("Failed to create PSBT: {}", e)))?;
 
-    // Create the script that will be used for spending
-    let required_sigs = committee_threshold as i64;
-    let script = create_multisig_script(public_keys, required_sigs)?;
-    let leaf_version = bitcoin::taproot::LeafVersion::TapScript;
+    let script = create_multisig_script(committee_keys, committee_threshold.into())?;
 
     // Get the spend info for the multisig
-    let spend_info =
-        create_subnet_multisig_spend_info(&secp, subnet_id, public_keys, required_sigs)?;
+    let spend_info = create_subnet_multisig_spend_info(
+        secp,
+        subnet_id,
+        committee_keys,
+        committee_threshold.into(),
+    )?;
 
     // Create the control block
     let control_block = spend_info
-        .control_block(&(script.clone(), leaf_version))
-        .ok_or_else(|| MultisigError::TaprootBuilderNotFinalizable)?;
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .ok_or(MultisigError::TaprootBuilderNotFinalizable)?;
 
-    psbt.inputs = psbt
-        .inputs
-        .into_iter()
-        .enumerate()
-        .map(|(psbt_input_index, mut psbt_input)| {
-            // Find the matching UTXO from our list
-            let utxo = unspent
-                .iter()
-                .find(|u| {
-                    u.txid == unsigned_tx.input[psbt_input_index].previous_output.txid
-                        && u.vout == unsigned_tx.input[psbt_input_index].previous_output.vout
-                })
-                .ok_or_else(|| format!("Failed to find UTXO for input {}", psbt_input_index))
-                // temp expect
-                .expect("Should find matching UTXO");
+    for (psbt_input_index, psbt_input) in psbt.inputs.iter_mut().enumerate() {
+        // Find the matching UTXO from our list
+        let utxo = unspent
+            .iter()
+            .find(|u| {
+                u.txid == unsigned_tx.input[psbt_input_index].previous_output.txid
+                    && u.vout == unsigned_tx.input[psbt_input_index].previous_output.vout
+            })
+            .ok_or_else(|| {
+                MultisigError::PsbtError(format!(
+                    "Cannot find matching utxo for {psbt_input_index}"
+                ))
+            })?;
 
-            // 1. Witnessable script (the tapscript)
-            psbt_input.witness_script = Some(script.clone());
+        psbt_input.witness_script = Some(script.clone());
 
-            // 2. Taproot-specific fields
-            psbt_input.tap_script_sigs = Default::default();
-            let mut tap_scripts = std::collections::BTreeMap::new();
-            tap_scripts.insert(control_block.clone(), (script.clone(), leaf_version));
-            psbt_input.tap_scripts = tap_scripts;
-            psbt_input.tap_merkle_root = spend_info.merkle_root();
-            psbt_input.tap_internal_key = Some(spend_info.internal_key());
+        // 2. Taproot-specific fields
+        psbt_input.tap_script_sigs = Default::default();
+        let mut tap_scripts = std::collections::BTreeMap::new();
+        tap_scripts.insert(
+            control_block.clone(),
+            (script.clone(), LeafVersion::TapScript),
+        );
+        psbt_input.tap_scripts = tap_scripts;
+        psbt_input.tap_merkle_root = spend_info.merkle_root();
+        psbt_input.tap_internal_key = Some(spend_info.internal_key());
 
-            // 3. Previous UTXO information
-            psbt_input.witness_utxo = Some(TxOut {
-                value: utxo.amount,
-                script_pubkey: utxo.script_pub_key.clone(),
-            });
-
-            psbt_input
-        })
-        .collect();
+        // 3. Previous UTXO information
+        psbt_input.witness_utxo = Some(TxOut {
+            value: utxo.amount,
+            script_pubkey: utxo.script_pub_key.clone(),
+        });
+    }
 
     Ok(psbt)
 }
 
-pub fn sign_psbt(
+pub fn sign_spend_psbt(
     secp: &Secp256k1<All>,
     mut psbt: bitcoin::Psbt,
     keypair: bitcoin::key::Keypair,
 ) -> Result<(bitcoin::Psbt, Vec<bitcoin::taproot::Signature>), MultisigError> {
-    // Create a key provider from our keypair
-    struct SingleKeyProvider {
-        keypair: bitcoin::key::Keypair,
+    let (xonly_pubkey, _parity) = keypair.x_only_public_key();
+    let mut signatures = Vec::new();
+
+    let all_witness_utxos: Vec<TxOut> = psbt
+        .iter_funding_utxos()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MultisigError::SigningError(format!("Failed to collect UTXOs: {}", e)))?
+        .into_iter()
+        .cloned()
+        .collect();
+
+    // Create a sighash cache once for the transaction
+    let mut sighash_cache = bitcoin::sighash::SighashCache::new(&psbt.unsigned_tx);
+    let sighash_type = bitcoin::sighash::TapSighashType::Default;
+
+    // For each input in the PSBT
+    for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+        // dbg!(input_index, &input);
+
+        // We need the script from tap_scripts
+        let (_control_block, (script, _leaf_version)) = match input.tap_scripts.iter().next() {
+            Some(entry) => entry,
+            None => continue,
+        };
+
+        let leaf_hash = script.tapscript_leaf_hash();
+        let prevouts = bitcoin::sighash::Prevouts::All(&all_witness_utxos);
+
+        // Calculate the sighash
+        let sighash = sighash_cache
+            .taproot_script_spend_signature_hash(input_index, &prevouts, leaf_hash, sighash_type)
+            .map_err(|e| {
+                MultisigError::SigningError(format!(
+                    "Failed to create sighash for input {}: {}",
+                    input_index, e
+                ))
+            })?;
+
+        // Create message from sighash
+        let msg =
+            bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref()).map_err(|e| {
+                MultisigError::SigningError(format!("Failed to create message from sighash: {}", e))
+            })?;
+
+        // Sign the message
+        let signature = secp.sign_schnorr(&msg, &keypair);
+        let signature = bitcoin::taproot::Signature {
+            signature,
+            sighash_type,
+        };
+
+        // Add the signature to the PSBT
+        input
+            .tap_script_sigs
+            .insert((xonly_pubkey, leaf_hash), signature);
+
+        // Add to our returned signatures
+        signatures.push(signature);
     }
 
-    impl bitcoin::psbt::GetKey for SingleKeyProvider {
-        type Error = ();
-
-        fn get_key<C: bitcoin::secp256k1::Signing>(
-            &self,
-            _key_request: bitcoin::psbt::KeyRequest,
-            _secp: &Secp256k1<C>,
-        ) -> Result<Option<bitcoin::key::PrivateKey>, Self::Error> {
-            dbg!(&_key_request);
-
-            let private_key = bitcoin::key::PrivateKey {
-                compressed: true,
-                network: NETWORK.into(),
-                inner: self.keypair.secret_key(),
-            };
-            dbg!(&private_key);
-            Ok(Some(private_key))
-        }
+    if signatures.is_empty() {
+        return Err(MultisigError::SigningError(
+            "No inputs were signed".to_string(),
+        ));
     }
 
-    let key_provider = SingleKeyProvider { keypair };
+    Ok((psbt, signatures))
+}
 
-    // Sign the PSBT using the built-in sign method
-    let signing_result = psbt.sign(&key_provider, secp);
+pub fn finalize_spend_psbt(
+    secp: &Secp256k1<All>,
+    subnet_id: &SubnetId,
+    committee_keys: &[XOnlyPublicKey],
+    committee_threshold: u16,
+    psbt: &bitcoin::Psbt,
+) -> Result<Transaction, MultisigError> {
+    let script = create_multisig_script(committee_keys, committee_threshold.into())?;
+    let leaf_hash = script.tapscript_leaf_hash();
 
-    dbg!(&signing_result);
+    // Get the spend info for the multisig
+    let spend_info = create_subnet_multisig_spend_info(
+        secp,
+        subnet_id,
+        committee_keys,
+        committee_threshold.into(),
+    )?;
 
-    // Process the signing result
-    match signing_result {
-        Ok(_) => {
-            // Collect all the signatures that were added
-            let mut signatures = Vec::new();
-            let (x_only_pubkey, _) = keypair.x_only_public_key();
+    // Create the control block
+    let control_block = spend_info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .ok_or(MultisigError::TaprootBuilderNotFinalizable)?;
 
-            for i in 0..psbt.inputs.len() {
-                // Find signatures for our x-only pubkey for each input
-                for (key_pair, sig) in &psbt.inputs[i].tap_script_sigs {
-                    if key_pair.0 == x_only_pubkey {
-                        // Found a signature by our keypair for this input
-                        signatures.push(sig.clone());
-                        break; // We expect only one signature per input with our keypair
-                    }
-                }
+    let mut finalized_psbt = psbt.clone();
+
+    // Finalize each input in the PSBT
+    for input in finalized_psbt.inputs.iter_mut() {
+        let mut witness = Witness::new();
+
+        for pubkey in committee_keys.iter().rev() {
+            if let Some(sig) = input.tap_script_sigs.get(&(*pubkey, leaf_hash)) {
+                witness.push(sig.signature.serialize());
+            } else {
+                witness.push([]);
             }
-
-            // Return the signed PSBT and the added signatures
-            Ok((psbt, signatures))
         }
-        Err((_, errors)) => {
-            // Log errors
-            for (input_idx, error) in errors.iter() {
-                error!("Error signing input {}: {:?}", input_idx, error);
-            }
 
-            Err(MultisigError::SigningError(
-                "Failed to sign PSBT inputs".to_string(),
-            ))
-        }
+        // Add script and control block
+        witness.push(script.to_bytes());
+        witness.push(control_block.serialize());
+
+        // Set the finalized witness
+        input.final_script_witness = Some(witness);
+        // Clear other fields now that we've finalized
+        input.tap_script_sigs.clear();
+        input.tap_scripts.clear();
     }
+
+    // Extract the transaction
+    let finalized_tx = finalized_psbt
+        .extract_tx()
+        .map_err(|e| MultisigError::PsbtError(format!("Failed to extract transaction: {}", e)))?;
+
+    Ok(finalized_tx)
 }
 
 #[derive(Error, Debug)]
@@ -466,6 +528,12 @@ pub enum MultisigError {
 
     #[error("signing error: {0}")]
     SigningError(String),
+
+    #[error("psbt error: {0}")]
+    PsbtError(String),
+
+    #[error("taproot error: {0}")]
+    SighashTaprootError(#[from] bitcoin::sighash::TaprootError),
 
     #[error("taproot builder is not finalizable")]
     TaprootBuilderNotFinalizable,
@@ -1028,7 +1096,7 @@ mod coin_selection_tests {
 
         let (selected, change) = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1058,7 +1126,7 @@ mod coin_selection_tests {
 
         let (selected, change) = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1094,7 +1162,7 @@ mod coin_selection_tests {
 
         let result = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1137,7 +1205,7 @@ mod coin_selection_tests {
 
         let (selected, _) = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1168,7 +1236,7 @@ mod coin_selection_tests {
 
         let result = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1211,7 +1279,7 @@ mod coin_selection_tests {
 
         let (selected, change) = select_coins(
             target,
-            utxos,
+            &utxos,
             fee_rate,
             base_weight,
             input_weight,
@@ -1239,12 +1307,14 @@ mod coin_selection_tests {
 }
 
 #[cfg(test)]
-mod sign_psbt_tests {
+mod psbt_tests {
     use super::tests::{generate_keypairs, generate_subnet_id};
     use super::*;
+    use crate::multisig::tests::verify_transaction;
+    use crate::NETWORK;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-    use bitcoin::{Amount, Network, TxOut};
+    use bitcoin::{transaction, Amount, OutPoint, Sequence, TxOut, Txid};
     use std::str::FromStr;
 
     #[test]
@@ -1271,7 +1341,7 @@ mod sign_psbt_tests {
             &subnet_id,
             &committee_pubkeys,
             required_sigs,
-            Network::Regtest,
+            NETWORK,
         )
         .unwrap();
 
@@ -1305,21 +1375,21 @@ mod sign_psbt_tests {
         // Construct a PSBT for spending
         let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
         let psbt = construct_spend_psbt(
-            &destination,
-            spend_amount,
-            &vec![utxo],
-            &multisig_address, // Use the same address for change
-            3,                 // committee size
-            2,                 // required signatures
-            &fee_rate,
+            &secp,
             &subnet_id,
             &committee_pubkeys,
+            2,                 // required signatures
+            &multisig_address, // Use the same address for change
+            &vec![utxo],
+            &destination,
+            spend_amount,
+            &fee_rate,
         )
         .unwrap();
 
         // Sign the PSBT with the first keypair
         let (signed_psbt, signatures) =
-            sign_psbt(&secp, psbt, committee_keypairs[0].clone()).unwrap();
+            sign_spend_psbt(&secp, psbt, committee_keypairs[0]).unwrap();
 
         // Verify we got exactly one signature (one for each input)
         assert_eq!(signatures.len(), 1);
@@ -1367,5 +1437,164 @@ mod sign_psbt_tests {
                 .is_ok(),
             "Schnorr signature verification failed"
         );
+    }
+
+    #[test]
+    fn test_signing_and_spending() {
+        let secp = Secp256k1::new();
+
+        // Generate 3 keypairs for the committee
+        let keypairs = generate_keypairs(3);
+
+        for keypair in keypairs.iter() {
+            let (x_only, parity) = keypair.x_only_public_key();
+            println!(
+                "PK = {}\nP = {:?}\nXPK = {}\nSK = {}\nADDR = {}\n\n",
+                keypair.public_key(),
+                parity,
+                x_only,
+                keypair.secret_key().display_secret(),
+                alloy_primitives::Address::from_raw_public_key(
+                    &keypair.public_key().serialize_uncompressed()[1..]
+                ),
+            );
+        }
+
+        let committee_pubkeys: Vec<XOnlyPublicKey> =
+            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+
+        // Generate a subnet ID
+        let subnet_id = generate_subnet_id();
+
+        // Create a 2-of-3 multisig setup
+        let required_sigs = 2_u16;
+        let script = create_multisig_script(&committee_pubkeys, required_sigs.into()).unwrap();
+
+        // Create multisig address
+        let multisig_address = create_subnet_multisig_address(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            required_sigs.into(),
+            NETWORK,
+        )
+        .unwrap();
+
+        println!("Multisig address: {}", multisig_address);
+
+        // Create a funding UTXO that sends to our multisig address
+        let funding_amount = Amount::from_sat(100_000);
+
+        // Create the actual funding transaction (for verification later)
+        let funding_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_amount,
+                script_pubkey: multisig_address.script_pubkey(),
+            }],
+        };
+
+        let utxo = bitcoincore_rpc::json::ListUnspentResultEntry {
+            txid: funding_tx.compute_txid(),
+            vout: 0,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: multisig_address.script_pubkey(),
+            amount: funding_amount,
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        };
+
+        // Destination for the spending transaction
+        let destination = Address::from_str("bcrt1qrj2fz0jj45y5gx9nawgmpyzegnn828vzvletjm")
+            .unwrap()
+            .assume_checked();
+        let spend_amount = Amount::from_sat(90_000);
+
+        // Create a PSBT to spend from the multisig
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+        let unsigned_psbt = construct_spend_psbt(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            2,                 // required signatures
+            &multisig_address, // Use the same address for change
+            &vec![utxo.clone()],
+            &destination,
+            spend_amount,
+            &fee_rate,
+        )
+        .unwrap();
+
+        // dbg!(&unsigned_psbt);
+
+        // Sign with first keypair
+        let (psbt_signed_once, sigs1) = sign_spend_psbt(&secp, unsigned_psbt, keypairs[0])
+            .expect("First signature should work");
+
+        println!("Signed with first keypair");
+        assert_eq!(sigs1.len(), 1);
+
+        // Sign with second keypair
+        let (psbt_signed_twice, sigs2) = sign_spend_psbt(&secp, psbt_signed_once, keypairs[1])
+            .expect("Second signature should work");
+
+        println!("Signed with second keypair");
+        assert_eq!(sigs2.len(), 1);
+
+        // Verify the signatures are for the correct pubkeys
+        let (xonly_pubkey1, _) = keypairs[0].x_only_public_key();
+        let (xonly_pubkey2, _) = keypairs[1].x_only_public_key();
+
+        // Check that signatures for both pubkeys exist in the PSBT
+        let leaf_hash = script.tapscript_leaf_hash();
+
+        assert!(psbt_signed_twice.inputs[0]
+            .tap_script_sigs
+            .contains_key(&(xonly_pubkey1, leaf_hash)));
+        assert!(psbt_signed_twice.inputs[0]
+            .tap_script_sigs
+            .contains_key(&(xonly_pubkey2, leaf_hash)));
+
+        //
+        // Finalize the PSBT
+        //
+
+        let finalized_tx = finalize_spend_psbt(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            required_sigs.try_into().unwrap(),
+            &psbt_signed_twice,
+        )
+        .expect("Failed to finalize PSBT");
+
+        dbg!(&finalized_tx);
+
+        // Verify the finalized transaction can spend the UTXO
+        let verify_result =
+            verify_transaction(&finalized_tx, |_| Some(funding_tx.output[0].clone()));
+
+        assert!(
+            verify_result.is_ok(),
+            "Transaction should be valid with 2 of 3 signatures: {:?}",
+            verify_result
+        );
+        println!("Transaction successfully verified with 2-of-3 signatures!");
     }
 }

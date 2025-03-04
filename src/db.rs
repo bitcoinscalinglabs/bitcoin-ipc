@@ -125,26 +125,30 @@ impl SubnetCommittee {
         to: &Address,
         amount: bitcoin::Amount,
     ) -> Result<bitcoin::Psbt, multisig::MultisigError> {
-        let address = self
+        let committee_address = self
             .multisig_address
             .clone()
             .require_network(NETWORK)
             .expect("Multisig should be valid for saved subnet genesis info");
 
-        let unspent = wallet::get_unspent_for_address(rpc, &address).expect("temp expect");
-        let fee_rate = bitcoin_utils::get_fee_rate(&rpc, None, None);
-        let public_keys = self.validators.iter().map(|v| v.pubkey).collect::<Vec<_>>();
+        let unspent =
+            wallet::get_unspent_for_address(rpc, &committee_address).expect("temp expect");
+        let fee_rate = bitcoin_utils::get_fee_rate(rpc, None, None);
+        let committee_keys = self.validators.iter().map(|v| v.pubkey).collect::<Vec<_>>();
+        let commitee_threshold = self.threshold;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
 
         let psbt = multisig::construct_spend_psbt(
+            &secp,
+            subnet_id,
+            &committee_keys,
+            commitee_threshold,
+            &committee_address,
+            &unspent,
             to,
             amount,
-            &unspent,
-            &address,
-            self.validators.len() as u16,
-            self.threshold,
             &fee_rate,
-            &subnet_id,
-            &public_keys,
         )?;
 
         Ok(psbt)
