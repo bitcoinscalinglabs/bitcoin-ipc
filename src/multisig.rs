@@ -518,6 +518,43 @@ pub fn finalize_spend_psbt(
     Ok(finalized_tx)
 }
 
+pub fn finalize_spend_psbt_from_sigs(
+    secp: &Secp256k1<All>,
+    subnet_id: &SubnetId,
+    committee_keys: &[XOnlyPublicKey],
+    committee_threshold: u16,
+    psbt: &bitcoin::Psbt,
+    signature_sets: &[&[bitcoin::taproot::Signature]],
+) -> Result<Transaction, MultisigError> {
+    let mut signed_psbt = psbt.clone();
+
+    let script = create_multisig_script(&committee_keys, committee_threshold.into()).unwrap();
+    let leaf_hash = script.tapscript_leaf_hash();
+
+    for (xonly_pubkey, signatures) in committee_keys.iter().zip(signature_sets.iter()) {
+        // For each input this signer has signed
+        for (input_idx, signature) in signatures.iter().enumerate() {
+            // Make sure we don't go out of bounds
+            if input_idx < signed_psbt.inputs.len() {
+                // Add the signature to the PSBT
+                signed_psbt.inputs[input_idx]
+                    .tap_script_sigs
+                    .insert((*xonly_pubkey, leaf_hash), *signature);
+            }
+        }
+    }
+
+    let finalized_psbt = finalize_spend_psbt(
+        &secp,
+        &subnet_id,
+        &committee_keys,
+        committee_threshold,
+        &signed_psbt,
+    )?;
+
+    Ok(finalized_psbt)
+}
+
 #[derive(Error, Debug)]
 pub enum MultisigError {
     #[error("insufficient public keys provided")]
@@ -570,21 +607,30 @@ mod tests {
         S: FnMut(&OutPoint) -> Option<TxOut>,
     {
         let serialized_tx = encode::serialize(tx);
-        for (idx, input) in tx.input.iter().enumerate() {
+
+        // First, collect all UTXOs being spent in this transaction
+        let mut all_spent_utxos = Vec::with_capacity(tx.input.len());
+        for input in &tx.input {
             if let Some(output) = spent(&input.previous_output) {
-                // duplicating the same output because bitcoinconsensus is weird
-                // this is needed for taproot verification
-                let spent_utxo = bitcoinconsensus::Utxo {
+                all_spent_utxos.push(bitcoinconsensus::Utxo {
                     script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
                     script_pubkey_len: output.script_pubkey.len() as u32,
                     value: output.value.to_sat() as i64,
-                };
+                });
+            } else {
+                println!("Unknown spent output: {:?}", input.previous_output);
+                panic!("Unknown spent output");
+            }
+        }
 
+        for (idx, input) in tx.input.iter().enumerate() {
+            // Get the current input's UTXO for the first argument
+            if let Some(output) = spent(&input.previous_output) {
                 bitcoinconsensus::verify_with_flags(
                     output.script_pubkey.as_bytes(),
                     output.value.to_sat(),
                     serialized_tx.as_slice(),
-                    Some(&[spent_utxo]),
+                    Some(&all_spent_utxos),
                     idx,
                     bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
                 )?;
@@ -1596,5 +1642,186 @@ mod psbt_tests {
             verify_result
         );
         println!("Transaction successfully verified with 2-of-3 signatures!");
+    }
+
+    #[test]
+    fn test_parallel_signing_and_spending() {
+        let secp = Secp256k1::new();
+
+        // Generate 3 keypairs for the committee
+        let keypairs = generate_keypairs(3);
+        let committee_pubkeys: Vec<XOnlyPublicKey> =
+            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+
+        // Generate a subnet ID
+        let subnet_id = generate_subnet_id();
+
+        // Create a 2-of-3 multisig setup
+        let required_sigs = 2_u16;
+
+        // Create multisig address
+        let multisig_address = create_subnet_multisig_address(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            required_sigs.into(),
+            NETWORK,
+        )
+        .unwrap();
+
+        println!("Multisig address: {}", multisig_address);
+
+        // Create two funding UTXOs that send to our multisig address
+        let funding_amount1 = Amount::from_sat(70_000);
+        let funding_amount2 = Amount::from_sat(60_000);
+
+        // Create the first funding transaction (for verification later)
+        let funding_tx1 = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_amount1,
+                script_pubkey: multisig_address.script_pubkey(),
+            }],
+        };
+
+        // Create the second funding transaction
+        let funding_tx2 = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_str(
+                        "1111111111111111111111111111111111111111111111111111111111111111",
+                    )
+                    .unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_amount2,
+                script_pubkey: multisig_address.script_pubkey(),
+            }],
+        };
+
+        let utxos = vec![
+            bitcoincore_rpc::json::ListUnspentResultEntry {
+                txid: funding_tx1.compute_txid(),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: multisig_address.script_pubkey(),
+                amount: funding_amount1,
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            },
+            bitcoincore_rpc::json::ListUnspentResultEntry {
+                txid: funding_tx2.compute_txid(),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: multisig_address.script_pubkey(),
+                amount: funding_amount2,
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            },
+        ];
+
+        // Destination for the spending transaction
+        let destination = Address::from_str("bcrt1qrj2fz0jj45y5gx9nawgmpyzegnn828vzvletjm")
+            .unwrap()
+            .assume_checked();
+        let spend_amount = Amount::from_sat(90_000);
+
+        // Create a PSBT to spend from the multisig
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+        let unsigned_psbt = construct_spend_psbt(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            2,                 // required signatures
+            &multisig_address, // Use the same address for change
+            &utxos,
+            &destination,
+            spend_amount,
+            &fee_rate,
+        )
+        .unwrap();
+
+        // Verify the PSBT has two inputs (one for each UTXO)
+        assert_eq!(unsigned_psbt.inputs.len(), 2, "PSBT should have two inputs");
+
+        // Clone the unsigned PSBT for each signer
+        let unsigned_psbt_for_signer1 = unsigned_psbt.clone();
+        let unsigned_psbt_for_signer2 = unsigned_psbt.clone();
+
+        // Each signer signs their own copy of the PSBT independently
+        let (_, sigs1) = sign_spend_psbt(&secp, unsigned_psbt_for_signer1, keypairs[0])
+            .expect("First signature should work");
+
+        let (_, sigs2) = sign_spend_psbt(&secp, unsigned_psbt_for_signer2, keypairs[1])
+            .expect("Second signature should work");
+
+        println!("Signed independently with two keypairs");
+
+        // Verify we have signatures for both inputs
+        assert_eq!(sigs1.len(), 2, "First signer should sign both inputs");
+        assert_eq!(sigs2.len(), 2, "Second signer should sign both inputs");
+
+        // Create a fresh PSBT and manually add all signatures
+        let finalized_tx = finalize_spend_psbt_from_sigs(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            required_sigs,
+            &unsigned_psbt,
+            &[&sigs1, &sigs2],
+        )
+        .expect("should finalize");
+
+        // Verify the finalized transaction can spend the UTXO
+        let verify_result = verify_transaction(&finalized_tx, |outpoint| {
+            dbg!(&outpoint);
+            dbg!(funding_tx1.compute_txid());
+            dbg!(funding_tx2.compute_txid());
+
+            if outpoint.txid == funding_tx1.compute_txid() && outpoint.vout == 0 {
+                Some(funding_tx1.output[0].clone())
+            } else if outpoint.txid == funding_tx2.compute_txid() && outpoint.vout == 0 {
+                Some(funding_tx2.output[0].clone())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            verify_result.is_ok(),
+            "Transaction should be valid with signatures collected in parallel: {:?}",
+            verify_result
+        );
+
+        println!("Transaction successfully verified with signatures collected in parallel!");
     }
 }
