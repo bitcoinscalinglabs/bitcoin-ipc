@@ -392,7 +392,7 @@ pub fn sign_spend_psbt(
     secp: &Secp256k1<All>,
     mut psbt: bitcoin::Psbt,
     keypair: bitcoin::key::Keypair,
-) -> Result<(bitcoin::Psbt, Vec<bitcoin::taproot::Signature>), MultisigError> {
+) -> Result<(bitcoin::Psbt, Vec<bitcoin::secp256k1::schnorr::Signature>), MultisigError> {
     let (xonly_pubkey, _parity) = keypair.x_only_public_key();
     let mut signatures = Vec::new();
 
@@ -439,7 +439,10 @@ pub fn sign_spend_psbt(
 
         // Sign the message
         let signature = secp.sign_schnorr(&msg, &keypair);
-        let signature = bitcoin::taproot::Signature {
+        // Add to our returned signatures
+        signatures.push(signature);
+
+        let taproot_sig = bitcoin::taproot::Signature {
             signature,
             sighash_type,
         };
@@ -447,10 +450,7 @@ pub fn sign_spend_psbt(
         // Add the signature to the PSBT
         input
             .tap_script_sigs
-            .insert((xonly_pubkey, leaf_hash), signature);
-
-        // Add to our returned signatures
-        signatures.push(signature);
+            .insert((xonly_pubkey, leaf_hash), taproot_sig);
     }
 
     if signatures.is_empty() {
@@ -524,11 +524,11 @@ pub fn finalize_spend_psbt_from_sigs(
     committee_keys: &[XOnlyPublicKey],
     committee_threshold: u16,
     psbt: &bitcoin::Psbt,
-    signature_sets: &[&[bitcoin::taproot::Signature]],
+    signature_sets: &[&[bitcoin::secp256k1::schnorr::Signature]],
 ) -> Result<Transaction, MultisigError> {
     let mut signed_psbt = psbt.clone();
 
-    let script = create_multisig_script(&committee_keys, committee_threshold.into()).unwrap();
+    let script = create_multisig_script(committee_keys, committee_threshold.into()).unwrap();
     let leaf_hash = script.tapscript_leaf_hash();
 
     for (xonly_pubkey, signatures) in committee_keys.iter().zip(signature_sets.iter()) {
@@ -536,18 +536,23 @@ pub fn finalize_spend_psbt_from_sigs(
         for (input_idx, signature) in signatures.iter().enumerate() {
             // Make sure we don't go out of bounds
             if input_idx < signed_psbt.inputs.len() {
+                let taproot_sig = bitcoin::taproot::Signature {
+                    signature: *signature,
+                    sighash_type: bitcoin::sighash::TapSighashType::Default,
+                };
+
                 // Add the signature to the PSBT
                 signed_psbt.inputs[input_idx]
                     .tap_script_sigs
-                    .insert((*xonly_pubkey, leaf_hash), *signature);
+                    .insert((*xonly_pubkey, leaf_hash), taproot_sig);
             }
         }
     }
 
     let finalized_psbt = finalize_spend_psbt(
-        &secp,
-        &subnet_id,
-        &committee_keys,
+        secp,
+        subnet_id,
+        committee_keys,
         committee_threshold,
         &signed_psbt,
     )?;
@@ -1449,7 +1454,7 @@ mod psbt_tests {
             .map(|(_, sig)| sig);
 
         assert!(found_sig.is_some());
-        assert_eq!(found_sig.unwrap(), &signatures[0]);
+        assert_eq!(found_sig.unwrap().signature, signatures[0]);
 
         // Verify the signature is valid by checking it against the sighash
         let mut sighash_cache = SighashCache::new(&signed_psbt.unsigned_tx);
@@ -1472,14 +1477,8 @@ mod psbt_tests {
 
         let msg = Message::from_digest_slice(sighash.as_ref()).unwrap();
 
-        // Verify the signature against the message and public key
-        let schnorr_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
-            &signatures[0].to_vec()[..64], // Take only the signature part, not the sighash byte
-        )
-        .unwrap();
-
         assert!(
-            secp.verify_schnorr(&schnorr_sig, &msg, &xonly_pubkey)
+            secp.verify_schnorr(&signatures[0], &msg, &xonly_pubkey)
                 .is_ok(),
             "Schnorr signature verification failed"
         );
