@@ -685,3 +685,192 @@ pub enum DbError {
     #[error("Type conversion error: {0}")]
     TypeConversionError(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{hashes::Hash, Amount, BlockHash, Txid};
+    use tempfile::tempdir;
+
+    fn create_test_db() -> HeedDb {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().to_str().unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(HeedDb::new(db_path, false))
+            .unwrap()
+    }
+
+    fn create_rand_subnet_id() -> SubnetId {
+        SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
+    }
+    fn create_rand_txid() -> Txid {
+        Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+    }
+    fn create_rand_blockhash() -> BlockHash {
+        BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+    }
+    fn create_rand_addr() -> alloy_primitives::Address {
+        alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
+    }
+
+    fn create_test_rootnet_message(
+        subnet_id: SubnetId,
+        nonce: u64,
+        block_height: u64,
+    ) -> RootnetMessage {
+        let dummy_txid = create_rand_txid();
+        let dummy_block_hash = create_rand_blockhash();
+
+        let msg = IpcFundSubnetMsg {
+            subnet_id,
+            amount: Amount::from_sat(1_000_000),
+            address: create_rand_addr(),
+        };
+
+        RootnetMessage::FundSubnet {
+            msg,
+            block_height,
+            block_hash: dummy_block_hash,
+            nonce,
+            txid: dummy_txid,
+        }
+    }
+
+    #[test]
+    fn test_rootnet_message_nonce() {
+        let db = create_test_db();
+        let subnet_id = create_rand_subnet_id();
+        let block_height = 100;
+
+        // Verify no messages exist initially
+        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), None);
+        // Check next nonce is 0
+        assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 0);
+
+        // Add a message with nonce 0
+        let mut txn = db.write_txn().unwrap();
+        let msg1 = create_test_rootnet_message(subnet_id, 0, block_height);
+        db.add_rootnet_msg(&mut txn, subnet_id, msg1.clone())
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Check last nonce is now 0
+        let result = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        assert_eq!(result, Some(0));
+
+        // Check next nonce is 1
+        let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();
+        assert_eq!(next_nonce, 1);
+
+        // Add a message with nonce 1
+        let mut txn = db.write_txn().unwrap();
+        let msg2 = create_test_rootnet_message(subnet_id, 1, block_height);
+        db.add_rootnet_msg(&mut txn, subnet_id, msg2.clone())
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Add a message with nonce 2 at block height 101
+        let mut txn = db.write_txn().unwrap();
+        let msg2 = create_test_rootnet_message(subnet_id, 2, block_height + 1);
+        db.add_rootnet_msg(&mut txn, subnet_id, msg2.clone())
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Check last nonce is now 2
+        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), Some(2));
+
+        // Check next nonce is 3
+        assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 3);
+
+        // Verify we can retrieve messages by nonce
+        let retrieved_msg0 = db.get_rootnet_msg(subnet_id, 0).unwrap().unwrap();
+        match &retrieved_msg0 {
+            RootnetMessage::FundSubnet {
+                nonce,
+                block_height,
+                ..
+            } => {
+                assert_eq!(*nonce, 0);
+                assert_eq!(*block_height, *block_height);
+            }
+        }
+
+        // Check get_all_rootnet_msgs returns both messages
+        assert_eq!(db.get_all_rootnet_msgs(subnet_id).unwrap().len(), 3);
+
+        // Check get_rootnet_msgs_by_height returns only messages at specified height
+        assert_eq!(
+            db.get_rootnet_msgs_by_height(subnet_id, block_height)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db.get_rootnet_msgs_by_height(subnet_id, block_height + 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_rootnet_message_nonce_many_messages() {
+        let db = create_test_db();
+        let subnet_id = create_rand_subnet_id();
+        // Total number of messages
+        let total_message_count = 100;
+
+        // Number of messages per block
+        let messages_per_block = 10;
+
+        // Calculate number of blocks needed
+        let num_blocks = total_message_count / messages_per_block;
+
+        // Add all messages
+        let mut nonce = 0;
+
+        for block in 0..num_blocks {
+            let block_height = 1000 + block as u64;
+            let mut txn = db.write_txn().unwrap();
+
+            // Add messages_per_block messages to this block
+            for _ in 0..messages_per_block {
+                let msg = create_test_rootnet_message(subnet_id, nonce, block_height);
+                db.add_rootnet_msg(&mut txn, subnet_id, msg).unwrap();
+                nonce += 1;
+            }
+
+            txn.commit().unwrap();
+
+            // check next nonce
+            assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), nonce);
+        }
+
+        // Check the last nonce is total_message_count - 1
+        let last_nonce = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        assert_eq!(last_nonce, Some((total_message_count - 1) as u64));
+
+        // Check the next nonce is total_message_count
+        let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();
+        assert_eq!(next_nonce, total_message_count as u64);
+        // Check total message count
+        let all_msgs = db.get_all_rootnet_msgs(subnet_id).unwrap();
+        assert_eq!(all_msgs.len(), total_message_count);
+
+        // Check messages per block for a specific block
+        let specific_block = 1005; // should be the 6th block
+        let block_msgs = db
+            .get_rootnet_msgs_by_height(subnet_id, specific_block)
+            .unwrap();
+        assert_eq!(block_msgs.len(), messages_per_block);
+
+        // Verify nonces for messages in the specific block
+        let expected_first_nonce = messages_per_block * 5; // for block 1005 (0-indexed from 1000)
+        let nonces: Vec<u64> = block_msgs.iter().map(|msg| msg.nonce()).collect();
+
+        for (i, &nonce) in nonces.iter().enumerate() {
+            assert_eq!(nonce, expected_first_nonce as u64 + i as u64);
+        }
+    }
+}

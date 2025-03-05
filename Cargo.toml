@@ -32,3 +32,4 @@ base64 = "0.22.1"
 
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"
+tempfile = "3.17.1"
