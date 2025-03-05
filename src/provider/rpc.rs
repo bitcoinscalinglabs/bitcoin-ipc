@@ -67,6 +67,7 @@ pub struct ServerData {
     pub db: Arc<HeedDb>,
     pub btc_rpc: Arc<Client>,
     pub btc_watchonly_rpc: Arc<Client>,
+    pub validator_sk: bitcoin::secp256k1::SecretKey,
 }
 
 //

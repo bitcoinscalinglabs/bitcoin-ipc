@@ -379,7 +379,10 @@ impl HeedDb {
         }
 
         let flags = if read_only {
-            debug!("Opening database in read-only mode");
+            debug!(
+                "Opening database '{}' in read-only mode",
+                database_path.display()
+            );
             heed::EnvFlags::READ_ONLY
         } else {
             heed::EnvFlags::empty()
