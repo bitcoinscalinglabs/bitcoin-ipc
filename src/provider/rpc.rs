@@ -474,6 +474,5 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getrootnetmessages", get_rootnet_messages)
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
-        .with_method("signmultisigspendpsbt", gen_multisig_spend_psbt)
         .finish()
 }
