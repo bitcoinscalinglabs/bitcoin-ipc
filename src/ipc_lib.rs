@@ -4,6 +4,7 @@ use bitcoin::Amount;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
+use ipc_api::checkpoint::BottomUpCheckpoint;
 use ipc_serde::IpcSerialize;
 use log::trace;
 use log::{debug, info};
@@ -943,6 +944,78 @@ impl IpcFundSubnetMsg {
             }
             Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
+#[tag(IPC_CHECKPOINT_TAG)]
+pub struct IpcSubmitCheckpointMsg {
+    /// The checkpoint to submit
+    pub checkpoint: BottomUpCheckpoint,
+}
+
+impl IpcSubmitCheckpointMsg {
+    /// Submits the submit checkpoint message to the Bitcoin network
+    /// Using commit-reveal scheme
+    /// And sends the collateral to the subnet multisig address
+    ///
+    /// Returns the join txid — the txid of the reveal transaction
+    /// TODO: DRY
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Txid, IpcLibError> {
+        let subnet_data = self.ipc_serialize();
+
+        info!(
+            "Submitting join subnet msg to bitcoin. Multisig address = {}. Data={}",
+            multisig_address, subnet_data
+        );
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
+            rpc,
+            &secp,
+            multisig_address,
+            subnet_data.as_bytes(),
+            None,
+        )?;
+
+        // TODO: Add messages on commit tx
+        let commit_txid = commit_tx.compute_txid();
+        let reveal_txid = reveal_tx.compute_txid();
+        debug!(
+            "Join subnet commit_txid={} reveal_txid={}",
+            commit_txid, reveal_txid
+        );
+
+        match submit_to_mempool(rpc, vec![commit_tx.clone(), reveal_tx.clone()]) {
+            Ok(_) => {
+                info!(
+                    "Submitted checkpoint for subnet_id={} commit_txid={} reveal_txid={}",
+                    self.checkpoint.subnet_id, commit_txid, reveal_txid,
+                );
+                Ok(reveal_txid)
+            }
+            Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+        }
+    }
+
+    /// Modifies the database to account for the checkpoint message
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        txid: Txid,
+    ) -> Result<(), IpcLibError> {
+        // TODO: validation?
+
+        // let mut wtxn = db.write_txn()?;
+        // db.save_checkpoint(&mut wtxn, self.subnet_id, self.checkpoint_txid)?;
+        // wtxn.commit()?;
+
+        Ok(())
     }
 }
 

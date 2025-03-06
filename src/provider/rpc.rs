@@ -1,6 +1,9 @@
 use crate::{
     db::{self, Database, HeedDb},
-    ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
+    ipc_lib::{
+        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcSubmitCheckpointMsg,
+        IpcValidate, SubnetId,
+    },
     IpcCreateSubnetMsg, BTC_CONFIRMATIONS,
 };
 use bitcoincore_rpc::{Client, RpcApi};
@@ -199,6 +202,18 @@ pub async fn join_subnet(
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct SubmitCheckpointResponse {
+    success: bool,
+}
+
+pub async fn submit_checkpoint(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcSubmitCheckpointMsg>,
+) -> Result<SubmitCheckpointResponse, JsonRpcError> {
+    Ok(SubmitCheckpointResponse { success: true })
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct GetGenesisInfoParams {
     subnet_id: SubnetId,
 }
@@ -362,6 +377,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // subnet
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
+        .with_method("submitcheckpoint", submit_checkpoint)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
