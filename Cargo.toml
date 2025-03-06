@@ -28,6 +28,7 @@ num-traits = "0.2.19"
 num-bigint = "0.4.6"
 alloy-primitives = { version = "0.8.19", features = ["serde"] }
 fvm_shared = "4.5.3"
+ipc-api = { git = "https://github.com/bitcoinscalinglabs/ipc.git", branch = "feature/btc_checkpoint", package = "ipc-api" }
 
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"
