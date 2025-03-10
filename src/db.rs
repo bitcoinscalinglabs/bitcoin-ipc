@@ -1,7 +1,6 @@
 use crate::{
-    bitcoin_utils,
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
-    multisig::{self, create_subnet_multisig_address, multisig_threshold},
+    multisig::{create_subnet_multisig_address, multisig_threshold},
     wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
@@ -106,6 +105,20 @@ pub struct SubnetCommittee {
 }
 
 impl SubnetCommittee {
+    pub fn size(&self) -> u16 {
+        self.validators
+            .len()
+            .try_into()
+            .expect("SubnetCommittee size should be < u16::max")
+    }
+
+    pub fn address_checked(&self) -> Address {
+        self.multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid current network")
+    }
+
     pub fn get_unspent(
         &self,
         rpc: &bitcoincore_rpc::Client,
@@ -118,41 +131,26 @@ impl SubnetCommittee {
         wallet::get_unspent_for_address(rpc, &address)
     }
 
-    pub fn construct_spend_psbt(
-        &self,
-        rpc: &bitcoincore_rpc::Client,
-        subnet_id: &SubnetId,
-        to: &Address,
-        amount: bitcoin::Amount,
-    ) -> Result<bitcoin::Psbt, multisig::MultisigError> {
-        let committee_address = self
-            .multisig_address
-            .clone()
-            .require_network(NETWORK)
-            .expect("Multisig should be valid for saved subnet genesis info");
-
-        let unspent =
-            wallet::get_unspent_for_address(rpc, &committee_address).expect("temp expect");
-        let fee_rate = bitcoin_utils::get_fee_rate(rpc, None, None);
-        let committee_keys = self.validators.iter().map(|v| v.pubkey).collect::<Vec<_>>();
-        let commitee_threshold = self.threshold;
-
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-
-        let psbt = multisig::construct_spend_psbt(
-            &secp,
-            subnet_id,
-            &committee_keys,
-            commitee_threshold,
-            &committee_address,
-            &unspent,
-            to,
-            amount,
-            &fee_rate,
-        )?;
-
-        Ok(psbt)
+    pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
+        self.validators.iter().any(|v| &v.pubkey == pubkey)
     }
+}
+
+/// Subnet checkpoint
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SubnetCheckpoint {
+    /// The block height of the child subnet at which the checkpoint was cut
+    pub child_block_height: u64,
+    /// The block hash of the child subnet at which the checkpoint was cut
+    pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
+    /// The block height of the checkpoint on Bitcoin
+    pub block_height: u64,
+    /// The txid of the checkpoint on Bitcoin
+    pub txid: bitcoin::Txid,
+    /// The number of the committee that signed the checkpoint
+    pub signed_committee_number: u64,
+    /// The number of the next committee (different if rotation happened)
+    pub next_committee_number: u64,
 }
 
 /// The current state of a subnet
@@ -167,6 +165,8 @@ pub struct SubnetState {
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
+    /// The number of the last checkpoint
+    pub last_checkpoint_number: Option<u64>,
 }
 
 impl SubnetState {
@@ -194,6 +194,10 @@ impl SubnetState {
         let label = format!("{}-{}", self.id, self.committee_number);
         wallet::import_address(rpc, &address, label)?;
         Ok(())
+    }
+
+    pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
+        self.committee.is_validator(pubkey)
     }
 }
 
@@ -282,6 +286,7 @@ impl SubnetGenesisInfo {
         SubnetState {
             id: self.subnet_id,
             committee_number: 1,
+            last_checkpoint_number: None,
             committee: self.genesis_validators.to_committee(&self.subnet_id),
         }
     }

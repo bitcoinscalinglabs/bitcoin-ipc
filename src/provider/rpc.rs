@@ -419,8 +419,10 @@ pub async fn gen_multisig_spend_psbt(
         commitee_threshold,
         &committee_address,
         &unspent,
-        &recipient,
-        params.amount,
+        &[bitcoin::TxOut {
+            value: params.amount,
+            script_pubkey: recipient.script_pubkey(),
+        }],
         &fee_rate,
     )
     .map_err(|e| {
@@ -474,5 +476,8 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getrootnetmessages", get_rootnet_messages)
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
+        // checkpoints
+        // .with_method("gencheckpointpsbt", gen_multisig_spend_psbt)
+        // .with_method("finalizecheckpointpsbt", gen_multisig_spend_psbt)
         .finish()
 }

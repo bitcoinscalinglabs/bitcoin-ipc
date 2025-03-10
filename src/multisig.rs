@@ -227,15 +227,10 @@ pub fn construct_spend_unsigned_transaction(
     committee_threshold: u16,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
-    to: &Address,
-    amount: Amount,
+    tx_outs: &[TxOut],
     fee_rate: &FeeRate,
 ) -> Result<Transaction, MultisigError> {
-    trace!(
-        "Creating multisig spend tx for address={}, amount={}",
-        &to,
-        &amount
-    );
+    trace!("Creating multisig spend tx for tx_outs={:?}", &tx_outs);
 
     // size of the witness data when spending a multisig utxo
     let spend_witness_size = multisig_spend_witness_size(committee_size, committee_threshold);
@@ -245,19 +240,23 @@ pub fn construct_spend_unsigned_transaction(
     let spending_weight_per_input = Weight::from_non_witness_data_size(spend_txin_size as u64)
         + Weight::from_witness_data_size(spend_witness_size as u64);
 
-    let tx_out = bitcoin::TxOut {
-        value: amount,
-        script_pubkey: to.script_pubkey(),
-    };
     let non_dust_change_tx_out =
         bitcoin::TxOut::minimal_non_dust(committee_change_address.script_pubkey());
+
+    // Create base outputs functionally by concatenating vectors
+    let outputs = [tx_outs, &[non_dust_change_tx_out]].concat();
+
+    // Calculate the total amount to spend, including the potential change output
+    // TODO: should we include the change output in the amount, even though
+    // we're not sure if it will be added?
+    let amount = outputs.iter().map(|tx_out| tx_out.value).sum::<Amount>();
 
     // base transaction, assume a change output
     let base_tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![],
-        output: vec![tx_out.clone(), non_dust_change_tx_out],
+        output: outputs,
     };
     let base_tx_weight = base_tx.weight();
 
@@ -288,7 +287,7 @@ pub fn construct_spend_unsigned_transaction(
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: inputs,
-        output: vec![tx_out],
+        output: tx_outs.to_vec(),
     };
     if let Some(change_tx_out) = change {
         spend_tx.output.push(change_tx_out);
@@ -306,15 +305,10 @@ pub fn construct_spend_psbt(
     committee_threshold: u16,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
-    to: &Address,
-    amount: Amount,
+    tx_outs: &[TxOut],
     fee_rate: &FeeRate,
 ) -> Result<bitcoin::Psbt, MultisigError> {
-    trace!(
-        "Creating multisig spend PSBT for address={}, amount={}",
-        &to,
-        &amount
-    );
+    trace!("Creating multisig spend PSBT for tx_outs={:?}", &tx_outs);
 
     let committee_size: u16 = committee_keys
         .len()
@@ -327,8 +321,7 @@ pub fn construct_spend_psbt(
         committee_threshold,
         committee_change_address,
         unspent,
-        to,
-        amount,
+        tx_outs,
         fee_rate,
     )?;
 
@@ -587,16 +580,15 @@ pub enum MultisigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{generate_keypairs, generate_subnet_id, generate_xonly_pubkeys};
     use bitcoin::consensus::encode;
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::Message;
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
     use bitcoin::taproot::LeafVersion;
     use bitcoin::{
-        absolute::LockTime,
-        key::Keypair,
-        secp256k1::{PublicKey, Secp256k1, SecretKey},
-        AddressType, Amount, Network, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        absolute::LockTime, secp256k1::Secp256k1, AddressType, Amount, Network, Sequence,
+        Transaction, TxIn, TxOut, Txid, Witness,
     };
     use bitcoin::{transaction, OutPoint};
 
@@ -645,37 +637,6 @@ mod tests {
             }
         }
         Ok(())
-    }
-
-    fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
-        let secp = Secp256k1::new();
-        (0..n)
-            .map(|_| {
-                let secret_key = SecretKey::new(&mut rand::thread_rng());
-                let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                XOnlyPublicKey::from(public_key)
-            })
-            .collect()
-    }
-
-    pub fn generate_keypairs(n: usize) -> Vec<Keypair> {
-        let secp = Secp256k1::new();
-        let mut keypairs: Vec<Keypair> = (0..n)
-            .map(|_| {
-                let mut secret_key = SecretKey::new(&mut rand::thread_rng());
-                if secret_key.x_only_public_key(&secp).1 == bitcoin::key::Parity::Odd {
-                    secret_key = secret_key.negate();
-                }
-                Keypair::from_secret_key(&secp, &secret_key)
-            })
-            .collect();
-        // sort keypairs by x-only public key
-        keypairs.sort_by_key(|k| k.x_only_public_key());
-        keypairs
-    }
-
-    pub fn generate_subnet_id() -> SubnetId {
-        SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
     }
 
     #[test]
@@ -1359,9 +1320,9 @@ mod coin_selection_tests {
 
 #[cfg(test)]
 mod psbt_tests {
-    use super::tests::{generate_keypairs, generate_subnet_id};
     use super::*;
     use crate::multisig::tests::verify_transaction;
+    use crate::test_utils::{generate_keypairs, generate_subnet_id};
     use crate::NETWORK;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -1432,8 +1393,10 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &vec![utxo],
-            &destination,
-            spend_amount,
+            &[bitcoin::TxOut {
+                value: spend_amount,
+                script_pubkey: destination.script_pubkey(),
+            }],
             &fee_rate,
         )
         .unwrap();
@@ -1571,6 +1534,11 @@ mod psbt_tests {
             .assume_checked();
         let spend_amount = Amount::from_sat(90_000);
 
+        let tx_out = TxOut {
+            value: spend_amount,
+            script_pubkey: destination.script_pubkey(),
+        };
+
         // Create a PSBT to spend from the multisig
         let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
         let unsigned_psbt = construct_spend_psbt(
@@ -1580,8 +1548,7 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &vec![utxo.clone()],
-            &destination,
-            spend_amount,
+            &[tx_out],
             &fee_rate,
         )
         .unwrap();
@@ -1753,6 +1720,10 @@ mod psbt_tests {
             .unwrap()
             .assume_checked();
         let spend_amount = Amount::from_sat(90_000);
+        let tx_out = TxOut {
+            value: spend_amount,
+            script_pubkey: destination.script_pubkey(),
+        };
 
         // Create a PSBT to spend from the multisig
         let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
@@ -1763,8 +1734,7 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &utxos,
-            &destination,
-            spend_amount,
+            &[tx_out],
             &fee_rate,
         )
         .unwrap();

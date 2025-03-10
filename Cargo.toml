@@ -29,6 +29,7 @@ num-bigint = "0.4.6"
 alloy-primitives = { version = "0.8.19", features = ["serde"] }
 fvm_shared = "4.5.3"
 base64 = "0.22.1"
+bincode = { version = "2.0.0", features = ["alloc", "std", "serde"] }
 
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"

@@ -1,0 +1,118 @@
+use bitcoin::{
+    hashes::Hash,
+    key::{Keypair, Secp256k1},
+    secp256k1::{PublicKey, SecretKey},
+    Txid, XOnlyPublicKey,
+};
+
+use crate::{db, SubnetId};
+
+pub fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
+    let secp = Secp256k1::new();
+    (0..n)
+        .map(|_| {
+            let secret_key = SecretKey::new(&mut rand::thread_rng());
+            let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+            XOnlyPublicKey::from(public_key)
+        })
+        .collect()
+}
+
+pub fn generate_keypairs(n: usize) -> Vec<Keypair> {
+    let secp = Secp256k1::new();
+    let mut keypairs: Vec<Keypair> = (0..n)
+        .map(|_| {
+            let mut secret_key = SecretKey::new(&mut rand::thread_rng());
+            if secret_key.x_only_public_key(&secp).1 == bitcoin::key::Parity::Odd {
+                secret_key = secret_key.negate();
+            }
+            Keypair::from_secret_key(&secp, &secret_key)
+        })
+        .collect();
+    // sort keypairs by x-only public key
+    keypairs.sort_by_key(|k| k.x_only_public_key());
+    keypairs
+}
+
+pub fn generate_subnet_id() -> SubnetId {
+    SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
+}
+
+pub fn generate_subnet(n: usize) -> db::SubnetState {
+    use crate::{
+        db, eth_utils::eth_addr_from_x_only_pubkey, multisig::create_subnet_multisig_address,
+        NETWORK,
+    };
+    use bitcoin::Amount;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::str::FromStr;
+
+    assert!(n >= 1, "n must be at least 1");
+
+    let subnet_id = generate_subnet_id();
+    let keypairs = generate_keypairs(n);
+
+    // Create subnet validators
+    let validators: Vec<db::SubnetValidator> = keypairs
+        .iter()
+        .enumerate()
+        .map(|(i, kp)| {
+            let (pubkey, _) = kp.x_only_public_key();
+            let subnet_address = eth_addr_from_x_only_pubkey(pubkey);
+
+            // Generate a random IP for testing
+            let ip = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, (i + 1) as u8)),
+                8080 + i as u16,
+            );
+
+            // Generate a random txid for the join transaction
+            let join_txid = Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap();
+
+            // Use regtest address format for testing
+            let backup_address =
+                bitcoin::Address::from_str("bcrt1qvr3jycfxtrkk8u6hp5caxc25tueek5f90mpnsv").unwrap();
+
+            db::SubnetValidator {
+                pubkey,
+                subnet_address,
+                collateral: Amount::from_sat(1000),
+                backup_address,
+                ip,
+                join_txid,
+            }
+        })
+        .collect();
+
+    // Create subnet parameters
+    let min_validators = std::cmp::max(1, n / 2) as u16; // Set threshold to n/2 rounded up
+
+    // Create committee
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let committee_pubkeys: Vec<XOnlyPublicKey> = validators.iter().map(|v| v.pubkey).collect();
+
+    // Create multisig address
+    let multisig_address = create_subnet_multisig_address(
+        &secp,
+        &subnet_id,
+        &committee_pubkeys,
+        min_validators.into(),
+        NETWORK,
+    )
+    .unwrap();
+    let multisig_address = multisig_address.as_unchecked();
+
+    let committee = db::SubnetCommittee {
+        validators,
+        threshold: min_validators,
+        multisig_address: multisig_address.clone(),
+    };
+
+    // Create SubnetState
+    db::SubnetState {
+        id: subnet_id,
+        committee_number: 1,
+        committee,
+        last_checkpoint_number: None,
+    }
+}
