@@ -119,6 +119,10 @@ impl SubnetCommittee {
             .expect("Multisig should be valid current network")
     }
 
+    pub fn pubkeys(&self) -> Vec<XOnlyPublicKey> {
+        self.validators.iter().map(|v| v.pubkey).collect()
+    }
+
     pub fn get_unspent(
         &self,
         rpc: &bitcoincore_rpc::Client,

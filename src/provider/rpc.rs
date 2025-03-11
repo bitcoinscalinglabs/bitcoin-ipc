@@ -2,8 +2,8 @@ use crate::{
     bitcoin_utils,
     db::{self, Database},
     ipc_lib::{
-        IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate,
-        SubnetId,
+        IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
+        IpcPrefundSubnetMsg, IpcValidate, SubnetId,
     },
     multisig, NETWORK,
 };
@@ -458,6 +458,83 @@ pub async fn gen_multisig_spend_psbt(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GenCheckpointPsbtResponse {
+    unsigned_psbt: bitcoin::Psbt,
+    unsigned_psbt_base64: String,
+    unsigned_psbt_hash: bitcoin::hashes::sha256::Hash,
+    psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
+}
+
+pub async fn gen_checkpoint_psbt(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcCheckpointSubnetMsg>,
+) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
+    trace!("gen_checkpoint_psbt: {:?}", msg);
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid checkpoint message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    // Check subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let unspent = subnet
+        .committee
+        .get_unspent(&data.btc_watchonly_rpc)
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
+
+    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    let unsigned_psbt = msg
+        .to_checkpoint_psbt(&subnet.committee, fee_rate, &unspent)
+        .map_err(|e| {
+            error!(
+                "Error generating checkpoint psbt for subnet_id={}: {}",
+                &msg.subnet_id, e
+            );
+
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    let validator_keypair = data.validator_sk.keypair(&secp);
+
+    let (_, psbt_inputs_signatures) =
+        multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
+            |e| {
+                error!(
+                    "Error signing multisig spend psbt for subnet_id={}: {}",
+                    &msg.subnet_id, e
+                );
+                RpcError::InternalError(e.to_string())
+            },
+        )?;
+
+    let unsigned_psbt_bytes = unsigned_psbt.serialize();
+    let unsigned_psbt_hash = bitcoin::hashes::sha256::Hash::hash(&unsigned_psbt_bytes);
+    let unsigned_psbt_base64 = BASE64_STANDARD.encode(unsigned_psbt_bytes);
+
+    Ok(GenCheckpointPsbtResponse {
+        unsigned_psbt_base64,
+        unsigned_psbt_hash,
+        psbt_inputs_signatures,
+        unsigned_psbt,
+    })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -477,7 +554,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         // checkpoints
-        // .with_method("gencheckpointpsbt", gen_multisig_spend_psbt)
+        .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
         // .with_method("finalizecheckpointpsbt", gen_multisig_spend_psbt)
         .finish()
 }

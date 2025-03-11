@@ -1212,14 +1212,59 @@ impl IpcCheckpointSubnetMsg {
         Ok(())
     }
 
-    /// Makes a unsigned checkpoint transaction that includes withdrawals and checkpoint metadata
-    /// and an optional batch transfer reveal transaction, if there are any transfers.
-    pub fn to_txs(
+    /// Returns the vout of the batched transfer commit output, if present
+    /// Useful for constructing the reveal transaction
+    pub fn batch_transfer_commit_vout(&self) -> Option<u32> {
+        if self.transfers.is_empty() {
+            return None;
+        }
+
+        // Calculate batch_transfer vout based on the number of withdrawals
+        // position after the metadata output and all withdrawal outputs
+        // i.e., 1 (metadata) + withdrawals.len() if present
+        Some(1 + self.withdrawals.len() as u32)
+    }
+
+    pub fn to_reveal_batch_transfer_tx(
+        &self,
+        checkpoint_tx_outpoint: bitcoin::OutPoint,
+        committee: &db::SubnetCommittee,
+        fee_rate: bitcoin::FeeRate,
+    ) -> Result<Option<Transaction>, IpcLibError> {
+        if self.transfers.is_empty() {
+            return Ok(None);
+        }
+
+        let (_, reveal_witness, reveal_tx_out) =
+        // Send any sats in the reveal transaction
+            self.make_batched_transfer(fee_rate, committee.address_checked())?;
+
+        // Make the reveal transaction to calculate weight
+
+        let reveal_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: checkpoint_tx_outpoint,
+                witness: reveal_witness,
+                ..Default::default()
+            }],
+            output: vec![reveal_tx_out],
+        };
+
+        dbg!(&reveal_tx);
+
+        Ok(Some(reveal_tx))
+    }
+
+    /// Makes a unsigned checkpoint transaction that includes checkpoint data
+    /// withdrawals and transfers
+    pub fn to_checkpoint_psbt(
         &self,
         committee: &db::SubnetCommittee,
         fee_rate: bitcoin::FeeRate,
         unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
-    ) -> Result<(Transaction, Option<Transaction>), IpcLibError> {
+    ) -> Result<bitcoin::Psbt, IpcLibError> {
         debug!(
             "Creating checkpoint transactions for subnet_id={}",
             self.subnet_id
@@ -1255,17 +1300,10 @@ impl IpcCheckpointSubnetMsg {
         // Add batched transfer output commit tx, if present
         //
         let has_transfers = !self.transfers.is_empty();
-        let mut batch_transfer_tx_info: Option<(bitcoin::Witness, bitcoin::TxOut, u32)> = None;
         if has_transfers {
-            let (batch_transfer_tx_out, reveal_witness, reveal_tx_out) =
+            let (batch_transfer_tx_out, _, _) =
             // Send any sats in the reveal transaction
                 self.make_batched_transfer(fee_rate, committee.address_checked())?;
-
-            // Calculate the vout of the batch transfer output
-            let batch_transfer_vout: u32 = tx_outs.len().try_into().expect("vout overflow");
-
-            // Set reveal batch tx
-            batch_transfer_tx_info = Some((reveal_witness, reveal_tx_out, batch_transfer_vout));
 
             // Push commit tx output
             tx_outs.push(batch_transfer_tx_out);
@@ -1299,35 +1337,28 @@ impl IpcCheckpointSubnetMsg {
             &fee_rate,
         )?;
 
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let checkpoint_psbt = multisig::construct_spend_psbt(
+            &secp,
+            &self.subnet_id,
+            &committee.pubkeys(),
+            committee.threshold,
+            &committee.address_checked(),
+            unspent,
+            &tx_outs,
+            &fee_rate,
+        )?;
+
         debug!("Checkpoint TX: {checkpoint_tx:?}");
         dbg!(&checkpoint_tx);
+        dbg!(&checkpoint_psbt);
 
-        //
-        // Create the reveal batched transfer transaction, if present
-        //
-        if let Some((reveal_witness, reveal_tx_out, commit_tx_vout)) = batch_transfer_tx_info {
-            let commit_output = bitcoin::OutPoint {
-                txid: checkpoint_tx.compute_txid(),
-                vout: commit_tx_vout,
-            };
+        assert_eq!(
+            checkpoint_tx.compute_txid(),
+            checkpoint_psbt.unsigned_tx.compute_txid()
+        );
 
-            let reveal_tx = Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: vec![bitcoin::TxIn {
-                    previous_output: commit_output,
-                    witness: reveal_witness,
-                    ..Default::default()
-                }],
-                output: vec![reveal_tx_out],
-            };
-
-            dbg!(&reveal_tx);
-
-            Ok((checkpoint_tx, Some(reveal_tx)))
-        } else {
-            Ok((checkpoint_tx, None))
-        }
+        Ok(checkpoint_psbt)
     }
 }
 
