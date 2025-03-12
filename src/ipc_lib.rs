@@ -1214,7 +1214,7 @@ impl IpcCheckpointSubnetMsg {
 
     /// Returns the vout of the batched transfer commit output, if present
     /// Useful for constructing the reveal transaction
-    pub fn batch_transfer_commit_vout(&self) -> Option<u32> {
+    fn batch_transfer_commit_outpoint(&self, txid: bitcoin::Txid) -> Option<bitcoin::OutPoint> {
         if self.transfers.is_empty() {
             return None;
         }
@@ -1222,18 +1222,25 @@ impl IpcCheckpointSubnetMsg {
         // Calculate batch_transfer vout based on the number of withdrawals
         // position after the metadata output and all withdrawal outputs
         // i.e., 1 (metadata) + withdrawals.len() if present
-        Some(1 + self.withdrawals.len() as u32)
+        let vout = 1 + self.withdrawals.len() as u32;
+
+        Some(bitcoin::OutPoint { txid, vout })
     }
 
+    /// Makes a batched transfer reveal transaction
     pub fn to_reveal_batch_transfer_tx(
         &self,
-        checkpoint_tx_outpoint: bitcoin::OutPoint,
+        checkpoint_txid: Txid,
         committee: &db::SubnetCommittee,
         fee_rate: bitcoin::FeeRate,
     ) -> Result<Option<Transaction>, IpcLibError> {
         if self.transfers.is_empty() {
             return Ok(None);
         }
+
+        let checkpoint_tx_outpoint = self
+            .batch_transfer_commit_outpoint(checkpoint_txid)
+            .expect("Batched transfer commit output must be present");
 
         let (_, reveal_witness, reveal_tx_out) =
         // Send any sats in the reveal transaction
@@ -2057,7 +2064,14 @@ mod checkpoint_msg_tests {
         let fee_rate = DEFAULT_BTC_FEE_RATE;
 
         // Generate transactions
-        let (checkpoint_tx, batch_tx) = checkpoint_msg.to_txs(committee, fee_rate, &utxos).unwrap();
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
+
+        let batch_tx = checkpoint_msg
+            .to_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), committee, fee_rate)
+            .unwrap();
 
         // First output should be OP_RETURN with metadata
         assert!(
@@ -2157,10 +2171,22 @@ mod checkpoint_msg_tests {
             change_address: Some(committee.multisig_address.clone()),
         };
 
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+
         // Generate transactions
-        let (checkpoint_tx, batch_tx) = checkpoint_msg
-            .to_txs(committee, DEFAULT_BTC_FEE_RATE, &utxos)
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, fee_rate, &utxos)
             .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
+
+        let batch_tx = checkpoint_msg
+            .to_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), committee, fee_rate)
+            .unwrap();
+
+        assert!(
+            batch_tx.is_none(),
+            "No batch transaction should be created when there are no transfers"
+        );
 
         // Verify structure
         assert_eq!(checkpoint_tx.output.len(), 4, "Should have 4 outputs");
@@ -2197,12 +2223,6 @@ mod checkpoint_msg_tests {
             0,
             "Transfer count marker should be 0"
         );
-
-        // Verify no batch transaction is returned when there are no transfers
-        assert!(
-            batch_tx.is_none(),
-            "No batch transaction should be created when there are no transfers"
-        );
     }
 
     #[test]
@@ -2227,10 +2247,22 @@ mod checkpoint_msg_tests {
             change_address: Some(committee.multisig_address.clone()),
         };
 
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+
         // Generate transactions
-        let (checkpoint_tx, batch_tx) = checkpoint_msg
-            .to_txs(committee, DEFAULT_BTC_FEE_RATE, &utxos)
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, fee_rate, &utxos)
             .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
+
+        let batch_tx = checkpoint_msg
+            .to_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), committee, fee_rate)
+            .unwrap();
+
+        assert!(
+            batch_tx.is_none(),
+            "No batch transaction should be created when there are no transfers"
+        );
 
         // Verify structure - should only have OP_RETURN metadata and change output
         assert_eq!(checkpoint_tx.output.len(), 2, "Should have 2 outputs");
