@@ -33,14 +33,28 @@ pub type FvmAddress = fvm_shared::address::Address;
 
 // Tag
 
+pub const IPC_TAG_LENGTH: usize = 7;
+
 // TODO make tags take less space
 pub const IPC_TAG_DELIMITER: &str = "#";
 pub const IPC_CREATE_SUBNET_TAG: &str = "IPC:CRT";
-pub const IPC_PREFUND_SUBNET_TAG: &str = "IPC:PREFUND";
-pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOIN";
-pub const IPC_FUND_SUBNET_TAG: &str = "IPC:FUND";
+pub const IPC_PREFUND_SUBNET_TAG: &str = "IPC:PFD";
+pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOI";
+pub const IPC_FUND_SUBNET_TAG: &str = "IPC:FND";
 pub const IPC_CHECKPOINT_TAG: &str = "IPC:CPT";
+pub const IPC_TRANSFER_TAG: &str = "IPC:TFR";
 pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DEL";
+
+// Static assertion to verify tag lengths at compile time
+const _: () = {
+    assert!(IPC_CREATE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_PREFUND_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_JOIN_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_FUND_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_CHECKPOINT_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_TRANSFER_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_DELETE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+};
 
 // Define the IPC tags enum
 #[derive(Debug, PartialEq)]
@@ -1117,11 +1131,21 @@ impl IpcCheckpointSubnetMsg {
             entry.push((transfer.subnet_user_address, transfer.amount));
         }
 
-        bincode::serde::encode_to_vec(&transfers_by_subnet, bincode::config::standard()).map_err(
-            |e| {
-                IpcValidateError::InvalidMsg(format!("Failed to serialize transfers: {}", e)).into()
-            },
-        )
+        let transfers_binary =
+            bincode::serde::encode_to_vec(&transfers_by_subnet, bincode::config::standard())
+                .map_err(|e| {
+                    IpcLibError::from(IpcValidateError::InvalidMsg(format!(
+                        "Failed to serialize transfers: {}",
+                        e
+                    )))
+                })?;
+
+        // Combine UTF-8 tag and binary data
+        let mut complete_data = Vec::with_capacity(IPC_TRANSFER_TAG.len() + transfers_binary.len());
+        complete_data.extend_from_slice(IPC_TRANSFER_TAG.as_bytes()); // UTF-8 tag prefix
+        complete_data.extend_from_slice(&transfers_binary); // Binary data follows
+
+        Ok(complete_data)
     }
 
     fn make_batched_transfer(
@@ -2304,6 +2328,36 @@ mod checkpoint_msg_tests {
         assert!(
             batch_tx.is_none(),
             "No batch transaction should be created when there are no transfers"
+        );
+    }
+
+    #[test]
+    fn test_batch_transfer_reveal_tx_tag() {
+        // Create a test checkpoint message with transfers
+        let checkpoint_msg = create_test_checkpoint_msg();
+
+        // Get the batched transfer data
+        let transfer_data = checkpoint_msg.make_batched_transfer_data().unwrap();
+
+        // Check that the transfer data starts with the correct tag
+        let tag_bytes = IPC_TRANSFER_TAG.as_bytes();
+        let prefix = &transfer_data[0..tag_bytes.len()];
+
+        assert_eq!(
+            prefix, tag_bytes,
+            "Transfer data should start with IPC:TFR tag"
+        );
+
+        let tag_str = std::str::from_utf8(prefix).unwrap();
+        assert_eq!(
+            tag_str, IPC_TRANSFER_TAG,
+            "Transfer tag should be valid UTF-8"
+        );
+
+        // Verify we have additional data after the tag
+        assert!(
+            transfer_data.len() > tag_bytes.len(),
+            "Transfer data should contain more than just the tag"
         );
     }
 }
