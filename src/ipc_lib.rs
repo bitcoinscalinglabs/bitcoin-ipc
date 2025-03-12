@@ -1407,20 +1407,28 @@ pub enum IpcMessage {
 }
 
 impl IpcMessage {
-    pub fn deserialize(s: &str) -> Result<Self, IpcSerializeError> {
-        let tag = s
-            .split(IPC_TAG_DELIMITER)
-            .next()
-            .ok_or_else(|| IpcSerializeError::DeserializationError("Missing tag".to_string()))?;
+    pub fn from_witness(w: Vec<u8>) -> Result<Self, IpcSerializeError> {
+        let tag = if w.len() >= IPC_TAG_LENGTH {
+            &w[..IPC_TAG_LENGTH]
+        } else {
+            return Err(IpcSerializeError::DeserializationError(
+                "Message too short for a valid tag".to_string(),
+            ));
+        };
+        let tag = std::str::from_utf8(tag).map_err(|e| {
+            IpcSerializeError::DeserializationError(format!("Could not deserialize tag: {}", e))
+        })?;
 
-        // Temporary clippy warning because there is only one value
-        #[allow(clippy::manual_map)]
+        let wstr = std::str::from_utf8(&w).map_err(|_| {
+            IpcSerializeError::DeserializationError("Could not deserialize witness".to_string())
+        });
+
         match IpcTag::from_str(tag)? {
             IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(
-                IpcCreateSubnetMsg::ipc_deserialize(s)?,
+                IpcCreateSubnetMsg::ipc_deserialize(wstr?)?,
             )),
             IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::ipc_deserialize(
-                s,
+                wstr?,
             )?)),
             //
             // The bellow messages aren't using serialization in witness
@@ -1996,8 +2004,10 @@ mod prefund_msg_tests {
         // Test case 3: Wrong tag in OP_RETURN
         let mut wrong_tag_tx = tx.clone();
         let mut wrong_data = Vec::new();
-        // same length as "IPC:PREFUND"
-        let invalid_tag = "IPC:TEST123";
+        // same length as "IPC:PFD"
+        let invalid_tag = "IPC:123";
+        // sanity check if we change tag length
+        assert_eq!(invalid_tag.len(), IPC_TAG_LENGTH);
         wrong_data.extend_from_slice(invalid_tag.as_bytes()); // Different tag
         wrong_data.extend_from_slice(&[0u8; 32]); // txid
         wrong_data.extend_from_slice(&[0u8; 20]); // address

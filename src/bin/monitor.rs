@@ -306,16 +306,14 @@ where
             // TODO check more efficiently if witness has IPC tag
             for witness in input.witness.iter().filter(|w| !w.is_empty()) {
                 // Reconstruct the witness data
-                let concatenated_data = match bitcoin_utils::concatenate_op_push_data(witness) {
+                let witness_data = match bitcoin_utils::concatenate_op_push_data(witness) {
                     Ok(data) => data,
                     Err(_) => {
                         continue;
                     }
                 };
 
-                let witness_str = find_valid_utf8(&concatenated_data);
-                let ipc_message = IpcMessage::deserialize(witness_str);
-
+                let ipc_message = IpcMessage::from_witness(witness_data);
                 let ipc_message = match ipc_message {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -456,17 +454,6 @@ where
             }
         }
     }
-}
-
-fn find_valid_utf8(data: &[u8]) -> &str {
-    let mut start = 0;
-    while start < data.len() {
-        match std::str::from_utf8(&data[start..]) {
-            Ok(valid_str) => return valid_str,
-            Err(_) => start += 1,
-        }
-    }
-    ""
 }
 
 #[derive(Error, Debug)]
