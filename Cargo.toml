@@ -34,3 +34,4 @@ bincode = { version = "2.0.0", features = ["alloc", "std", "serde"] }
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"
 tempfile = "3.17.1"
+test_retry = "0.1.0"

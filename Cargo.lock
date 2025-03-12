@@ -674,6 +674,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test_retry",
  "thiserror 1.0.61",
  "tokio",
  "tokio-util",
@@ -3008,6 +3009,17 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "test_retry"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "532fa61a8207816e2bf329548a15ceed1ab5a1fac0afed6475f95675cba1f412"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
