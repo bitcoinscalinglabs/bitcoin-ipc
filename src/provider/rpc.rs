@@ -535,6 +535,189 @@ pub async fn gen_checkpoint_psbt(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct DevMultisignPsbtParams {
+    unsigned_psbt_base64: String,
+    secret_keys: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DevMultisignPsbtResponse {
+    // Include signatures for each input, mapped by pubkey
+    signatures: Vec<(
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    )>,
+}
+
+pub async fn dev_multisign_psbt(
+    _data: Data<Arc<ServerData>>,
+    Params(params): Params<DevMultisignPsbtParams>,
+) -> Result<DevMultisignPsbtResponse, JsonRpcError> {
+    trace!(
+        "dev_multisign_psbt: unsigned_psbt with {} secret_keys",
+        params.secret_keys.len()
+    );
+
+    // Decode base64 PSBT
+    let psbt_bytes = BASE64_STANDARD
+        .decode(params.unsigned_psbt_base64.as_bytes())
+        .map_err(|e| {
+            error!("Invalid base64 format for PSBT: {}", e);
+            RpcError::InvalidParams(format!("Invalid base64 format for PSBT: {}", e))
+        })?;
+
+    // Deserialize PSBT
+    let unsigned_psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|e| {
+        error!("Invalid PSBT format: {}", e);
+        RpcError::InvalidParams(format!("Invalid PSBT format: {}", e))
+    })?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    // Store signatures keyed by public key
+    let mut all_signatures = Vec::new();
+
+    // Convert each hex string to a SecretKey and sign the PSBT
+    for hex_key in params.secret_keys {
+        // Remove "0x" prefix if present
+        let hex_key = hex_key.strip_prefix("0x").unwrap_or(&hex_key);
+
+        // Convert hex string to bytes
+        let key_bytes = hex::decode(hex_key).map_err(|e| {
+            error!("Invalid hex format for secret key: {}", e);
+            RpcError::InvalidParams(format!("Invalid hex format for secret key: {}", e))
+        })?;
+
+        // Create secret key from bytes
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes).map_err(|e| {
+            error!("Invalid secret key: {}", e);
+            RpcError::InvalidParams(format!("Invalid secret key: {}", e))
+        })?;
+
+        // Create keypair
+        let keypair = secret_key.keypair(&secp);
+        let (xonly_pubkey, _) = keypair.x_only_public_key();
+
+        // Sign and collect signatures
+        let (_, signatures) = multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), keypair)
+            .map_err(|e| {
+                error!("Error signing psbt with key: {}", e);
+                RpcError::InternalError(e.to_string())
+            })?;
+
+        all_signatures.push((xonly_pubkey, signatures));
+    }
+
+    Ok(DevMultisignPsbtResponse {
+        signatures: all_signatures,
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FinalizeCheckpointPsbtParams {
+    subnet_id: SubnetId,
+    unsigned_psbt_base64: String,
+    signatures: Vec<(
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    )>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FinalizeCheckpointPsbtResponse {
+    tx: bitcoin::Transaction,
+    txid: String,
+    tx_hex: String,
+}
+
+pub async fn finalize_checkpoint_psbt(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<FinalizeCheckpointPsbtParams>,
+) -> Result<FinalizeCheckpointPsbtResponse, JsonRpcError> {
+    trace!("finalize_checkpoint_psbt for subnet {}", params.subnet_id);
+
+    // Check subnet exists and get committee info
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    // Get committee info
+    let committee_keys: Vec<bitcoin::XOnlyPublicKey> = subnet
+        .committee
+        .validators
+        .iter()
+        .map(|v| v.pubkey)
+        .collect();
+    let committee_threshold = subnet.committee.threshold;
+
+    // Decode base64 PSBT
+    let psbt_bytes = BASE64_STANDARD
+        .decode(params.unsigned_psbt_base64.as_bytes())
+        .map_err(|e| {
+            error!("Invalid base64 format for PSBT: {}", e);
+            RpcError::InvalidParams(format!("Invalid base64 format for PSBT: {}", e))
+        })?;
+
+    // Deserialize PSBT
+    let unsigned_psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|e| {
+        error!("Invalid PSBT format: {}", e);
+        RpcError::InvalidParams(format!("Invalid PSBT format: {}", e))
+    })?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    // Organize signatures by signer
+    let signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> = params
+        .signatures
+        .iter()
+        .map(|(_, sigs)| sigs.as_slice())
+        .collect();
+
+    // Finalize the PSBT using multisig::finalize_spend_psbt_from_sigs
+    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(
+        &secp,
+        &params.subnet_id,
+        &committee_keys,
+        committee_threshold,
+        &unsigned_psbt,
+        &signature_sets,
+    )
+    .map_err(|e| {
+        error!("Error finalizing PSBT: {}", e);
+        RpcError::InternalError(e.to_string())
+    })?;
+
+    // Convert transaction to hex
+    let tx_hex = hex::encode(bitcoin::consensus::serialize(&finalized_tx));
+
+    // Get transaction ID
+    let txid = finalized_tx.compute_txid().to_string();
+
+    // Send the transaction to the Bitcoin network
+    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![finalized_tx.clone()]).map_err(|e| {
+        error!("Error sending transaction to Bitcoin network: {}", e);
+        RpcError::InternalError(format!(
+            "Error sending transaction to Bitcoin network: {}",
+            e
+        ))
+    })?;
+
+    Ok(FinalizeCheckpointPsbtResponse {
+        tx: finalized_tx,
+        txid,
+        tx_hex,
+    })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -555,6 +738,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
-        // .with_method("finalizecheckpointpsbt", gen_multisig_spend_psbt)
+        .with_method("dev_multisignpsbt", dev_multisign_psbt) // dev only
+        .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .finish()
 }

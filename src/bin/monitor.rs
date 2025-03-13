@@ -355,6 +355,16 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
+        } else if let Ok(checkpoint_msg) = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(tx) {
+            let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
         }
 
         Ok(())
@@ -426,6 +436,38 @@ where
                 msg.validate()?;
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
                 info!("Processed FundSubnet for Subnet ID: {}", msg.subnet_id);
+                Ok(())
+            }
+
+            IpcMessage::CheckpointSubnet(msg) => {
+                debug!("Found IPC message: {:#?}", msg);
+
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, txid)?;
+
+                Ok(())
+            }
+
+            IpcMessage::BatchTransfer(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+
+                let checkpoint_txid = tx
+                    .input
+                    .first()
+                    .map(|i| i.previous_output.txid)
+                    .ok_or(MonitorError::IpcTxInvalid("tx must have input".to_string()))?;
+
+                let checkpoint_tx = self
+                    .watchonly_rpc
+                    .get_transaction(&checkpoint_txid, Some(true))?;
+
+                println!("batch-transfer: checkpoint tx {:#?}", checkpoint_tx);
+
+                // msg.validate()?;
+                //  msg.save_to_db(&self.db, block_height, txid)?;
+                // get checkpoint tx
+                // get subnets from db
+
                 Ok(())
             }
         }

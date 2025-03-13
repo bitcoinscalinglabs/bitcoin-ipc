@@ -18,6 +18,8 @@ const SUBNET_GENESIS_INFO_KEY: &str = "subnet_genesis_info:";
 const SUBNET_STATE_KEY: &str = "subnet_state:";
 // rootnet_msgs:<subnet_id>:<nonce>
 const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
+// checkpoints:<subnet_id>:<nonce>
+const CHECKPOINTS_KEY: &str = "checkpoints:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -35,6 +37,10 @@ fn rootnet_msgs_prefix(subnet_id: SubnetId) -> String {
 
 fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
     format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
+}
+
+fn checkpoints_key(subnet_id: SubnetId, number: u64) -> String {
+    format!("{CHECKPOINTS_KEY}:{}:{}", subnet_id, number)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,14 +149,16 @@ impl SubnetCommittee {
 /// Subnet checkpoint
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCheckpoint {
-    /// The block height of the child subnet at which the checkpoint was cut
-    pub child_block_height: u64,
     /// The block hash of the child subnet at which the checkpoint was cut
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// The block height of the checkpoint on Bitcoin
     pub block_height: u64,
     /// The txid of the checkpoint on Bitcoin
     pub txid: bitcoin::Txid,
+    /// The txid of the batch transfer, if there are any transfers
+    pub batch_transfer_txid: Option<bitcoin::Txid>,
+    /// The block height of the batch transfer, if there are any transfers
+    pub batch_transfer_block_height: Option<u64>,
     /// The number of the committee that signed the checkpoint
     pub signed_committee_number: u64,
     /// The number of the next committee (different if rotation happened)
@@ -359,6 +367,7 @@ pub struct HeedDb {
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
+    checkpoints_db: HeedDatabase<Str, SerdeBincode<SubnetCheckpoint>>,
     // TODO use SerdeBincode for this as well
     // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
@@ -416,6 +425,9 @@ impl HeedDb {
             let subnet_genesis_db = env
                 .open_database(&rtxn, Some("subnet_genesis_db"))?
                 .ok_or(DbError::DbNotFound("subnet_genesis_db".to_string()))?;
+            let checkpoints_db = env
+                .open_database(&rtxn, Some("checkpoints_db"))?
+                .ok_or(DbError::DbNotFound("checkpoints_db".to_string()))?;
             let rootnet_msgs_db = env
                 .open_database(&rtxn, Some("rootnet_msgs_db"))?
                 .ok_or(DbError::DbNotFound("rootnet_msgs_db".to_string()))?;
@@ -426,6 +438,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                checkpoints_db,
                 rootnet_msgs_db,
             })
         } else {
@@ -434,6 +447,7 @@ impl HeedDb {
             let monitor_info = env.create_database(&mut txn, Some("monitor_info"))?;
             let subnet_db = env.create_database(&mut txn, Some("subnet_db"))?;
             let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
+            let checkpoints_db = env.create_database(&mut txn, Some("checkpoints_db"))?;
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
             txn.commit()?;
 
@@ -442,6 +456,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                checkpoints_db,
                 rootnet_msgs_db,
             })
         }
@@ -495,6 +510,19 @@ pub trait Database {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         msg: RootnetMessage,
+    ) -> Result<(), DbError>;
+
+    // Checkpoints
+    fn get_checkpoint(
+        &self,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError>;
+    fn save_checkpoint(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        checkpoint: &SubnetCheckpoint,
     ) -> Result<(), DbError>;
 }
 
@@ -672,6 +700,30 @@ impl Database for HeedDb {
         let key = rootnet_msgs_key(subnet_id, msg.nonce());
         trace!("Add rootnet msg: {msg:#?}");
         self.rootnet_msgs_db.put(txn, &key, &msg)?;
+        Ok(())
+    }
+
+    // Checkpoints
+
+    fn get_checkpoint(
+        &self,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError> {
+        let key = checkpoints_key(subnet_id, number);
+        let txn = self.env.read_txn()?;
+        let checkpoint = self.checkpoints_db.get(&txn, &key)?;
+        Ok(checkpoint)
+    }
+
+    fn save_checkpoint(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        checkpoint: &SubnetCheckpoint,
+    ) -> Result<(), DbError> {
+        let key = checkpoints_key(subnet_id, checkpoint.signed_committee_number);
+        self.checkpoints_db.put(txn, &key, checkpoint)?;
         Ok(())
     }
 }
