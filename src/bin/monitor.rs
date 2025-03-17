@@ -365,6 +365,16 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
+        } else if let Ok(batch_transfer_msg) = ipc_lib::IpcBatchTransferMsg::from_tx(tx, &self.db) {
+            let ipc_message = IpcMessage::BatchTransfer(batch_transfer_msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
         }
 
         Ok(())
@@ -448,25 +458,41 @@ where
                 Ok(())
             }
 
-            IpcMessage::BatchTransfer(msg) => {
+            IpcMessage::BatchTransfer(mut msg) => {
                 debug!("Found IPC message: {:?}", msg);
 
-                let checkpoint_txid = tx
-                    .input
-                    .first()
-                    .map(|i| i.previous_output.txid)
-                    .ok_or(MonitorError::IpcTxInvalid("tx must have input".to_string()))?;
+                msg.validate()?;
+
+                // Get checkpoint tx and parse as msg
 
                 let checkpoint_tx = self
                     .watchonly_rpc
-                    .get_transaction(&checkpoint_txid, Some(true))?;
+                    .get_transaction(&msg.checkpoint_txid, Some(true))?;
 
-                println!("batch-transfer: checkpoint tx {:?}", checkpoint_tx);
+                let checkpoint_tx = checkpoint_tx.transaction().map_err(|e| {
+                    MonitorError::IpcTxInvalid(format!(
+                        "BatchTransferMsg previous tx {} invalid: {e}",
+                        msg.checkpoint_txid
+                    ))
+                })?;
 
-                // msg.validate()?;
-                //  msg.save_to_db(&self.db, block_height, txid)?;
-                // get checkpoint tx
-                // get subnets from db
+                let checkpoint_msg = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(
+                    &checkpoint_tx,
+                )
+                .map_err(|e| {
+                    MonitorError::IpcTxInvalid(format!(
+                        "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
+                    ))
+                })?;
+
+                trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
+
+                msg.validate_for_checkpoint(&checkpoint_tx)?;
+                msg.subnet_id = checkpoint_msg.subnet_id;
+
+                // Save to DB
+
+                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
 
                 Ok(())
             }

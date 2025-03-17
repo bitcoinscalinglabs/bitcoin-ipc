@@ -44,6 +44,8 @@ RANDOM_HASH=$(openssl rand -hex 32)
 CURRENT_BLOCK=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$CURRENT_BLOCK")
 
+DESTINATION_SUBNET_ID_1="/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm"
+
 echo "Current block: $CURRENT_BLOCK ($BLOCK_HASH)"
 echo "Using checkpoint hash: $RANDOM_HASH"
 
@@ -65,18 +67,17 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
         \"transfers\": [
             {
                 \"amount\": 150000,
-                \"destination_subnet_id\": \"/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm\",
+                \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
                 \"subnet_multisig_address\": \"bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5\",
                 \"subnet_user_address\": \"0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf\"
             },
             {
                 \"amount\": 100000,
-                \"destination_subnet_id\": \"/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm\",
+                \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
                 \"subnet_multisig_address\": \"bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5\",
                 \"subnet_user_address\": \"0x4967bB72907683bb6a933d47348a49bC3832968b\"
             }
-        ],
-        \"change_address\": \"bcrt1p5a03k4m8hj026twhkucm8ue6zemrkq62zj3pwkhg95jst3jtdt0scnwz3s\"
+        ]
     },
     \"id\": 1
 }")
@@ -202,5 +203,21 @@ curl -s -X POST "$API_URL" \
     },
     \"id\": 1
 }" | jq '.result'
+
+if [ "$BATCH_TRANSFER_TX_HEX" != "null" ] && [ -n "$BATCH_TRANSFER_TX_HEX" ]; then
+	echo "Getting rootnet messages state..."
+	curl -s -X POST "$API_URL" \
+	  -H "Content-Type: application/json" \
+	  -H "Authorization: Bearer $BEARER_TOKEN" \
+	  -d "{
+	      \"jsonrpc\": \"2.0\",
+	      \"method\": \"getrootnetmessages\",
+	      \"params\": {
+	          \"subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
+		      \"block_height\": $NEW_BLOCK
+	      },
+	      \"id\": 1
+	  }" | jq
+fi
 
 echo "Checkpoint submission complete!"

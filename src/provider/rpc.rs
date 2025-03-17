@@ -480,6 +480,12 @@ pub async fn gen_checkpoint_psbt(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
+    if msg.change_address.is_some() {
+        return Err(
+            RpcError::InvalidParams("Specifying change address not supported".to_string()).into(),
+        );
+    }
+
     // Check subnet exists
     let subnet = data
         .db

@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid, XOnlyPublicKey};
-use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RwTxn};
+use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RoTxn, RwTxn};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
@@ -490,6 +490,11 @@ pub trait Database {
         subnet_id: SubnetId,
         subnet_state: &SubnetState,
     ) -> Result<(), DbError>;
+    /// Gets a subnet by its multisig address
+    fn get_subnet_by_multisig_address(
+        &self,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError>;
 
     // Rootnet Messages
     fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError>;
@@ -498,8 +503,17 @@ pub trait Database {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError>;
+    fn get_last_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError>;
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+    fn get_next_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError>;
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
@@ -523,6 +537,7 @@ pub trait Database {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         checkpoint: &SubnetCheckpoint,
+        number: u64,
     ) -> Result<(), DbError>;
 }
 
@@ -605,6 +620,24 @@ impl Database for HeedDb {
         Ok(())
     }
 
+    fn get_subnet_by_multisig_address(
+        &self,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError> {
+        let txn = self.env.read_txn()?;
+        let subnets = self.subnet_db.iter(&txn)?;
+
+        for item in subnets {
+            let (_, subnet_state) = item?;
+
+            if &subnet_state.committee.multisig_address == multisig_address {
+                return Ok(Some(subnet_state));
+            }
+        }
+
+        Ok(None)
+    }
+
     // Rootnet Messages
 
     /// Note: Potentially returns a large number of messages,
@@ -653,9 +686,12 @@ impl Database for HeedDb {
         Ok(msgs)
     }
 
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError> {
+    fn get_last_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError> {
         let prefix = rootnet_msgs_prefix(subnet_id);
-        let txn = self.env.read_txn()?;
         let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
         let count: u64 = msgs_iter.count().try_into().map_err(|_| {
             DbError::TypeConversionError("max rootnet messages reached".to_string())
@@ -669,7 +705,24 @@ impl Database for HeedDb {
     }
 
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
-        let nonce = self.get_last_rootnet_msg_nonce(subnet_id)?;
+        let txn = self.env.read_txn()?;
+        let nonce = self.get_last_rootnet_msg_nonce_txn(&txn, subnet_id)?;
+        let nonce = match nonce {
+            // If there is a nonce, increment it
+            Some(n) => n + 1,
+            // Otherwise start from 0
+            None => 0,
+        };
+
+        Ok(nonce)
+    }
+
+    fn get_next_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError> {
+        let nonce = self.get_last_rootnet_msg_nonce_txn(txn, subnet_id)?;
         let nonce = match nonce {
             // If there is a nonce, increment it
             Some(n) => n + 1,
@@ -721,8 +774,9 @@ impl Database for HeedDb {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         checkpoint: &SubnetCheckpoint,
+        number: u64,
     ) -> Result<(), DbError> {
-        let key = checkpoints_key(subnet_id, checkpoint.signed_committee_number);
+        let key = checkpoints_key(subnet_id, number);
         self.checkpoints_db.put(txn, &key, checkpoint)?;
         Ok(())
     }
@@ -811,8 +865,15 @@ mod tests {
         let subnet_id = create_rand_subnet_id();
         let block_height = 100;
 
+        let ro_txn = db.env.read_txn().unwrap();
+
         // Verify no messages exist initially
-        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), None);
+        assert_eq!(
+            db.get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+                .unwrap(),
+            None
+        );
+        drop(ro_txn);
         // Check next nonce is 0
         assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 0);
 
@@ -824,8 +885,12 @@ mod tests {
         txn.commit().unwrap();
 
         // Check last nonce is now 0
-        let result = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        let ro_txn = db.env.read_txn().unwrap();
+        let result = db
+            .get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+            .unwrap();
         assert_eq!(result, Some(0));
+        drop(ro_txn);
 
         // Check next nonce is 1
         let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();
@@ -846,7 +911,13 @@ mod tests {
         txn.commit().unwrap();
 
         // Check last nonce is now 2
-        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), Some(2));
+        let ro_txn = db.env.read_txn().unwrap();
+        assert_eq!(
+            db.get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+                .unwrap(),
+            Some(2)
+        );
+        drop(ro_txn);
 
         // Check next nonce is 3
         assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 3);
@@ -916,8 +987,12 @@ mod tests {
         }
 
         // Check the last nonce is total_message_count - 1
-        let last_nonce = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        let ro_txn = db.env.read_txn().unwrap();
+        let last_nonce = db
+            .get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+            .unwrap();
         assert_eq!(last_nonce, Some((total_message_count - 1) as u64));
+        drop(ro_txn);
 
         // Check the next nonce is total_message_count
         let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();

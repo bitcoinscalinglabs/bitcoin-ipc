@@ -194,8 +194,7 @@ curl -X POST http://localhost:3030/api \
                 "subnet_multisig_address": "bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5",
                 "subnet_user_address": "0x4967bB72907683bb6a933d47348a49bC3832968b"
             }
-        ],
-        "change_address": "bcrt1pnzehjzlgv2chzku60rvef6my0zpmuzqpky9mvm97ruzxyp832ycsz4re6v"
+        ]
     },
     "id": 1
 }' | jq
