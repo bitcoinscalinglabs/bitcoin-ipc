@@ -83,6 +83,7 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
 
 # Extract the unsigned PSBT
 UNSIGNED_PSBT_BASE64=$(echo "$CHECKPOINT_RESPONSE" | jq -r '.result.unsigned_psbt_base64')
+BATCH_TRANSFER_TX_HEX=$(echo "$CHECKPOINT_RESPONSE" | jq -r '.result.batch_transfer_tx_hex')
 
 if [ "$UNSIGNED_PSBT_BASE64" == "null" ] || [ -z "$UNSIGNED_PSBT_BASE64" ]; then
   echo "Error generating checkpoint PSBT:"
@@ -154,6 +155,19 @@ TXID=$(echo "$FINALIZE_RESPONSE" | jq -r '.result.txid')
 
 echo "Checkpoint transaction finalized and broadcast successfully"
 echo "Transaction ID: $TXID"
+
+sleep 1
+
+# 5. Submit batch transfer transaction if present
+if [ "$BATCH_TRANSFER_TX_HEX" != "null" ] && [ -n "$BATCH_TRANSFER_TX_HEX" ]; then
+  echo "3.1. Submitting batch transfer reveal transaction..."
+  echo $BATCH_TRANSFER_TX_HEX
+  BATCH_TRANSFER_TXID=$(bitcoin-cli sendrawtransaction "$BATCH_TRANSFER_TX_HEX")
+
+  echo "Batch transfer transaction submitted with TXID: $BATCH_TRANSFER_TXID"
+else
+echo "No batch transfer transaction present"
+fi
 
 # 4. Mine a block to confirm the transaction
 echo "4. Mining a block to confirm the transaction..."

@@ -460,10 +460,13 @@ pub async fn gen_multisig_spend_psbt(
 
 #[derive(Serialize, Deserialize)]
 pub struct GenCheckpointPsbtResponse {
+    // Checkpoint
     unsigned_psbt: bitcoin::Psbt,
     unsigned_psbt_base64: String,
     unsigned_psbt_hash: bitcoin::hashes::sha256::Hash,
     psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
+    // Batch transfer reveal
+    batch_transfer_tx_hex: Option<String>,
 }
 
 pub async fn gen_checkpoint_psbt(
@@ -510,6 +513,28 @@ pub async fn gen_checkpoint_psbt(
             RpcError::InternalError(e.to_string())
         })?;
 
+    let checkpoint_txid = unsigned_psbt.unsigned_tx.compute_txid();
+
+    let batch_transfer_tx = msg
+        .make_reveal_batch_transfer_tx(checkpoint_txid, fee_rate)
+        .map_err(|e| {
+            error!(
+                "Error generating batch transfer tx for subnet_id={}: {}",
+                &msg.subnet_id, e
+            );
+
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    trace!(
+        "checkpoint_txid={} batch_transfer_txid={:?}",
+        checkpoint_txid,
+        batch_transfer_tx.clone().map(|tx| tx.compute_txid()),
+    );
+
+    let batch_transfer_tx_hex =
+        batch_transfer_tx.map(|tx| bitcoin::consensus::encode::serialize_hex(&tx));
+
     let validator_keypair = data.validator_sk.keypair(&secp);
 
     let (_, psbt_inputs_signatures) =
@@ -532,6 +557,7 @@ pub async fn gen_checkpoint_psbt(
         unsigned_psbt_hash,
         psbt_inputs_signatures,
         unsigned_psbt,
+        batch_transfer_tx_hex,
     })
 }
 
@@ -701,6 +727,8 @@ pub async fn finalize_checkpoint_psbt(
 
     // Get transaction ID
     let txid = finalized_tx.compute_txid().to_string();
+
+    trace!("checkpoint_txid = {}", txid);
 
     // Send the transaction to the Bitcoin network
     bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![finalized_tx.clone()]).map_err(|e| {

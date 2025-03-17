@@ -164,6 +164,8 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
+# checkpoint with withdrawals and transfers
+
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
@@ -193,6 +195,29 @@ curl -X POST http://localhost:3030/api \
                 "subnet_user_address": "0x4967bB72907683bb6a933d47348a49bC3832968b"
             }
         ],
+        "change_address": "bcrt1pnzehjzlgv2chzku60rvef6my0zpmuzqpky9mvm97ruzxyp832ycsz4re6v"
+    },
+    "id": 1
+}' | jq
+
+# no transfers checkpoint
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "gencheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "checkpoint_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "withdrawals": [
+            {
+                "amount": 25000,
+                "address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n"
+            }
+        ],
+        "transfers": [],
         "change_address": "bcrt1pnzehjzlgv2chzku60rvef6my0zpmuzqpky9mvm97ruzxyp832ycsz4re6v"
     },
     "id": 1
