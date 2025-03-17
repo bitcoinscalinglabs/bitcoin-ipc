@@ -1,10 +1,14 @@
 use crate::{
-    bitcoin_utils::get_confirmed_from_height,
-    db::{self, Database, HeedDb},
-    ipc_lib::{IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate, SubnetId},
-    IpcCreateSubnetMsg, NETWORK,
+    bitcoin_utils,
+    db::{self, Database},
+    ipc_lib::{
+        IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcPrefundSubnetMsg, IpcValidate,
+        SubnetId,
+    },
+    multisig, NETWORK,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::{error, trace};
@@ -64,9 +68,10 @@ impl actix_web::error::ResponseError for RpcError {
 // TODO use generics
 #[derive(Clone)]
 pub struct ServerData {
-    pub db: Arc<HeedDb>,
+    pub db: Arc<db::HeedDb>,
     pub btc_rpc: Arc<Client>,
     pub btc_watchonly_rpc: Arc<Client>,
+    pub validator_sk: bitcoin::secp256k1::SecretKey,
 }
 
 //
@@ -104,14 +109,15 @@ pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u
 
     match client.get_block_count() {
         Ok(current_height) => {
-            let confirmed_block_height = match get_confirmed_from_height(current_height) {
-                Some(height) => height,
-                None => {
-                    return Err(JsonRpcError::internal(
-                        "Not enough blocks to have a confirmed block",
-                    ))
-                }
-            };
+            let confirmed_block_height =
+                match bitcoin_utils::get_confirmed_from_height(current_height) {
+                    Some(height) => height,
+                    None => {
+                        return Err(JsonRpcError::internal(
+                            "Not enough blocks to have a confirmed block",
+                        ))
+                    }
+                };
             Ok(confirmed_block_height)
         }
         Err(e) => Err(JsonRpcError::internal(e)),
@@ -344,7 +350,7 @@ pub async fn get_rootnet_messages(
         })
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GenMultisigSpendPsbtParams {
     subnet_id: SubnetId,
     recipient: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
@@ -354,14 +360,18 @@ pub struct GenMultisigSpendPsbtParams {
 
 #[derive(Serialize, Deserialize)]
 pub struct GenMultisigSpendPsbtResponse {
-    psbt: bitcoin::Psbt,
-    psbt_base64: String,
+    unsigned_psbt: bitcoin::Psbt,
+    unsigned_psbt_base64: String,
+    unsigned_psbt_hash: bitcoin::hashes::sha256::Hash,
+    psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
 }
 
 pub async fn gen_multisig_spend_psbt(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GenMultisigSpendPsbtParams>,
 ) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
+    trace!("gen_multisig_spend_psbt: {:?}", params);
+
     // Check subnet exists
     let subnet = data
         .db
@@ -379,25 +389,71 @@ pub async fn gen_multisig_spend_psbt(
         RpcError::InvalidParams(format!("Invalid address network, required {NETWORK}"))
     })?;
 
-    let psbt = subnet
+    let committee_address = subnet
         .committee
-        .construct_spend_psbt(
-            &data.btc_watchonly_rpc,
-            &params.subnet_id,
-            &recipient,
-            params.amount,
-        )
-        .map_err(|e| {
-            error!(
-                "Error generating multisig spend psbt for subnet_id={}: {}",
-                &params.subnet_id, e
-            );
-            RpcError::InternalError(e.to_string())
-        })?;
+        .multisig_address
+        .clone()
+        .require_network(NETWORK)
+        .expect("Multisig should be valid for saved subnet genesis info");
+    let committee_keys = subnet
+        .committee
+        .validators
+        .iter()
+        .map(|v| v.pubkey)
+        .collect::<Vec<_>>();
+    let commitee_threshold = subnet.committee.threshold;
 
-    let psbt_base64 = BASE64_STANDARD.encode(psbt.serialize());
+    let unspent = subnet
+        .committee
+        .get_unspent(&data.btc_watchonly_rpc)
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
 
-    Ok(GenMultisigSpendPsbtResponse { psbt, psbt_base64 })
+    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    let unsigned_psbt = multisig::construct_spend_psbt(
+        &secp,
+        &params.subnet_id,
+        &committee_keys,
+        commitee_threshold,
+        &committee_address,
+        &unspent,
+        &recipient,
+        params.amount,
+        &fee_rate,
+    )
+    .map_err(|e| {
+        error!(
+            "Error generating multisig spend psbt for subnet_id={}: {}",
+            &params.subnet_id, e
+        );
+        RpcError::InternalError(e.to_string())
+    })?;
+
+    let validator_keypair = data.validator_sk.keypair(&secp);
+
+    let (_, psbt_inputs_signatures) =
+        multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
+            |e| {
+                error!(
+                    "Error signing multisig spend psbt for subnet_id={}: {}",
+                    &params.subnet_id, e
+                );
+                RpcError::InternalError(e.to_string())
+            },
+        )?;
+
+    let unsigned_psbt_bytes = unsigned_psbt.serialize();
+    let unsigned_psbt_hash = bitcoin::hashes::sha256::Hash::hash(&unsigned_psbt_bytes);
+    let unsigned_psbt_base64 = BASE64_STANDARD.encode(unsigned_psbt_bytes);
+
+    Ok(GenMultisigSpendPsbtResponse {
+        unsigned_psbt_base64,
+        unsigned_psbt_hash,
+        psbt_inputs_signatures,
+        unsigned_psbt,
+    })
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
