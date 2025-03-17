@@ -1,7 +1,6 @@
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
 use bitcoin::Amount;
-use bitcoin::ScriptBuf;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
@@ -1093,7 +1092,7 @@ impl IpcCheckpointSubnetMsg {
     const DATA_LEN: usize =
         Self::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN + Self::MARKERS_LEN;
 
-    fn make_metadata_tx_out(&self) -> bitcoin::TxOut {
+    fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
 
         let tag_offset = 0;
@@ -1117,8 +1116,10 @@ impl IpcCheckpointSubnetMsg {
         op_return_data[markers_offset + 1] = self.transfers.len().min(255) as u8; // Transfer count
 
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let op_return_value = op_return_script.minimal_non_dust_custom(fee_rate);
+
         bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
+            value: op_return_value,
             script_pubkey: op_return_script,
         }
     }
@@ -1155,6 +1156,7 @@ impl IpcCheckpointSubnetMsg {
     fn make_batched_transfer(
         &self,
         fee_rate: bitcoin::FeeRate,
+        return_address: &bitcoin::Address,
     ) -> Result<(bitcoin::TxOut, bitcoin::Witness, bitcoin::TxOut), IpcLibError> {
         let batched_transfer_data = self.make_batched_transfer_data()?;
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -1188,11 +1190,11 @@ impl IpcCheckpointSubnetMsg {
         let reveal_witness =
             bitcoin::Witness::from_slice(&[commit_script.to_bytes(), control_block.serialize()]);
 
-        let reveal_script_pubkey = ScriptBuf::new_op_return([0]);
-
         let reveal_tx_out = bitcoin::TxOut {
-            value: Amount::from_sat(546),
-            script_pubkey: reveal_script_pubkey,
+            value: return_address
+                .script_pubkey()
+                .minimal_non_dust_custom(fee_rate),
+            script_pubkey: return_address.script_pubkey(),
         };
 
         debug!("\n\n\nreveal_tx_out: {:?}", reveal_tx_out);
@@ -1261,6 +1263,7 @@ impl IpcCheckpointSubnetMsg {
         &self,
         checkpoint_txid: Txid,
         fee_rate: bitcoin::FeeRate,
+        return_address: &bitcoin::Address,
     ) -> Result<Option<Transaction>, IpcLibError> {
         if self.transfers.is_empty() {
             return Ok(None);
@@ -1272,7 +1275,7 @@ impl IpcCheckpointSubnetMsg {
 
         let (_, reveal_witness, reveal_tx_out) =
         // Send any sats in the reveal transaction
-            self.make_batched_transfer(fee_rate)?;
+            self.make_batched_transfer(fee_rate, return_address)?;
 
         // Make the reveal transaction to calculate weight
 
@@ -1312,7 +1315,7 @@ impl IpcCheckpointSubnetMsg {
         // Add first output, the metadata
         //
 
-        let data_tx_out = self.make_metadata_tx_out();
+        let data_tx_out = self.make_metadata_tx_out(fee_rate);
         tx_outs.push(data_tx_out);
 
         //
@@ -1338,8 +1341,7 @@ impl IpcCheckpointSubnetMsg {
         let has_transfers = !self.transfers.is_empty();
         if has_transfers {
             let (batch_transfer_tx_out, _, _) =
-            // Send any sats in the reveal transaction
-                self.make_batched_transfer(fee_rate)?;
+                self.make_batched_transfer(fee_rate, &committee.address_checked())?;
 
             // Push commit tx output
             tx_outs.push(batch_transfer_tx_out);
@@ -2387,7 +2389,11 @@ mod checkpoint_msg_tests {
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
         let batch_tx = checkpoint_msg
-            .make_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), fee_rate)
+            .make_reveal_batch_transfer_tx(
+                checkpoint_tx.compute_txid(),
+                fee_rate,
+                &committee.address_checked(),
+            )
             .unwrap();
 
         // First output should be OP_RETURN with metadata
@@ -2497,7 +2503,11 @@ mod checkpoint_msg_tests {
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
         let batch_tx = checkpoint_msg
-            .make_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), fee_rate)
+            .make_reveal_batch_transfer_tx(
+                checkpoint_tx.compute_txid(),
+                fee_rate,
+                &committee.address_checked(),
+            )
             .unwrap();
 
         assert!(
@@ -2573,7 +2583,11 @@ mod checkpoint_msg_tests {
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
         let batch_tx = checkpoint_msg
-            .make_reveal_batch_transfer_tx(checkpoint_tx.compute_txid(), fee_rate)
+            .make_reveal_batch_transfer_tx(
+                checkpoint_tx.compute_txid(),
+                fee_rate,
+                &committee.address_checked(),
+            )
             .unwrap();
 
         assert!(

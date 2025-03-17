@@ -461,7 +461,7 @@ where
                     .watchonly_rpc
                     .get_transaction(&checkpoint_txid, Some(true))?;
 
-                println!("batch-transfer: checkpoint tx {:#?}", checkpoint_tx);
+                println!("batch-transfer: checkpoint tx {:?}", checkpoint_tx);
 
                 // msg.validate()?;
                 //  msg.save_to_db(&self.db, block_height, txid)?;

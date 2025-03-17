@@ -516,7 +516,11 @@ pub async fn gen_checkpoint_psbt(
     let checkpoint_txid = unsigned_psbt.unsigned_tx.compute_txid();
 
     let batch_transfer_tx = msg
-        .make_reveal_batch_transfer_tx(checkpoint_txid, fee_rate)
+        .make_reveal_batch_transfer_tx(
+            checkpoint_txid,
+            fee_rate,
+            &subnet.committee.address_checked(),
+        )
         .map_err(|e| {
             error!(
                 "Error generating batch transfer tx for subnet_id={}: {}",
