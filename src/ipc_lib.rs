@@ -997,7 +997,8 @@ pub struct IpcCrossSubnetTransfer {
     // maybe the subnet was killed in the meantime
     pub destination_subnet_id: SubnetId,
     /// The address of the subnet
-    pub subnet_multisig_address: bitcoin::Address<NetworkUnchecked>,
+    #[serde(skip_deserializing)]
+    pub subnet_multisig_address: Option<bitcoin::Address<NetworkUnchecked>>,
     /// The address to transfer to
     pub subnet_user_address: alloy_primitives::Address,
 }
@@ -1011,10 +1012,13 @@ pub struct IpcCheckpointSubnetMsg {
     /// The checkpoint hash
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// Withdrawals
+    #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
     /// Cross-subnet transfers
+    #[serde(default)]
     pub transfers: Vec<IpcCrossSubnetTransfer>,
     /// Optional change address (multisig)
+    #[serde(skip_deserializing)]
     pub change_address: Option<bitcoin::Address<NetworkUnchecked>>,
 }
 
@@ -1273,9 +1277,27 @@ impl IpcCheckpointSubnetMsg {
         Ok((commit_tx_out, reveal_witness, reveal_tx_out))
     }
 
-    pub fn validate_subnets_for_transfer(&self) -> Result<(), IpcValidateError> {
-        // TODO should we validate transfers for all subnets
-        // check subnets exist and addresses match
+    /// For each transfer, given the subnet id, set the subnet
+    /// multisig address.
+    pub fn update_subnets_for_transfer<D: db::Database>(
+        &mut self,
+        db: &D,
+    ) -> Result<(), IpcLibError> {
+        // For each transfer, look up the target subnet and get its multisig address
+        for transfer in &mut self.transfers {
+            if let Some(subnet_state) = db.get_subnet_state(transfer.destination_subnet_id)? {
+                // Set the multisig address from the subnet state
+                transfer.subnet_multisig_address =
+                    Some(subnet_state.committee.multisig_address.clone());
+            } else {
+                return Err(IpcValidateError::InvalidField(
+                    "destination_subnet_id",
+                    format!("Subnet {} does not exist", transfer.destination_subnet_id),
+                )
+                .into());
+            }
+        }
+
         Ok(())
     }
 
@@ -1389,6 +1411,13 @@ impl IpcCheckpointSubnetMsg {
                     script_pubkey: transfer
                         .subnet_multisig_address
                         .clone()
+                        // this should not happen as we fill it
+                        // in update_subnets_for_transfer
+                        // and it's always defined in the transaction outputs
+                        .ok_or(IpcValidateError::InvalidField(
+                            "transfer.subnet_multisig_address",
+                            "subnet_multisig_address must be defined".to_string(),
+                        ))?
                         // safe to assume it's checked and panic otherwise
                         // because of the validation beforehand
                         .require_network(NETWORK)
@@ -1556,7 +1585,7 @@ impl IpcCheckpointSubnetMsg {
                             transfer_start_index + i
                         ))
                     })?;
-                let subnet_multisig_address = subnet_multisig_address.into_unchecked();
+                let subnet_multisig_address = Some(subnet_multisig_address.into_unchecked());
 
                 // Note: We're creating placeholder values for subnet ID and user address
                 // These will need to be filled in by parsing the batch reveal transaction
@@ -1778,7 +1807,7 @@ impl IpcBatchTransferMsg {
                     IpcCrossSubnetTransfer {
                         amount,
                         destination_subnet_id,
-                        subnet_multisig_address: subnet_multisig_address.clone(),
+                        subnet_multisig_address: Some(subnet_multisig_address.clone()),
                         subnet_user_address,
                     }
                 })
@@ -2610,7 +2639,7 @@ mod checkpoint_msg_tests {
         let transfer = IpcCrossSubnetTransfer {
             amount: Amount::from_sat(30000),
             destination_subnet_id: destination_subnet.id,
-            subnet_multisig_address: destination_subnet.committee.multisig_address.clone(),
+            subnet_multisig_address: Some(destination_subnet.committee.multisig_address.clone()),
             subnet_user_address: alloy_primitives::Address::from_str(
                 "742d35Cc6634C0532925a3b844Bc454e4438f44e",
             )

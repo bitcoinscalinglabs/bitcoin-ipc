@@ -185,13 +185,11 @@ curl -X POST http://localhost:3030/api \
             {
                 "amount": 150000,
                 "destination_subnet_id": "/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm",
-                "subnet_multisig_address": "bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5",
                 "subnet_user_address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
             },
             {
                 "amount": 100000,
                 "destination_subnet_id": "/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm",
-                "subnet_multisig_address": "bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5",
                 "subnet_user_address": "0x4967bB72907683bb6a933d47348a49bC3832968b"
             }
         ]
@@ -216,8 +214,22 @@ curl -X POST http://localhost:3030/api \
                 "address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n"
             }
         ],
-        "transfers": [],
-        "change_address": "bcrt1pnzehjzlgv2chzku60rvef6my0zpmuzqpky9mvm97ruzxyp832ycsz4re6v"
+        "transfers": []
+    },
+    "id": 1
+}' | jq
+
+# no transfers no withdrawals
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "gencheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "checkpoint_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
     },
     "id": 1
 }' | jq

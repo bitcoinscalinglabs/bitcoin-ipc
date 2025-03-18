@@ -68,13 +68,11 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
             {
                 \"amount\": 150000,
                 \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
-                \"subnet_multisig_address\": \"bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5\",
                 \"subnet_user_address\": \"0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf\"
             },
             {
                 \"amount\": 100000,
                 \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
-                \"subnet_multisig_address\": \"bcrt1p5anlf78u5l3grhzv9nrlc3djse903z25arjlzlfd0ms4jesawvaspu0yc5\",
                 \"subnet_user_address\": \"0x4967bB72907683bb6a933d47348a49bC3832968b\"
             }
         ]

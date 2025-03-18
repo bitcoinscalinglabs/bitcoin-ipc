@@ -471,7 +471,7 @@ pub struct GenCheckpointPsbtResponse {
 
 pub async fn gen_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
-    Params(msg): Params<IpcCheckpointSubnetMsg>,
+    Params(mut msg): Params<IpcCheckpointSubnetMsg>,
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
     trace!("gen_checkpoint_psbt: {:?}", msg);
 
@@ -498,6 +498,12 @@ pub async fn gen_checkpoint_psbt(
             "Subnet {} not found.",
             msg.subnet_id
         )))?;
+
+    // Fill in the subnet addresses, erroring out if any subnet is not found
+    msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
+        error!("Error updating subnets for transfer: {}", e);
+        RpcError::InvalidParams(e.to_string())
+    })?;
 
     let unspent = subnet
         .committee
