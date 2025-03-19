@@ -71,7 +71,7 @@ pub struct ServerData {
     pub db: Arc<db::HeedDb>,
     pub btc_rpc: Arc<Client>,
     pub btc_watchonly_rpc: Arc<Client>,
-    pub validator_sk: bitcoin::secp256k1::SecretKey,
+    pub validator: Option<(bitcoin::XOnlyPublicKey, bitcoin::secp256k1::SecretKey)>,
 }
 
 //
@@ -372,6 +372,16 @@ pub async fn gen_multisig_spend_psbt(
 ) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
     trace!("gen_multisig_spend_psbt: {:?}", params);
 
+    let (_, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
     // Check subnet exists
     let subnet = data
         .db
@@ -433,7 +443,7 @@ pub async fn gen_multisig_spend_psbt(
         RpcError::InternalError(e.to_string())
     })?;
 
-    let validator_keypair = data.validator_sk.keypair(&secp);
+    let validator_keypair = validator_sk.keypair(&secp);
 
     let (_, psbt_inputs_signatures) =
         multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
@@ -475,6 +485,16 @@ pub async fn gen_checkpoint_psbt(
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
     trace!("gen_checkpoint_psbt: {:?}", msg);
 
+    let (validator_xonly_pubkey, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
     if let Err(err) = msg.validate() {
         error!("Invalid checkpoint message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -501,10 +521,8 @@ pub async fn gen_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    let (self_pubkey, _) = data.validator_sk.x_only_public_key(&secp);
-
     // Check if self is a validator in the subnet
-    if !subnet.is_validator(&self_pubkey) {
+    if !subnet.is_validator(&validator_xonly_pubkey) {
         error!("Configured validator isn't a validator in the specified subnet.");
         return Err(RpcError::InvalidParams(
             "Configured validator isn't a validator in the specified subnet.".to_string(),
@@ -562,7 +580,7 @@ pub async fn gen_checkpoint_psbt(
     let batch_transfer_tx_hex =
         batch_transfer_tx.map(|tx| bitcoin::consensus::encode::serialize_hex(&tx));
 
-    let validator_keypair = data.validator_sk.keypair(&secp);
+    let validator_keypair = validator_sk.keypair(&secp);
 
     let (_, psbt_inputs_signatures) =
         multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bitcoin_ipc::db::HeedDb;
 use bitcoin_ipc::{bitcoin_utils, eth_utils, provider};
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
 
 const DEFAULT_PROVIDER_PORT: &str = "3030";
 
@@ -65,7 +65,7 @@ async fn main() -> std::io::Result<()> {
     let btc_watchonly_rpc = Arc::new(bitcoin_utils::make_watchonly_rpc_client_from_env());
 
     // Load validator secret key
-    let validator_sk = load_validator_sk()?;
+    let validator = load_validator()?;
 
     // Set correct fvm network
 
@@ -79,7 +79,7 @@ async fn main() -> std::io::Result<()> {
         db,
         btc_rpc,
         btc_watchonly_rpc,
-        validator_sk,
+        validator,
     });
 
     provider::Server::new(token, port, server_data)
@@ -87,12 +87,16 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
-fn load_validator_sk() -> Result<bitcoin::secp256k1::SecretKey, std::io::Error> {
+fn load_validator(
+) -> Result<Option<(bitcoin::XOnlyPublicKey, bitcoin::secp256k1::SecretKey)>, std::io::Error> {
     // Load validator secret key from path
-    let sk_path = std::env::var("VALIDATOR_SK_PATH").map_err(|e| {
-        error!("Couldn't load VALIDATOR_SK_PATH: {}", e);
-        std::io::Error::new(std::io::ErrorKind::Other, "Couldn't load VALIDATOR_SK_PATH")
-    })?;
+    let sk_path = match std::env::var("VALIDATOR_SK_PATH") {
+        Ok(path) if !path.is_empty() => path,
+        _ => {
+            warn!("VALIDATOR_SK_PATH is empty, you won't be able to sign transactions!");
+            return Ok(None);
+        }
+    };
     let sk_path = PathBuf::from(sk_path);
 
     let sk_hex = std::fs::read_to_string(&sk_path).map_err(|e| {
@@ -128,7 +132,11 @@ fn load_validator_sk() -> Result<bitcoin::secp256k1::SecretKey, std::io::Error> 
         )
     })?;
 
-    info!("Loaded validator secret key from {}", sk_path.display());
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (validator_pk, _) = validator_sk.x_only_public_key(&secp);
 
-    Ok(validator_sk)
+    info!("Loaded validator secret key from {}.", sk_path.display(),);
+    info!("Validator PK: {}", validator_pk);
+
+    Ok(Some((validator_pk, validator_sk)))
 }

@@ -692,7 +692,7 @@ impl Database for HeedDb {
         subnet_id: SubnetId,
     ) -> Result<Option<u64>, DbError> {
         let prefix = rootnet_msgs_prefix(subnet_id);
-        let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
+        let msgs_iter = self.rootnet_msgs_db.prefix_iter(txn, &prefix)?;
         let count: u64 = msgs_iter.count().try_into().map_err(|_| {
             DbError::TypeConversionError("max rootnet messages reached".to_string())
         })?;
