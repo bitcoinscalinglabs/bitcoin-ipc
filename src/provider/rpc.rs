@@ -499,6 +499,19 @@ pub async fn gen_checkpoint_psbt(
             msg.subnet_id
         )))?;
 
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    let (self_pubkey, _) = data.validator_sk.x_only_public_key(&secp);
+
+    // Check if self is a validator in the subnet
+    if !subnet.is_validator(&self_pubkey) {
+        error!("Configured validator isn't a validator in the specified subnet.");
+        return Err(RpcError::InvalidParams(
+            "Configured validator isn't a validator in the specified subnet.".to_string(),
+        )
+        .into());
+    }
+
     // Fill in the subnet addresses, erroring out if any subnet is not found
     msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
         error!("Error updating subnets for transfer: {}", e);
@@ -511,8 +524,6 @@ pub async fn gen_checkpoint_psbt(
         .map_err(|e| RpcError::InternalError(e.to_string()))?;
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
-
-    let secp = bitcoin::secp256k1::Secp256k1::new();
 
     let unsigned_psbt = msg
         .to_checkpoint_psbt(&subnet.committee, fee_rate, &unspent)
