@@ -487,6 +487,7 @@ where
 
                 trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
 
+                checkpoint_msg.validate()?;
                 msg.validate_for_checkpoint(&checkpoint_tx)?;
                 msg.subnet_id = checkpoint_msg.subnet_id;
 

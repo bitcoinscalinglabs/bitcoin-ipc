@@ -664,6 +664,7 @@ pub struct FinalizeCheckpointPsbtParams {
         bitcoin::XOnlyPublicKey,
         Vec<bitcoin::secp256k1::schnorr::Signature>,
     )>,
+    batch_transfer_tx_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -700,6 +701,24 @@ pub async fn finalize_checkpoint_psbt(
         .map(|v| v.pubkey)
         .collect();
     let committee_threshold = subnet.committee.threshold;
+
+    let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {
+        Some(hex) => {
+            let tx_bytes = hex::decode(hex).map_err(|e| {
+                error!("Invalid hex format for batch transfer tx: {}", e);
+                RpcError::InvalidParams(format!("Invalid hex format for batch transfer tx: {}", e))
+            })?;
+
+            Some(bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
+                error!("Invalid transaction format for batch transfer tx: {}", e);
+                RpcError::InvalidParams(format!(
+                    "Invalid transaction format for batch transfer tx: {}",
+                    e
+                ))
+            })?)
+        }
+        None => None,
+    };
 
     // Decode base64 PSBT
     let psbt_bytes = BASE64_STANDARD
@@ -746,8 +765,15 @@ pub async fn finalize_checkpoint_psbt(
 
     trace!("checkpoint_txid = {}", txid);
 
+    let mut tx_to_submit = vec![finalized_tx.clone()];
+
+    if let Some(batch_transfer_tx) = batch_transfer_tx {
+        trace!("batch_transfer_tx = {}", batch_transfer_tx.compute_txid());
+        tx_to_submit.push(batch_transfer_tx);
+    }
+
     // Send the transaction to the Bitcoin network
-    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![finalized_tx.clone()]).map_err(|e| {
+    bitcoin_utils::submit_to_mempool(&data.btc_rpc, tx_to_submit).map_err(|e| {
         error!("Error sending transaction to Bitcoin network: {}", e);
         RpcError::InternalError(format!(
             "Error sending transaction to Bitcoin network: {}",
