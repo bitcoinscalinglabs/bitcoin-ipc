@@ -672,6 +672,7 @@ pub struct FinalizeCheckpointPsbtResponse {
     tx: bitcoin::Transaction,
     txid: String,
     tx_hex: String,
+    batch_transfer_txid: Option<String>,
 }
 
 pub async fn finalize_checkpoint_psbt(
@@ -762,13 +763,15 @@ pub async fn finalize_checkpoint_psbt(
 
     // Get transaction ID
     let txid = finalized_tx.compute_txid().to_string();
+    let batch_transfer_txid = batch_transfer_tx
+        .clone()
+        .map(|tx| tx.compute_txid().to_string());
 
     trace!("checkpoint_txid = {}", txid);
 
     let mut tx_to_submit = vec![finalized_tx.clone()];
 
     if let Some(batch_transfer_tx) = batch_transfer_tx {
-        trace!("batch_transfer_tx = {}", batch_transfer_tx.compute_txid());
         tx_to_submit.push(batch_transfer_tx);
     }
 
@@ -785,6 +788,7 @@ pub async fn finalize_checkpoint_psbt(
         tx: finalized_tx,
         txid,
         tx_hex,
+        batch_transfer_txid,
     })
 }
 

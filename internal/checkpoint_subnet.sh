@@ -128,19 +128,36 @@ fi
 # 3. Finalize the checkpoint transaction
 echo "3. Finalizing checkpoint transaction..."
 
-FINALIZE_RESPONSE=$(curl -s -X POST "$API_URL" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $BEARER_TOKEN" \
-  -d "{
-    \"jsonrpc\": \"2.0\",
-    \"method\": \"finalizecheckpointpsbt\",
-    \"params\": {
-        \"subnet_id\": \"$SUBNET_ID\",
-        \"unsigned_psbt_base64\": \"$UNSIGNED_PSBT_BASE64\",
-        \"signatures\": $SIGNATURES
-    },
-    \"id\": 1
-}")
+if [ "$BATCH_TRANSFER_TX_HEX" != "null" ] && [ -n "$BATCH_TRANSFER_TX_HEX" ]; then
+  FINALIZE_RESPONSE=$(curl -s -X POST "$API_URL" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $BEARER_TOKEN" \
+    -d "{
+      \"jsonrpc\": \"2.0\",
+      \"method\": \"finalizecheckpointpsbt\",
+      \"params\": {
+          \"subnet_id\": \"$SUBNET_ID\",
+          \"unsigned_psbt_base64\": \"$UNSIGNED_PSBT_BASE64\",
+          \"signatures\": $SIGNATURES,
+          \"batch_transfer_tx_hex\": \"$BATCH_TRANSFER_TX_HEX\"
+      },
+      \"id\": 1
+  }")
+else
+  FINALIZE_RESPONSE=$(curl -s -X POST "$API_URL" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $BEARER_TOKEN" \
+    -d "{
+      \"jsonrpc\": \"2.0\",
+      \"method\": \"finalizecheckpointpsbt\",
+      \"params\": {
+          \"subnet_id\": \"$SUBNET_ID\",
+          \"unsigned_psbt_base64\": \"$UNSIGNED_PSBT_BASE64\",
+          \"signatures\": $SIGNATURES
+      },
+      \"id\": 1
+  }")
+fi
 
 # Check for errors in the response
 if echo "$FINALIZE_RESPONSE" | jq -e '.error' > /dev/null; then
@@ -156,17 +173,6 @@ echo "Checkpoint transaction finalized and broadcast successfully"
 echo "Transaction ID: $TXID"
 
 sleep 1
-
-# 5. Submit batch transfer transaction if present
-if [ "$BATCH_TRANSFER_TX_HEX" != "null" ] && [ -n "$BATCH_TRANSFER_TX_HEX" ]; then
-  echo "3.1. Submitting batch transfer reveal transaction..."
-  echo $BATCH_TRANSFER_TX_HEX
-  BATCH_TRANSFER_TXID=$(bitcoin-cli sendrawtransaction "$BATCH_TRANSFER_TX_HEX")
-
-  echo "Batch transfer transaction submitted with TXID: $BATCH_TRANSFER_TXID"
-else
-echo "No batch transfer transaction present"
-fi
 
 # 4. Mine a block to confirm the transaction
 echo "4. Mining a block to confirm the transaction..."
@@ -185,8 +191,6 @@ if [[ $BLOCK_INFO == *"$TXID"* ]]; then
 else
   echo "⚠️ Checkpoint transaction not found in the new block"
 fi
-
-sleep 3.5
 
 # Get updated subnet state to verify checkpoint was processed
 echo "Getting updated subnet state..."
