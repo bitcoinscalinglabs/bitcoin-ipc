@@ -4,6 +4,7 @@ use bitcoin::{
     secp256k1::{PublicKey, SecretKey},
     Txid, XOnlyPublicKey,
 };
+use rand::Rng;
 
 use crate::multisig::{collateral_to_power, Power, WeightedKey};
 use crate::{db, SubnetId};
@@ -23,6 +24,15 @@ pub fn generate_equal_weighted_keys(n: usize) -> Vec<WeightedKey> {
     generate_xonly_pubkeys(n)
         .into_iter()
         .map(|pubkey| (pubkey, 1))
+        .collect()
+}
+
+pub fn generate_random_weighted_keys(n: usize) -> Vec<WeightedKey> {
+    let power: Power = rand::thread_rng().gen_range(0..=5000);
+
+    generate_xonly_pubkeys(n)
+        .into_iter()
+        .map(|pubkey| (pubkey, power))
         .collect()
 }
 

@@ -110,7 +110,7 @@ pub fn multisig_threshold(total_power: Power) -> Power {
 
 // TODO figure out scaling factor
 pub const POWER_SCALE_FACTOR: u64 = 10_000;
-pub const MAX_POWER: u64 = i32::MAX as u64;
+pub const MAX_POWER: u64 = u32::MAX as u64;
 
 /// Converts a Bitcoin Amount to a power/weight value (u32) using a fixed scale factor.
 /// Discards small satoshi values based on the provided minimum amount.
@@ -1844,5 +1844,296 @@ mod psbt_tests {
         );
 
         println!("Transaction successfully verified with signatures collected in parallel!");
+    }
+}
+
+#[cfg(test)]
+mod multisig_weighted_tests {
+    use super::*;
+    use crate::test_utils::generate_subnet_id;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{transaction, Amount, OutPoint, Sequence, TxOut, Txid};
+
+    #[test]
+    fn test_weighted_spend() {
+        let secp = Secp256k1::new();
+
+        // Generate 4 keypairs with different weights
+        let keypairs = crate::test_utils::generate_keypairs(4);
+
+        // Assign different weights to each validator:
+        // - Validator 0: 10 power (heavy)
+        // - Validator 1: 5 power (medium)
+        // - Validator 2: 3 power (light)
+        // - Validator 3: 2 power (light)
+        // Total power: 20
+        let committee_pubkeys: Vec<WeightedKey> = vec![
+            (keypairs[0].x_only_public_key().0, 10), // Heavy validator
+            (keypairs[1].x_only_public_key().0, 5),  // Medium validator
+            (keypairs[2].x_only_public_key().0, 3),  // Light validator
+            (keypairs[3].x_only_public_key().0, 2),  // Light validator
+        ];
+
+        // Set threshold to 12 (60% of total power)
+        let threshold = 12_u32;
+        let subnet_id = generate_subnet_id();
+
+        // Create multisig address
+        let network = bitcoin::Network::Regtest;
+        let multisig_address = create_subnet_multisig_address(
+            &secp,
+            &subnet_id,
+            &committee_pubkeys,
+            threshold,
+            network,
+        )
+        .unwrap();
+
+        println!("Multisig address: {}", multisig_address);
+
+        // Create the multisig script
+        let script = create_multisig_script(&committee_pubkeys, threshold).unwrap();
+        let leaf_hash = script.tapscript_leaf_hash();
+
+        // Get spend info for the multisig
+        let spend_info =
+            create_subnet_multisig_spend_info(&secp, &subnet_id, &committee_pubkeys, threshold)
+                .unwrap();
+
+        // Create control block
+        let control_block = spend_info
+            .control_block(&(script.clone(), LeafVersion::TapScript))
+            .unwrap();
+
+        // Create a funding transaction that sends to our multisig
+        let funding_amount = Amount::from_sat(100_000);
+        let funding_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_amount,
+                script_pubkey: multisig_address.script_pubkey(),
+            }],
+        };
+        let funding_txid = funding_tx.compute_txid();
+
+        // Create spending transaction
+        let spending_amount = Amount::from_sat(90_000);
+        let spending_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: funding_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: spending_amount,
+                script_pubkey: ScriptBuf::new_op_return([1]),
+            }],
+        };
+
+        // Create sighash for signing
+        let mut sighash_cache = SighashCache::new(&spending_tx);
+        let sighash = sighash_cache
+            .taproot_script_spend_signature_hash(
+                0,
+                &Prevouts::All(&[funding_tx.output[0].clone()]),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .expect("Failed to create sighash");
+
+        // Test case 1: Only the heavy validator (10 power) - insufficient
+        {
+            let mut tx_insufficient = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Sign with the heavy validator only (10 power)
+            let msg =
+                Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+            let sig = secp.sign_schnorr(&msg, &keypairs[0]);
+
+            // Add signature for validator 0 (heavy)
+            witness.push(sig.serialize());
+
+            // Empty signatures for the rest
+            for _ in 1..keypairs.len() {
+                witness.push([]);
+            }
+
+            witness.push(script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_insufficient.input[0].witness = witness;
+
+            let verify_result = super::tests::verify_transaction(&tx_insufficient, |_| {
+                Some(funding_tx.output[0].clone())
+            });
+
+            // Should fail: 10 power < 12 threshold
+            assert!(
+                verify_result.is_err(),
+                "Transaction with only the heavy validator should fail"
+            );
+            println!("Test case 1 passed: Heavy validator alone (10 power) cannot meet threshold");
+        }
+
+        // Test case 2: Heavy validator (10) + Light validator (2) = 12 power (exactly threshold)
+        {
+            let mut tx_sufficient = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Empty signature array in reverse order of committee
+            let mut signatures = vec![vec![]; keypairs.len()];
+
+            // Sign with validators 0 (heavy, 10 power) and 3 (light, 2 power)
+            let msg =
+                Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+
+            // Sign with heavy validator (index 0)
+            let sig0 = secp.sign_schnorr(&msg, &keypairs[0]);
+            signatures[0] = sig0.serialize().to_vec();
+
+            // Sign with light validator (index 3)
+            let sig3 = secp.sign_schnorr(&msg, &keypairs[3]);
+            signatures[3] = sig3.serialize().to_vec();
+
+            // Add signatures in reverse order
+            for sig_bytes in signatures.iter().rev() {
+                if sig_bytes.is_empty() {
+                    witness.push([]);
+                } else {
+                    witness.push(sig_bytes.as_slice());
+                }
+            }
+
+            witness.push(script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_sufficient.input[0].witness = witness;
+
+            let verify_result = super::tests::verify_transaction(&tx_sufficient, |_| {
+                Some(funding_tx.output[0].clone())
+            });
+
+            // Should succeed: 10 + 2 = 12 power = threshold
+            assert!(
+                verify_result.is_ok(),
+                "Transaction with exactly threshold power should succeed: {:?}",
+                verify_result
+            );
+            println!("Test case 2 passed: Heavy validator (10 power) + Light validator (2 power) = 12 power reaches threshold");
+        }
+
+        // Test case 3: Medium validator (5) + two Light validators (3+2=5) = 10 power (insufficient)
+        {
+            let mut tx_insufficient = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Empty signature array in reverse order of committee
+            let mut signatures = vec![vec![]; keypairs.len()];
+
+            // Sign with validators 1 (medium, 5 power), 2 (light, 3 power), and 3 (light, 2 power)
+            let msg =
+                Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+
+            // Sign with medium validator (index 1)
+            let sig1 = secp.sign_schnorr(&msg, &keypairs[1]);
+            signatures[1] = sig1.serialize().to_vec();
+
+            // Sign with light validator (index 2)
+            let sig2 = secp.sign_schnorr(&msg, &keypairs[2]);
+            signatures[2] = sig2.serialize().to_vec();
+
+            // Sign with light validator (index 3)
+            let sig3 = secp.sign_schnorr(&msg, &keypairs[3]);
+            signatures[3] = sig3.serialize().to_vec();
+
+            // Add signatures in reverse order
+            for sig_bytes in signatures.iter().rev() {
+                if sig_bytes.is_empty() {
+                    witness.push([]);
+                } else {
+                    witness.push(sig_bytes.as_slice());
+                }
+            }
+
+            witness.push(script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_insufficient.input[0].witness = witness;
+
+            let verify_result = super::tests::verify_transaction(&tx_insufficient, |_| {
+                Some(funding_tx.output[0].clone())
+            });
+
+            // Should fail: 5 + 3 + 2 = 10 power < 12 threshold
+            assert!(
+                verify_result.is_err(),
+                "Transaction with 3 validators but insufficient power should fail"
+            );
+            println!("Test case 3 passed: Medium (5) + two Light validators (3+2) = 10 power cannot meet threshold");
+        }
+
+        // Test case 4: Heavy validator (10) + Medium validator (5) = 15 power (above threshold)
+        {
+            let mut tx_above_threshold = spending_tx.clone();
+            let mut witness = Witness::new();
+
+            // Empty signature array in reverse order of committee
+            let mut signatures = vec![vec![]; keypairs.len()];
+
+            // Sign with validators 0 (heavy, 10 power) and 1 (medium, 5 power)
+            let msg =
+                Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
+
+            // Sign with heavy validator (index 0)
+            let sig0 = secp.sign_schnorr(&msg, &keypairs[0]);
+            signatures[0] = sig0.serialize().to_vec();
+
+            // Sign with medium validator (index 1)
+            let sig1 = secp.sign_schnorr(&msg, &keypairs[1]);
+            signatures[1] = sig1.serialize().to_vec();
+
+            // Add signatures in reverse order
+            for sig_bytes in signatures.iter().rev() {
+                if sig_bytes.is_empty() {
+                    witness.push([]);
+                } else {
+                    witness.push(sig_bytes.as_slice());
+                }
+            }
+
+            witness.push(script.to_bytes());
+            witness.push(control_block.serialize());
+
+            tx_above_threshold.input[0].witness = witness;
+
+            let verify_result = super::tests::verify_transaction(&tx_above_threshold, |_| {
+                Some(funding_tx.output[0].clone())
+            });
+
+            // Should succeed: 10 + 5 = 15 power > 12 threshold
+            assert!(
+                verify_result.is_ok(),
+                "Transaction with above threshold power should succeed"
+            );
+            println!("Test case 4 passed: Heavy (10) + Medium validator (5) = 15 power exceeds threshold");
+        }
     }
 }
