@@ -38,8 +38,7 @@ pub fn create_multisig_script(
     let builder = Builder::new().push_int(0); // power accumulator
     Ok(sorted_public_keys
         .iter()
-        .enumerate()
-        .fold(builder, |builder, (_index, (key, weight))| {
+        .fold(builder, |builder, (key, weight)| {
             builder
                 .push_opcode(opcodes::all::OP_SWAP)
                 .push_x_only_key(key)
