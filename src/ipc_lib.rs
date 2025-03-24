@@ -273,15 +273,25 @@ impl IpcCreateSubnetMsg {
 
     /// Creates a multisig address from the whitelisted public keys
     /// and the subnet id
+    /// Each whitelisted key has the same weight
     pub fn multisig_address_from_whitelist(
         &self,
         subnet_id: &SubnetId,
     ) -> Result<bitcoin::Address, IpcLibError> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        let whitelist_weighted_keys = self
+            .whitelist
+            .clone()
+            .into_iter()
+            // Each key has the same weight
+            .map(|xpk| (xpk, 1))
+            .collect::<Vec<_>>();
+
         let multisig_address = create_subnet_multisig_address(
             &secp,
             subnet_id,
-            &self.whitelist.clone(),
+            &whitelist_weighted_keys,
             self.min_validators.into(),
             NETWORK,
         )?;
@@ -427,10 +437,16 @@ impl IpcJoinSubnetMsg {
 
         let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
+        let power = multisig::collateral_to_power(
+            &self.collateral,
+            &genesis_info.create_subnet_msg.min_validator_stake,
+        )?;
+
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
             subnet_address,
             collateral: self.collateral,
+            power,
             backup_address: self.backup_address.clone(),
             ip: self.ip,
             join_txid: txid,
@@ -1431,8 +1447,10 @@ impl IpcCheckpointSubnetMsg {
         // Create the checkpoint unsigned transaction
         //
 
+        let committee_keys = committee.validator_weighted_keys();
+
         let checkpoint_tx = multisig::construct_spend_unsigned_transaction(
-            committee.size(),
+            &committee_keys,
             committee.threshold,
             &committee.address_checked(),
             unspent,
@@ -1444,7 +1462,7 @@ impl IpcCheckpointSubnetMsg {
         let checkpoint_psbt = multisig::construct_spend_psbt(
             &secp,
             &self.subnet_id,
-            &committee.pubkeys(),
+            &committee_keys,
             committee.threshold,
             &committee.address_checked(),
             unspent,

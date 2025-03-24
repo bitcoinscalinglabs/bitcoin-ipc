@@ -152,6 +152,11 @@ pub fn submit_to_mempool(
     {
         Ok(r) => r,
         Err(e) => {
+            error!("Error testing mempool acceptance: {}", e);
+            // Print the transactions that are being rejected
+            for (i, tx) in txs.iter().enumerate() {
+                error!("TX_{}: {}", i, tx.raw_hex());
+            }
             return Err(BitcoinUtilsError::MempoolAcceptanceFailed(e.to_string()));
         }
     };

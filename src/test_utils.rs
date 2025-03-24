@@ -5,6 +5,7 @@ use bitcoin::{
     Txid, XOnlyPublicKey,
 };
 
+use crate::multisig::{collateral_to_power, Power, WeightedKey};
 use crate::{db, SubnetId};
 
 pub fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
@@ -15,6 +16,13 @@ pub fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
             let public_key = PublicKey::from_secret_key(&secp, &secret_key);
             XOnlyPublicKey::from(public_key)
         })
+        .collect()
+}
+
+pub fn generate_equal_weighted_keys(n: usize) -> Vec<WeightedKey> {
+    generate_xonly_pubkeys(n)
+        .into_iter()
+        .map(|pubkey| (pubkey, 1))
         .collect()
 }
 
@@ -73,10 +81,15 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
             let backup_address =
                 bitcoin::Address::from_str("bcrt1qvr3jycfxtrkk8u6hp5caxc25tueek5f90mpnsv").unwrap();
 
+            let collateral = Amount::from_sat(100000);
+            let power = collateral_to_power(&collateral, &Amount::from_sat(10000))
+                .expect("expect good collateral");
+
             db::SubnetValidator {
                 pubkey,
                 subnet_address,
-                collateral: Amount::from_sat(1000),
+                collateral,
+                power,
                 backup_address,
                 ip,
                 join_txid,
@@ -85,17 +98,17 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         .collect();
 
     // Create subnet parameters
-    let min_validators = std::cmp::max(1, n / 2) as u16; // Set threshold to n/2 rounded up
+    let min_validators = std::cmp::max(1, n / 2) as Power; // Set threshold to n/2 rounded up
 
     // Create committee
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let committee_pubkeys: Vec<XOnlyPublicKey> = validators.iter().map(|v| v.pubkey).collect();
+    let committee_keys: Vec<WeightedKey> = validators.iter().map(|v| (v.pubkey, 1)).collect();
 
     // Create multisig address
     let multisig_address = create_subnet_multisig_address(
         &secp,
         &subnet_id,
-        &committee_pubkeys,
+        &committee_keys,
         min_validators.into(),
         NETWORK,
     )

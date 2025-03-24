@@ -18,31 +18,38 @@ use crate::bitcoin_utils::unspenable_internal_key;
 
 use crate::SubnetId;
 
+pub type Power = u32;
+pub type WeightedKey = (XOnlyPublicKey, Power);
+
 pub fn create_multisig_script(
-    public_keys: &[XOnlyPublicKey],
-    required_sigs: i64,
+    public_keys: &[WeightedKey],
+    threshold: Power,
 ) -> Result<ScriptBuf, MultisigError> {
-    // check if enough public keys are provided
-    if (public_keys.len() as i64) < required_sigs {
-        return Err(MultisigError::InsufficientPublicKeys);
+    // Check if enough weight is available
+    let total_weight: Power = public_keys.iter().map(|(_, weight)| weight).sum();
+    if total_weight < threshold {
+        return Err(MultisigError::InsufficientTotalPower);
     }
 
     // Public keys need to be sorted for consistent scriptPubKey
     let mut sorted_public_keys = public_keys.to_vec();
-    sorted_public_keys.sort();
+    sorted_public_keys.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
 
+    let builder = Builder::new().push_int(0); // power accumulator
     Ok(sorted_public_keys
         .iter()
         .enumerate()
-        .fold(Builder::new(), |builder, (index, key)| {
-            let builder = builder.push_x_only_key(key);
-            if index == 0 {
-                builder.push_opcode(opcodes::all::OP_CHECKSIG)
-            } else {
-                builder.push_opcode(opcodes::all::OP_CHECKSIGADD)
-            }
+        .fold(builder, |builder, (_index, (key, weight))| {
+            builder
+                .push_opcode(opcodes::all::OP_SWAP)
+                .push_x_only_key(key)
+                .push_opcode(opcodes::all::OP_CHECKSIG)
+                .push_opcode(opcodes::all::OP_IF)
+                .push_int((*weight).into())
+                .push_opcode(opcodes::all::OP_ADD)
+                .push_opcode(opcodes::all::OP_ENDIF)
         })
-        .push_int(required_sigs)
+        .push_int(threshold.into())
         .push_opcode(opcodes::all::OP_GREATERTHANOREQUAL)
         .into_script())
 }
@@ -63,10 +70,10 @@ fn create_unspendable_subnet_id_script(subnet_id: &SubnetId) -> ScriptBuf {
 pub fn create_subnet_multisig_spend_info(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
-    public_keys: &[XOnlyPublicKey],
-    required_sigs: i64,
+    public_keys: &[WeightedKey],
+    threshold: Power,
 ) -> Result<TaprootSpendInfo, MultisigError> {
-    let multisig_script = create_multisig_script(public_keys, required_sigs)?;
+    let multisig_script = create_multisig_script(public_keys, threshold)?;
     let subnet_id_script = create_unspendable_subnet_id_script(subnet_id);
 
     let builder =
@@ -82,12 +89,11 @@ pub fn create_subnet_multisig_spend_info(
 pub fn create_subnet_multisig_address(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
-    public_keys: &[XOnlyPublicKey],
-    required_sigs: i64,
+    public_keys: &[WeightedKey],
+    threshold: Power,
     network: Network,
 ) -> Result<Address, MultisigError> {
-    let spend_info =
-        create_subnet_multisig_spend_info(secp, subnet_id, public_keys, required_sigs)?;
+    let spend_info = create_subnet_multisig_spend_info(secp, subnet_id, public_keys, threshold)?;
 
     Ok(Address::p2tr(
         secp,
@@ -97,29 +103,50 @@ pub fn create_subnet_multisig_address(
     ))
 }
 
-pub fn multisig_threshold(participants: u16) -> u16 {
+pub fn multisig_threshold(total_power: Power) -> Power {
     // TODO figure out threshold
-    (participants / 2) + 1
+    (total_power / 2) + 1
+}
+
+// TODO figure out scaling factor
+pub const POWER_SCALE_FACTOR: u64 = 10_000;
+pub const MAX_POWER: u64 = i32::MAX as u64;
+
+/// Converts a Bitcoin Amount to a power/weight value (u32) using a fixed scale factor.
+/// Discards small satoshi values based on the provided minimum amount.
+// TODO improve this
+pub fn collateral_to_power(amount: &Amount, min_amount: &Amount) -> Result<Power, MultisigError> {
+    // Check if amount is below minimum threshold
+    if amount < min_amount {
+        return Err(MultisigError::InsufficientCollateral);
+    }
+
+    let power = amount.to_sat().min(MAX_POWER) / POWER_SCALE_FACTOR;
+
+    let power: Power = power
+        .try_into()
+        .map_err(|_| MultisigError::CollateralTooHigh)?;
+
+    Ok(power)
 }
 
 /// Calculates the size in bytes of witness elements for spending a multisig utxo
+/// Calculates the "worst case" size, assuming all public keys' signatures are included
 /// Useful for fee calculations.
-pub fn multisig_spend_witness_size(committee_size: u16, committee_threshold: u16) -> usize {
-    // Each required signature
-    let signatures_size =
-        bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE * committee_threshold as usize;
+pub fn multisig_spend_max_witness_size(public_keys: &[WeightedKey], threshold: Power) -> usize {
+    let committee_size = public_keys.len();
 
-    // For each unused key position, we need an empty signature (represented as empty vector with 1 byte length)
-    // In witness format, an empty element still takes 1 byte (the length byte indicating zero-length data)
-    let empty_sigs_size = (committee_size - committee_threshold) as usize;
+    let signatures_size = bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE * committee_size;
 
-    // Script size: all x-only public keys (32 bytes each) plus opcodes
-    // - Each key needs 1 byte push operation (for the 32-byte key) = 33 bytes per key
-    // - 1 byte for each OP_CHECKSIG or OP_CHECKSIGADD
-    // - 1 byte for integer push (required_sigs)
-    // - 1 byte for OP_GREATERTHANOREQUAL
-    let script_size =
-        (bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE + 2) * committee_size as usize + 2;
+    let script_size = 1
+        + public_keys
+            .iter()
+            .map(|(_, power)| {
+                bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE + 5 + VarInt::from(*power).size()
+            })
+            .sum::<usize>()
+        + VarInt::from(threshold).size()
+        + 1;
 
     // Control block calculation:
     // - TAPROOT_CONTROL_BASE_SIZE (33 bytes: 1 byte version + 32 bytes internal key)
@@ -131,13 +158,13 @@ pub fn multisig_spend_witness_size(committee_size: u16, committee_threshold: u16
 	    // varint for the number of witnesses, which is a signature for each committee member + script + control block
 	    bitcoin::VarInt::from(committee_size + 2).size()
 	    // each schnorr sig
-        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * committee_threshold as usize
+        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * threshold as usize
         // script size
         + VarInt::from(script_size).size()
         // control block size
         + VarInt::from(control_block_content_size).size();
 
-    signatures_size + empty_sigs_size + script_size + control_block_content_size + var_ints
+    signatures_size + script_size + control_block_content_size + var_ints
 }
 
 /// Selects UTXOs to spend for a transaction
@@ -202,6 +229,7 @@ pub fn select_coins(
                 total_fee,
                 change
             );
+            #[cfg(test)]
             dbg!(change, non_dust_change_tx_out.value);
 
             // if change is non-dust, return it
@@ -223,8 +251,8 @@ pub fn select_coins(
 }
 
 pub fn construct_spend_unsigned_transaction(
-    committee_size: u16,
-    committee_threshold: u16,
+    committee_keys: &[WeightedKey],
+    threshold: Power,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     tx_outs: &[TxOut],
@@ -233,7 +261,7 @@ pub fn construct_spend_unsigned_transaction(
     trace!("Creating multisig spend tx for tx_outs={:?}", &tx_outs);
 
     // size of the witness data when spending a multisig utxo
-    let spend_witness_size = multisig_spend_witness_size(committee_size, committee_threshold);
+    let spend_witness_size = multisig_spend_max_witness_size(committee_keys, threshold);
     // base input size
     let spend_txin_size = bitcoin::TxIn::default().base_size();
     // weight of spending one input
@@ -301,8 +329,8 @@ pub fn construct_spend_unsigned_transaction(
 pub fn construct_spend_psbt(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
-    committee_keys: &[XOnlyPublicKey],
-    committee_threshold: u16,
+    committee_keys: &[WeightedKey],
+    committee_threshold: Power,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     tx_outs: &[TxOut],
@@ -310,14 +338,9 @@ pub fn construct_spend_psbt(
 ) -> Result<bitcoin::Psbt, MultisigError> {
     trace!("Creating multisig spend PSBT for tx_outs={:?}", &tx_outs);
 
-    let committee_size: u16 = committee_keys
-        .len()
-        .try_into()
-        .map_err(|_| MultisigError::PsbtError("Committee size too large".to_string()))?;
-
     // First construct the unsigned transaction
     let unsigned_tx = construct_spend_unsigned_transaction(
-        committee_size,
+        committee_keys,
         committee_threshold,
         committee_change_address,
         unspent,
@@ -329,15 +352,11 @@ pub fn construct_spend_psbt(
     let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(unsigned_tx.clone())
         .map_err(|e| MultisigError::CoinSelectionFailed(format!("Failed to create PSBT: {}", e)))?;
 
-    let script = create_multisig_script(committee_keys, committee_threshold.into())?;
+    let script = create_multisig_script(committee_keys, committee_threshold)?;
 
     // Get the spend info for the multisig
-    let spend_info = create_subnet_multisig_spend_info(
-        secp,
-        subnet_id,
-        committee_keys,
-        committee_threshold.into(),
-    )?;
+    let spend_info =
+        create_subnet_multisig_spend_info(secp, subnet_id, committee_keys, committee_threshold)?;
 
     // Create the control block
     let control_block = spend_info
@@ -458,20 +477,16 @@ pub fn sign_spend_psbt(
 pub fn finalize_spend_psbt(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
-    committee_keys: &[XOnlyPublicKey],
-    committee_threshold: u16,
+    committee_keys: &[WeightedKey],
+    committee_threshold: Power,
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
-    let script = create_multisig_script(committee_keys, committee_threshold.into())?;
+    let script = create_multisig_script(committee_keys, committee_threshold)?;
     let leaf_hash = script.tapscript_leaf_hash();
 
     // Get the spend info for the multisig
-    let spend_info = create_subnet_multisig_spend_info(
-        secp,
-        subnet_id,
-        committee_keys,
-        committee_threshold.into(),
-    )?;
+    let spend_info =
+        create_subnet_multisig_spend_info(secp, subnet_id, committee_keys, committee_threshold)?;
 
     // Create the control block
     let control_block = spend_info
@@ -484,7 +499,7 @@ pub fn finalize_spend_psbt(
     for input in finalized_psbt.inputs.iter_mut() {
         let mut witness = Witness::new();
 
-        for pubkey in committee_keys.iter().rev() {
+        for (pubkey, _power) in committee_keys.iter().rev() {
             if let Some(sig) = input.tap_script_sigs.get(&(*pubkey, leaf_hash)) {
                 witness.push(sig.signature.serialize());
             } else {
@@ -514,17 +529,17 @@ pub fn finalize_spend_psbt(
 pub fn finalize_spend_psbt_from_sigs(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
-    committee_keys: &[XOnlyPublicKey],
-    committee_threshold: u16,
+    committee_keys: &[WeightedKey],
+    committee_threshold: u32,
     psbt: &bitcoin::Psbt,
     signature_sets: &[&[bitcoin::secp256k1::schnorr::Signature]],
 ) -> Result<Transaction, MultisigError> {
     let mut signed_psbt = psbt.clone();
 
-    let script = create_multisig_script(committee_keys, committee_threshold.into()).unwrap();
+    let script = create_multisig_script(committee_keys, committee_threshold).unwrap();
     let leaf_hash = script.tapscript_leaf_hash();
 
-    for (xonly_pubkey, signatures) in committee_keys.iter().zip(signature_sets.iter()) {
+    for ((xonly_pubkey, _power), signatures) in committee_keys.iter().zip(signature_sets.iter()) {
         // For each input this signer has signed
         for (input_idx, signature) in signatures.iter().enumerate() {
             // Make sure we don't go out of bounds
@@ -558,6 +573,15 @@ pub enum MultisigError {
     #[error("insufficient public keys provided")]
     InsufficientPublicKeys,
 
+    #[error("insufficient total validator power provided")]
+    InsufficientTotalPower,
+
+    #[error("insufficient collateral provided")]
+    InsufficientCollateral,
+
+    #[error("collateral too high")]
+    CollateralTooHigh,
+
     #[error("error during coin selection: {0}")]
     CoinSelectionFailed(String),
 
@@ -580,7 +604,7 @@ pub enum MultisigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{generate_keypairs, generate_subnet_id, generate_xonly_pubkeys};
+    use crate::test_utils::{generate_equal_weighted_keys, generate_keypairs, generate_subnet_id};
     use bitcoin::consensus::encode;
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::Message;
@@ -642,7 +666,7 @@ mod tests {
     #[test]
     fn test_create_multisig_address_single_key() {
         let secp = Secp256k1::new();
-        let public_keys = generate_xonly_pubkeys(1);
+        let public_keys = generate_equal_weighted_keys(1);
         let required_sigs = 1;
         let network = Network::Bitcoin;
 
@@ -661,7 +685,7 @@ mod tests {
     #[test]
     fn test_create_multisig_address_multiple_keys() {
         let secp = Secp256k1::new();
-        let public_keys = generate_xonly_pubkeys(3);
+        let public_keys = generate_equal_weighted_keys(3);
         let required_sigs = 2;
         let network = Network::Bitcoin;
 
@@ -680,19 +704,19 @@ mod tests {
     #[test]
     fn test_create_multisig_address_insufficient_keys() {
         let secp = Secp256k1::new();
-        let public_keys = generate_xonly_pubkeys(1);
-        let required_sigs = 2; // More signatures required than keys available
+        let public_keys = generate_equal_weighted_keys(1);
+        let threshold = 2; // More signatures required than keys available
         let network = Network::Bitcoin;
 
         let result = create_subnet_multisig_address(
             &secp,
             &generate_subnet_id(),
             &public_keys,
-            required_sigs,
+            threshold,
             network,
         );
 
-        assert!(matches!(result, Err(MultisigError::InsufficientPublicKeys)));
+        assert!(matches!(result, Err(MultisigError::InsufficientTotalPower)));
     }
 
     //
@@ -723,21 +747,25 @@ mod tests {
             );
         }
 
-        let public_keys: Vec<XOnlyPublicKey> =
-            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+        let power_per_validator = 2000;
+
+        let committee_keys: Vec<WeightedKey> = keypairs
+            .iter()
+            .map(|kp| (kp.x_only_public_key().0, power_per_validator))
+            .collect();
 
         let required_sigs = 3;
         let network = Network::Regtest;
 
         let subnet_id = generate_subnet_id();
 
-        let script = create_multisig_script(&public_keys, required_sigs)
+        let script = create_multisig_script(&committee_keys, required_sigs)
             .expect("Failed to create multisig script");
 
         dbg!(&script);
 
         let spend_info =
-            create_subnet_multisig_spend_info(&secp, &subnet_id, &public_keys, required_sigs)
+            create_subnet_multisig_spend_info(&secp, &subnet_id, &committee_keys, required_sigs)
                 .expect("Failed to create multisig spend info");
 
         let control_block = spend_info
@@ -746,9 +774,14 @@ mod tests {
 
         dbg!(&control_block.size());
 
-        let multisig_address =
-            create_subnet_multisig_address(&secp, &subnet_id, &public_keys, required_sigs, network)
-                .expect("Failed to create multisig address");
+        let multisig_address = create_subnet_multisig_address(
+            &secp,
+            &subnet_id,
+            &committee_keys,
+            required_sigs,
+            network,
+        )
+        .expect("Failed to create multisig address");
 
         dbg!(&multisig_address);
 
@@ -828,6 +861,7 @@ mod tests {
                     Message::from_digest_slice(sighash.as_ref()).expect("Failed to create message");
                 let sig = secp.sign_schnorr(&msg, keypair);
                 witness.push(sig.serialize());
+                dbg!(sig);
             }
 
             // Push empty signatures for the remaining keys
@@ -875,8 +909,10 @@ mod tests {
             witness.push(control_block.serialize());
 
             // Test the spend witness size calculation
-            let spend_witness_size = multisig_spend_witness_size(5, 3);
-            assert_eq!(witness.size(), spend_witness_size);
+            let spend_witness_size = multisig_spend_max_witness_size(&committee_keys, 3);
+            dbg!(spend_witness_size);
+            dbg!(witness.size());
+            assert!(witness.size() < spend_witness_size);
 
             tx_valid.input[0].witness = witness;
 
@@ -967,7 +1003,7 @@ mod tests {
     #[test]
     fn test_multisig_addresses_different_subnet_id() {
         let secp = Secp256k1::new();
-        let public_keys = generate_xonly_pubkeys(3);
+        let public_keys = generate_equal_weighted_keys(3);
         let required_sigs = 2;
         let network = Network::Bitcoin;
 
@@ -1002,26 +1038,36 @@ mod tests {
 
     #[test]
     fn test_witness_size_calculation() {
-        let committee_configs: [(u16, u16); 7] =
-            [(1, 1), (2, 3), (3, 5), (5, 7), (7, 10), (11, 15), (14, 20)];
+        let committee_configs: [(u32, u32); 12] = [
+            (1, 1),
+            (2, 2),
+            (2, 3),
+            (3, 3),
+            (3, 4),
+            (3, 5),
+            (5, 7),
+            (7, 10),
+            (11, 15),
+            (11, 20),
+            (14, 20),
+            (19, 20),
+        ];
 
         let secp = Secp256k1::new();
 
-        for (required_sigs, committee_size) in committee_configs {
+        for (threshold, committee_size) in committee_configs {
             let keypairs = generate_keypairs(committee_size as usize);
-            let public_keys: Vec<XOnlyPublicKey> =
-                keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+            let public_keys: Vec<WeightedKey> = keypairs
+                .iter()
+                .map(|kp| (kp.x_only_public_key().0, 100000))
+                .collect();
 
             let subnet_id = generate_subnet_id();
-            let script = create_multisig_script(&public_keys, required_sigs as i64).unwrap();
+            let script = create_multisig_script(&public_keys, threshold).unwrap();
 
-            let spend_info = create_subnet_multisig_spend_info(
-                &secp,
-                &subnet_id,
-                &public_keys,
-                required_sigs as i64,
-            )
-            .unwrap();
+            let spend_info =
+                create_subnet_multisig_spend_info(&secp, &subnet_id, &public_keys, threshold)
+                    .unwrap();
             let control_block = spend_info
                 .control_block(&(script.clone(), LeafVersion::TapScript))
                 .unwrap();
@@ -1031,11 +1077,11 @@ mod tests {
 
             // Add required signatures
             let dummy_sig = [1u8; bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE];
-            for _ in 0..required_sigs {
+            for _ in 0..threshold {
                 witness.push(&dummy_sig[..]);
             }
             // Add empty signatures for unused keys
-            for _ in required_sigs..committee_size {
+            for _ in threshold..committee_size {
                 witness.push([]);
             }
             // Add the script and control block
@@ -1046,14 +1092,14 @@ mod tests {
             let actual_size = witness.size();
 
             // Calculate using our function
-            let calculated_size = multisig_spend_witness_size(committee_size, required_sigs);
+            let calculated_size = multisig_spend_max_witness_size(&public_keys, threshold);
 
             // They should match
-            assert_eq!(calculated_size, actual_size);
             println!(
-                "{required_sigs}-of-{committee_size} Witness Size: Actual={}, Calculated={}",
+                "{threshold}-of-{committee_size} Witness Size: Actual={}, Calculated={}",
                 actual_size, calculated_size
             );
+            assert!(actual_size <= calculated_size);
         }
     }
 }
@@ -1335,9 +1381,9 @@ mod psbt_tests {
 
         // Generate keypairs for the committee
         let committee_keypairs = generate_keypairs(3);
-        let committee_pubkeys: Vec<XOnlyPublicKey> = committee_keypairs
+        let committee_pubkeys: Vec<WeightedKey> = committee_keypairs
             .iter()
-            .map(|kp| kp.x_only_public_key().0)
+            .map(|kp| (kp.x_only_public_key().0, 1))
             .collect();
 
         // Generate a subnet ID
@@ -1468,8 +1514,10 @@ mod psbt_tests {
             );
         }
 
-        let committee_pubkeys: Vec<XOnlyPublicKey> =
-            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+        let committee_pubkeys: Vec<WeightedKey> = keypairs
+            .iter()
+            .map(|kp| (kp.x_only_public_key().0, 1))
+            .collect();
 
         // Generate a subnet ID
         let subnet_id = generate_subnet_id();
@@ -1618,21 +1666,23 @@ mod psbt_tests {
 
         // Generate 3 keypairs for the committee
         let keypairs = generate_keypairs(3);
-        let committee_pubkeys: Vec<XOnlyPublicKey> =
-            keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+        let committee_pubkeys: Vec<WeightedKey> = keypairs
+            .iter()
+            .map(|kp| (kp.x_only_public_key().0, 1))
+            .collect();
 
         // Generate a subnet ID
         let subnet_id = generate_subnet_id();
 
         // Create a 2-of-3 multisig setup
-        let required_sigs = 2_u16;
+        let threshold = 2_u32;
 
         // Create multisig address
         let multisig_address = create_subnet_multisig_address(
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            required_sigs.into(),
+            threshold.into(),
             NETWORK,
         )
         .unwrap();
@@ -1766,7 +1816,7 @@ mod psbt_tests {
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            required_sigs,
+            threshold,
             &unsigned_psbt,
             &[&sigs1, &sigs2],
         )
