@@ -35,6 +35,15 @@ pub fn create_multisig_script(
     let mut sorted_public_keys = public_keys.to_vec();
     sorted_public_keys.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
 
+    //  It pushes an accumulator to the stack, and then for each pk:
+    // - it swaps the sig that's already on the stack as a witness, with the accumulator
+    // - pushes the pk
+    // - does a checksig that leaves 0/1 on the stack
+    // - if 1, pushes this validator's power and calls OP_ADD, summing the power and accumulator
+
+    // At the end we consume all sigs and public keys, we're left with the accumulator.
+    // We push the threshold to the stack and call `OP_GREATERTHANOREQUAL`
+    // which leaves 0/1 on the stack.
     let builder = Builder::new().push_int(0); // power accumulator
     Ok(sorted_public_keys
         .iter()
