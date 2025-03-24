@@ -114,7 +114,9 @@ pub const MAX_POWER: u64 = u32::MAX as u64;
 
 /// Converts a Bitcoin Amount to a power/weight value (u32) using a fixed scale factor.
 /// Discards small satoshi values based on the provided minimum amount.
-// TODO improve this
+//
+// TODO improve this, maybe cap the total power so we don't have
+// the CollateralTooHigh error possibility
 pub fn collateral_to_power(amount: &Amount, min_amount: &Amount) -> Result<Power, MultisigError> {
     // Check if amount is below minimum threshold
     if amount < min_amount {
