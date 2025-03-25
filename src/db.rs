@@ -1,12 +1,11 @@
 use crate::{
-    bitcoin_utils,
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
-    multisig::{self, create_subnet_multisig_address, multisig_threshold},
+    multisig::{create_subnet_multisig_address, multisig_threshold},
     wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
 use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid, XOnlyPublicKey};
-use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RwTxn};
+use heed::{types::*, Database as HeedDatabase, Env, EnvOpenOptions, RoTxn, RwTxn};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
@@ -19,6 +18,8 @@ const SUBNET_GENESIS_INFO_KEY: &str = "subnet_genesis_info:";
 const SUBNET_STATE_KEY: &str = "subnet_state:";
 // rootnet_msgs:<subnet_id>:<nonce>
 const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
+// checkpoints:<subnet_id>:<nonce>
+const CHECKPOINTS_KEY: &str = "checkpoints:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -36,6 +37,10 @@ fn rootnet_msgs_prefix(subnet_id: SubnetId) -> String {
 
 fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
     format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
+}
+
+fn checkpoints_key(subnet_id: SubnetId, number: u64) -> String {
+    format!("{CHECKPOINTS_KEY}:{}:{}", subnet_id, number)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +111,24 @@ pub struct SubnetCommittee {
 }
 
 impl SubnetCommittee {
+    pub fn size(&self) -> u16 {
+        self.validators
+            .len()
+            .try_into()
+            .expect("SubnetCommittee size should be < u16::max")
+    }
+
+    pub fn address_checked(&self) -> Address {
+        self.multisig_address
+            .clone()
+            .require_network(NETWORK)
+            .expect("Multisig should be valid current network")
+    }
+
+    pub fn pubkeys(&self) -> Vec<XOnlyPublicKey> {
+        self.validators.iter().map(|v| v.pubkey).collect()
+    }
+
     pub fn get_unspent(
         &self,
         rpc: &bitcoincore_rpc::Client,
@@ -118,41 +141,28 @@ impl SubnetCommittee {
         wallet::get_unspent_for_address(rpc, &address)
     }
 
-    pub fn construct_spend_psbt(
-        &self,
-        rpc: &bitcoincore_rpc::Client,
-        subnet_id: &SubnetId,
-        to: &Address,
-        amount: bitcoin::Amount,
-    ) -> Result<bitcoin::Psbt, multisig::MultisigError> {
-        let committee_address = self
-            .multisig_address
-            .clone()
-            .require_network(NETWORK)
-            .expect("Multisig should be valid for saved subnet genesis info");
-
-        let unspent =
-            wallet::get_unspent_for_address(rpc, &committee_address).expect("temp expect");
-        let fee_rate = bitcoin_utils::get_fee_rate(rpc, None, None);
-        let committee_keys = self.validators.iter().map(|v| v.pubkey).collect::<Vec<_>>();
-        let commitee_threshold = self.threshold;
-
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-
-        let psbt = multisig::construct_spend_psbt(
-            &secp,
-            subnet_id,
-            &committee_keys,
-            commitee_threshold,
-            &committee_address,
-            &unspent,
-            to,
-            amount,
-            &fee_rate,
-        )?;
-
-        Ok(psbt)
+    pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
+        self.validators.iter().any(|v| &v.pubkey == pubkey)
     }
+}
+
+/// Subnet checkpoint
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SubnetCheckpoint {
+    /// The block hash of the child subnet at which the checkpoint was cut
+    pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
+    /// The block height of the checkpoint on Bitcoin
+    pub block_height: u64,
+    /// The txid of the checkpoint on Bitcoin
+    pub txid: bitcoin::Txid,
+    /// The txid of the batch transfer, if there are any transfers
+    pub batch_transfer_txid: Option<bitcoin::Txid>,
+    /// The block height of the batch transfer, if there are any transfers
+    pub batch_transfer_block_height: Option<u64>,
+    /// The number of the committee that signed the checkpoint
+    pub signed_committee_number: u64,
+    /// The number of the next committee (different if rotation happened)
+    pub next_committee_number: u64,
 }
 
 /// The current state of a subnet
@@ -167,6 +177,8 @@ pub struct SubnetState {
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
+    /// The number of the last checkpoint
+    pub last_checkpoint_number: Option<u64>,
 }
 
 impl SubnetState {
@@ -194,6 +206,10 @@ impl SubnetState {
         let label = format!("{}-{}", self.id, self.committee_number);
         wallet::import_address(rpc, &address, label)?;
         Ok(())
+    }
+
+    pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
+        self.committee.is_validator(pubkey)
     }
 }
 
@@ -282,6 +298,7 @@ impl SubnetGenesisInfo {
         SubnetState {
             id: self.subnet_id,
             committee_number: 1,
+            last_checkpoint_number: None,
             committee: self.genesis_validators.to_committee(&self.subnet_id),
         }
     }
@@ -350,6 +367,7 @@ pub struct HeedDb {
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
+    checkpoints_db: HeedDatabase<Str, SerdeBincode<SubnetCheckpoint>>,
     // TODO use SerdeBincode for this as well
     // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
@@ -407,6 +425,9 @@ impl HeedDb {
             let subnet_genesis_db = env
                 .open_database(&rtxn, Some("subnet_genesis_db"))?
                 .ok_or(DbError::DbNotFound("subnet_genesis_db".to_string()))?;
+            let checkpoints_db = env
+                .open_database(&rtxn, Some("checkpoints_db"))?
+                .ok_or(DbError::DbNotFound("checkpoints_db".to_string()))?;
             let rootnet_msgs_db = env
                 .open_database(&rtxn, Some("rootnet_msgs_db"))?
                 .ok_or(DbError::DbNotFound("rootnet_msgs_db".to_string()))?;
@@ -417,6 +438,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                checkpoints_db,
                 rootnet_msgs_db,
             })
         } else {
@@ -425,6 +447,7 @@ impl HeedDb {
             let monitor_info = env.create_database(&mut txn, Some("monitor_info"))?;
             let subnet_db = env.create_database(&mut txn, Some("subnet_db"))?;
             let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
+            let checkpoints_db = env.create_database(&mut txn, Some("checkpoints_db"))?;
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
             txn.commit()?;
 
@@ -433,6 +456,7 @@ impl HeedDb {
                 monitor_info,
                 subnet_db,
                 subnet_genesis_db,
+                checkpoints_db,
                 rootnet_msgs_db,
             })
         }
@@ -466,6 +490,11 @@ pub trait Database {
         subnet_id: SubnetId,
         subnet_state: &SubnetState,
     ) -> Result<(), DbError>;
+    /// Gets a subnet by its multisig address
+    fn get_subnet_by_multisig_address(
+        &self,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError>;
 
     // Rootnet Messages
     fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError>;
@@ -474,8 +503,17 @@ pub trait Database {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError>;
+    fn get_last_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError>;
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+    fn get_next_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError>;
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
@@ -486,6 +524,20 @@ pub trait Database {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         msg: RootnetMessage,
+    ) -> Result<(), DbError>;
+
+    // Checkpoints
+    fn get_checkpoint(
+        &self,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError>;
+    fn save_checkpoint(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        checkpoint: &SubnetCheckpoint,
+        number: u64,
     ) -> Result<(), DbError>;
 }
 
@@ -568,6 +620,24 @@ impl Database for HeedDb {
         Ok(())
     }
 
+    fn get_subnet_by_multisig_address(
+        &self,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError> {
+        let txn = self.env.read_txn()?;
+        let subnets = self.subnet_db.iter(&txn)?;
+
+        for item in subnets {
+            let (_, subnet_state) = item?;
+
+            if &subnet_state.committee.multisig_address == multisig_address {
+                return Ok(Some(subnet_state));
+            }
+        }
+
+        Ok(None)
+    }
+
     // Rootnet Messages
 
     /// Note: Potentially returns a large number of messages,
@@ -616,10 +686,13 @@ impl Database for HeedDb {
         Ok(msgs)
     }
 
-    fn get_last_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<Option<u64>, DbError> {
+    fn get_last_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError> {
         let prefix = rootnet_msgs_prefix(subnet_id);
-        let txn = self.env.read_txn()?;
-        let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
+        let msgs_iter = self.rootnet_msgs_db.prefix_iter(txn, &prefix)?;
         let count: u64 = msgs_iter.count().try_into().map_err(|_| {
             DbError::TypeConversionError("max rootnet messages reached".to_string())
         })?;
@@ -632,7 +705,24 @@ impl Database for HeedDb {
     }
 
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
-        let nonce = self.get_last_rootnet_msg_nonce(subnet_id)?;
+        let txn = self.env.read_txn()?;
+        let nonce = self.get_last_rootnet_msg_nonce_txn(&txn, subnet_id)?;
+        let nonce = match nonce {
+            // If there is a nonce, increment it
+            Some(n) => n + 1,
+            // Otherwise start from 0
+            None => 0,
+        };
+
+        Ok(nonce)
+    }
+
+    fn get_next_rootnet_msg_nonce_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError> {
+        let nonce = self.get_last_rootnet_msg_nonce_txn(txn, subnet_id)?;
         let nonce = match nonce {
             // If there is a nonce, increment it
             Some(n) => n + 1,
@@ -663,6 +753,31 @@ impl Database for HeedDb {
         let key = rootnet_msgs_key(subnet_id, msg.nonce());
         trace!("Add rootnet msg: {msg:#?}");
         self.rootnet_msgs_db.put(txn, &key, &msg)?;
+        Ok(())
+    }
+
+    // Checkpoints
+
+    fn get_checkpoint(
+        &self,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError> {
+        let key = checkpoints_key(subnet_id, number);
+        let txn = self.env.read_txn()?;
+        let checkpoint = self.checkpoints_db.get(&txn, &key)?;
+        Ok(checkpoint)
+    }
+
+    fn save_checkpoint(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        checkpoint: &SubnetCheckpoint,
+        number: u64,
+    ) -> Result<(), DbError> {
+        let key = checkpoints_key(subnet_id, number);
+        self.checkpoints_db.put(txn, &key, checkpoint)?;
         Ok(())
     }
 }
@@ -750,8 +865,15 @@ mod tests {
         let subnet_id = create_rand_subnet_id();
         let block_height = 100;
 
+        let ro_txn = db.env.read_txn().unwrap();
+
         // Verify no messages exist initially
-        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), None);
+        assert_eq!(
+            db.get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+                .unwrap(),
+            None
+        );
+        drop(ro_txn);
         // Check next nonce is 0
         assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 0);
 
@@ -763,8 +885,12 @@ mod tests {
         txn.commit().unwrap();
 
         // Check last nonce is now 0
-        let result = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        let ro_txn = db.env.read_txn().unwrap();
+        let result = db
+            .get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+            .unwrap();
         assert_eq!(result, Some(0));
+        drop(ro_txn);
 
         // Check next nonce is 1
         let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();
@@ -785,7 +911,13 @@ mod tests {
         txn.commit().unwrap();
 
         // Check last nonce is now 2
-        assert_eq!(db.get_last_rootnet_msg_nonce(subnet_id).unwrap(), Some(2));
+        let ro_txn = db.env.read_txn().unwrap();
+        assert_eq!(
+            db.get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+                .unwrap(),
+            Some(2)
+        );
+        drop(ro_txn);
 
         // Check next nonce is 3
         assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 3);
@@ -855,8 +987,12 @@ mod tests {
         }
 
         // Check the last nonce is total_message_count - 1
-        let last_nonce = db.get_last_rootnet_msg_nonce(subnet_id).unwrap();
+        let ro_txn = db.env.read_txn().unwrap();
+        let last_nonce = db
+            .get_last_rootnet_msg_nonce_txn(&ro_txn, subnet_id)
+            .unwrap();
         assert_eq!(last_nonce, Some((total_message_count - 1) as u64));
+        drop(ro_txn);
 
         // Check the next nonce is total_message_count
         let next_nonce = db.get_next_rootnet_msg_nonce(subnet_id).unwrap();

@@ -163,4 +163,132 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
+
+# checkpoint with withdrawals and transfers
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "gencheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "checkpoint_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "withdrawals": [
+            {
+                "amount": 25000,
+                "address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n"
+            }
+        ],
+        "transfers": [
+            {
+                "amount": 150000,
+                "destination_subnet_id": "/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm",
+                "subnet_user_address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
+            },
+            {
+                "amount": 100000,
+                "destination_subnet_id": "/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm",
+                "subnet_user_address": "0x4967bB72907683bb6a933d47348a49bC3832968b"
+            }
+        ]
+    },
+    "id": 1
+}' | jq
+
+# no transfers checkpoint
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "gencheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "checkpoint_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "withdrawals": [
+            {
+                "amount": 25000,
+                "address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n"
+            }
+        ],
+        "transfers": []
+    },
+    "id": 1
+}' | jq
+
+# no transfers no withdrawals
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "gencheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "checkpoint_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "dev_multisignpsbt",
+    "params": {
+        "unsigned_psbt_base64": "cHNidP8BAP1SAQIAAAABiZUUNBUjat9BZH6yhbFBVE01N39wx18nYv7bGCk9wNgBAAAAAP////8GAAAAAAAAAABLaklJUEM6Q1BUFweIKLGnkq7gNJVf/AZcY3oIqAkFnIr0Kg8sWUiGoaQAAAAAABnWaJwIWuFlgx6TT/djrkaipsFys/G2CozibwECqGEAAAAAAAAWABSKRTgEccvV0a9lany7HV7qjXmRW5gSAAAAAAAAIlEg65foRoWTTULdXwrR0E7GOxHyHdPpMXk3Jgme08GCfnLwSQIAAAAAACJRIKdn9Pj8p+KB3Ewsx/xFsoZK+IlU6OXxfS1+4VlmHXM7oIYBAAAAAAAiUSCnZ/T4/KfigdxMLMf8RbKGSviJVOjl8X0tfuFZZh1zO1r0RQwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEAAAAAAAEBK8BcSgwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEBBYogXw3+06UnrHQMfUpZTNOqEFmpNhhzmfxJ4/xupq4XcmisIIUcG9oydYRHnpinwo6nrcCX0pDv0QUxC89xQjG7mfr0uiCxX5mSjyR4oQxXOaA/VJXTQudzUtYk58yOv73tVE+awLogtF/VJXPo5r/gr/gvsijoh/3ZIhD+CVKuZaWQgP7H5Sm6U6JCFcB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmR/A0V8sImCxylvl4wqDc9KyfpJ29BMIsGNeb/ogOBLwiyBfDf7TpSesdAx9SllM06oQWak2GHOZ/Enj/G6mrhdyaKwghRwb2jJ1hEeemKfCjqetwJfSkO/RBTELz3FCMbuZ+vS6ILFfmZKPJHihDFc5oD9UldNC53NS1iTnzI6/ve1UT5rAuiC0X9Ulc+jmv+Cv+C+yKOiH/dkiEP4JUq5lpZCA/sflKbpTosABFyB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmQEYIJ04u+iZnmVuhe+3wJVCa+C8bG10fuKiKDaN1vZukXIoAAAAAAAAAA==",
+        "secret_keys": [
+            "21b16a87dd69bc6283045ab63738c9ab73c93c93f91e96cd0e54bd321bba80ad",
+            "67308c2f3915f4c36135f267ed709418c2880025d669e4ada7a206842d53c146",
+            "994220215e4601d21a245f8f5e0c407f2f5733ce7907e128c3190c64f4ef443c",
+            "ab3a1fafa925836386be55b12fdc92f208ebdad5ef96c0109e4bd06638dcb897"
+        ]
+    },
+    "id": 1
+}' | jq
+
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "finalizecheckpointpsbt",
+    "params": {
+        "subnet_id": "/b4/t420fc4dyqkfru6jk5ybusvp7ybs4mn5arkajawoiv5bkb4wfssegugslaeixmm",
+        "unsigned_psbt_base64": "cHNidP8BAP1SAQIAAAABiZUUNBUjat9BZH6yhbFBVE01N39wx18nYv7bGCk9wNgBAAAAAP////8GAAAAAAAAAABLaklJUEM6Q1BUFweIKLGnkq7gNJVf/AZcY3oIqAkFnIr0Kg8sWUiGoaQAAAAAABnWaJwIWuFlgx6TT/djrkaipsFys/G2CozibwECqGEAAAAAAAAWABSKRTgEccvV0a9lany7HV7qjXmRW5gSAAAAAAAAIlEg65foRoWTTULdXwrR0E7GOxHyHdPpMXk3Jgme08GCfnLwSQIAAAAAACJRIKdn9Pj8p+KB3Ewsx/xFsoZK+IlU6OXxfS1+4VlmHXM7oIYBAAAAAAAiUSCnZ/T4/KfigdxMLMf8RbKGSviJVOjl8X0tfuFZZh1zO1r0RQwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEAAAAAAAEBK8BcSgwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEBBYogXw3+06UnrHQMfUpZTNOqEFmpNhhzmfxJ4/xupq4XcmisIIUcG9oydYRHnpinwo6nrcCX0pDv0QUxC89xQjG7mfr0uiCxX5mSjyR4oQxXOaA/VJXTQudzUtYk58yOv73tVE+awLogtF/VJXPo5r/gr/gvsijoh/3ZIhD+CVKuZaWQgP7H5Sm6U6JCFcB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmR/A0V8sImCxylvl4wqDc9KyfpJ29BMIsGNeb/ogOBLwiyBfDf7TpSesdAx9SllM06oQWak2GHOZ/Enj/G6mrhdyaKwghRwb2jJ1hEeemKfCjqetwJfSkO/RBTELz3FCMbuZ+vS6ILFfmZKPJHihDFc5oD9UldNC53NS1iTnzI6/ve1UT5rAuiC0X9Ulc+jmv+Cv+C+yKOiH/dkiEP4JUq5lpZCA/sflKbpTosABFyB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmQEYIJ04u+iZnmVuhe+3wJVCa+C8bG10fuKiKDaN1vZukXIoAAAAAAAAAA==",
+        "signatures": [
+        [
+          "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268",
+          [
+            "f245679ccda14b190213d4115ba8c10d484d5f0d1e0a37a493bd88f9fce3f05b5514debb23e83c693a1fdeb0622970fc3691dbbdee87b7430af41acdca58f44c"
+          ]
+        ],
+        [
+          "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
+          [
+            "14da8c21b0a6ab6218b27e8bec5f750de26c0f0fe1e0265b6788dcc0f1c059473547e1737d16e2238587e927a428fa1c5d20e460bedf4ae4af25bb245448c1b2"
+          ]
+        ],
+        [
+          "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
+          [
+            "c280fcca9d56e8f62757ee05ee17cec953bf09958e78d92ab50804d9d23b15a98a0a4ff6de421e78f73cd4874524e8d17efb2a21cccb92d9fac42407c2f3b031"
+          ]
+        ],
+        [
+          "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529",
+          [
+            "5625ce8a09a441111fc1fc1e8491a5ba0dd84a0bdc73c4c3e284321c64f1dfbd9a863725f0da7a2e99f014c3d10c6eb207f7d5bd06fd8fcacbc31a6d040bde7a"
+          ]
+        ]
+        ]
+    },
+    "id": 1
+}' | jq
 ```

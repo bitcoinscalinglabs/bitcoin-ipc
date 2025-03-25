@@ -306,16 +306,14 @@ where
             // TODO check more efficiently if witness has IPC tag
             for witness in input.witness.iter().filter(|w| !w.is_empty()) {
                 // Reconstruct the witness data
-                let concatenated_data = match bitcoin_utils::concatenate_op_push_data(witness) {
+                let witness_data = match bitcoin_utils::concatenate_op_push_data(witness) {
                     Ok(data) => data,
                     Err(_) => {
                         continue;
                     }
                 };
 
-                let witness_str = find_valid_utf8(&concatenated_data);
-                let ipc_message = IpcMessage::deserialize(witness_str);
-
+                let ipc_message = IpcMessage::from_witness(witness_data);
                 let ipc_message = match ipc_message {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -349,6 +347,26 @@ where
             }
         } else if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
+        } else if let Ok(checkpoint_msg) = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(tx) {
+            let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
+        } else if let Ok(batch_transfer_msg) = ipc_lib::IpcBatchTransferMsg::from_tx(tx, &self.db) {
+            let ipc_message = IpcMessage::BatchTransfer(batch_transfer_msg);
 
             match self
                 .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
@@ -430,6 +448,55 @@ where
                 info!("Processed FundSubnet for Subnet ID: {}", msg.subnet_id);
                 Ok(())
             }
+
+            IpcMessage::CheckpointSubnet(msg) => {
+                debug!("Found IPC message: {:#?}", msg);
+
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, txid)?;
+
+                Ok(())
+            }
+
+            IpcMessage::BatchTransfer(mut msg) => {
+                debug!("Found IPC message: {:?}", msg);
+
+                msg.validate()?;
+
+                // Get checkpoint tx and parse as msg
+
+                let checkpoint_tx = self
+                    .watchonly_rpc
+                    .get_transaction(&msg.checkpoint_txid, Some(true))?;
+
+                let checkpoint_tx = checkpoint_tx.transaction().map_err(|e| {
+                    MonitorError::IpcTxInvalid(format!(
+                        "BatchTransferMsg previous tx {} invalid: {e}",
+                        msg.checkpoint_txid
+                    ))
+                })?;
+
+                let checkpoint_msg = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(
+                    &checkpoint_tx,
+                )
+                .map_err(|e| {
+                    MonitorError::IpcTxInvalid(format!(
+                        "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
+                    ))
+                })?;
+
+                trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
+
+                checkpoint_msg.validate()?;
+                msg.validate_for_checkpoint(&checkpoint_tx)?;
+                msg.subnet_id = checkpoint_msg.subnet_id;
+
+                // Save to DB
+
+                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
+
+                Ok(())
+            }
         }
     }
 
@@ -456,17 +523,6 @@ where
             }
         }
     }
-}
-
-fn find_valid_utf8(data: &[u8]) -> &str {
-    let mut start = 0;
-    while start < data.len() {
-        match std::str::from_utf8(&data[start..]) {
-            Ok(valid_str) => return valid_str,
-            Err(_) => start += 1,
-        }
-    }
-    ""
 }
 
 #[derive(Error, Debug)]

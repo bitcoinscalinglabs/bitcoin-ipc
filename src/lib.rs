@@ -8,6 +8,9 @@ pub mod multisig;
 pub mod provider;
 pub mod wallet;
 
+#[cfg(test)]
+pub mod test_utils;
+
 // Temporary re-exports
 pub use ipc_lib::prelude::*;
 
