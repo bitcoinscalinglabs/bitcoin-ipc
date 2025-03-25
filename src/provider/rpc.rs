@@ -198,18 +198,20 @@ pub struct GetGenesisInfoParams {
 
 pub async fn get_genesis_info(
     data: Data<Arc<ServerData>>,
-    Params(msg): Params<GetGenesisInfoParams>,
+    Params(params): Params<GetGenesisInfoParams>,
 ) -> Result<db::SubnetGenesisInfo, JsonRpcError> {
+    trace!("getgenesisinfo: {}", params.subnet_id);
+
     let genesis_info = data
         .db
-        .get_subnet_genesis_info(msg.subnet_id)
+        .get_subnet_genesis_info(params.subnet_id)
         .map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
             RpcError::DbError(e)
         })?
         .ok_or(RpcError::InvalidParams(format!(
             "Subnet {} not found.",
-            msg.subnet_id
+            params.subnet_id
         )))?;
 
     Ok(genesis_info)
@@ -251,6 +253,8 @@ pub async fn prefund_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcPrefundSubnetMsg>,
 ) -> Result<PrefundSubnetResponse, JsonRpcError> {
+    trace!("prefundsubnet: {}", msg.subnet_id);
+
     if let Err(err) = msg.validate() {
         error!("Invalid prefund message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -292,6 +296,8 @@ pub async fn fund_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcFundSubnetMsg>,
 ) -> Result<FundSubnetResponse, JsonRpcError> {
+    trace!("fundsubnet: {}", msg.subnet_id);
+
     if let Err(err) = msg.validate() {
         error!("Invalid prefund message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -330,6 +336,8 @@ pub async fn get_rootnet_messages(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetRootnetMessagesParams>,
 ) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
+    trace!("getrootnetmessages: {}", params.subnet_id);
+
     // Check subnet exists
     data.db
         .get_subnet_state(params.subnet_id)
@@ -346,6 +354,53 @@ pub async fn get_rootnet_messages(
         .get_rootnet_msgs_by_height(params.subnet_id, params.block_height)
         .map_err(|e| {
             error!("Error getting rootnet messages from Db: {}", e);
+            RpcError::DbError(e).into()
+        })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetSubnetCheckpointParams {
+    subnet_id: SubnetId,
+    number: Option<u64>,
+}
+
+pub async fn get_subnet_checkpoint(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetSubnetCheckpointParams>,
+) -> Result<Option<db::SubnetCheckpoint>, JsonRpcError> {
+    trace!(
+        "getsubnetcheckpoint: {} number={:?}",
+        params.subnet_id,
+        params.number
+    );
+
+    // Check if subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or_else(|| {
+            error!("Subnet {} not found.", params.subnet_id);
+            RpcError::InvalidParams(format!("Subnet {} not found.", params.subnet_id))
+        })?;
+
+    let last_checkpoint_number = match subnet.last_checkpoint_number {
+        Some(number) => number,
+        None => {
+            return Ok(None);
+        }
+    };
+
+    // Default to the last checkpoint
+    let number = params.number.unwrap_or(last_checkpoint_number);
+
+    data.db
+        .get_checkpoint(params.subnet_id, number)
+        .map_err(|e| {
+            error!("Error getting checkpoint from Db: {}", e);
             RpcError::DbError(e).into()
         })
 }
@@ -833,5 +888,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
         .with_method("dev_multisignpsbt", dev_multisign_psbt) // dev only
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
+        .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
         .finish()
 }

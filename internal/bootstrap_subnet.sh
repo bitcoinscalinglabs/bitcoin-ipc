@@ -41,7 +41,7 @@ CREATE_OUTPUT=$(curl -s -X POST "$API_URL" \
       \"params\": {
           \"min_validator_stake\": $MIN_VAL,
           \"min_validators\": 4,
-          \"bottomup_check_period\": 5,
+          \"bottomup_check_period\": 50,
           \"active_validators_limit\": 4,
           \"min_cross_msg_fee\": 200,
           \"whitelist\": [
@@ -144,28 +144,47 @@ BLOCK_NUM=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$BLOCK_NUM")
 echo "Subnet bootstrapped in block number ${BLOCK_NUM} (hash: ${BLOCK_HASH})"
 
-# 5. Fund the subnet with a random amount between 100000000 and 400000000
-FUND_AMOUNT=$(rand_in_range $MIN_VAL $MAX_VAL)
-curl -s -X POST "$API_URL" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $BEARER_TOKEN" \
-  -d "{
-      \"jsonrpc\": \"2.0\",
-      \"method\": \"fundsubnet\",
-      \"params\": {
-          \"subnet_id\": \"$SUBNET_ID\",
-          \"amount\": $FUND_AMOUNT,
-          \"address\": \"0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf\"
-      },
-      \"id\": 1
-  }" > /dev/null
+MIN_FUND_VAL=6000000000
+MAX_FUND_VAL=8000000000
 
-# 6. Mine one more block
+fund_subnet() {
+    local subnet_id=$1
+    local eth_address=$2
+    local amount=$(rand_in_range $MIN_FUND_VAL $MAX_FUND_VAL)
+
+    curl -s -X POST "$API_URL" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $BEARER_TOKEN" \
+      -d "{
+          \"jsonrpc\": \"2.0\",
+          \"method\": \"fundsubnet\",
+          \"params\": {
+              \"subnet_id\": \"$subnet_id\",
+              \"amount\": $amount,
+              \"address\": \"$eth_address\"
+          },
+          \"id\": 1
+      }" > /dev/null
+
+    echo "Funded subnet with $amount satoshis to address $eth_address"
+}
+
+# 5. Fund the subnet with a random amount between 100000000 and 400000000
+# Fund each validator.
+
+fund_subnet "$SUBNET_ID" "0x27B60D9f71D6806cCa7D5A92b391093FE100f8e8"
+fund_subnet "$SUBNET_ID" "0xd9c4CgetBitcoinCheckpointSignatures(uint256)(bytes,bytes,address[],bytes[])2CA843a53bff146C79B5D32Ca4b9321414"
+fund_subnet "$SUBNET_ID" "0x646Aed5404567ae15648E9b9B0004cbAfb126949"
+fund_subnet "$SUBNET_ID" "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
+
+# 6. Mine one more blocks
 bitcoin-cli generatetoaddress 1 "$(bitcoin-cli -rpcwallet=default getnewaddress)" > /dev/null
 sleep 3.5
 BLOCK_NUM=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$BLOCK_NUM")
 echo "Subnet funded in block number ${BLOCK_NUM} (hash: ${BLOCK_HASH})"
+
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli -rpcwallet=default getnewaddress)" > /dev/null
 
 # 7. Retrieve and print the subnet state
 echo "Subnet state:

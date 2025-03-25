@@ -35,17 +35,17 @@ pub type FvmAddress = fvm_shared::address::Address;
 
 // Tag
 
-pub const IPC_TAG_LENGTH: usize = 7;
+pub const IPC_TAG_LENGTH: usize = 6;
 
 // TODO make tags take less space
 pub const IPC_TAG_DELIMITER: &str = "#";
-pub const IPC_CREATE_SUBNET_TAG: &str = "IPC:CRT";
-pub const IPC_PREFUND_SUBNET_TAG: &str = "IPC:PFD";
-pub const IPC_JOIN_SUBNET_TAG: &str = "IPC:JOI";
-pub const IPC_FUND_SUBNET_TAG: &str = "IPC:FND";
-pub const IPC_CHECKPOINT_TAG: &str = "IPC:CPT";
-pub const IPC_TRANSFER_TAG: &str = "IPC:TFR";
-pub const IPC_DELETE_SUBNET_TAG: &str = "IPC:DEL";
+pub const IPC_CREATE_SUBNET_TAG: &str = "IPCCRT";
+pub const IPC_PREFUND_SUBNET_TAG: &str = "IPCPFD";
+pub const IPC_JOIN_SUBNET_TAG: &str = "IPCJOI";
+pub const IPC_FUND_SUBNET_TAG: &str = "IPCFND";
+pub const IPC_CHECKPOINT_TAG: &str = "IPCCPT";
+pub const IPC_TRANSFER_TAG: &str = "IPCTFR";
+pub const IPC_DELETE_SUBNET_TAG: &str = "IPCDEL";
 
 // Static assertion to verify tag lengths at compile time
 const _: () = {
@@ -537,10 +537,8 @@ impl IpcValidate for IpcPrefundSubnetMsg {
 impl IpcPrefundSubnetMsg {
     // Locktime for the pre-release script
     const RELEASE_LOCKTIME: u32 = 6;
-    // The length of the subnet tag - helper
-    const PREFUND_TAG_LEN: usize = IPC_PREFUND_SUBNET_TAG.len();
     // The total length of the op_return data - helper
-    const DATA_LEN: usize = Self::PREFUND_TAG_LEN + Txid::LEN + ETH_ADDR_LEN;
+    const DATA_LEN: usize = IPC_TAG_LENGTH + Txid::LEN + ETH_ADDR_LEN;
 
     /// Validates the join subnet message, for the given genesis info
     pub fn validate_for_genesis_info(
@@ -597,7 +595,7 @@ impl IpcPrefundSubnetMsg {
         }
 
         // Split data into its components
-        let (tag, rest) = op_return_data.split_at(Self::PREFUND_TAG_LEN);
+        let (tag, rest) = op_return_data.split_at(IPC_TAG_LENGTH);
         let (txid_bytes, addr_bytes) = rest.split_at(Txid::LEN);
 
         // Verify tag
@@ -639,7 +637,7 @@ impl IpcPrefundSubnetMsg {
         // ipc tag, subnet_id (txid) and user's subnet address to fund
         //
 
-        let prefund_tag: [u8; Self::PREFUND_TAG_LEN] = IPC_PREFUND_SUBNET_TAG
+        let prefund_tag: [u8; IPC_TAG_LENGTH] = IPC_PREFUND_SUBNET_TAG
             .as_bytes()
             .try_into()
             .expect("IPC_PREFUND_SUBNET_TAG has incorrect length");
@@ -649,10 +647,10 @@ impl IpcPrefundSubnetMsg {
         // Construct op_return data
         let mut op_return_data = [0u8; Self::DATA_LEN];
 
-        op_return_data[0..Self::PREFUND_TAG_LEN].copy_from_slice(&prefund_tag);
-        op_return_data[Self::PREFUND_TAG_LEN..(Self::PREFUND_TAG_LEN + Txid::LEN)]
+        op_return_data[0..IPC_TAG_LENGTH].copy_from_slice(&prefund_tag);
+        op_return_data[IPC_TAG_LENGTH..(IPC_TAG_LENGTH + Txid::LEN)]
             .copy_from_slice(&subnet_id_txid);
-        op_return_data[(Self::PREFUND_TAG_LEN + Txid::LEN)..].copy_from_slice(&subnet_addr);
+        op_return_data[(IPC_TAG_LENGTH + Txid::LEN)..].copy_from_slice(&subnet_addr);
 
         // Make op_return script and txout
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
@@ -1027,6 +1025,8 @@ pub struct IpcCheckpointSubnetMsg {
     pub subnet_id: SubnetId,
     /// The checkpoint hash
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
+    /// The checkpoint height of child chain
+    pub checkpoint_height: u64,
     /// Withdrawals
     #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
@@ -1041,6 +1041,13 @@ pub struct IpcCheckpointSubnetMsg {
 impl IpcValidate for IpcCheckpointSubnetMsg {
     /// Validates the checkpoint message
     fn validate(&self) -> Result<(), IpcValidateError> {
+        if self.checkpoint_height == 0 {
+            return Err(IpcValidateError::InvalidField(
+                "checkpoint_height",
+                "Checkpoint height must be greater than zero".to_string(),
+            ));
+        }
+
         // Ensure number of withdrawals and transfers doesn't exceed u8::MAX (255)
         if self.withdrawals.len() > u8::MAX as usize {
             return Err(IpcValidateError::InvalidMsg(format!(
@@ -1105,38 +1112,50 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
 }
 
 impl IpcCheckpointSubnetMsg {
-    // The length of the subnet tag - helper
-    const TAG_LEN: usize = IPC_CHECKPOINT_TAG.len();
     // Length of the withdrawal + transfer markers, 1 byte each
     const MARKERS_LEN: usize = 2;
+    // u64 length
+    const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
     // The total length of the op_return data - helper
-    const DATA_LEN: usize =
-        Self::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN + Self::MARKERS_LEN;
+    const DATA_LEN: usize = IPC_TAG_LENGTH
+        + Txid::LEN
+        + bitcoin::hashes::sha256::Hash::LEN
+        + Self::MARKERS_LEN
+        + Self::HEIGHT_LEN;
+
+    const TAG_OFFSET: usize = 0;
+    const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
+    const HASH_OFFSET: usize = Self::TXID_OFFSET + Txid::LEN;
+    const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
+    const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
 
     fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
 
-        let tag_offset = 0;
-        let txid_offset = tag_offset + Self::TAG_LEN;
-        let hash_offset = txid_offset + Txid::LEN;
-        let markers_offset = hash_offset + bitcoin::hashes::sha256::Hash::LEN;
-
         // Copy tag
-        op_return_data[tag_offset..txid_offset].copy_from_slice(IPC_CHECKPOINT_TAG.as_bytes());
+        op_return_data[Self::TAG_OFFSET..Self::TXID_OFFSET]
+            .copy_from_slice(IPC_CHECKPOINT_TAG.as_bytes());
 
         // Copy subnet ID txid
-        op_return_data[txid_offset..hash_offset]
+        op_return_data[Self::TXID_OFFSET..Self::HASH_OFFSET]
             .copy_from_slice(&self.subnet_id.txid().as_raw_hash().to_byte_array());
 
         // Copy checkpoint hash
-        op_return_data[hash_offset..markers_offset]
+        op_return_data[Self::HASH_OFFSET..Self::HEIGHT_OFFSET]
             .copy_from_slice(&self.checkpoint_hash.to_byte_array());
 
-        // Set marker values
-        op_return_data[markers_offset] = self.withdrawals.len().min(255) as u8; // Withdrawal count
-        op_return_data[markers_offset + 1] = self.transfers.len().min(255) as u8; // Transfer count
+        // Add checkpoint height
+        op_return_data[Self::HEIGHT_OFFSET..Self::MARKERS_OFFSET]
+            .copy_from_slice(&self.checkpoint_height.to_le_bytes());
 
-        let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        // Set marker values
+        op_return_data[Self::MARKERS_OFFSET] = self.withdrawals.len().min(255) as u8; // Withdrawal count
+        op_return_data[Self::MARKERS_OFFSET + 1] = self.transfers.len().min(255) as u8; // Transfer count
+
+        let push_bytes: &bitcoin::script::PushBytes =
+            (&op_return_data[..]).try_into().expect("the size is okay");
+
+        let op_return_script = bitcoin_utils::make_op_return_script(push_bytes);
         let op_return_value = op_return_script.minimal_non_dust_custom(fee_rate);
 
         bitcoin::TxOut {
@@ -1175,9 +1194,8 @@ impl IpcCheckpointSubnetMsg {
         }
 
         // Extract the markers
-        let markers_offset = Self::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN;
-        let withdrawal_count = op_return_data[markers_offset];
-        let transfer_count = op_return_data[markers_offset + 1];
+        let withdrawal_count = op_return_data[Self::MARKERS_OFFSET];
+        let transfer_count = op_return_data[Self::MARKERS_OFFSET + 1];
 
         Ok((withdrawal_count, transfer_count))
     }
@@ -1471,11 +1489,8 @@ impl IpcCheckpointSubnetMsg {
         )?;
 
         debug!("Checkpoint TX: {checkpoint_tx:?}");
-        #[cfg(test)]
-        {
-            dbg!(&checkpoint_tx);
-            dbg!(&checkpoint_psbt);
-        }
+        // dbg!(&checkpoint_tx);
+        // dbg!(&checkpoint_psbt);
 
         assert_eq!(
             checkpoint_tx.compute_txid(),
@@ -1525,14 +1540,8 @@ impl IpcCheckpointSubnetMsg {
             )));
         }
 
-        // Extract components from the metadata
-        let tag_offset = 0;
-        let txid_offset = tag_offset + Self::TAG_LEN;
-        let hash_offset = txid_offset + Txid::LEN;
-        let markers_offset = hash_offset + bitcoin::hashes::sha256::Hash::LEN;
-
         // Verify tag
-        let tag = &op_return_data[tag_offset..txid_offset];
+        let tag = &op_return_data[Self::TAG_OFFSET..Self::TXID_OFFSET];
         if tag != IPC_CHECKPOINT_TAG.as_bytes() {
             return Err(err(format!(
                 "Invalid tag: got '{}', expected '{}'",
@@ -1542,19 +1551,25 @@ impl IpcCheckpointSubnetMsg {
         }
 
         // Extract subnet ID
-        let txid_bytes = &op_return_data[txid_offset..hash_offset];
+        let txid_bytes = &op_return_data[Self::TXID_OFFSET..Self::HASH_OFFSET];
         let txid = Txid::from_slice(txid_bytes)
             .map_err(|e| err(format!("Invalid subnet ID bytes: {}", e)))?;
         let subnet_id = SubnetId::from_txid(&txid);
 
         // Extract checkpoint hash
-        let hash_bytes = &op_return_data[hash_offset..markers_offset];
+        let hash_bytes = &op_return_data[Self::HASH_OFFSET..Self::HEIGHT_OFFSET];
         let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_slice(hash_bytes)
             .map_err(|e| err(format!("Invalid checkpoint hash bytes: {}", e)))?;
 
+        let height_bytes = &op_return_data[Self::HEIGHT_OFFSET..Self::MARKERS_OFFSET];
+        let checkpoint_height =
+            u64::from_le_bytes(height_bytes.try_into().map_err(|_| {
+                err("Failed to convert checkpoint height bytes to u64".to_string())
+            })?);
+
         // Extract marker values
-        let withdrawals_count = op_return_data[markers_offset] as usize;
-        let transfers_count = op_return_data[markers_offset + 1] as usize;
+        let withdrawals_count = op_return_data[Self::MARKERS_OFFSET] as usize;
+        let transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
 
         // Check if we have enough outputs for all the withdrawals and transfers
         let expected_outputs = 1 + // metadata
@@ -1630,6 +1645,7 @@ impl IpcCheckpointSubnetMsg {
         Ok(Self {
             subnet_id,
             checkpoint_hash,
+            checkpoint_height,
             withdrawals,
             transfers,
             change_address,
@@ -1657,6 +1673,7 @@ impl IpcCheckpointSubnetMsg {
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
             checkpoint_hash: self.checkpoint_hash,
+            checkpoint_height: self.checkpoint_height,
             block_height,
             txid,
             // Will be updated when batch transfer is confirmed
@@ -2612,8 +2629,8 @@ mod prefund_msg_tests {
         // Test case 3: Wrong tag in OP_RETURN
         let mut wrong_tag_tx = tx.clone();
         let mut wrong_data = Vec::new();
-        // same length as "IPC:PFD"
-        let invalid_tag = "IPC:123";
+        // same length as "IPCPFD"
+        let invalid_tag = "IPC123";
         // sanity check if we change tag length
         assert_eq!(invalid_tag.len(), IPC_TAG_LENGTH);
         wrong_data.extend_from_slice(invalid_tag.as_bytes()); // Different tag
@@ -2667,6 +2684,7 @@ mod checkpoint_msg_tests {
         IpcCheckpointSubnetMsg {
             subnet_id: subnet_state.id,
             checkpoint_hash,
+            checkpoint_height: 50,
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
@@ -2737,19 +2755,16 @@ mod checkpoint_msg_tests {
             })
             .unwrap();
 
-        // Calculate offset for markers
-        let markers_offset =
-            IpcCheckpointSubnetMsg::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN;
-
         // Check the withdrawal count marker
         assert_eq!(
-            op_return_data[markers_offset], 1,
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET],
+            1,
             "Withdrawal count marker should be 1"
         );
 
         // Check the transfer count marker
         assert_eq!(
-            op_return_data[markers_offset + 1],
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET + 1],
             1,
             "Transfer count marker should be 1"
         );
@@ -2812,6 +2827,7 @@ mod checkpoint_msg_tests {
         let checkpoint_msg = IpcCheckpointSubnetMsg {
             subnet_id: subnet.id,
             checkpoint_hash,
+            checkpoint_height: 50,
             withdrawals: vec![withdrawal, withdrawal2],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
@@ -2857,19 +2873,16 @@ mod checkpoint_msg_tests {
             })
             .unwrap();
 
-        // Calculate offset for markers
-        let markers_offset =
-            IpcCheckpointSubnetMsg::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN;
-
         // Check the withdrawal count marker
         assert_eq!(
-            op_return_data[markers_offset], 2,
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET],
+            2,
             "Withdrawal count marker should be 1"
         );
 
         // Check the transfer count marker
         assert_eq!(
-            op_return_data[markers_offset + 1],
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET + 1],
             0,
             "Transfer count marker should be 0"
         );
@@ -2892,6 +2905,7 @@ mod checkpoint_msg_tests {
         let checkpoint_msg = IpcCheckpointSubnetMsg {
             subnet_id: subnet.id,
             checkpoint_hash,
+            checkpoint_height: 50,
             withdrawals: vec![],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
@@ -2937,19 +2951,16 @@ mod checkpoint_msg_tests {
             })
             .unwrap();
 
-        // Calculate offset for markers
-        let markers_offset =
-            IpcCheckpointSubnetMsg::TAG_LEN + Txid::LEN + bitcoin::hashes::sha256::Hash::LEN;
-
         // Check the withdrawal count marker
         assert_eq!(
-            op_return_data[markers_offset], 0,
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET],
+            0,
             "Withdrawal count marker should be 0"
         );
 
         // Check the transfer count marker
         assert_eq!(
-            op_return_data[markers_offset + 1],
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET + 1],
             0,
             "Transfer count marker should be 0"
         );

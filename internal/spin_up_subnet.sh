@@ -50,6 +50,8 @@ VALIDATOR1_OUTPUT=$(cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
     -e RESOLVER_HOST_PORT=26655 \
     -e PARENT_ENDPOINT="$API_URL" \
     -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
+    -e TOPDOWN_CHAIN_HEAD_DELAY=1 \
+    -e TOPDOWN_PROPOSAL_DELAY=0 \
     -e FM_PULL_SKIP=1 \
     child-validator 2>/dev/null)
 
@@ -82,6 +84,8 @@ run_validator() {
         -e RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${RESOLVER_ADDR}" \
         -e PARENT_ENDPOINT="$API_URL" \
         -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
+        -e TOPDOWN_CHAIN_HEAD_DELAY=1 \
+        -e TOPDOWN_PROPOSAL_DELAY=0 \
         -e FM_PULL_SKIP=1 \
         child-validator > /dev/null 2>&1
     echo "Validator $validator_num started!"

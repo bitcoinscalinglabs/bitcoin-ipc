@@ -291,4 +291,31 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
+
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getsubnetcheckpoint",
+    "params": {
+        "subnet_id": "/b4/t420fluns5gbn747yx4niyqwmfvsessium7psci7w7lld7omo3n2hrutp3ayv2y"
+    },
+    "id": 1
+}' | jq
+
+# get a specific subnet checkpoint
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getsubnetcheckpoint",
+    "params": {
+        "subnet_id": "/b4/t420fluns5gbn747yx4niyqwmfvsessium7psci7w7lld7omo3n2hrutp3ayv2y",
+        "number": 1
+    },
+    "id": 1
+}' | jq
 ```
