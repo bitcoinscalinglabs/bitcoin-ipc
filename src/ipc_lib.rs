@@ -1048,6 +1048,8 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             ));
         }
 
+        // TODO validate that checkpoint height no duplicates?
+
         // Ensure number of withdrawals and transfers doesn't exceed u8::MAX (255)
         if self.withdrawals.len() > u8::MAX as usize {
             return Err(IpcValidateError::InvalidMsg(format!(
@@ -2072,7 +2074,7 @@ impl IpcMessage {
 // Subnet ID
 //
 
-pub const L1_DELEGATED_NAMESPACE: u64 = 20;
+pub const L1_DELEGATED_NAMESPACE: u64 = 10;
 
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the reveal transaction.
@@ -2489,7 +2491,7 @@ mod tests {
             IPC_TAG_DELIMITER
         )));
         assert!(serialized.contains(&format!(
-            "{}subnet_id={}/t420fhor637l2pmjle6whfq7go5upmf74qg6dx7j5qyy",
+            "{}subnet_id={}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
             IPC_TAG_DELIMITER, L1_NAME
         )));
 
@@ -2534,7 +2536,7 @@ mod tests {
     fn test_subnet_id_from_str() {
         set_test_fvm_network();
         let subnet_id_str = format!(
-            "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6dx7j5qyy",
+            "{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
             crate::L1_NAME
         );
         let subnet_id = SubnetId::from_str(&subnet_id_str).unwrap();
@@ -2556,7 +2558,7 @@ mod tests {
         assert_eq!(
             subnet_id.to_string(),
             format!(
-                "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6dx7j5qyy",
+                "{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
                 crate::L1_NAME
             )
         );
@@ -2599,7 +2601,7 @@ mod tests {
         // Test JSON serialization
         let serialized = serde_json::to_string(&subnet_id).unwrap();
         let expected = format!(
-            "\"{}/t420fhor637l2pmjle6whfq7go5upmf74qg6dx7j5qyy\"",
+            "\"{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei\"",
             crate::L1_NAME
         );
         assert_eq!(serialized, expected);
@@ -2616,7 +2618,7 @@ mod tests {
 
         // 1. Start with a valid txid
         let txid =
-            Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+            Txid::from_str("06426ef74c42f874ce7824c640074d0e0bd8a676b49e91ea567a5eb596cfb8cb")
                 .unwrap();
 
         // 2. Create a SubnetId from the txid
