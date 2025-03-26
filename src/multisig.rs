@@ -6,7 +6,6 @@ use thiserror::Error;
 use bitcoin::{
     absolute::LockTime,
     blockdata::script::Builder,
-    hashes::Hash,
     opcodes,
     secp256k1::{All, Secp256k1},
     taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
@@ -71,7 +70,7 @@ pub fn create_multisig_script(
 fn create_unspendable_subnet_id_script(subnet_id: &SubnetId) -> ScriptBuf {
     Builder::new()
         .push_opcode(opcodes::all::OP_RETURN)
-        .push_slice(subnet_id.txid().as_byte_array())
+        .push_slice(subnet_id.txid20())
         .into_script()
 }
 
@@ -1380,6 +1379,7 @@ mod psbt_tests {
     use crate::multisig::tests::verify_transaction;
     use crate::test_utils::{generate_keypairs, generate_subnet_id};
     use crate::NETWORK;
+    use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
     use bitcoin::{transaction, Amount, OutPoint, Sequence, TxOut, Txid};
@@ -1861,6 +1861,7 @@ mod psbt_tests {
 mod multisig_weighted_tests {
     use super::*;
     use crate::test_utils::generate_subnet_id;
+    use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
     use bitcoin::{transaction, Amount, OutPoint, Sequence, TxOut, Txid};
