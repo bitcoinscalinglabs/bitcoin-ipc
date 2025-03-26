@@ -167,6 +167,8 @@ pub struct SubnetCheckpoint {
     /// The block hash of the child subnet at which the checkpoint was cut
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// The block height of the checkpoint on Bitcoin
+    pub checkpoint_height: u64,
+    /// The block height of the checkpoint on Bitcoin
     pub block_height: u64,
     /// The txid of the checkpoint on Bitcoin
     pub txid: bitcoin::Txid,

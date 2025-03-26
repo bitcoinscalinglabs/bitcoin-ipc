@@ -44,7 +44,7 @@ RANDOM_HASH=$(openssl rand -hex 32)
 CURRENT_BLOCK=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$CURRENT_BLOCK")
 
-DESTINATION_SUBNET_ID_1="/b4/t420f4pyvwv4erfqcqrjykznyu4zkyepp7v6ki2p2v2wug6bubrxrlpiwpxozzm"
+DESTINATION_SUBNET_ID_1="/b4/t420fxivdpexcejskneatarvuth2qv7ncn5mbod7x4w4lm5h575rzq6depsiklm"
 
 echo "Current block: $CURRENT_BLOCK ($BLOCK_HASH)"
 echo "Using checkpoint hash: $RANDOM_HASH"
@@ -58,6 +58,7 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
     \"params\": {
         \"subnet_id\": \"$SUBNET_ID\",
         \"checkpoint_hash\": \"$RANDOM_HASH\",
+        \"checkpoint_height\": 50,
         \"withdrawals\": [
             {
                 \"amount\": 25000,
