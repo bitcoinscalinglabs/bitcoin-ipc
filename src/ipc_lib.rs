@@ -2128,8 +2128,7 @@ impl Txid20Ext for Txid20 {
     }
 
     fn to_hex(&self) -> String {
-        hex::encode(&self)
-        // self.iter().map(|b| format!("{:02x}", b)).collect()
+        hex::encode(self)
     }
 
     fn from_txid(txid: &Txid) -> Txid20 {

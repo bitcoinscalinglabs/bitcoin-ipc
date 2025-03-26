@@ -20,6 +20,12 @@ use crate::SubnetId;
 pub type Power = u32;
 pub type WeightedKey = (XOnlyPublicKey, Power);
 
+fn sort_committee_keys(committee_keys: &[WeightedKey]) -> Vec<WeightedKey> {
+    let mut sorted_keys = committee_keys.to_vec();
+    sorted_keys.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
+    sorted_keys
+}
+
 pub fn create_multisig_script(
     public_keys: &[WeightedKey],
     threshold: Power,
@@ -31,8 +37,7 @@ pub fn create_multisig_script(
     }
 
     // Public keys need to be sorted for consistent scriptPubKey
-    let mut sorted_public_keys = public_keys.to_vec();
-    sorted_public_keys.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
+    let sorted_public_keys = sort_committee_keys(&public_keys);
 
     //  It pushes an accumulator to the stack, and then for each pk:
     // - it swaps the sig that's already on the stack as a witness, with the accumulator
@@ -490,12 +495,17 @@ pub fn finalize_spend_psbt(
     committee_threshold: Power,
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
-    let script = create_multisig_script(committee_keys, committee_threshold)?;
+    println!("finalize_spend_psbt");
+    dbg!(&committee_keys);
+    let committee_keys = sort_committee_keys(&committee_keys);
+    dbg!(&committee_keys);
+
+    let script = create_multisig_script(&committee_keys, committee_threshold)?;
     let leaf_hash = script.tapscript_leaf_hash();
 
     // Get the spend info for the multisig
     let spend_info =
-        create_subnet_multisig_spend_info(secp, subnet_id, committee_keys, committee_threshold)?;
+        create_subnet_multisig_spend_info(secp, subnet_id, &committee_keys, committee_threshold)?;
 
     // Create the control block
     let control_block = spend_info
@@ -545,10 +555,20 @@ pub fn finalize_spend_psbt_from_sigs(
 ) -> Result<Transaction, MultisigError> {
     let mut signed_psbt = psbt.clone();
 
+    let mut key_sig_pairs: Vec<(WeightedKey, &[bitcoin::secp256k1::schnorr::Signature])> =
+        committee_keys
+            .iter()
+            .cloned()
+            .zip(signature_sets.iter().cloned())
+            .collect();
+
+    // Sort by public key - same ordering as in create_multisig_script
+    key_sig_pairs.sort_by(|(key_a, _), (key_b, _)| key_a.0.cmp(&key_b.0));
+
     let script = create_multisig_script(committee_keys, committee_threshold).unwrap();
     let leaf_hash = script.tapscript_leaf_hash();
 
-    for ((xonly_pubkey, _power), signatures) in committee_keys.iter().zip(signature_sets.iter()) {
+    for ((xonly_pubkey, _power), signatures) in key_sig_pairs {
         // For each input this signer has signed
         for (input_idx, signature) in signatures.iter().enumerate() {
             // Make sure we don't go out of bounds
@@ -561,7 +581,7 @@ pub fn finalize_spend_psbt_from_sigs(
                 // Add the signature to the PSBT
                 signed_psbt.inputs[input_idx]
                     .tap_script_sigs
-                    .insert((*xonly_pubkey, leaf_hash), taproot_sig);
+                    .insert((xonly_pubkey, leaf_hash), taproot_sig);
             }
         }
     }
@@ -771,7 +791,7 @@ mod tests {
         let script = create_multisig_script(&committee_keys, required_sigs)
             .expect("Failed to create multisig script");
 
-        dbg!(&script);
+        // dbg!(&script);
 
         let spend_info =
             create_subnet_multisig_spend_info(&secp, &subnet_id, &committee_keys, required_sigs)
@@ -781,7 +801,7 @@ mod tests {
             .control_block(&(script.clone(), LeafVersion::TapScript))
             .expect("Should create control block");
 
-        dbg!(&control_block.size());
+        // dbg!(&control_block.size());
 
         let multisig_address = create_subnet_multisig_address(
             &secp,
@@ -1828,7 +1848,41 @@ mod psbt_tests {
             &committee_pubkeys,
             threshold,
             &unsigned_psbt,
-            &[&sigs1, &sigs2],
+            &[&sigs1, &sigs2, &[]],
+        )
+        .expect("should finalize");
+
+        // Verify the finalized transaction can spend the UTXO
+        let verify_result = verify_transaction(&finalized_tx, |outpoint| {
+            dbg!(&outpoint);
+            dbg!(funding_tx1.compute_txid());
+            dbg!(funding_tx2.compute_txid());
+
+            if outpoint.txid == funding_tx1.compute_txid() && outpoint.vout == 0 {
+                Some(funding_tx1.output[0].clone())
+            } else if outpoint.txid == funding_tx2.compute_txid() && outpoint.vout == 0 {
+                Some(funding_tx2.output[0].clone())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            verify_result.is_ok(),
+            "Transaction should be valid with signatures collected in parallel: {:?}",
+            verify_result
+        );
+
+        let committe_pubkeys_reverse = committee_pubkeys.iter().rev().cloned().collect::<Vec<_>>();
+
+        // Create a fresh PSBT and manually add all signatures
+        let finalized_tx = finalize_spend_psbt_from_sigs(
+            &secp,
+            &subnet_id,
+            &committe_pubkeys_reverse,
+            threshold,
+            &unsigned_psbt,
+            &[&[], &sigs2, &sigs1],
         )
         .expect("should finalize");
 
