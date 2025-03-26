@@ -405,12 +405,7 @@ pub async fn gen_multisig_spend_psbt(
         .clone()
         .require_network(NETWORK)
         .expect("Multisig should be valid for saved subnet genesis info");
-    let committee_keys = subnet
-        .committee
-        .validators
-        .iter()
-        .map(|v| v.pubkey)
-        .collect::<Vec<_>>();
+    let committee_keys = subnet.committee.validator_weighted_keys();
     let commitee_threshold = subnet.committee.threshold;
 
     let unspent = subnet
@@ -724,12 +719,7 @@ pub async fn finalize_checkpoint_psbt(
         )))?;
 
     // Get committee info
-    let committee_keys: Vec<bitcoin::XOnlyPublicKey> = subnet
-        .committee
-        .validators
-        .iter()
-        .map(|v| v.pubkey)
-        .collect();
+    let committee_keys = subnet.committee.validator_weighted_keys();
     let committee_threshold = subnet.committee.threshold;
 
     let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {

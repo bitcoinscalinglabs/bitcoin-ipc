@@ -28,8 +28,8 @@ rand_in_range() {
 	echo $(((raw + 50000) / 100000 * 100000))
 }
 
-MIN_VAL=100000000
-MAX_VAL=400000000
+MIN_VAL=10000000
+MAX_VAL=40000000
 
 # 1. Create the subnet and record the subnet ID in a variable
 CREATE_OUTPUT=$(curl -s -X POST "$API_URL" \

@@ -1,6 +1,6 @@
 use crate::{
     ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
-    multisig::{create_subnet_multisig_address, multisig_threshold},
+    multisig::{create_subnet_multisig_address, multisig_threshold, Power, WeightedKey},
     wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
@@ -55,6 +55,8 @@ pub struct SubnetValidator {
     pub pubkey: XOnlyPublicKey,
     /// The ethereum address of the validator pubkey
     pub subnet_address: alloy_primitives::Address,
+    /// The power of the validator
+    pub power: Power,
     /// The current balance of the validator's stake
     pub collateral: bitcoin::Amount,
     /// Validator backup address
@@ -67,27 +69,29 @@ pub struct SubnetValidator {
 }
 
 trait SubnetValidators {
+    fn total_power(&self) -> Power;
+    fn threshold(&self) -> Power;
     fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked>;
-    fn threshold(&self) -> u16;
     fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee;
 }
 
 impl SubnetValidators for Vec<SubnetValidator> {
+    fn total_power(&self) -> Power {
+        self.iter().map(|v| v.power).sum()
+    }
+
+    fn threshold(&self) -> Power {
+        multisig_threshold(self.total_power())
+    }
+
     fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
-        let pubkeys = self.iter().map(|v| v.pubkey).collect::<Vec<_>>();
-        // TODO remove as 16
-        let threshold = multisig_threshold(pubkeys.len() as u16);
+        let pubkeys = self.iter().map(|v| (v.pubkey, v.power)).collect::<Vec<_>>();
         let multisig_address =
-            create_subnet_multisig_address(&secp, subnet_id, &pubkeys, threshold.into(), NETWORK)
+            create_subnet_multisig_address(&secp, subnet_id, &pubkeys, self.threshold(), NETWORK)
                 .expect("Multisig address should be valid");
 
         multisig_address.into_unchecked()
-    }
-
-    fn threshold(&self) -> u16 {
-        // TODO remove as 16
-        multisig_threshold(self.len() as u16)
     }
 
     fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee {
@@ -103,7 +107,7 @@ impl SubnetValidators for Vec<SubnetValidator> {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCommittee {
     /// The threshold for the multisig
-    pub threshold: u16,
+    pub threshold: Power,
     /// The current list of validators, with their balances
     pub validators: Vec<SubnetValidator>,
     /// The subnet multisig address
@@ -116,6 +120,17 @@ impl SubnetCommittee {
             .len()
             .try_into()
             .expect("SubnetCommittee size should be < u16::max")
+    }
+
+    pub fn total_power(&self) -> Power {
+        self.validators.total_power()
+    }
+
+    pub fn validator_weighted_keys(&self) -> Vec<WeightedKey> {
+        self.validators
+            .iter()
+            .map(|v| (v.pubkey, v.power))
+            .collect()
     }
 
     pub fn address_checked(&self) -> Address {
@@ -269,10 +284,18 @@ impl SubnetGenesisInfo {
     pub fn multisig_address(&self) -> Address {
         let secp = bitcoin::secp256k1::Secp256k1::new();
 
+        let whitelist_weighted_keys = self
+            .create_subnet_msg
+            .whitelist
+            .clone()
+            .into_iter()
+            .map(|xpk| (xpk, 1))
+            .collect::<Vec<_>>();
+
         create_subnet_multisig_address(
             &secp,
             &self.subnet_id,
-            &self.create_subnet_msg.whitelist.clone(),
+            &whitelist_weighted_keys,
             self.create_subnet_msg.min_validators.into(),
             NETWORK,
         )
