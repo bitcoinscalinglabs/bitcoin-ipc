@@ -92,7 +92,7 @@ curl -X POST http://localhost:3030/api \
 	"jsonrpc": "2.0",
 	"method": "getgenesisinfo",
 	"params": {
-		"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm"
+		"subnet_id": "/b4/t410fzmra6da4kf2xslwqgqjxgrh67zvd6mhujbqdosi"
 	},
 	"id": 1
 }' | jq

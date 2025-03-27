@@ -165,7 +165,7 @@ The next step is to create a subnet under `/b4` — Bitcoin Regtest. Validator 1
 ```sh
 ipc-cli --config-path ~/.ipc/validator1/config.toml subnet create \
 	# general subnet options
-	--parent /b4 --min-validators 4 --bottomup-check-period 300 \
+	--parent /b4 --min-validators 4 --bottomup-check-period 100 \
 	# btc specific options
 	btc --min-validator-stake 100000000 --min-cross-msg-fee 10 \
 	# comma-separated list of our validators x-only public keys
