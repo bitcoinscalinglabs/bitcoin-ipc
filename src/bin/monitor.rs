@@ -350,7 +350,7 @@ where
     }
 
     async fn process_block(&mut self, block_height: u64) -> Result<(), MonitorError> {
-        info!("Processing block {}", block_height);
+        debug!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
 

@@ -495,7 +495,6 @@ pub fn finalize_spend_psbt(
     committee_threshold: Power,
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
-    println!("finalize_spend_psbt");
     let committee_keys = sort_committee_keys(&committee_keys);
     trace!(
         "finalize_spend_psbt sorted committee_keys: {:?}",
@@ -1871,7 +1870,7 @@ mod psbt_tests {
 
         assert!(
             verify_result.is_ok(),
-            "Transaction should be valid with signatures collected in parallel: {:?}",
+            "Transaction should be valid with signatures collected in parallel but in reverse: {:?}",
             verify_result
         );
 
