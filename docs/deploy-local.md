@@ -18,18 +18,25 @@ bitcoin-cli createwallet "validator1"
 bitcoin-cli createwallet "validator2"
 bitcoin-cli createwallet "validator3"
 bitcoin-cli createwallet "validator4"
+bitcoin-cli createwallet "user1"
+bitcoin-cli createwallet "user2"
 
 # fund 4 wallets
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator1 getnewaddress)"
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator2 getnewaddress)"
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator3 getnewaddress)"
-bitcoin-cli generatetoaddress 102 "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=user1 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=user2 getnewaddress)"
+bitcoin-cli generatetoaddress 102 "$(bitcoin-cli --rpcwallet=default getnewaddress)"
 
 # check balances
 bitcoin-cli --rpcwallet=validator1 getbalance
 bitcoin-cli --rpcwallet=validator2 getbalance
 bitcoin-cli --rpcwallet=validator3 getbalance
 bitcoin-cli --rpcwallet=validator4 getbalance
+bitcoin-cli --rpcwallet=user1 getbalance
+bitcoin-cli --rpcwallet=user2 getbalance
 ```
 
 All wallets should have at least 100 BTC.

@@ -1,0 +1,28 @@
+monitor:
+	- scans blocks and transactions
+	- sees a checkpoint from the first output (ipc tag)
+		- notices op_return output:
+			- notices the subnet id
+			- notices the committee hash
+			- notices the flags for withdrawals/transfers
+			- notices the child block height
+		- notices withdrawal outputs
+			- /* creates a release rootnet message from each withdrawal (/
+			- does nothing
+		- notices a batched transfer commit tx output
+			- does nothing
+		- notices transfer output for each subnet
+			- does nothing
+		- notices a change output
+			- if address is the same as sender, does nothing
+			- if address is different
+				- the committee has changed, it must be the address of the next_committee
+
+	...
+
+	- scans blocks and transactions
+	- sees a batched transfer release tx from witness (ipc tag)
+		- reads the subnets and addresses
+		- gets the previous transaction
+		- verifies the batched transfer data matches outputs
+		- creates transfer rootnet messages for each subnet and address
