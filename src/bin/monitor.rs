@@ -214,15 +214,21 @@ where
 
             match self.get_latest_confirmed_height() {
                 Ok(block_count) => {
-                    if block_count > self.current_height {
-                        match self.process_block(block_count).await {
+                    // It could happen, in regtest especially, that there are
+                    // multiple blocks mined at once, so we need to process all of them
+                    // and not just the most recent one
+                    while self.current_height < block_count {
+                        let next_height = self.current_height + 1;
+
+                        match self.process_block(next_height).await {
                             Ok(_) => {
-                                info!("Processed block {}", block_count);
-                                self.current_height = block_count;
+                                info!("Processed block {}", next_height);
+                                self.current_height = next_height;
                                 if let Err(e) =
                                     self.db.set_last_processed_block(self.current_height)
                                 {
                                     error!("Failed to update last processed block: {:?}", e);
+                                    return Err(e.into());
                                 }
                             }
                             Err(e) => {
@@ -547,6 +553,9 @@ pub enum MonitorError {
 
     #[error("Cannot get last processed block: {0}")]
     CannotGetMonitorInfo(db::DbError),
+
+    #[error(transparent)]
+    DbError(#[from] db::DbError),
 
     #[error(transparent)]
     BitcoinRpcError(#[from] bitcoincore_rpc::Error),
