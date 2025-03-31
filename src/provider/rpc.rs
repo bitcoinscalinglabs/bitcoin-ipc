@@ -811,12 +811,42 @@ pub async fn finalize_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    // Organize signatures by signer
-    let signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> = params
-        .signatures
-        .iter()
-        .map(|(_, sigs)| sigs.as_slice())
-        .collect();
+    // Create a map of provided signatures indexed by public key
+    let signatures_map: std::collections::HashMap<
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    > = params.signatures.into_iter().collect();
+
+    // Prepare signature sets in the same order as committee keys
+    let mut signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> =
+        Vec::with_capacity(committee_keys.len());
+
+    // Check if any unrecognized public keys were provided
+    for (pubkey, _) in &signatures_map {
+        if !committee_keys
+            .iter()
+            .any(|(committee_key, _)| committee_key == pubkey)
+        {
+            error!("Unrecognized public key in signatures: {}", pubkey);
+            return Err(RpcError::InvalidParams(format!(
+                "Unrecognized public key in signatures: {}",
+                pubkey
+            ))
+            .into());
+        }
+    }
+
+    // Empty signature vector to use when a validator hasn't provided signatures
+    let empty_sigs: Vec<bitcoin::secp256k1::schnorr::Signature> = Vec::new();
+
+    // For each committee key, get the corresponding signatures or use empty set
+    for (pubkey, _) in &committee_keys {
+        let sigs = match signatures_map.get(pubkey) {
+            Some(sigs) => sigs.as_slice(),
+            None => empty_sigs.as_slice(),
+        };
+        signature_sets.push(sigs);
+    }
 
     // Finalize the PSBT using multisig::finalize_spend_psbt_from_sigs
     let finalized_tx = multisig::finalize_spend_psbt_from_sigs(

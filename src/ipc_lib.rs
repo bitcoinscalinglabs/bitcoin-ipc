@@ -538,7 +538,7 @@ impl IpcPrefundSubnetMsg {
     // Locktime for the pre-release script
     const RELEASE_LOCKTIME: u32 = 6;
     // The total length of the op_return data - helper
-    const DATA_LEN: usize = IPC_TAG_LENGTH + Txid::LEN + ETH_ADDR_LEN;
+    const DATA_LEN: usize = IPC_TAG_LENGTH + SubnetId::INNER_LEN + ETH_ADDR_LEN;
 
     /// Validates the join subnet message, for the given genesis info
     pub fn validate_for_genesis_info(
@@ -596,7 +596,7 @@ impl IpcPrefundSubnetMsg {
 
         // Split data into its components
         let (tag, rest) = op_return_data.split_at(IPC_TAG_LENGTH);
-        let (txid_bytes, addr_bytes) = rest.split_at(Txid::LEN);
+        let (txid_bytes, addr_bytes) = rest.split_at(SubnetId::INNER_LEN);
 
         // Verify tag
         if tag != IPC_PREFUND_SUBNET_TAG.as_bytes() {
@@ -608,9 +608,9 @@ impl IpcPrefundSubnetMsg {
         }
 
         // Convert txid bytes to Txid
-        let txid =
-            Txid::from_slice(txid_bytes).map_err(|e| err(format!("Invalid txid bytes: {}", e)))?;
-        let subnet_id = SubnetId::from_txid(&txid);
+        let txid20 = Txid20::from_slice(txid_bytes)
+            .map_err(|e| err(format!("Invalid txid bytes: {}", e)))?;
+        let subnet_id = SubnetId::from_txid20(&txid20);
 
         // Convert address bytes to alloy Address
         let address = alloy_primitives::Address::from_slice(addr_bytes);
@@ -641,16 +641,16 @@ impl IpcPrefundSubnetMsg {
             .as_bytes()
             .try_into()
             .expect("IPC_PREFUND_SUBNET_TAG has incorrect length");
-        let subnet_id_txid: [u8; Txid::LEN] = self.subnet_id.txid().as_raw_hash().to_byte_array();
+        let subnet_id_txid: [u8; SubnetId::INNER_LEN] = self.subnet_id.txid20();
         let subnet_addr: [u8; ETH_ADDR_LEN] = self.address.into_array();
 
         // Construct op_return data
         let mut op_return_data = [0u8; Self::DATA_LEN];
 
         op_return_data[0..IPC_TAG_LENGTH].copy_from_slice(&prefund_tag);
-        op_return_data[IPC_TAG_LENGTH..(IPC_TAG_LENGTH + Txid::LEN)]
+        op_return_data[IPC_TAG_LENGTH..(IPC_TAG_LENGTH + SubnetId::INNER_LEN)]
             .copy_from_slice(&subnet_id_txid);
-        op_return_data[(IPC_TAG_LENGTH + Txid::LEN)..].copy_from_slice(&subnet_addr);
+        op_return_data[(IPC_TAG_LENGTH + SubnetId::INNER_LEN)..].copy_from_slice(&subnet_addr);
 
         // Make op_return script and txout
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
@@ -776,7 +776,7 @@ impl IpcFundSubnetMsg {
     // The length of the subnet tag - helper
     const FUND_TAG_LEN: usize = IPC_FUND_SUBNET_TAG.len();
     // The total length of the op_return data - helper
-    const DATA_LEN: usize = Self::FUND_TAG_LEN + Txid::LEN + ETH_ADDR_LEN;
+    const DATA_LEN: usize = Self::FUND_TAG_LEN + SubnetId::INNER_LEN + ETH_ADDR_LEN;
 
     /// Validates the fund msg for the given subnet
     pub fn validate_for_subnet(
@@ -878,7 +878,7 @@ impl IpcFundSubnetMsg {
 
         // Split data into its components
         let (tag, rest) = op_return_data.split_at(Self::FUND_TAG_LEN);
-        let (txid_bytes, addr_bytes) = rest.split_at(Txid::LEN);
+        let (txid_bytes, addr_bytes) = rest.split_at(SubnetId::INNER_LEN);
 
         // Verify tag
         if tag != IPC_FUND_SUBNET_TAG.as_bytes() {
@@ -890,9 +890,9 @@ impl IpcFundSubnetMsg {
         }
 
         // Convert txid bytes to Txid
-        let txid =
-            Txid::from_slice(txid_bytes).map_err(|e| err(format!("Invalid txid bytes: {}", e)))?;
-        let subnet_id = SubnetId::from_txid(&txid);
+        let txid20 = Txid20::from_slice(txid_bytes)
+            .map_err(|e| err(format!("Invalid txid bytes: {}", e)))?;
+        let subnet_id = SubnetId::from_txid20(&txid20);
 
         // Convert address bytes to alloy Address
         let address = alloy_primitives::Address::from_slice(addr_bytes);
@@ -916,16 +916,16 @@ impl IpcFundSubnetMsg {
             .as_bytes()
             .try_into()
             .expect("IPC_FUND_SUBNET_TAG has incorrect length");
-        let subnet_id_txid: [u8; Txid::LEN] = self.subnet_id.txid().as_raw_hash().to_byte_array();
+        let subnet_id_txid: [u8; SubnetId::INNER_LEN] = self.subnet_id.txid20();
         let subnet_addr: [u8; ETH_ADDR_LEN] = self.address.into_array();
 
         // Construct op_return data
-        let mut op_return_data = [0u8; Self::FUND_TAG_LEN + Txid::LEN + ETH_ADDR_LEN];
+        let mut op_return_data = [0u8; Self::FUND_TAG_LEN + SubnetId::INNER_LEN + ETH_ADDR_LEN];
 
         op_return_data[0..Self::FUND_TAG_LEN].copy_from_slice(&fund_tag);
-        op_return_data[Self::FUND_TAG_LEN..(Self::FUND_TAG_LEN + Txid::LEN)]
+        op_return_data[Self::FUND_TAG_LEN..(Self::FUND_TAG_LEN + SubnetId::INNER_LEN)]
             .copy_from_slice(&subnet_id_txid);
-        op_return_data[(Self::FUND_TAG_LEN + Txid::LEN)..].copy_from_slice(&subnet_addr);
+        op_return_data[(Self::FUND_TAG_LEN + SubnetId::INNER_LEN)..].copy_from_slice(&subnet_addr);
 
         // Make op_return script and txout
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
@@ -1048,6 +1048,8 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             ));
         }
 
+        // TODO validate that checkpoint height no duplicates?
+
         // Ensure number of withdrawals and transfers doesn't exceed u8::MAX (255)
         if self.withdrawals.len() > u8::MAX as usize {
             return Err(IpcValidateError::InvalidMsg(format!(
@@ -1118,14 +1120,14 @@ impl IpcCheckpointSubnetMsg {
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
-        + Txid::LEN
+        + SubnetId::INNER_LEN
         + bitcoin::hashes::sha256::Hash::LEN
         + Self::MARKERS_LEN
         + Self::HEIGHT_LEN;
 
     const TAG_OFFSET: usize = 0;
     const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
-    const HASH_OFFSET: usize = Self::TXID_OFFSET + Txid::LEN;
+    const HASH_OFFSET: usize = Self::TXID_OFFSET + SubnetId::INNER_LEN;
     const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
     const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
 
@@ -1138,7 +1140,7 @@ impl IpcCheckpointSubnetMsg {
 
         // Copy subnet ID txid
         op_return_data[Self::TXID_OFFSET..Self::HASH_OFFSET]
-            .copy_from_slice(&self.subnet_id.txid().as_raw_hash().to_byte_array());
+            .copy_from_slice(&self.subnet_id.txid20());
 
         // Copy checkpoint hash
         op_return_data[Self::HASH_OFFSET..Self::HEIGHT_OFFSET]
@@ -1202,11 +1204,11 @@ impl IpcCheckpointSubnetMsg {
 
     fn make_batched_transfer_data(&self) -> Result<Vec<u8>, IpcLibError> {
         // Group transfers by destination subnet_id
-        let mut transfers_by_subnet: HashMap<Txid, Vec<(alloy_primitives::Address, Amount)>> =
+        let mut transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
             HashMap::new();
 
         for transfer in &self.transfers {
-            let key = transfer.destination_subnet_id.txid();
+            let key = transfer.destination_subnet_id.txid20();
             let entry = transfers_by_subnet.entry(key).or_default();
 
             entry.push((transfer.subnet_user_address, transfer.amount));
@@ -1552,9 +1554,9 @@ impl IpcCheckpointSubnetMsg {
 
         // Extract subnet ID
         let txid_bytes = &op_return_data[Self::TXID_OFFSET..Self::HASH_OFFSET];
-        let txid = Txid::from_slice(txid_bytes)
+        let txid20 = Txid20::from_slice(txid_bytes)
             .map_err(|e| err(format!("Invalid subnet ID bytes: {}", e)))?;
-        let subnet_id = SubnetId::from_txid(&txid);
+        let subnet_id = SubnetId::from_txid20(&txid20);
 
         // Extract checkpoint hash
         let hash_bytes = &op_return_data[Self::HASH_OFFSET..Self::HEIGHT_OFFSET];
@@ -2072,7 +2074,7 @@ impl IpcMessage {
 // Subnet ID
 //
 
-pub const L1_DELEGATED_NAMESPACE: u64 = 20;
+pub const L1_DELEGATED_NAMESPACE: u64 = 10;
 
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the reveal transaction.
@@ -2087,11 +2089,95 @@ pub enum SubnetIdError {
     InvalidFvmAddress(#[from] fvm_shared::address::Error),
 }
 
+/// First 20 bytes of a transaction ID
+pub type Txid20 = [u8; 20];
+
+/// Helper methods for Txid20
+pub trait Txid20Ext {
+    /// Convert from hexadecimal string to Txid20
+    fn from_hex(hex: &str) -> Result<Txid20, String>;
+
+    /// Convert Txid20 to hexadecimal string
+    fn to_hex(&self) -> String;
+
+    /// Create a Txid20 from the first 20 bytes of a full Txid
+    fn from_txid(txid: &Txid) -> Txid20;
+
+    /// Create a Txid20 from a byte slice
+    fn from_slice(slice: &[u8]) -> Result<Txid20, String>;
+
+    /// Creates a Txid20 filled with zeros
+    fn zeros() -> Txid20;
+
+    /// Convert this Txid20 to a SubnetId
+    fn to_subnet_id(&self) -> SubnetId;
+}
+
+impl Txid20Ext for Txid20 {
+    fn from_hex(hex: &str) -> Result<Txid20, String> {
+        if hex.len() != 40 {
+            return Err(format!(
+                "Invalid Txid20 hex length: {}, expected 40",
+                hex.len()
+            ));
+        }
+
+        let bytes = hex::decode(hex).map_err(|e| format!("Invalid hex: {}", e))?;
+
+        Self::from_slice(&bytes)
+    }
+
+    fn to_hex(&self) -> String {
+        hex::encode(self)
+    }
+
+    fn from_txid(txid: &Txid) -> Txid20 {
+        let txid_bytes = txid.as_byte_array();
+        let mut result = [0u8; 20];
+        result.copy_from_slice(&txid_bytes[0..20]);
+        result
+    }
+
+    fn from_slice(slice: &[u8]) -> Result<Txid20, String> {
+        if slice.len() < 20 {
+            return Err(format!(
+                "Byte slice too short: length {}, expected at least 20 bytes",
+                slice.len()
+            ));
+        }
+
+        let mut result = [0u8; 20];
+        result.copy_from_slice(&slice[0..20]);
+        Ok(result)
+    }
+
+    fn zeros() -> Txid20 {
+        [0u8; 20]
+    }
+
+    fn to_subnet_id(&self) -> SubnetId {
+        SubnetId::from_txid20(self)
+    }
+}
+
 impl SubnetId {
+    pub const INNER_LEN: usize = 20;
+
     /// Creates a new SubnetId from a transaction ID
     pub fn from_txid(txid: &Txid) -> Self {
-        let addr = FvmAddress::new_delegated(L1_DELEGATED_NAMESPACE, txid.as_ref())
+        let mut txid20: Txid20 = [0u8; 20];
+        let txid_bytes = txid.as_byte_array();
+        txid20.copy_from_slice(&txid_bytes[0..20]);
+
+        let addr = FvmAddress::new_delegated(L1_DELEGATED_NAMESPACE, &txid20)
             .expect("txid is longer than 32 bytes, unreachable");
+        Self(addr)
+    }
+
+    /// Creates a new SubnetId directly from a 20-byte transaction ID fragment
+    pub fn from_txid20(txid20: &Txid20) -> Self {
+        let addr = FvmAddress::new_delegated(L1_DELEGATED_NAMESPACE, txid20)
+            .expect("txid20 is 20 bytes, should always be valid");
         Self(addr)
     }
 
@@ -2102,14 +2188,26 @@ impl SubnetId {
     // Getting the txid from the delegated address
     // It's impossible to create other types of addresses or with other data
     // So it's safe to panic to handle errors
-    pub fn txid(&self) -> Txid {
+    pub fn txid20(&self) -> Txid20 {
         let payload = self.0.payload();
         let sub_address = match payload {
             fvm_shared::address::Payload::Delegated(del_addr) => del_addr.subaddress(),
             _ => panic!("SubnetId doesn't have a delegated address"),
         };
 
-        Txid::from_slice(sub_address).expect("SubnetId subaddress is an invalid txid")
+        // Panic here since there's no other way to create a subnet id
+        assert_eq!(
+            sub_address.len(),
+            Self::INNER_LEN,
+            "SubnetId subaddress length mismatch: expected {}, got {}",
+            Self::INNER_LEN,
+            sub_address.len()
+        );
+
+        let mut txid20: Txid20 = [0u8; 20];
+        txid20.copy_from_slice(&sub_address[..20]);
+
+        txid20
     }
 }
 
@@ -2192,7 +2290,11 @@ pub enum IpcLibError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eth_utils::{
+        delegated_fvm_to_eth_address, evm_address_to_delegated_fvm, set_fvm_network,
+    };
     use crate::L1_NAME;
+    use bitcoin::hex::DisplayHex;
     use fvm_shared::address::{set_current_network, Network as FvmNetwork};
 
     fn set_test_fvm_network() {
@@ -2388,7 +2490,7 @@ mod tests {
             IPC_TAG_DELIMITER
         )));
         assert!(serialized.contains(&format!(
-            "{}subnet_id={}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+            "{}subnet_id={}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
             IPC_TAG_DELIMITER, L1_NAME
         )));
 
@@ -2413,6 +2515,8 @@ mod tests {
 
     #[test]
     fn test_subnet_id_creation() {
+        set_test_fvm_network();
+
         let txid =
             Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
                 .unwrap();
@@ -2421,21 +2525,24 @@ mod tests {
 
         println!("{subnet_id} {addr}");
 
-        assert_eq!(subnet_id.txid(), txid);
+        let mut expected_txid20 = [0u8; 20];
+        expected_txid20.copy_from_slice(&txid.as_byte_array()[0..20]);
+
+        assert_eq!(subnet_id.txid20(), expected_txid20);
     }
 
     #[test]
     fn test_subnet_id_from_str() {
         set_test_fvm_network();
         let subnet_id_str = format!(
-            "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+            "{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
             crate::L1_NAME
         );
         let subnet_id = SubnetId::from_str(&subnet_id_str).unwrap();
 
         assert_eq!(
-            subnet_id.txid().to_string(),
-            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+            subnet_id.txid20().to_hex(),
+            "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3"
         );
     }
 
@@ -2450,7 +2557,7 @@ mod tests {
         assert_eq!(
             subnet_id.to_string(),
             format!(
-                "{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m",
+                "{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
                 crate::L1_NAME
             )
         );
@@ -2493,7 +2600,7 @@ mod tests {
         // Test JSON serialization
         let serialized = serde_json::to_string(&subnet_id).unwrap();
         let expected = format!(
-            "\"{}/t420fhor637l2pmjle6whfq7go5upmf74qg6drcffcmr2t64kusy6lzfagfyi6m\"",
+            "\"{}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei\"",
             crate::L1_NAME
         );
         assert_eq!(serialized, expected);
@@ -2501,6 +2608,81 @@ mod tests {
         // Test JSON deserialization
         let deserialized: SubnetId = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized, subnet_id);
+    }
+
+    #[test]
+    fn test_txid_to_subnet_id_to_eth_addr_conversion() {
+        // Set FVM network for address formatting
+        set_fvm_network();
+
+        // 1. Start with a valid txid
+        let txid =
+            Txid::from_str("06426ef74c42f874ce7824c640074d0e0bd8a676b49e91ea567a5eb596cfb8cb")
+                .unwrap();
+
+        // 2. Create a SubnetId from the txid
+        let subnet_id = SubnetId::from_txid(&txid);
+
+        // Get the txid20 directly from Txid
+        let txid20 = Txid20::from_txid(&txid);
+
+        // Also get txid20 from subnet_id for comparison
+        let subnet_txid20 = subnet_id.txid20();
+
+        // These should match
+        assert_eq!(
+            txid20, subnet_txid20,
+            "txid20 from Txid and from SubnetId should match"
+        );
+
+        // 3. Convert the txid20 to an Ethereum address
+        let eth_addr = alloy_primitives::Address::from_slice(&txid20);
+
+        // Verify the Ethereum address bytes match the txid20
+        assert_eq!(
+            eth_addr.as_slice(),
+            &txid20,
+            "Ethereum address bytes should match txid20"
+        );
+
+        // 4. Convert the Ethereum address to an FVM delegated address
+        let eth_fvm_addr = evm_address_to_delegated_fvm(&eth_addr, L1_DELEGATED_NAMESPACE);
+
+        // 5. Extract the Ethereum address back from the FVM address
+        let recovered_eth_addr = delegated_fvm_to_eth_address(&eth_fvm_addr)
+            .expect("Should be able to convert delegated address back to Ethereum address");
+
+        // The recovered ETH address should match the original
+        assert_eq!(
+            recovered_eth_addr, eth_addr,
+            "Recovered Ethereum address should match original"
+        );
+
+        // 6. Create a Subnet ID from the txid20
+        let subnet_id_from_txid20 = SubnetId::from_txid20(&txid20);
+
+        // 7. Create a Subnet ID directly from the Ethereum address
+        let subnet_id_from_eth = {
+            let txid20: Txid20 = eth_addr.into_array();
+            SubnetId::from_txid20(&txid20)
+        };
+
+        // Both subnet IDs should match the original
+        assert_eq!(
+            subnet_id_from_txid20, subnet_id,
+            "SubnetId from txid20 should match original"
+        );
+        assert_eq!(
+            subnet_id_from_eth, subnet_id,
+            "SubnetId from Ethereum address should match original"
+        );
+
+        // Verify the string representation
+        println!("TXID: {}", txid);
+        println!("Subnet ID: {}", subnet_id);
+        println!("ETH Address: 0x{}", eth_addr.as_hex());
+        println!("ETH FVM Address: {}", eth_fvm_addr);
+        println!("Txid20 hex: {}", txid20.to_hex());
     }
 }
 
@@ -2634,7 +2816,7 @@ mod prefund_msg_tests {
         // sanity check if we change tag length
         assert_eq!(invalid_tag.len(), IPC_TAG_LENGTH);
         wrong_data.extend_from_slice(invalid_tag.as_bytes()); // Different tag
-        wrong_data.extend_from_slice(&[0u8; 32]); // txid
+        wrong_data.extend_from_slice(&[0u8; SubnetId::INNER_LEN]); // txid
         wrong_data.extend_from_slice(&[0u8; 20]); // address
         let wrong_data: [u8; IpcPrefundSubnetMsg::DATA_LEN] = wrong_data.try_into().unwrap();
         wrong_tag_tx.output[0].script_pubkey = bitcoin_utils::make_op_return_script(wrong_data);

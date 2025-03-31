@@ -173,7 +173,7 @@ fund_subnet() {
 # Fund each validator.
 
 fund_subnet "$SUBNET_ID" "0x27B60D9f71D6806cCa7D5A92b391093FE100f8e8"
-fund_subnet "$SUBNET_ID" "0xd9c4CgetBitcoinCheckpointSignatures(uint256)(bytes,bytes,address[],bytes[])2CA843a53bff146C79B5D32Ca4b9321414"
+fund_subnet "$SUBNET_ID" "0xd9c4C92CA843a53bff146C79B5D32Ca4b9321414"
 fund_subnet "$SUBNET_ID" "0x646Aed5404567ae15648E9b9B0004cbAfb126949"
 fund_subnet "$SUBNET_ID" "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
 
