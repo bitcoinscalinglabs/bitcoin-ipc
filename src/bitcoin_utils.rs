@@ -30,7 +30,7 @@ use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 
 use crate::{
     BTC_CONFIRMATIONS, DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE,
-    WATCHONLY_WALLET_NAME,
+    WATCHONLY_WALLET_SUFFIX,
 };
 
 /// Returns the number of blocks to wait for before considering a
@@ -78,21 +78,18 @@ pub fn make_watchonly_rpc_client_from_env() -> Client {
     let rpc_user = std::env::var("RPC_USER").expect("RPC_USER env var not defined");
     let rpc_pass = std::env::var("RPC_PASS").expect("RPC_PASS env var not defined");
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL env var not defined");
+    let user_wallet_name = std::env::var("WALLET_NAME").expect("WALLET_NAME env var not defined");
+    let wallet_name = format!("{}{}", user_wallet_name, WATCHONLY_WALLET_SUFFIX);
 
-    let rpc = match init_rpc_client(
-        rpc_user,
-        rpc_pass,
-        rpc_url,
-        WATCHONLY_WALLET_NAME.to_string(),
-    ) {
+    let rpc = match init_rpc_client(rpc_user, rpc_pass, rpc_url, wallet_name.clone()) {
         Ok(rpc) => rpc,
         Err(e) => {
             panic!("Error making bitcoincore rpc client: {}", e);
         }
     };
 
-    create_or_load_wallet(&rpc, WATCHONLY_WALLET_NAME, true)
-        .unwrap_or_else(|_| panic!("Error creating {}", WATCHONLY_WALLET_NAME));
+    create_or_load_wallet(&rpc, &wallet_name, true)
+        .unwrap_or_else(|_| panic!("Error creating {}", wallet_name));
 
     rpc
 }
