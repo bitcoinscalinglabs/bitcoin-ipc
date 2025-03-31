@@ -822,7 +822,7 @@ pub async fn finalize_checkpoint_psbt(
         Vec::with_capacity(committee_keys.len());
 
     // Check if any unrecognized public keys were provided
-    for (pubkey, _) in &signatures_map {
+    for (pubkey, _sigs) in &signatures_map {
         if !committee_keys
             .iter()
             .any(|(committee_key, _)| committee_key == pubkey)
@@ -836,14 +836,11 @@ pub async fn finalize_checkpoint_psbt(
         }
     }
 
-    // Empty signature vector to use when a validator hasn't provided signatures
-    let empty_sigs: Vec<bitcoin::secp256k1::schnorr::Signature> = Vec::new();
-
     // For each committee key, get the corresponding signatures or use empty set
     for (pubkey, _) in &committee_keys {
         let sigs = match signatures_map.get(pubkey) {
             Some(sigs) => sigs.as_slice(),
-            None => empty_sigs.as_slice(),
+            None => &[],
         };
         signature_sets.push(sigs);
     }
@@ -872,6 +869,9 @@ pub async fn finalize_checkpoint_psbt(
         .map(|tx| tx.compute_txid().to_string());
 
     trace!("checkpoint_txid = {}", txid);
+    if let Some(ref batch_transfer_txid) = batch_transfer_txid {
+        trace!("batch_transfer_txid = {}", *batch_transfer_txid);
+    }
 
     let mut tx_to_submit = vec![finalized_tx.clone()];
 

@@ -5,6 +5,7 @@ use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
 use ipc_serde::IpcSerialize;
+use log::error;
 use log::trace;
 use log::warn;
 use log::{debug, info};
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use thiserror::Error;
 
+use crate::bitcoin_utils::get_fee_rate;
 use crate::bitcoin_utils::{self, submit_to_mempool};
 use crate::db;
 use crate::eth_utils::eth_addr_from_x_only_pubkey;
@@ -627,6 +629,7 @@ impl IpcPrefundSubnetMsg {
 
     pub fn to_tx(
         &self,
+        fee_rate: bitcoin::FeeRate,
         multisig_address: &bitcoin::Address,
         release_address: &bitcoin::Address,
     ) -> Result<Transaction, IpcLibError> {
@@ -654,8 +657,10 @@ impl IpcPrefundSubnetMsg {
 
         // Make op_return script and txout
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let data_value = op_return_script.minimal_non_dust_custom(fee_rate);
+
         let data_tx_out = bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
+            value: data_value,
             script_pubkey: op_return_script,
         };
 
@@ -697,7 +702,8 @@ impl IpcPrefundSubnetMsg {
 
         // Construct, fund and sign the prefund transaction
 
-        let prefund_tx = self.to_tx(multisig_address, &release_address)?;
+        let fee_rate = get_fee_rate(rpc, None, None);
+        let prefund_tx = self.to_tx(fee_rate, multisig_address, &release_address)?;
 
         let prefund_tx = crate::wallet::fund_tx(rpc, prefund_tx, None)?;
         trace!("Prefund funded TX: {prefund_tx:?}");
@@ -907,7 +913,11 @@ impl IpcFundSubnetMsg {
         })
     }
 
-    pub fn to_tx(&self, multisig_address: &bitcoin::Address) -> Result<Transaction, IpcLibError> {
+    pub fn to_tx(
+        &self,
+        fee_rate: bitcoin::FeeRate,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Transaction, IpcLibError> {
         //
         // Create the first output: op_return with
         // ipc tag, subnet_id (txid) and user's subnet address to fund
@@ -929,8 +939,9 @@ impl IpcFundSubnetMsg {
 
         // Make op_return script and txout
         let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let data_value = op_return_script.minimal_non_dust_custom(fee_rate);
         let data_tx_out = bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
+            value: data_value,
             script_pubkey: op_return_script,
         };
 
@@ -962,10 +973,10 @@ impl IpcFundSubnetMsg {
             multisig_address, self.amount
         );
 
+        let fee_rate = get_fee_rate(rpc, None, None);
+        let fund_tx = self.to_tx(fee_rate, multisig_address)?;
+
         // Construct, fund and sign the prefund transaction
-
-        let fund_tx = self.to_tx(multisig_address)?;
-
         let fund_tx = crate::wallet::fund_tx(rpc, fund_tx, None)?;
         trace!("Fund msg funded TX: {fund_tx:?}");
         let fund_tx = crate::wallet::sign_tx(rpc, fund_tx)?;
@@ -1384,8 +1395,8 @@ impl IpcCheckpointSubnetMsg {
             output: vec![reveal_tx_out],
         };
 
-        #[cfg(test)]
-        dbg!(&reveal_tx);
+        // #[cfg(test)]
+        // dbg!(&reveal_tx);
 
         Ok(Some(reveal_tx))
     }
@@ -1512,7 +1523,10 @@ impl IpcCheckpointSubnetMsg {
     /// 4. Transfer outputs for each transfer
     ///
     /// Returns an error if the transaction doesn't match the expected format.
-    pub fn from_checkpoint_tx(tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_checkpoint_tx<D: db::Database>(
+        db: &D,
+        tx: &Transaction,
+    ) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -1620,15 +1634,32 @@ impl IpcCheckpointSubnetMsg {
                             transfer_start_index + i
                         ))
                     })?;
-                let subnet_multisig_address = Some(subnet_multisig_address.into_unchecked());
+                let subnet_multisig_address = subnet_multisig_address.into_unchecked();
+
+                let destination_subnet_id = match db
+                    .get_subnet_by_multisig_address(&subnet_multisig_address)
+                {
+                    Ok(Some(subnet)) => subnet.id,
+                    Ok(None) => {
+                        error!("CheckpointSubnetMsg: Could not find subnet with multisig address {:?} for transfer.", subnet_multisig_address);
+                        SubnetId::default()
+                    }
+                    Err(e) => {
+                        return Err(err(format!(
+                            "CheckpointSubnetMsg: Error while looking up subnet with multisig address {:?}: {}",
+                            subnet_multisig_address, e
+                        )));
+                    }
+                };
 
                 // Note: We're creating placeholder values for subnet ID and user address
                 // These will need to be filled in by parsing the batch reveal transaction
                 transfers.push(IpcCrossSubnetTransfer {
                     amount,
-                    destination_subnet_id: SubnetId::default(), // Placeholder
-                    subnet_multisig_address,
-                    subnet_user_address: alloy_primitives::Address::ZERO, // Placeholder
+                    destination_subnet_id,
+                    subnet_multisig_address: Some(subnet_multisig_address),
+                    // Placeholder, will be filled in batch transfer tx
+                    subnet_user_address: alloy_primitives::Address::ZERO,
                 });
             }
         }
@@ -1770,7 +1801,7 @@ impl IpcBatchTransferMsg {
     /// - The witness contains our batch transfer data with IPC:TFR tag prefix
     ///
     /// Returns an error if the expected data is missing or malformed.
-    pub fn from_tx(tx: &Transaction, db: &impl db::Database) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::Database>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         // Helper closure for error creation
         let err = |msg: String| IpcLibError::MsgParseError(IPC_TRANSFER_TAG, msg);
 
@@ -1806,7 +1837,7 @@ impl IpcBatchTransferMsg {
 
         // Deserialize the transfers
         let (transfers_by_subnet, _): (
-            HashMap<Txid, Vec<(alloy_primitives::Address, Amount)>>,
+            HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>>,
             usize,
         ) = bincode::serde::decode_from_slice(
             &witness_data[IPC_TRANSFER_TAG.len()..],
@@ -1817,8 +1848,8 @@ impl IpcBatchTransferMsg {
         // Collect all cross-subnet transfers with proper subnet info
         let transfers = transfers_by_subnet
             .into_iter()
-            .filter_map(|(txid, transfer_list)| {
-                let destination_subnet_id = SubnetId::from_txid(&txid);
+            .filter_map(|(txid20, transfer_list)| {
+                let destination_subnet_id = SubnetId::from_txid20(&txid20);
 
                 // Try to get the subnet state
                 match db.get_subnet_state(destination_subnet_id) {
@@ -2078,7 +2109,7 @@ pub const L1_DELEGATED_NAMESPACE: u64 = 10;
 
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the reveal transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SubnetId(FvmAddress);
 
 #[derive(Debug, Error)]
@@ -2240,6 +2271,12 @@ impl FromStr for SubnetId {
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", crate::L1_NAME, self.0)
+    }
+}
+
+impl std::fmt::Debug for SubnetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SubnetId({}/{})", crate::L1_NAME, self.0)
     }
 }
 
@@ -2688,6 +2725,8 @@ mod tests {
 
 #[cfg(test)]
 mod prefund_msg_tests {
+    use crate::DEFAULT_BTC_FEE_RATE;
+
     use super::*;
 
     fn create_test_msg() -> IpcPrefundSubnetMsg {
@@ -2726,7 +2765,9 @@ mod prefund_msg_tests {
         let (multisig_address, release_address) = get_addresses();
 
         // Generate transaction
-        let tx = msg.to_tx(&multisig_address, &release_address).unwrap();
+        let tx = msg
+            .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
+            .unwrap();
 
         // Check basic structure
         assert_eq!(
@@ -2765,7 +2806,7 @@ mod prefund_msg_tests {
 
         // Create transaction using to_tx
         let tx = original_msg
-            .to_tx(&multisig_address, &release_address)
+            .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
             .unwrap();
 
         // Parse it back using from_tx
@@ -2795,7 +2836,7 @@ mod prefund_msg_tests {
 
         // Test case 2: Transaction with only one output
         let tx = create_test_msg()
-            .to_tx(&multisig_address, &release_address)
+            .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
             .unwrap();
         let single_output_tx = Transaction {
             version: tx.version,

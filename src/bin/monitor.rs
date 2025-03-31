@@ -361,7 +361,9 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
-        } else if let Ok(checkpoint_msg) = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(tx) {
+        } else if let Ok(checkpoint_msg) =
+            ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, tx)
+        {
             let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
 
             match self
@@ -371,7 +373,7 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
-        } else if let Ok(batch_transfer_msg) = ipc_lib::IpcBatchTransferMsg::from_tx(tx, &self.db) {
+        } else if let Ok(batch_transfer_msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx) {
             let ipc_message = IpcMessage::BatchTransfer(batch_transfer_msg);
 
             match self
@@ -482,14 +484,13 @@ where
                     ))
                 })?;
 
-                let checkpoint_msg = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(
-                    &checkpoint_tx,
-                )
-                .map_err(|e| {
-                    MonitorError::IpcTxInvalid(format!(
-                        "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
-                    ))
-                })?;
+                let checkpoint_msg =
+                    ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, &checkpoint_tx)
+                        .map_err(|e| {
+                        MonitorError::IpcTxInvalid(format!(
+                            "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
+                        ))
+                    })?;
 
                 trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
 

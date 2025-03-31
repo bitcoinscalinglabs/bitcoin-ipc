@@ -496,7 +496,6 @@ pub fn finalize_spend_psbt(
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
     println!("finalize_spend_psbt");
-    dbg!(&committee_keys);
     let committee_keys = sort_committee_keys(&committee_keys);
     dbg!(&committee_keys);
 
