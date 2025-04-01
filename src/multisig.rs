@@ -497,7 +497,10 @@ pub fn finalize_spend_psbt(
 ) -> Result<Transaction, MultisigError> {
     println!("finalize_spend_psbt");
     let committee_keys = sort_committee_keys(&committee_keys);
-    dbg!(&committee_keys);
+    trace!(
+        "finalize_spend_psbt sorted committee_keys: {:?}",
+        &committee_keys
+    );
 
     let script = create_multisig_script(&committee_keys, committee_threshold)?;
     let leaf_hash = script.tapscript_leaf_hash();

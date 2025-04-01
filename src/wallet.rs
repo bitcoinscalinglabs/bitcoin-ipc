@@ -140,6 +140,48 @@ pub fn import_address(
     Ok(())
 }
 
+pub fn import_address_batch(
+    rpc: &Client,
+    addresses: &[(bitcoin::Address, String, u32)], // (address, label, unix_timestamp)
+) -> Result<Vec<bitcoincore_rpc::json::ImportMultiResult>, bitcoincore_rpc::Error> {
+    use bitcoincore_rpc::json::{ImportDescriptors, Timestamp};
+
+    let json_reqs = addresses
+        .iter()
+        .map(|(address, label, timestamp)| {
+            let raw_descriptor = format!("addr({})", address);
+            let descriptor_info = rpc.get_descriptor_info(&raw_descriptor)?;
+            let descriptor = descriptor_info.descriptor;
+
+            let req = ImportDescriptors {
+                descriptor,
+                label: Some(label.clone()),
+                timestamp: Timestamp::Time((*timestamp).into()),
+                active: None,
+                range: None,
+                next_index: None,
+                internal: None,
+            };
+            Ok(req)
+        })
+        .collect::<Result<Vec<ImportDescriptors>, bitcoincore_rpc::Error>>()?;
+
+    let json_reqs = json_reqs
+        .iter()
+        .map(|r| serde_json::to_value(r))
+        .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
+
+    let args: [serde_json::Value; 1] = [json_reqs.into()];
+
+    debug!(
+        "Importing {} descriptors into wallet: {}",
+        addresses.len(),
+        args[0]
+    );
+
+    rpc.call("importdescriptors", &args)
+}
+
 #[derive(Error, Debug)]
 pub enum WalletError {
     #[error(transparent)]

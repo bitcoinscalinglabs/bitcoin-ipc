@@ -130,7 +130,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "fundsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410fuvtcymuzlxqj4ypvbf7ybk4rdlkq6u4mqtcrybi",
 			"amount": 40000000,
 			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
     },
