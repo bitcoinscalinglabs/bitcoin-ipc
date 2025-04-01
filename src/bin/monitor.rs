@@ -290,14 +290,14 @@ where
         let import_addresses: Vec<(bitcoin::Address, String, u32)> = self
             .side_effects
             .iter()
-            .filter_map(|effect| {
+            .map(|effect| {
                 let SideEffect::ImportAddress {
                     address,
                     label,
                     timestamp,
                 } = effect;
 
-                Some((address.clone(), label.clone(), *timestamp))
+                (address.clone(), label.clone(), *timestamp)
             })
             .collect();
 

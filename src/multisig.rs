@@ -37,7 +37,7 @@ pub fn create_multisig_script(
     }
 
     // Public keys need to be sorted for consistent scriptPubKey
-    let sorted_public_keys = sort_committee_keys(&public_keys);
+    let sorted_public_keys = sort_committee_keys(public_keys);
 
     //  It pushes an accumulator to the stack, and then for each pk:
     // - it swaps the sig that's already on the stack as a witness, with the accumulator
@@ -495,7 +495,7 @@ pub fn finalize_spend_psbt(
     committee_threshold: Power,
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
-    let committee_keys = sort_committee_keys(&committee_keys);
+    let committee_keys = sort_committee_keys(committee_keys);
     trace!(
         "finalize_spend_psbt sorted committee_keys: {:?}",
         &committee_keys

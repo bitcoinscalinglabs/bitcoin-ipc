@@ -823,7 +823,7 @@ pub async fn finalize_checkpoint_psbt(
         Vec::with_capacity(committee_keys.len());
 
     // Check if any unrecognized public keys were provided
-    for (pubkey, _sigs) in &signatures_map {
+    for pubkey in signatures_map.keys() {
         if !committee_keys
             .iter()
             .any(|(committee_key, _)| committee_key == pubkey)
