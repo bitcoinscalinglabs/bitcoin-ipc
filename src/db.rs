@@ -20,6 +20,8 @@ const SUBNET_STATE_KEY: &str = "subnet_state:";
 const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
 // checkpoints:<subnet_id>:<nonce>
 const CHECKPOINTS_KEY: &str = "checkpoints:";
+// transactions:<txid>
+const TRANSACTIONS_KEY: &str = "transactions:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -41,6 +43,10 @@ fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
 
 fn checkpoints_key(subnet_id: SubnetId, number: u64) -> String {
     format!("{CHECKPOINTS_KEY}:{}:{}", subnet_id, number)
+}
+
+fn transaction_key(txid: &Txid) -> String {
+    format!("{TRANSACTIONS_KEY}:{}", txid)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,6 +170,8 @@ impl SubnetCommittee {
 /// Subnet checkpoint
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCheckpoint {
+    /// The number of the checkpoint (starting from 0)
+    pub checkpoint_number: u64,
     /// The block hash of the child subnet at which the checkpoint was cut
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// The block height of the checkpoint on Bitcoin
@@ -382,6 +390,7 @@ pub struct HeedDb {
     // TODO use SerdeBincode for this as well
     // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
+    transactions_db: HeedDatabase<Str, SerdeBincode<Vec<u8>>>,
 }
 
 impl HeedDb {
@@ -442,6 +451,9 @@ impl HeedDb {
             let rootnet_msgs_db = env
                 .open_database(&rtxn, Some("rootnet_msgs_db"))?
                 .ok_or(DbError::DbNotFound("rootnet_msgs_db".to_string()))?;
+            let transactions_db = env
+                .open_database(&rtxn, Some("transactions_db"))?
+                .ok_or(DbError::DbNotFound("transactions_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -451,6 +463,7 @@ impl HeedDb {
                 subnet_genesis_db,
                 checkpoints_db,
                 rootnet_msgs_db,
+                transactions_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -460,6 +473,7 @@ impl HeedDb {
             let subnet_genesis_db = env.create_database(&mut txn, Some("subnet_genesis_db"))?;
             let checkpoints_db = env.create_database(&mut txn, Some("checkpoints_db"))?;
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
+            let transactions_db = env.create_database(&mut txn, Some("transactions_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -469,6 +483,7 @@ impl HeedDb {
                 subnet_genesis_db,
                 checkpoints_db,
                 rootnet_msgs_db,
+                transactions_db,
             })
         }
     }
@@ -550,6 +565,10 @@ pub trait Database {
         checkpoint: &SubnetCheckpoint,
         number: u64,
     ) -> Result<(), DbError>;
+
+    // Transaction storage
+    fn get_transaction(&self, txid: &Txid) -> Result<Option<bitcoin::Transaction>, DbError>;
+    fn save_transaction(&self, txn: &mut RwTxn, tx: &bitcoin::Transaction) -> Result<(), DbError>;
 }
 
 #[async_trait]
@@ -789,6 +808,33 @@ impl Database for HeedDb {
     ) -> Result<(), DbError> {
         let key = checkpoints_key(subnet_id, number);
         self.checkpoints_db.put(txn, &key, checkpoint)?;
+        Ok(())
+    }
+
+    // Transaction storage
+
+    fn get_transaction(&self, txid: &Txid) -> Result<Option<bitcoin::Transaction>, DbError> {
+        let txn = self.env.read_txn()?;
+        let key = transaction_key(txid);
+
+        match self.transactions_db.get(&txn, &key)? {
+            Some(tx_bytes) => {
+                let tx = bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| {
+                    DbError::TypeConversionError("Failed to deserialize transaction".to_string())
+                })?;
+                Ok(Some(tx))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn save_transaction(&self, txn: &mut RwTxn, tx: &bitcoin::Transaction) -> Result<(), DbError> {
+        let txid = tx.compute_txid();
+        let key = transaction_key(&txid);
+
+        let tx_bytes = bitcoin::consensus::serialize(tx);
+        self.transactions_db.put(txn, &key, &tx_bytes)?;
+
         Ok(())
     }
 }

@@ -1703,8 +1703,11 @@ impl IpcCheckpointSubnetMsg {
             IpcValidateError::InvalidMsg(format!("Subnet ID {} does not exist", self.subnet_id))
         })?;
 
+        let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
+
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
+            checkpoint_number,
             checkpoint_hash: self.checkpoint_hash,
             checkpoint_height: self.checkpoint_height,
             block_height,
@@ -1718,7 +1721,6 @@ impl IpcCheckpointSubnetMsg {
         };
 
         // Update the checkpoint number in subnet state
-        let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
         subnet_state.last_checkpoint_number = Some(checkpoint_number);
 
         // Begin a database transaction
@@ -2030,14 +2032,6 @@ impl IpcBatchTransferMsg {
 
         // Commit all changes
         wtxn.commit()?;
-
-        info!(
-            "Processed batch transfer txid {} for checkpoint #{} of subnet {}, with {} transfers",
-            txid,
-            checkpoint_number,
-            source_subnet_id,
-            self.transfers.len()
-        );
 
         Ok(checkpoint)
     }

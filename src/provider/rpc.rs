@@ -780,18 +780,25 @@ pub async fn finalize_checkpoint_psbt(
 
     let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {
         Some(hex) => {
-            let tx_bytes = hex::decode(hex).map_err(|e| {
-                error!("Invalid hex format for batch transfer tx: {}", e);
-                RpcError::InvalidParams(format!("Invalid hex format for batch transfer tx: {}", e))
-            })?;
+            if hex.is_empty() {
+                None
+            } else {
+                let tx_bytes = hex::decode(hex).map_err(|e| {
+                    error!("Invalid hex format for batch transfer tx: {}", e);
+                    RpcError::InvalidParams(format!(
+                        "Invalid hex format for batch transfer tx: {}",
+                        e
+                    ))
+                })?;
 
-            Some(bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
-                error!("Invalid transaction format for batch transfer tx: {}", e);
-                RpcError::InvalidParams(format!(
-                    "Invalid transaction format for batch transfer tx: {}",
-                    e
-                ))
-            })?)
+                Some(bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
+                    error!("Invalid transaction format for batch transfer tx: {}", e);
+                    RpcError::InvalidParams(format!(
+                        "Invalid transaction format for batch transfer tx: {}",
+                        e
+                    ))
+                })?)
+            }
         }
         None => None,
     };
