@@ -213,16 +213,10 @@ impl SubnetState {
             .expect("Multisig should be valid for saved subnet genesis info")
     }
 
-    /// Imports the subnet multisig address to Bitcoin Core
-    /// as a watch-only address. Bitcoincore will monitor the UTXOs.
-    pub fn import_current_address_to_wallet(
-        &self,
-        rpc: &bitcoincore_rpc::Client,
-    ) -> Result<(), bitcoincore_rpc::Error> {
+    pub fn committee_address_label(&self) -> (bitcoin::Address, String) {
         let address = self.multisig_address();
         let label = format!("{}-{}", self.id, self.committee_number);
-        wallet::import_address(rpc, &address, label)?;
-        Ok(())
+        (address, label)
     }
 
     pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
@@ -305,18 +299,10 @@ impl SubnetGenesisInfo {
         .expect("Multisig should be valid for saved subnet genesis info")
     }
 
-    /// Imports the whitelist multisig address to Bitcoin Core
-    /// as a watch-only address. Bitcoincore will monitor the UTXOs.
-    pub fn import_whitelist_address_to_wallet(
-        &self,
-        rpc: &bitcoincore_rpc::Client,
-    ) -> Result<(), bitcoincore_rpc::Error> {
+    pub fn whitelist_address_label(&self) -> (bitcoin::Address, String) {
         let address = self.multisig_address();
-        // Import the subnet whitelist address to the wallet
-        // with a committee number 0
         let label = format!("{}-{}", self.subnet_id, 0);
-        wallet::import_address(rpc, &address, label)?;
-        Ok(())
+        (address, label)
     }
 
     pub fn to_subnet(&self) -> SubnetState {

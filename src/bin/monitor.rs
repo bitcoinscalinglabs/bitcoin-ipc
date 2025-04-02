@@ -105,6 +105,16 @@ async fn main() {
     info!("Shutting down");
 }
 
+/// Side-effects that need to be executed after processing blocks
+#[derive(Debug)]
+enum SideEffect {
+    ImportAddress {
+        address: bitcoin::Address,
+        label: String,
+        timestamp: u32, // block.header.time
+    },
+}
+
 // TODO use generics for rpc + add a trait for the monitor
 struct Monitor<D: Database> {
     db: D,
@@ -113,6 +123,7 @@ struct Monitor<D: Database> {
     check_interval: Duration,
     current_height: u64,
     cancel_token: CancellationToken,
+    side_effects: Vec<SideEffect>,
 }
 
 impl<D> Monitor<D>
@@ -133,6 +144,7 @@ where
             check_interval,
             cancel_token,
             current_height: 0,
+            side_effects: Vec::new(),
         }
     }
 
@@ -200,6 +212,9 @@ where
             }
         }
 
+        // Process any collected side effects
+        self.process_side_effects()?;
+
         Ok(true)
     }
 
@@ -244,8 +259,58 @@ where
                 }
             }
 
+            // Process any collected side effects
+            self.process_side_effects()?;
+
             tokio::time::sleep(self.check_interval).await;
         }
+    }
+
+    fn import_watchonly_address(
+        &mut self,
+        address: bitcoin::Address,
+        label: String,
+        timestamp: u32,
+    ) {
+        self.side_effects.push(SideEffect::ImportAddress {
+            address,
+            label,
+            timestamp,
+        });
+    }
+
+    fn process_side_effects(&mut self) -> Result<(), MonitorError> {
+        if self.side_effects.is_empty() {
+            trace!("No side effects to process");
+            return Ok(());
+        }
+        debug!("Processing side effects.");
+
+        // Group import address effects
+        let import_addresses: Vec<(bitcoin::Address, String, u32)> = self
+            .side_effects
+            .iter()
+            .filter_map(|effect| {
+                let SideEffect::ImportAddress {
+                    address,
+                    label,
+                    timestamp,
+                } = effect;
+
+                Some((address.clone(), label.clone(), *timestamp))
+            })
+            .collect();
+
+        if !import_addresses.is_empty() {
+            // Import all addresses in a batch, each with its own timestamp
+            bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)?;
+
+            debug!("Imported {} addresses in batch.", import_addresses.len());
+        }
+
+        // Clear processed side effects
+        self.side_effects.clear();
+        Ok(())
     }
 
     async fn sync_and_listen(&mut self) -> Result<(), MonitorError> {
@@ -284,13 +349,13 @@ where
         Ok(latest - BTC_CONFIRMATIONS)
     }
 
-    async fn process_block(&self, block_height: u64) -> Result<(), MonitorError> {
+    async fn process_block(&mut self, block_height: u64) -> Result<(), MonitorError> {
         info!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
 
         for tx in block.txdata {
-            self.process_transaction(&tx, block_height, block_hash)
+            self.process_transaction(&tx, block_height, block_hash, block.header.time)
                 .await?;
         }
 
@@ -298,10 +363,11 @@ where
     }
 
     async fn process_transaction(
-        &self,
+        &mut self,
         tx: &bitcoin::Transaction,
         block_height: u64,
         block_hash: BlockHash,
+        block_time: u32,
     ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
@@ -329,7 +395,7 @@ where
                 };
 
                 match self
-                    .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                    .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
                     .await
                 {
                     Ok(_) => {}
@@ -345,7 +411,7 @@ where
             let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -355,7 +421,7 @@ where
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -367,7 +433,7 @@ where
             let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -377,7 +443,7 @@ where
             let ipc_message = IpcMessage::BatchTransfer(batch_transfer_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -389,9 +455,10 @@ where
     }
 
     async fn process_ipc_msg(
-        &self,
+        &mut self,
         block_height: u64,
         block_hash: BlockHash,
+        block_time: u32,
         tx: &bitcoin::Transaction,
         txid: bitcoin::Txid,
         msg: IpcMessage,
@@ -404,8 +471,9 @@ where
                 let subnet_genesis_info =
                     create_subnet_msg.save_to_db(&self.db, block_height, txid)?;
 
-                // TODO think about how to handle side-effects in monitor
-                subnet_genesis_info.import_whitelist_address_to_wallet(&self.watchonly_rpc)?;
+                let (whitelist_addr, label) = subnet_genesis_info.whitelist_address_label();
+
+                self.import_watchonly_address(whitelist_addr, label, block_time);
 
                 info!(
                     "Processed CreateSubnet for Subnet ID: {}",
@@ -429,9 +497,9 @@ where
 
                 join_subnet_msg.validate()?;
                 if let Some(subnet) = join_subnet_msg.save_to_db(&self.db, block_height, txid)? {
-                    // TODO think about how to handle side-effects in monitor
                     // Subnet bootstrapped
-                    subnet.import_current_address_to_wallet(&self.watchonly_rpc)?;
+                    let (committee_addr, label) = subnet.committee_address_label();
+                    self.import_watchonly_address(committee_addr, label, block_time);
                 }
 
                 info!(
@@ -475,7 +543,13 @@ where
 
                 let checkpoint_tx = self
                     .watchonly_rpc
-                    .get_transaction(&msg.checkpoint_txid, Some(true))?;
+                    .get_transaction(&msg.checkpoint_txid, Some(true))
+                    .map_err(|e| {
+                        MonitorError::IpcTxInvalid(format!(
+                            "Can't get Checkpoint Txid {} for BatchTransferMsg invalid: {e}",
+                            msg.checkpoint_txid
+                        ))
+                    })?;
 
                 let checkpoint_tx = checkpoint_tx.transaction().map_err(|e| {
                     MonitorError::IpcTxInvalid(format!(
