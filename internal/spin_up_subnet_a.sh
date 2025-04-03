@@ -34,7 +34,7 @@ BEARER_TOKEN_4="validator4_auth_token"
 API_URL_1="http://host.docker.internal:${PORT_1}/api"
 API_URL_2="http://host.docker.internal:${PORT_2}/api"
 API_URL_3="http://host.docker.internal:${PORT_3}/api"
-API_URL_4="http://host.docker.internal:${PORT_4}/ai"
+API_URL_4="http://host.docker.internal:${PORT_4}/api"
 
 echo "Starting validator 1..."
 VALIDATOR1_OUTPUT=$(cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
