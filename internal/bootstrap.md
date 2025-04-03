@@ -6,18 +6,36 @@ Validators:
 SK   = 21b16a87dd69bc6283045ab63738c9ab73c93c93f91e96cd0e54bd321bba80ad
 XPK  = 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268
 ADDR = 0x27B60D9f71D6806cCa7D5A92b391093FE100f8e8
+FIL  = t410fe63a3h3r22agzst5lkjlheijh7qqb6hifh72eti
 
 SK   = 67308c2f3915f4c36135f267ed709418c2880025d669e4ada7a206842d53c146
 XPK  = 851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4
 ADDR = 0xd9c4C92CA843a53bff146C79B5D32Ca4b9321414
+FIL  = t410f3hcmslfiiostx7yunr43luzmus4tefau7ficgmi
 
 SK   = 994220215e4601d21a245f8f5e0c407f2f5733ce7907e128c3190c64f4ef443c
 XPK  = b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0
 ADDR = 0x646Aed5404567ae15648E9b9B0004cbAfb126949
+FIL  = t410fmrvo2vaekz5ocvsi5g43aacmxl5re2kjdncxlqq
 
 SK   = ab3a1fafa925836386be55b12fdc92f208ebdad5ef96c0109e4bd06638dcb897
 XPK  = b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
 ADDR = 0xBcE2f194e9628E6ae06fa0D85DD57Cd5579213bf
+FIL  = t410fxtrpdfhjmkhgvydpudmf3vl42vlzee576zairpi
+```
+
+Users:
+
+```
+SK   = 6ddc4793c467232d3c441e811d79871e7a2c5e84cca89e6b1c8de0eed06ee4e1
+XPK  = e327a66b169732bde49d827d90781327af558fc12d5cd2d5004e7551ec00c662
+ADDR = 0xb628237ff4875b039ec1c3dedcf5fad93430ee4a
+FIL  = t410fwyucg77uq5nqhhwbyppnz5p23e2db3sk77zjjty
+
+SK   = 5dc1518d5be379c7c3a9a1c0f3274605ddc98e4c032a80ec8b78f668bf54dc01
+XPK  = 71ac1eb874233999e11cd050f388f1dd6da9b446180fdf9b06740419cc487b6f
+ADDR = 0x117607d776e450856c08fbfda27b92573779aeae
+FIL  = t410fcf3apv3w4riik3ai7p62e64sk43xtlvo7guzmpy
 ```
 
 
@@ -35,6 +53,11 @@ ipc-cli wallet import --wallet-type btc --private-key "0x21b16a87dd69bc6283045ab
 ipc-cli wallet import --wallet-type btc --private-key "0x67308c2f3915f4c36135f267ed709418c2880025d669e4ada7a206842d53c146"
 ipc-cli wallet import --wallet-type btc --private-key "0x994220215e4601d21a245f8f5e0c407f2f5733ce7907e128c3190c64f4ef443c"
 ipc-cli wallet import --wallet-type btc --private-key "0xab3a1fafa925836386be55b12fdc92f208ebdad5ef96c0109e4bd06638dcb897"
+
+# users
+ipc-cli wallet import --wallet-type btc --private-key "6ddc4793c467232d3c441e811d79871e7a2c5e84cca89e6b1c8de0eed06ee4e1"
+ipc-cli wallet import --wallet-type btc --private-key "5dc1518d5be379c7c3a9a1c0f3274605ddc98e4c032a80ec8b78f668bf54dc01"
+
 ```
 
 ```sh
@@ -43,7 +66,7 @@ ipc-cli wallet set-default --wallet-type btc --address 0x27B60D9f71D6806cCa7D5A9
 
 
 ```sh
-ipc-cli --config-path=~/.ipc/validator1/config.toml subnet create --parent /b4 --min-validators 4 --bottomup-check-period 300 btc --min-validator-stake 100000000 --min-cross-msg-fee 10 --validator-whitelist 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
+ipc-cli --config-path=~/.ipc/validator1/config.toml subnet create --parent /b4 --min-validators 4 --bottomup-check-period 100 btc --min-validator-stake 100000000 --min-cross-msg-fee 10 --validator-whitelist 5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529
 
 # mine a block
 
