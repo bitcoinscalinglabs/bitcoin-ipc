@@ -168,7 +168,7 @@ pub fn import_address_batch(
 
     let json_reqs = json_reqs
         .iter()
-        .map(|r| serde_json::to_value(r))
+        .map(serde_json::to_value)
         .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
 
     let args: [serde_json::Value; 1] = [json_reqs.into()];

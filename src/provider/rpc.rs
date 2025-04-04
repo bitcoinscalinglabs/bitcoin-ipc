@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::{error, trace};
+use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -137,6 +137,8 @@ pub async fn create_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcCreateSubnetMsg>,
 ) -> Result<CreateSubnetResponse, JsonRpcError> {
+    info!("createsubnet: {:?}", msg);
+
     if let Err(err) = msg.validate() {
         error!("Invalid create message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -159,6 +161,8 @@ pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcJoinSubnetMsg>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
+    info!("joinsubnet: {:?}", msg);
+
     if let Err(err) = msg.validate() {
         error!("Invalid join message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -200,7 +204,7 @@ pub async fn get_genesis_info(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetGenesisInfoParams>,
 ) -> Result<db::SubnetGenesisInfo, JsonRpcError> {
-    trace!("getgenesisinfo: {}", params.subnet_id);
+    info!("getgenesisinfo: {}", params.subnet_id);
 
     let genesis_info = data
         .db
@@ -226,7 +230,7 @@ pub async fn get_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetSubnetParams>,
 ) -> Result<db::SubnetState, JsonRpcError> {
-    trace!("getsubnet: {}", params.subnet_id);
+    info!("getsubnet: {}", params.subnet_id);
 
     // Check subnet exists
     let subnet = data
@@ -253,7 +257,7 @@ pub async fn prefund_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcPrefundSubnetMsg>,
 ) -> Result<PrefundSubnetResponse, JsonRpcError> {
-    trace!("prefundsubnet: {}", msg.subnet_id);
+    info!("prefundsubnet: {}", msg.subnet_id);
 
     if let Err(err) = msg.validate() {
         error!("Invalid prefund message={msg:?}: {err}");
@@ -296,7 +300,7 @@ pub async fn fund_subnet(
     data: Data<Arc<ServerData>>,
     Params(msg): Params<IpcFundSubnetMsg>,
 ) -> Result<FundSubnetResponse, JsonRpcError> {
-    trace!("fundsubnet: {}", msg.subnet_id);
+    info!("fundsubnet: {}", msg.subnet_id);
 
     if let Err(err) = msg.validate() {
         error!("Invalid prefund message={msg:?}: {err}");
@@ -317,8 +321,6 @@ pub async fn fund_subnet(
 
     let multisig_address = subnet_state.multisig_address();
 
-    println!("subnet multisig = {multisig_address:?}");
-
     let fund_txid = msg
         .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
@@ -336,7 +338,7 @@ pub async fn get_rootnet_messages(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetRootnetMessagesParams>,
 ) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
-    trace!("getrootnetmessages: {}", params.subnet_id);
+    info!("getrootnetmessages: {}", params.subnet_id);
 
     // Check subnet exists
     data.db
@@ -368,10 +370,9 @@ pub async fn get_subnet_checkpoint(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetSubnetCheckpointParams>,
 ) -> Result<Option<db::SubnetCheckpoint>, JsonRpcError> {
-    trace!(
+    info!(
         "getsubnetcheckpoint: {} number={:?}",
-        params.subnet_id,
-        params.number
+        params.subnet_id, params.number
     );
 
     // Check if subnet exists
@@ -425,7 +426,7 @@ pub async fn gen_multisig_spend_psbt(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GenMultisigSpendPsbtParams>,
 ) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
-    trace!("gen_multisig_spend_psbt: {:?}", params);
+    info!("gen_multisig_spend_psbt: {:?}", params);
 
     let (_, validator_sk) = match data.validator {
         Some(validator) => validator,
@@ -533,7 +534,7 @@ pub async fn gen_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
     Params(mut msg): Params<IpcCheckpointSubnetMsg>,
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
-    trace!("gen_checkpoint_psbt: {:?}", msg);
+    info!("gen_checkpoint_psbt: {:?}", msg);
 
     let (validator_xonly_pubkey, validator_sk) = match data.validator {
         Some(validator) => validator,
@@ -675,7 +676,7 @@ pub async fn dev_multisign_psbt(
     _data: Data<Arc<ServerData>>,
     Params(params): Params<DevMultisignPsbtParams>,
 ) -> Result<DevMultisignPsbtResponse, JsonRpcError> {
-    trace!(
+    info!(
         "dev_multisign_psbt: unsigned_psbt with {} secret_keys",
         params.secret_keys.len()
     );
@@ -758,7 +759,7 @@ pub async fn finalize_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
     Params(params): Params<FinalizeCheckpointPsbtParams>,
 ) -> Result<FinalizeCheckpointPsbtResponse, JsonRpcError> {
-    trace!("finalize_checkpoint_psbt for subnet {}", params.subnet_id);
+    info!("finalize_checkpoint_psbt for subnet {}", params.subnet_id);
 
     // Check subnet exists and get committee info
     let subnet = data
@@ -779,18 +780,25 @@ pub async fn finalize_checkpoint_psbt(
 
     let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {
         Some(hex) => {
-            let tx_bytes = hex::decode(hex).map_err(|e| {
-                error!("Invalid hex format for batch transfer tx: {}", e);
-                RpcError::InvalidParams(format!("Invalid hex format for batch transfer tx: {}", e))
-            })?;
+            if hex.is_empty() {
+                None
+            } else {
+                let tx_bytes = hex::decode(hex).map_err(|e| {
+                    error!("Invalid hex format for batch transfer tx: {}", e);
+                    RpcError::InvalidParams(format!(
+                        "Invalid hex format for batch transfer tx: {}",
+                        e
+                    ))
+                })?;
 
-            Some(bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
-                error!("Invalid transaction format for batch transfer tx: {}", e);
-                RpcError::InvalidParams(format!(
-                    "Invalid transaction format for batch transfer tx: {}",
-                    e
-                ))
-            })?)
+                Some(bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
+                    error!("Invalid transaction format for batch transfer tx: {}", e);
+                    RpcError::InvalidParams(format!(
+                        "Invalid transaction format for batch transfer tx: {}",
+                        e
+                    ))
+                })?)
+            }
         }
         None => None,
     };
@@ -822,7 +830,7 @@ pub async fn finalize_checkpoint_psbt(
         Vec::with_capacity(committee_keys.len());
 
     // Check if any unrecognized public keys were provided
-    for (pubkey, _sigs) in &signatures_map {
+    for pubkey in signatures_map.keys() {
         if !committee_keys
             .iter()
             .any(|(committee_key, _)| committee_key == pubkey)

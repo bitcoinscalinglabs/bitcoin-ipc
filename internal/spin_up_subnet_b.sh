@@ -20,36 +20,33 @@ SUBNET_ID=$1
 
 FENDERMINT_MAKEFILE_PATH="../ipc/infra/fendermint/Makefile.toml"
 
-# Load environment variables from the .env file in the root of the project
-ENV_FILE=".env"
-if [ ! -f "$ENV_FILE" ]; then
-  echo "Error: $ENV_FILE not found!"
-  exit 1
-fi
+# Define hardcoded ports and auth tokens for each validator
+PORT_1="3030"
+PORT_2="3031"
+PORT_3="3032"
+PORT_4="3033"
 
-# Extract the PROVIDER_AUTH_TOKEN and PROVIDER_PORT values
-BEARER_TOKEN=$(grep '^PROVIDER_AUTH_TOKEN=' "$ENV_FILE" | cut -d '=' -f2)
-PORT=$(grep '^PROVIDER_PORT=' "$ENV_FILE" | cut -d '=' -f2)
+BEARER_TOKEN_1="validator1_auth_token"
+BEARER_TOKEN_2="validator2_auth_token"
+BEARER_TOKEN_3="validator3_auth_token"
+BEARER_TOKEN_4="validator4_auth_token"
 
-if [ -z "$BEARER_TOKEN" ] || [ -z "$PORT" ]; then
-  echo "Error: Required environment variables not found in $ENV_FILE"
-  exit 1
-fi
-
-API_URL="http://host.docker.internal:${PORT}/api"
-
+API_URL_1="http://host.docker.internal:${PORT_1}/api"
+API_URL_2="http://host.docker.internal:${PORT_2}/api"
+API_URL_3="http://host.docker.internal:${PORT_3}/api"
+API_URL_4="http://host.docker.internal:${PORT_4}/api"
 
 echo "Starting validator 1..."
 VALIDATOR1_OUTPUT=$(cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
-    -e NODE_NAME=validator-1 \
+    -e NODE_NAME=validator-1-subnet-b \
     -e SUBNET_ID="$SUBNET_ID" \
     -e PRIVATE_KEY_PATH="$HOME/.ipc/validator1/validator.sk" \
-    -e CMT_P2P_HOST_PORT=26656 \
-    -e CMT_RPC_HOST_PORT=26657 \
-    -e ETHAPI_HOST_PORT=8545 \
-    -e RESOLVER_HOST_PORT=26655 \
-    -e PARENT_ENDPOINT="$API_URL" \
-    -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
+    -e CMT_P2P_HOST_PORT=27656 \
+    -e CMT_RPC_HOST_PORT=27657 \
+    -e ETHAPI_HOST_PORT=9545 \
+    -e RESOLVER_HOST_PORT=27655 \
+    -e PARENT_ENDPOINT="$API_URL_1" \
+    -e PARENT_AUTH_TOKEN="$BEARER_TOKEN_1" \
     -e TOPDOWN_CHAIN_HEAD_DELAY=0 \
     -e TOPDOWN_PROPOSAL_DELAY=0 \
     -e FM_PULL_SKIP=1 \
@@ -70,20 +67,22 @@ run_validator() {
     local rpc_port=$3
     local eth_port=$4
     local resolver_port=$5
+    local api_url=$6
+    local bearer_token=$7
 
     echo "Starting validator $validator_num..."
     cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
-        -e NODE_NAME="validator-$validator_num" \
+        -e NODE_NAME="validator-$validator_num-subnet-b" \
         -e SUBNET_ID="$SUBNET_ID" \
         -e PRIVATE_KEY_PATH="$HOME/.ipc/validator${validator_num}/validator.sk" \
         -e CMT_P2P_HOST_PORT="$p2p_port" \
         -e CMT_RPC_HOST_PORT="$rpc_port" \
         -e ETHAPI_HOST_PORT="$eth_port" \
         -e RESOLVER_HOST_PORT="$resolver_port" \
-        -e BOOTSTRAPS="${COMETBFT_ID}@validator-1-cometbft:26656" \
-        -e RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${RESOLVER_ADDR}" \
-        -e PARENT_ENDPOINT="$API_URL" \
-        -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
+        -e BOOTSTRAPS="${COMETBFT_ID}@validator-1-subnet-b-cometbft:26656" \
+        -e RESOLVER_BOOTSTRAPS="/dns/validator-1-subnet-b-fendermint/tcp/27655/p2p/${RESOLVER_ADDR}" \
+        -e PARENT_ENDPOINT="$api_url" \
+        -e PARENT_AUTH_TOKEN="$bearer_token" \
         -e TOPDOWN_CHAIN_HEAD_DELAY=0 \
         -e TOPDOWN_PROPOSAL_DELAY=0 \
         -e FM_PULL_SKIP=1 \
@@ -92,9 +91,9 @@ run_validator() {
 }
 
 # Start other validators in parallel
-run_validator 2 26756 26757 8645 26755 &
-run_validator 3 26856 26857 8745 26855 &
-run_validator 4 26956 26957 8845 26955 &
+run_validator 2 27756 27757 9645 27755 "$API_URL_2" "$BEARER_TOKEN_2" &
+run_validator 3 27856 27857 9745 27855 "$API_URL_3" "$BEARER_TOKEN_3" &
+run_validator 4 27956 27957 9845 27955 "$API_URL_4" "$BEARER_TOKEN_4" &
 
 # Wait for all background processes to complete
 wait

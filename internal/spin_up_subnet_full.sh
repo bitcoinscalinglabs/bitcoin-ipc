@@ -17,27 +17,66 @@ if [ "$#" -ne 1 ]; then
 fi
 
 SUBNET_ID=$1
-
+BITCOIN_IPC_DIR=$(pwd)
 FENDERMINT_MAKEFILE_PATH="../ipc/infra/fendermint/Makefile.toml"
 
-# Load environment variables from the .env file in the root of the project
-ENV_FILE=".env"
-if [ ! -f "$ENV_FILE" ]; then
-  echo "Error: $ENV_FILE not found!"
-  exit 1
-fi
+# Create directories for validators if they don't exist
+for i in {1..4}; do
+    mkdir -p ~/.ipc/validator$i
+done
 
-# Extract the PROVIDER_AUTH_TOKEN and PROVIDER_PORT values
-BEARER_TOKEN=$(grep '^PROVIDER_AUTH_TOKEN=' "$ENV_FILE" | cut -d '=' -f2)
-PORT=$(grep '^PROVIDER_PORT=' "$ENV_FILE" | cut -d '=' -f2)
+# Prepare environment files for each validator
+for i in {1..4}; do
+    ENV_FILE=~/.ipc/validator$i/.env
+    PORT=$((3029 + $i))
 
-if [ -z "$BEARER_TOKEN" ] || [ -z "$PORT" ]; then
-  echo "Error: Required environment variables not found in $ENV_FILE"
-  exit 1
-fi
+    # Check if the env file already exists
+    if [ -f "$ENV_FILE" ]; then
+        echo "Using env file for validator $i: $ENV_FILE"
+    else
+        echo "Creating environment file for validator $i: $ENV_FILE"
 
-API_URL="http://host.docker.internal:${PORT}/api"
+        cat > $ENV_FILE << EOL
+# Bitcoin Core RPC
+RPC_USER=ristic
+RPC_PASS=ristic
+RPC_URL=http://localhost:18443
+WALLET_NAME=validator$i
 
+# Validator
+VALIDATOR_SK_PATH=$HOME/.ipc/validator$i/validator.sk
+
+# Provider + Monitor
+DATABASE_URL=$HOME/.ipc/validator$i/regtest_db
+
+# Provider
+PROVIDER_PORT=$PORT
+PROVIDER_AUTH_TOKEN=validator${i}_auth_token
+
+# General
+RUST_LOG=bitcoin_ipc=info,monitor=info,provider=info,bitcoincore_rpc=error,actix_web=error
+EOL
+    fi
+done
+
+# Function to mine blocks every 10 seconds
+mine_blocks() {
+    while true; do
+        echo "Mining a new block..."
+        bitcoin-cli generatetoaddress 1 "$(bitcoin-cli -rpcwallet=default getnewaddress)" > /dev/null
+        sleep 10
+    done
+}
+
+# Start monitor and provider for each validator
+for i in {1..4}; do
+    echo "Starting monitor and provider for validator $i..."
+    $BITCOIN_IPC_DIR/target/release/monitor --env ~/.ipc/validator$i/.env &
+    sleep 2  # Give monitor time to initialize database
+    $BITCOIN_IPC_DIR/target/release/provider --env ~/.ipc/validator$i/.env &
+done
+
+echo "All monitors and providers are running. Starting validators..."
 
 echo "Starting validator 1..."
 VALIDATOR1_OUTPUT=$(cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
@@ -48,9 +87,9 @@ VALIDATOR1_OUTPUT=$(cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
     -e CMT_RPC_HOST_PORT=26657 \
     -e ETHAPI_HOST_PORT=8545 \
     -e RESOLVER_HOST_PORT=26655 \
-    -e PARENT_ENDPOINT="$API_URL" \
-    -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
-    -e TOPDOWN_CHAIN_HEAD_DELAY=0 \
+    -e PARENT_ENDPOINT="http://host.docker.internal:3030/api" \
+    -e PARENT_AUTH_TOKEN="validator1_auth_token" \
+    -e TOPDOWN_CHAIN_HEAD_DELAY=1 \
     -e TOPDOWN_PROPOSAL_DELAY=0 \
     -e FM_PULL_SKIP=1 \
     child-validator 2>/dev/null)
@@ -70,6 +109,7 @@ run_validator() {
     local rpc_port=$3
     local eth_port=$4
     local resolver_port=$5
+    local provider_port=$((3029 + $validator_num))
 
     echo "Starting validator $validator_num..."
     cargo make --makefile "$FENDERMINT_MAKEFILE_PATH" \
@@ -82,9 +122,9 @@ run_validator() {
         -e RESOLVER_HOST_PORT="$resolver_port" \
         -e BOOTSTRAPS="${COMETBFT_ID}@validator-1-cometbft:26656" \
         -e RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${RESOLVER_ADDR}" \
-        -e PARENT_ENDPOINT="$API_URL" \
-        -e PARENT_AUTH_TOKEN="$BEARER_TOKEN" \
-        -e TOPDOWN_CHAIN_HEAD_DELAY=0 \
+        -e PARENT_ENDPOINT="http://host.docker.internal:${provider_port}/api" \
+        -e PARENT_AUTH_TOKEN="validator${validator_num}_auth_token" \
+        -e TOPDOWN_CHAIN_HEAD_DELAY=1 \
         -e TOPDOWN_PROPOSAL_DELAY=0 \
         -e FM_PULL_SKIP=1 \
         child-validator > /dev/null 2>&1
@@ -96,7 +136,11 @@ run_validator 2 26756 26757 8645 26755 &
 run_validator 3 26856 26857 8745 26855 &
 run_validator 4 26956 26957 8845 26955 &
 
+echo "All validators are running. Starting block miner..."
+# Start block miner in background
+mine_blocks &
+
+echo "System fully operational. Press Ctrl+C to stop all processes."
+
 # Wait for all background processes to complete
 wait
-
-echo "All validators have been started!"

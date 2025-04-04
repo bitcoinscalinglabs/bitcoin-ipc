@@ -1,6 +1,6 @@
 use std::vec;
 
-use log::{error, trace};
+use log::{debug, error, trace};
 use thiserror::Error;
 
 use bitcoin::{
@@ -37,7 +37,7 @@ pub fn create_multisig_script(
     }
 
     // Public keys need to be sorted for consistent scriptPubKey
-    let sorted_public_keys = sort_committee_keys(&public_keys);
+    let sorted_public_keys = sort_committee_keys(public_keys);
 
     //  It pushes an accumulator to the stack, and then for each pk:
     // - it swaps the sig that's already on the stack as a witness, with the accumulator
@@ -495,8 +495,7 @@ pub fn finalize_spend_psbt(
     committee_threshold: Power,
     psbt: &bitcoin::Psbt,
 ) -> Result<Transaction, MultisigError> {
-    println!("finalize_spend_psbt");
-    let committee_keys = sort_committee_keys(&committee_keys);
+    let committee_keys = sort_committee_keys(committee_keys);
     trace!(
         "finalize_spend_psbt sorted committee_keys: {:?}",
         &committee_keys
@@ -573,6 +572,11 @@ pub fn finalize_spend_psbt_from_sigs(
     for ((xonly_pubkey, _power), signatures) in key_sig_pairs {
         // For each input this signer has signed
         for (input_idx, signature) in signatures.iter().enumerate() {
+            debug!(
+                "finalize_spend_psbt_from_sigs xpk={} input_idx={} sig={}",
+                xonly_pubkey, input_idx, signature
+            );
+
             // Make sure we don't go out of bounds
             if input_idx < signed_psbt.inputs.len() {
                 let taproot_sig = bitcoin::taproot::Signature {
@@ -1871,7 +1875,7 @@ mod psbt_tests {
 
         assert!(
             verify_result.is_ok(),
-            "Transaction should be valid with signatures collected in parallel: {:?}",
+            "Transaction should be valid with signatures collected in parallel but in reverse: {:?}",
             verify_result
         );
 

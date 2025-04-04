@@ -14,22 +14,31 @@ In order for each validator to stake, they need to have a wallet set up. We'll c
 
 ```sh
 # create 4 wallets
+bitcoin-cli createwallet "default"
 bitcoin-cli createwallet "validator1"
 bitcoin-cli createwallet "validator2"
 bitcoin-cli createwallet "validator3"
 bitcoin-cli createwallet "validator4"
+bitcoin-cli createwallet "user1"
+bitcoin-cli createwallet "user2"
 
-# fund 4 wallets
+# fund wallets
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator1 getnewaddress)"
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator2 getnewaddress)"
 bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator3 getnewaddress)"
-bitcoin-cli generatetoaddress 102 "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=validator4 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=user1 getnewaddress)"
+bitcoin-cli generatetoaddress 2 "$(bitcoin-cli --rpcwallet=user2 getnewaddress)"
+bitcoin-cli generatetoaddress 102 "$(bitcoin-cli --rpcwallet=default getnewaddress)"
 
 # check balances
+bitcoin-cli --rpcwallet=default getbalance
 bitcoin-cli --rpcwallet=validator1 getbalance
 bitcoin-cli --rpcwallet=validator2 getbalance
 bitcoin-cli --rpcwallet=validator3 getbalance
 bitcoin-cli --rpcwallet=validator4 getbalance
+bitcoin-cli --rpcwallet=user1 getbalance
+bitcoin-cli --rpcwallet=user2 getbalance
 ```
 
 All wallets should have at least 100 BTC.
@@ -165,7 +174,7 @@ The next step is to create a subnet under `/b4` — Bitcoin Regtest. Validator 1
 ```sh
 ipc-cli --config-path ~/.ipc/validator1/config.toml subnet create \
 	# general subnet options
-	--parent /b4 --min-validators 4 --bottomup-check-period 300 \
+	--parent /b4 --min-validators 4 --bottomup-check-period 100 \
 	# btc specific options
 	btc --min-validator-stake 100000000 --min-cross-msg-fee 10 \
 	# comma-separated list of our validators x-only public keys

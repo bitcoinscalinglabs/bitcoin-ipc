@@ -290,14 +290,14 @@ where
         let import_addresses: Vec<(bitcoin::Address, String, u32)> = self
             .side_effects
             .iter()
-            .filter_map(|effect| {
+            .map(|effect| {
                 let SideEffect::ImportAddress {
                     address,
                     label,
                     timestamp,
                 } = effect;
 
-                Some((address.clone(), label.clone(), *timestamp))
+                (address.clone(), label.clone(), *timestamp)
             })
             .collect();
 
@@ -350,7 +350,7 @@ where
     }
 
     async fn process_block(&mut self, block_height: u64) -> Result<(), MonitorError> {
-        info!("Processing block {}", block_height);
+        debug!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
 
@@ -495,17 +495,26 @@ where
                 };
                 debug!("Found IPC message: {:?}", join_subnet_msg);
 
+                let mut bootstraped = false;
+
                 join_subnet_msg.validate()?;
                 if let Some(subnet) = join_subnet_msg.save_to_db(&self.db, block_height, txid)? {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
                     self.import_watchonly_address(committee_addr, label, block_time);
+                    bootstraped = true;
                 }
 
                 info!(
-                    "Processed JoinSubnet for Subnet ID: {}",
-                    join_subnet_msg.subnet_id
+                    "Processed JoinSubnet for Subnet ID: {} Validator XPK: {} Collateral: {}",
+                    join_subnet_msg.subnet_id, join_subnet_msg.pubkey, join_subnet_msg.collateral
                 );
+                if bootstraped {
+                    info!(
+                        "Subnet ID: {} has been bootstrapped",
+                        join_subnet_msg.subnet_id
+                    );
+                }
                 Ok(())
             }
 
@@ -513,7 +522,10 @@ where
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
                 msg.save_to_db(&self.db, block_height, txid)?;
-                info!("Processed PrefundSubnet for Subnet ID: {}", msg.subnet_id);
+                info!(
+                    "Processed PrefundSubnet for Subnet ID: {} Address: {}",
+                    msg.subnet_id, msg.address
+                );
                 Ok(())
             }
 
@@ -521,7 +533,10 @@ where
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
-                info!("Processed FundSubnet for Subnet ID: {}", msg.subnet_id);
+                info!(
+                    "Processed FundSubnet for Subnet ID: {} Address: {} Amount: {}",
+                    msg.subnet_id, msg.address, msg.amount
+                );
                 Ok(())
             }
 
@@ -529,7 +544,18 @@ where
                 debug!("Found IPC message: {:#?}", msg);
 
                 msg.validate()?;
-                msg.save_to_db(&self.db, block_height, txid)?;
+                let checkpoint = msg.save_to_db(&self.db, block_height, txid)?;
+
+                // Save the checkpoint tx to db
+                // we need it available for any batch transfer messages
+                let mut wtxn = self.db.write_txn()?;
+                self.db.save_transaction(&mut wtxn, tx)?;
+                wtxn.commit().map_err(db::DbError::from)?;
+
+                info!(
+                    "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {}",
+                    msg.subnet_id, msg.checkpoint_height, checkpoint.checkpoint_number
+                );
 
                 Ok(())
             }
@@ -541,22 +567,14 @@ where
 
                 // Get checkpoint tx and parse as msg
 
-                let checkpoint_tx = self
-                    .watchonly_rpc
-                    .get_transaction(&msg.checkpoint_txid, Some(true))
-                    .map_err(|e| {
+                let checkpoint_tx = self.db.get_transaction(&msg.checkpoint_txid)
+                    .map_err(MonitorError::DbError)?
+                    .ok_or_else(|| {
                         MonitorError::IpcTxInvalid(format!(
-                            "Can't get Checkpoint Txid {} for BatchTransferMsg invalid: {e}",
+                            "Can't get Checkpoint Txid {} for BatchTransferMsg: not found in database",
                             msg.checkpoint_txid
                         ))
                     })?;
-
-                let checkpoint_tx = checkpoint_tx.transaction().map_err(|e| {
-                    MonitorError::IpcTxInvalid(format!(
-                        "BatchTransferMsg previous tx {} invalid: {e}",
-                        msg.checkpoint_txid
-                    ))
-                })?;
 
                 let checkpoint_msg =
                     ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, &checkpoint_tx)
@@ -575,6 +593,11 @@ where
                 // Save to DB
 
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
+
+                info!(
+                    "Processed BatchTransfer for Subnet ID: {} Checkpoint Txid: {} Number of transfers: {}",
+                    msg.subnet_id, msg.checkpoint_txid, msg.transfers.len(),
+                );
 
                 Ok(())
             }

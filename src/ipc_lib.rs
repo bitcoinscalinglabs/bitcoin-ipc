@@ -403,6 +403,7 @@ impl IpcJoinSubnetMsg {
 
         let commit_txid = commit_tx.compute_txid();
         let reveal_txid = reveal_tx.compute_txid();
+
         debug!(
             "Join subnet commit_txid={} reveal_txid={}",
             commit_txid, reveal_txid
@@ -1169,7 +1170,9 @@ impl IpcCheckpointSubnetMsg {
             (&op_return_data[..]).try_into().expect("the size is okay");
 
         let op_return_script = bitcoin_utils::make_op_return_script(push_bytes);
-        let op_return_value = op_return_script.minimal_non_dust_custom(fee_rate);
+        let op_return_value = op_return_script
+            .minimal_non_dust_custom(fee_rate)
+            .max(op_return_script.minimal_non_dust());
 
         bitcoin::TxOut {
             value: op_return_value,
@@ -1315,9 +1318,18 @@ impl IpcCheckpointSubnetMsg {
 
         trace!("reveal_tx_fee={reveal_tx_fee}");
 
+        let commit_tx_value =
+            // Provide at least the minimal value for the output
+            commit_script_pubkey.minimal_non_dust_custom(fee_rate)
+            // At least the minimal broadcastable
+        	.max(commit_script_pubkey.minimal_non_dust())
+         	// Add enough sats to cover the reveal tx output and fee
+            .max(reveal_tx_out.value + reveal_tx_fee);
+
+        debug!("checkpoint batch_transfer commit_tx_value={commit_tx_value}");
+
         let commit_tx_out = bitcoin::TxOut {
-            // Add enough sats to cover the reveal tx output and fee
-            value: reveal_tx_out.value + reveal_tx_fee,
+            value: commit_tx_value,
             script_pubkey: commit_script_pubkey,
         };
 
@@ -1396,7 +1408,7 @@ impl IpcCheckpointSubnetMsg {
         };
 
         // #[cfg(test)]
-        // dbg!(&reveal_tx);
+        debug!("batch_transfer_reveal_tx={reveal_tx:?}");
 
         Ok(Some(reveal_tx))
     }
@@ -1703,8 +1715,11 @@ impl IpcCheckpointSubnetMsg {
             IpcValidateError::InvalidMsg(format!("Subnet ID {} does not exist", self.subnet_id))
         })?;
 
+        let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
+
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
+            checkpoint_number,
             checkpoint_hash: self.checkpoint_hash,
             checkpoint_height: self.checkpoint_height,
             block_height,
@@ -1718,7 +1733,6 @@ impl IpcCheckpointSubnetMsg {
         };
 
         // Update the checkpoint number in subnet state
-        let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
         subnet_state.last_checkpoint_number = Some(checkpoint_number);
 
         // Begin a database transaction
@@ -2030,14 +2044,6 @@ impl IpcBatchTransferMsg {
 
         // Commit all changes
         wtxn.commit()?;
-
-        info!(
-            "Processed batch transfer txid {} for checkpoint #{} of subnet {}, with {} transfers",
-            txid,
-            checkpoint_number,
-            source_subnet_id,
-            self.transfers.len()
-        );
 
         Ok(checkpoint)
     }
