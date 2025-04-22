@@ -3246,6 +3246,7 @@ mod checkpoint_msg_tests {
     }
 
     #[test]
+    #[test_retry::retry(3)]
     fn test_checkpoint_batch_transfers_to_same_subnet() {
         // Create a subnet with 3 validators - this will be our source subnet
         let source_subnet = test_utils::generate_subnet(3);

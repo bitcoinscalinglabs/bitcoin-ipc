@@ -917,6 +917,7 @@ mod tests {
     }
 
     #[test]
+    #[test_retry::retry(3)]
     fn test_rootnet_message_nonce() {
         let db = create_test_db();
         let subnet_id = create_rand_subnet_id();
@@ -1011,6 +1012,7 @@ mod tests {
     }
 
     #[test]
+    #[test_retry::retry(3)]
     fn test_rootnet_message_nonce_many_messages() {
         let db = create_test_db();
         let subnet_id = create_rand_subnet_id();

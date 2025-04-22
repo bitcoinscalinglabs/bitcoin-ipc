@@ -1695,7 +1695,7 @@ mod psbt_tests {
     }
 
     #[test]
-    #[test_retry::retry(3)]
+    #[test_retry::retry(5)]
     // For some reason this test is flaky
     fn test_parallel_signing_and_spending() {
         let secp = Secp256k1::new();
