@@ -1463,22 +1463,36 @@ impl IpcCheckpointSubnetMsg {
             // Push commit tx output
             tx_outs.push(batch_transfer_tx_out);
 
-            // Add transfers outputs
+            // Group transfers by subnet id (txid20)
+            let mut transfers_by_subnet: HashMap<
+                Txid20,
+                (Amount, bitcoin::Address<NetworkUnchecked>),
+            > = HashMap::new();
+
             for transfer in &self.transfers {
+                let subnet_txid20 = transfer.destination_subnet_id.txid20();
+
+                if let Some(multisig_addr) = &transfer.subnet_multisig_address {
+                    let entry = transfers_by_subnet
+                        .entry(subnet_txid20)
+                        .or_insert((Amount::ZERO, multisig_addr.clone()));
+
+                    // Add to the total amount for this subnet
+                    entry.0 += transfer.amount;
+                } else {
+                    return Err(IpcValidateError::InvalidField(
+                        "transfer.subnet_multisig_address",
+                        "subnet_multisig_address must be defined".to_string(),
+                    )
+                    .into());
+                }
+            }
+
+            // Add transfer outputs - one per unique subnet
+            for (_, (total_amount, multisig_addr)) in transfers_by_subnet {
                 tx_outs.push(bitcoin::TxOut {
-                    value: transfer.amount,
-                    script_pubkey: transfer
-                        .subnet_multisig_address
-                        .clone()
-                        // this should not happen as we fill it
-                        // in update_subnets_for_transfer
-                        // and it's always defined in the transaction outputs
-                        .ok_or(IpcValidateError::InvalidField(
-                            "transfer.subnet_multisig_address",
-                            "subnet_multisig_address must be defined".to_string(),
-                        ))?
-                        // safe to assume it's checked and panic otherwise
-                        // because of the validation beforehand
+                    value: total_amount,
+                    script_pubkey: multisig_addr
                         .require_network(NETWORK)
                         .expect("Address must be valid for network")
                         .script_pubkey(),
@@ -3228,6 +3242,165 @@ mod checkpoint_msg_tests {
         assert!(
             transfer_data.len() > tag_bytes.len(),
             "Transfer data should contain more than just the tag"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_batch_transfers_to_same_subnet() {
+        // Create a subnet with 3 validators - this will be our source subnet
+        let source_subnet = test_utils::generate_subnet(3);
+        let committee = &source_subnet.committee;
+        let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+
+        // Create a destination subnet for transfers
+        let destination_subnet = test_utils::generate_subnet(3);
+
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        // Create two transfers to the same destination subnet but different addresses
+        let transfer1 = IpcCrossSubnetTransfer {
+            amount: Amount::from_sat(30000),
+            destination_subnet_id: destination_subnet.id,
+            subnet_multisig_address: Some(destination_subnet.committee.multisig_address.clone()),
+            subnet_user_address: alloy_primitives::Address::from_str(
+                "742d35Cc6634C0532925a3b844Bc454e4438f44e",
+            )
+            .unwrap(),
+        };
+
+        let transfer2 = IpcCrossSubnetTransfer {
+            amount: Amount::from_sat(40000),
+            destination_subnet_id: destination_subnet.id,
+            subnet_multisig_address: Some(destination_subnet.committee.multisig_address.clone()),
+            subnet_user_address: alloy_primitives::Address::from_str(
+                "1111111111111111111111111111111111111111", // Different address
+            )
+            .unwrap(),
+        };
+
+        // Create a second destination subnet for a third transfer
+        let destination_subnet2 = test_utils::generate_subnet(3);
+
+        let transfer3 = IpcCrossSubnetTransfer {
+            amount: Amount::from_sat(50000),
+            destination_subnet_id: destination_subnet2.id,
+            subnet_multisig_address: Some(destination_subnet2.committee.multisig_address.clone()),
+            subnet_user_address: alloy_primitives::Address::from_str(
+                "2222222222222222222222222222222222222222",
+            )
+            .unwrap(),
+        };
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: source_subnet.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            withdrawals: vec![],
+            transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
+            change_address: Some(committee.multisig_address.clone()),
+        };
+
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+
+        // Generate transactions
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
+
+        // Verify transaction output structure:
+        // 1. OP_RETURN metadata
+        // 2. Batch transfer commit output
+        // 3. First destination subnet output (combined from transfer1 + transfer2)
+        // 4. Second destination subnet output (from transfer3)
+        // 5. Change output
+        assert_eq!(checkpoint_tx.output.len(), 5, "Should have 5 outputs");
+
+        // First output should be OP_RETURN with metadata
+        assert!(
+            checkpoint_tx.output[0].script_pubkey.is_op_return(),
+            "First output should be OP_RETURN"
+        );
+
+        // Extract OP_RETURN data from metadata output
+        let op_return_data = checkpoint_tx.output[0]
+            .script_pubkey
+            .instructions_minimal()
+            .find_map(|ins| match ins {
+                Ok(bitcoin::blockdata::script::Instruction::PushBytes(data)) => {
+                    Some(data.as_bytes())
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        // Check the transfer count marker is 3
+        assert_eq!(
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET + 1],
+            3,
+            "Transfer count marker should be 3"
+        );
+
+        // Check that there's a batch transfer commit output
+        let batch_tx_out = &checkpoint_tx.output[1]; // Second output should be batch transfer commit
+        assert!(
+            batch_tx_out.script_pubkey.is_p2tr(),
+            "Batch transfer commit output should be P2TR"
+        );
+
+        // Third output should be to the first destination subnet
+        let combined_output = &checkpoint_tx.output[2];
+        assert_eq!(
+            combined_output.script_pubkey,
+            destination_subnet
+                .committee
+                .multisig_address
+                .assume_checked()
+                .script_pubkey(),
+            "Output should be to the first destination subnet multisig address"
+        );
+
+        // The combined output value should be transfer1 + transfer2
+        let expected_value = transfer1.amount + transfer2.amount;
+        assert_eq!(
+            combined_output.value, expected_value,
+            "Combined output value should equal sum of transfer1 and transfer2"
+        );
+
+        // Fourth output should be to the second destination subnet
+        let second_subnet_output = &checkpoint_tx.output[3];
+        assert_eq!(
+            second_subnet_output.script_pubkey,
+            destination_subnet2
+                .committee
+                .multisig_address
+                .assume_checked()
+                .script_pubkey(),
+            "Output should be to the second destination subnet multisig address"
+        );
+
+        // The second subnet output value should match transfer3
+        assert_eq!(
+            second_subnet_output.value, transfer3.amount,
+            "Second subnet output value should equal transfer3"
+        );
+
+        // Make the batch reveal transaction
+        let batch_tx = checkpoint_msg
+            .make_reveal_batch_transfer_tx(
+                checkpoint_tx.compute_txid(),
+                fee_rate,
+                &committee.address_checked(),
+            )
+            .unwrap();
+
+        // Verify we have a batch transaction
+        assert!(
+            batch_tx.is_some(),
+            "Should have a batch transfer transaction"
         );
     }
 }
