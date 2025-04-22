@@ -1539,6 +1539,8 @@ impl IpcCheckpointSubnetMsg {
             self.subnet_id
         );
 
+        let committee_change_address = committee.address_checked();
+
         let mut tx_outs = vec![];
 
         //
@@ -1622,7 +1624,7 @@ impl IpcCheckpointSubnetMsg {
         let checkpoint_tx = multisig::construct_spend_unsigned_transaction(
             &committee_keys,
             committee.threshold,
-            &committee.address_checked(),
+            &committee_change_address,
             unspent,
             &tx_outs,
             &fee_rate,

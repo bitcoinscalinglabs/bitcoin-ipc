@@ -156,6 +156,16 @@ pub struct SubnetCommittee {
     pub multisig_address: Address<NetworkUnchecked>,
 }
 
+impl PartialEq for SubnetCommittee {
+    fn eq(&self, other: &Self) -> bool {
+        // this should suffice as we have the keys and the
+        // threshold in the script_pubkey for which we derive the address
+        self.multisig_address == other.multisig_address
+    }
+}
+
+impl Eq for SubnetCommittee {}
+
 impl SubnetCommittee {
     pub fn size(&self) -> u16 {
         self.validators
@@ -278,6 +288,18 @@ impl SubnetState {
 
     pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
         self.committee.is_validator(pubkey)
+    }
+
+    pub fn is_waiting_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
+        self.next_committee
+            .as_ref()
+            .is_some_and(|nc| nc.is_validator(pubkey))
+    }
+
+    pub fn needs_rotation(&self) -> bool {
+        self.next_committee
+            .as_ref()
+            .is_some_and(|nc| self.committee != *nc)
     }
 
     pub fn rotate_to_next_committee(&mut self) -> Result<(), DbError> {
@@ -1225,5 +1247,110 @@ mod tests {
 
         // Verify committee size didn't change after failed addition
         assert_eq!(committee.validators.len(), 3);
+    }
+
+    #[test]
+    fn test_subnet_state_rotation() {
+        // Setup: Create a subnet ID
+        let subnet_id = create_rand_subnet_id();
+
+        // Create validators for the current committee
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        let validator1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10,
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        let validator2 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15,
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create validators for the next committee (including a new one)
+        let (secret_key3, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey3 = XOnlyPublicKey::from_keypair(&secret_key3.keypair(&secp)).0;
+
+        let validator3 = SubnetValidator {
+            pubkey: pubkey3,
+            subnet_address: create_rand_addr(),
+            power: 20,
+            collateral: Amount::from_sat(3_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8002".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create current committee with validators 1 and 2
+        let mut current_validators = Vec::new();
+        current_validators.push(validator1.clone());
+        current_validators.push(validator2.clone());
+        let current_committee = current_validators.to_committee(&subnet_id);
+
+        // Create next committee with validators 1 and 3
+        let mut next_validators = Vec::new();
+        next_validators.push(validator1.clone());
+        next_validators.push(validator3.clone());
+        let next_committee = next_validators.to_committee(&subnet_id);
+
+        // Create subnet state
+        let mut subnet_state = SubnetState {
+            id: subnet_id,
+            committee_number: 1,
+            committee: current_committee.clone(),
+            next_committee: Some(next_committee.clone()),
+            last_checkpoint_number: None,
+        };
+
+        // Verify needs_rotation returns true when committees differ
+        assert!(subnet_state.needs_rotation());
+
+        // Verify original state
+        assert_eq!(subnet_state.committee_number, 1);
+        assert!(subnet_state.committee.is_validator(&pubkey1));
+        assert!(subnet_state.committee.is_validator(&pubkey2));
+        assert!(!subnet_state.committee.is_validator(&pubkey3));
+
+        // Perform rotation
+        subnet_state.rotate_to_next_committee().unwrap();
+
+        // Verify committee was updated
+        assert_eq!(subnet_state.committee_number, 2); // Committee number incremented
+        assert!(subnet_state.committee.is_validator(&pubkey1));
+        assert!(!subnet_state.committee.is_validator(&pubkey2)); // No longer in committee
+        assert!(subnet_state.committee.is_validator(&pubkey3)); // New validator added
+
+        // Verify next_committee was consumed
+        assert!(subnet_state.next_committee.is_none());
+
+        // Verify needs_rotation now returns false
+        assert!(!subnet_state.needs_rotation());
+
+        // Verify error when trying to rotate with no next committee
+        let result = subnet_state.rotate_to_next_committee();
+        assert!(result.is_err());
+
+        // Verify state didn't change after failed rotation
+        assert_eq!(subnet_state.committee_number, 2);
+        assert!(subnet_state.committee.is_validator(&pubkey1));
+        assert!(!subnet_state.committee.is_validator(&pubkey2));
+        assert!(subnet_state.committee.is_validator(&pubkey3));
     }
 }
