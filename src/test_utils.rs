@@ -136,6 +136,7 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         id: subnet_id,
         committee_number: 1,
         committee,
+        next_committee: None,
         last_checkpoint_number: None,
     }
 }

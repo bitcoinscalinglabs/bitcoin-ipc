@@ -180,10 +180,16 @@ pub async fn join_subnet(
             msg.subnet_id
         )))?;
 
-    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
-        error!("Error validating join msg for subnet info: {}", e);
-        RpcError::InvalidParams(e.to_string())
+    let subnet_state = data.db.get_subnet_state(msg.subnet_id).map_err(|e| {
+        error!("Error getting subnet info from Db: {}", e);
+        RpcError::DbError(e)
     })?;
+
+    msg.validate_for_subnet(&genesis_info, &subnet_state)
+        .map_err(|e| {
+            error!("Error validating join msg for subnet info: {}", e);
+            RpcError::InvalidParams(e.to_string())
+        })?;
 
     // TODO this check should be done in the Db
     let multisig_address = &genesis_info.multisig_address();

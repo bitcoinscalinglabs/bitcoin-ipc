@@ -324,19 +324,10 @@ pub struct IpcJoinSubnetMsg {
 
 impl IpcJoinSubnetMsg {
     /// Validates the join subnet message, for the given genesis info
-    pub fn validate_for_genesis_info(
+    pub fn validate_pre_bootstrap(
         &self,
         genesis_info: &db::SubnetGenesisInfo,
     ) -> Result<(), IpcValidateError> {
-        // Check if the subnet is already bootstrapped
-        if genesis_info.bootstrapped {
-            // TODO handle when subnet already bootstrapped
-            return Err(IpcValidateError::InvalidMsg(format!(
-                "Subnet {} is already bootstrapped.",
-                self.subnet_id
-            )));
-        }
-
         // Check if the collateral is at least the minimum validator stake
         if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
             return Err(IpcValidateError::InvalidField(
@@ -368,11 +359,79 @@ impl IpcJoinSubnetMsg {
         {
             return Err(IpcValidateError::InvalidField(
                 "pubkey",
-                "Validator with this public key already registered in subnet".to_string(),
+                format!(
+                    "Validator with public key '{}' already registered in subnet",
+                    self.pubkey
+                ),
             ));
         }
 
         Ok(())
+    }
+
+    /// Validates the join subnet message, for the given genesis info
+    /// and current subnet state
+    pub fn validate_post_bootstrap(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
+        // Check if the collateral is at least the minimum validator stake
+        if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
+            return Err(IpcValidateError::InvalidField(
+                "collateral",
+                format!(
+                    "Collateral must be at least {}, supplied {}",
+                    genesis_info.create_subnet_msg.min_validator_stake, self.collateral,
+                ),
+            ));
+        }
+
+        // Check if the validator with this public key is already registered
+        if subnet.committee.is_validator(&self.pubkey) {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' already registered in subnet",
+                self.pubkey
+            )));
+        }
+
+        // Check if the validator with this public key is already registered
+        // and waiting in the next committee
+        if subnet
+            .next_committee
+            .as_ref()
+            .is_some_and(|c| c.is_validator(&self.pubkey))
+        {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' already registered in subnet, waiting for next committee",
+                self.pubkey
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates the join subnet message, for the given genesis info
+    pub fn validate_for_subnet(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &Option<db::SubnetState>,
+    ) -> Result<(), IpcValidateError> {
+        if let Some(subnet) = subnet {
+            if subnet.id != self.subnet_id {
+                return Err(IpcValidateError::InvalidField(
+                    "subnet_id",
+                    format!(
+                        "Subnet ID mismatch: expected {}, got {}",
+                        subnet.id, self.subnet_id
+                    ),
+                ));
+            }
+
+            self.validate_post_bootstrap(genesis_info, subnet)
+        } else {
+            self.validate_pre_bootstrap(genesis_info)
+        }
     }
 
     /// Submits the join subnet message to the Bitcoin network
@@ -422,7 +481,9 @@ impl IpcJoinSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
-    /// Returning SubnetState if the subnet is bootstrapped
+    /// Returning SubnetState *only* if the subnet is bootstrapped
+    ///
+    /// It will return None if processed for an already bootstrapped subnet
     pub fn save_to_db<D: db::Database>(
         &self,
         db: &D,
@@ -436,7 +497,12 @@ impl IpcJoinSubnetMsg {
                     self.subnet_id
                 )))?;
 
-        self.validate_for_genesis_info(&genesis_info)?;
+        let subnet_state = db.get_subnet_state(self.subnet_id).map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            IpcValidateError::InvalidMsg(e.to_string())
+        })?;
+
+        self.validate_for_subnet(&genesis_info, &subnet_state)?;
 
         let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
@@ -455,29 +521,76 @@ impl IpcJoinSubnetMsg {
             join_txid: txid,
         };
         trace!("Processing {self:?}, adding new validator {new_validator:?}");
-        genesis_info.genesis_validators.push(new_validator);
-
-        // Write to DB
-        let mut wtxn = db.write_txn()?;
 
         //
-        // Check if the subnet is bootstrapped
+        // Handle post-bootstrap case
         //
-        if genesis_info.enough_to_bootstrap() {
-            trace!("Subnet {} bootstrapped", self.subnet_id);
-            genesis_info.bootstrapped = true;
-            genesis_info.genesis_block_height = Some(block_height);
+        if let Some(mut subnet) = subnet_state {
+            if subnet.is_validator(&self.pubkey) {
+                return Err(IpcValidateError::InvalidField(
+                    "pubkey",
+                    format!(
+                        "Validator with public key '{}' already registered in subnet",
+                        self.pubkey
+                    ),
+                )
+                .into());
+            }
 
-            // Save the newly create subnet state
-            let subnet_state = genesis_info.to_subnet();
-            db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+            let mut next_commitee = subnet
+                .next_committee
+                .unwrap_or_else(|| subnet.committee.clone());
+
+            if next_commitee.is_validator(&self.pubkey) {
+                return Err(IpcValidateError::InvalidField(
+                    "pubkey",
+                    format!(
+						"Validator with public key '{}' already registered in subnet, waiting in next committee.",
+						self.pubkey
+					),
+                )
+                .into());
+            }
+
+            next_commitee.join_validator(&subnet.id, &new_validator)?;
+
+            subnet.next_committee = Some(next_commitee);
+
+            // Write to DB
+            let mut wtxn = db.write_txn()?;
+            db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet)?;
             wtxn.commit()?;
-            Ok(Some(subnet_state))
-        } else {
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
-            wtxn.commit()?;
+
             Ok(None)
+        }
+        //
+        // Handle pre-bootstrap case
+        //
+        else {
+            genesis_info.genesis_validators.push(new_validator);
+
+            // Write to DB
+            let mut wtxn = db.write_txn()?;
+
+            //
+            // Check if the subnet is bootstrapped
+            //
+            if genesis_info.enough_to_bootstrap() {
+                info!("Subnet ID: {} has been bootstrapped", self.subnet_id);
+                genesis_info.bootstrapped = true;
+                genesis_info.genesis_block_height = Some(block_height);
+
+                // Save the newly create subnet state
+                let subnet_state = genesis_info.to_subnet();
+                db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
+                db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+                wtxn.commit()?;
+                Ok(Some(subnet_state))
+            } else {
+                db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+                wtxn.commit()?;
+                Ok(None)
+            }
         }
     }
 }

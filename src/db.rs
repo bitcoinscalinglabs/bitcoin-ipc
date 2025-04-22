@@ -79,6 +79,10 @@ trait SubnetValidators {
     fn threshold(&self) -> Power;
     fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked>;
     fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee;
+
+    fn add_validator(&mut self, validator: &SubnetValidator) -> Result<(), DbError>;
+    #[allow(unused)]
+    fn rm_validator(&mut self, validator_xpk: &XOnlyPublicKey) -> Result<SubnetValidator, DbError>;
 }
 
 impl SubnetValidators for Vec<SubnetValidator> {
@@ -105,6 +109,38 @@ impl SubnetValidators for Vec<SubnetValidator> {
             threshold: self.threshold(),
             validators: self.to_vec(),
             multisig_address: self.multisig_address(subnet_id),
+        }
+    }
+
+    fn add_validator(&mut self, validator: &SubnetValidator) -> Result<(), DbError> {
+        // Check if the validator already exists
+        if self.iter().any(|v| v.pubkey == validator.pubkey) {
+            return Err(DbError::InvalidChange(format!(
+                "Validator with public key {} already exists",
+                validator.pubkey
+            )));
+        }
+
+        // Add the validator
+        self.push(validator.clone());
+
+        Ok(())
+    }
+
+    fn rm_validator(&mut self, validator_xpk: &XOnlyPublicKey) -> Result<SubnetValidator, DbError> {
+        // Find the validator
+        let position = self.iter().position(|v| &v.pubkey == validator_xpk);
+
+        // Check if the validator exists
+        if let Some(pos) = position {
+            // Remove and return the validator
+            let validator = self.remove(pos);
+            Ok(validator)
+        } else {
+            Err(DbError::InvalidChange(format!(
+                "Validator with public key {} not found",
+                validator_xpk
+            )))
         }
     }
 }
@@ -165,6 +201,17 @@ impl SubnetCommittee {
     pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
         self.validators.iter().any(|v| &v.pubkey == pubkey)
     }
+
+    pub fn join_validator(
+        &mut self,
+        subnet_id: &SubnetId,
+        validator: &SubnetValidator,
+    ) -> Result<(), DbError> {
+        self.validators.add_validator(validator)?;
+        self.threshold = self.validators.threshold();
+        self.multisig_address = self.validators.multisig_address(subnet_id);
+        Ok(())
+    }
 }
 
 /// Subnet checkpoint
@@ -202,13 +249,15 @@ pub struct SubnetState {
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
+    /// The next commitee, if it differs
+    pub next_committee: Option<SubnetCommittee>,
     /// The number of the last checkpoint
     pub last_checkpoint_number: Option<u64>,
 }
 
 impl SubnetState {
     /// Returns the total stake of the current committee
-    pub fn stake(&self) -> bitcoin::Amount {
+    pub fn total_collateral(&self) -> bitcoin::Amount {
         self.committee.validators.iter().map(|v| v.collateral).sum()
     }
 
@@ -229,6 +278,18 @@ impl SubnetState {
 
     pub fn is_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
         self.committee.is_validator(pubkey)
+    }
+
+    pub fn rotate_to_next_committee(&mut self) -> Result<(), DbError> {
+        if let Some(next_committee) = self.next_committee.take() {
+            self.committee = next_committee;
+            self.committee_number += 1;
+            Ok(())
+        } else {
+            Err(DbError::InvalidChange(
+                "No next committee to rotate to".to_string(),
+            ))
+        }
     }
 }
 
@@ -319,6 +380,7 @@ impl SubnetGenesisInfo {
             committee_number: 1,
             last_checkpoint_number: None,
             committee: self.genesis_validators.to_committee(&self.subnet_id),
+            next_committee: None,
         }
     }
 
@@ -855,6 +917,10 @@ pub enum DbError {
     #[error("Key {0} could not be modified: {1}")]
     KeyModificationError(String, String),
 
+    /// Generic error that can be returned by our database
+    #[error("{0}")]
+    InvalidChange(String),
+
     #[error(transparent)]
     IoError(#[from] io::Error),
 
@@ -869,6 +935,7 @@ pub enum DbError {
 mod tests {
     use super::*;
     use bitcoin::{hashes::Hash, Amount, BlockHash, Txid};
+    use std::str::FromStr;
     use tempfile::tempdir;
 
     fn create_test_db() -> HeedDb {
@@ -1074,5 +1141,89 @@ mod tests {
         for (i, &nonce) in nonces.iter().enumerate() {
             assert_eq!(nonce, expected_first_nonce as u64 + i as u64);
         }
+    }
+
+    #[test]
+    fn test_subnet_committee_join_validator() {
+        // Setup: Create a subnet ID and initial committee
+        let subnet_id = create_rand_subnet_id();
+
+        // Create initial validators
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        let validator1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10,
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        let validator2 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15,
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create initial committee with two validators
+        let mut initial_validators = Vec::new();
+        initial_validators.push(validator1);
+        initial_validators.push(validator2);
+
+        let mut committee = initial_validators.to_committee(&subnet_id);
+
+        // Verify initial state
+        assert_eq!(committee.validators.len(), 2);
+        assert_eq!(committee.total_power(), 25); // 10 + 15
+        let initial_threshold = committee.threshold;
+        let initial_address = committee.multisig_address.clone();
+
+        // Create new validator to add
+        let (secret_key3, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey3 = XOnlyPublicKey::from_keypair(&secret_key3.keypair(&secp)).0;
+
+        let validator3 = SubnetValidator {
+            pubkey: pubkey3,
+            subnet_address: create_rand_addr(),
+            power: 20,
+            collateral: Amount::from_sat(3_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8002".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Add the new validator
+        committee.join_validator(&subnet_id, &validator3).unwrap();
+
+        // Verify the validator was added
+        assert_eq!(committee.validators.len(), 3);
+        assert!(committee.is_validator(&pubkey3));
+
+        // Verify the power and threshold updated
+        assert_eq!(committee.total_power(), 45); // 10 + 15 + 20
+        assert!(committee.threshold > initial_threshold);
+
+        // Verify multisig address changed
+        assert_ne!(committee.multisig_address, initial_address);
+
+        // Try adding an existing validator (should fail)
+        let result = committee.join_validator(&subnet_id, &validator3);
+        assert!(result.is_err());
+
+        // Verify committee size didn't change after failed addition
+        assert_eq!(committee.validators.len(), 3);
     }
 }
