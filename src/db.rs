@@ -22,6 +22,8 @@ const ROOTNET_MSGS_KEY: &str = "rootnet_msgs:";
 const CHECKPOINTS_KEY: &str = "checkpoints:";
 // transactions:<txid>
 const TRANSACTIONS_KEY: &str = "transactions:";
+// committee:<subnet_id>:<committee_number>
+const COMMITTEE_KEY: &str = "committee:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -47,6 +49,10 @@ fn checkpoints_key(subnet_id: SubnetId, number: u64) -> String {
 
 fn transaction_key(txid: &Txid) -> String {
     format!("{TRANSACTIONS_KEY}:{}", txid)
+}
+
+fn committee_key(subnet_id: SubnetId, committee_number: u64) -> String {
+    format!("{COMMITTEE_KEY}:{}:{}", subnet_id, committee_number)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -259,7 +265,7 @@ pub struct SubnetState {
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
-    /// The next commitee, if it differs
+    /// The next commitee, Some if it differs
     pub next_committee: Option<SubnetCommittee>,
     /// The number of the last checkpoint
     pub last_checkpoint_number: Option<u64>,
@@ -475,6 +481,7 @@ pub struct HeedDb {
     // There's a conflict of bincode and `serde(tag = "type")` for RootnetMessage
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
     transactions_db: HeedDatabase<Str, SerdeBincode<Vec<u8>>>,
+    committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
 }
 
 impl HeedDb {
@@ -538,6 +545,9 @@ impl HeedDb {
             let transactions_db = env
                 .open_database(&rtxn, Some("transactions_db"))?
                 .ok_or(DbError::DbNotFound("transactions_db".to_string()))?;
+            let committee_db = env
+                .open_database(&rtxn, Some("committee_db"))?
+                .ok_or(DbError::DbNotFound("committee_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -548,6 +558,7 @@ impl HeedDb {
                 checkpoints_db,
                 rootnet_msgs_db,
                 transactions_db,
+                committee_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -558,6 +569,7 @@ impl HeedDb {
             let checkpoints_db = env.create_database(&mut txn, Some("checkpoints_db"))?;
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
             let transactions_db = env.create_database(&mut txn, Some("transactions_db"))?;
+            let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -568,6 +580,7 @@ impl HeedDb {
                 checkpoints_db,
                 rootnet_msgs_db,
                 transactions_db,
+                committee_db,
             })
         }
     }
@@ -653,6 +666,21 @@ pub trait Database {
     // Transaction storage
     fn get_transaction(&self, txid: &Txid) -> Result<Option<bitcoin::Transaction>, DbError>;
     fn save_transaction(&self, txn: &mut RwTxn, tx: &bitcoin::Transaction) -> Result<(), DbError>;
+
+    // Committees
+    fn get_committee(
+        &self,
+        subnet_id: SubnetId,
+        committee_number: u64,
+    ) -> Result<Option<SubnetCommittee>, DbError>;
+
+    fn save_committee(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        committee_number: u64,
+        committee: &SubnetCommittee,
+    ) -> Result<(), DbError>;
 }
 
 #[async_trait]
@@ -919,6 +947,31 @@ impl Database for HeedDb {
         let tx_bytes = bitcoin::consensus::serialize(tx);
         self.transactions_db.put(txn, &key, &tx_bytes)?;
 
+        Ok(())
+    }
+
+    // Committees
+
+    fn get_committee(
+        &self,
+        subnet_id: SubnetId,
+        committee_number: u64,
+    ) -> Result<Option<SubnetCommittee>, DbError> {
+        let key = committee_key(subnet_id, committee_number);
+        let txn = self.env.read_txn()?;
+        let committee = self.committee_db.get(&txn, &key)?;
+        Ok(committee)
+    }
+
+    fn save_committee(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        committee_number: u64,
+        committee: &SubnetCommittee,
+    ) -> Result<(), DbError> {
+        let key = committee_key(subnet_id, committee_number);
+        self.committee_db.put(txn, &key, committee)?;
         Ok(())
     }
 }
@@ -1352,5 +1405,89 @@ mod tests {
         assert!(subnet_state.committee.is_validator(&pubkey1));
         assert!(!subnet_state.committee.is_validator(&pubkey2));
         assert!(subnet_state.committee.is_validator(&pubkey3));
+    }
+
+    #[test]
+    fn test_different_power_different_multisig() {
+        // Setup: Create a subnet ID
+        let subnet_id = create_rand_subnet_id();
+
+        // Create validators
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        // Create first set of validators with certain powers
+        let validator1_set1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10, // Power of 10 for first set
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        let validator2_set1 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15, // Power of 15 for first set
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create second set of validators with the same pubkeys but different powers
+        let validator1_set2 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 20, // Power of 20 for second set
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        let validator2_set2 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 25, // Power of 25 for second set
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create the two committees
+        let mut validators_set1 = Vec::new();
+        validators_set1.push(validator1_set1);
+        validators_set1.push(validator2_set1);
+
+        let mut validators_set2 = Vec::new();
+        validators_set2.push(validator1_set2);
+        validators_set2.push(validator2_set2);
+
+        let committee1 = validators_set1.to_committee(&subnet_id);
+        let committee2 = validators_set2.to_committee(&subnet_id);
+
+        // Verify both committees have the same validators (by pubkey)
+        assert_eq!(committee1.pubkeys(), committee2.pubkeys());
+
+        // Verify the committees have different total powers
+        assert_eq!(committee1.total_power(), 25); // 10 + 15
+        assert_eq!(committee2.total_power(), 45); // 20 + 25
+
+        // Verify the committees have different thresholds
+        assert_ne!(committee1.threshold, committee2.threshold);
+
+        // Verify the multisig addresses are different
+        assert_ne!(committee1.multisig_address, committee2.multisig_address);
     }
 }

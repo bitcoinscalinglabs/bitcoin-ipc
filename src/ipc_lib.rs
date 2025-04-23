@@ -584,6 +584,12 @@ impl IpcJoinSubnetMsg {
                 let subnet_state = genesis_info.to_subnet();
                 db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
                 db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+                db.save_committee(
+                    &mut wtxn,
+                    self.subnet_id,
+                    subnet_state.committee_number,
+                    &subnet_state.committee,
+                )?;
                 wtxn.commit()?;
                 Ok(Some(subnet_state))
             } else {
