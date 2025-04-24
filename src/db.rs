@@ -24,6 +24,8 @@ const CHECKPOINTS_KEY: &str = "checkpoints:";
 const TRANSACTIONS_KEY: &str = "transactions:";
 // committee:<subnet_id>:<committee_number>
 const COMMITTEE_KEY: &str = "committee:";
+// stake_changes:<subnet_id>:<configuration_number>
+const STAKE_CHANGES_KEY: &str = "stake_changes:";
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -53,6 +55,14 @@ fn transaction_key(txid: &Txid) -> String {
 
 fn committee_key(subnet_id: SubnetId, committee_number: u64) -> String {
     format!("{COMMITTEE_KEY}:{}:{}", subnet_id, committee_number)
+}
+
+fn stake_changes_prefix(subnet_id: SubnetId) -> String {
+    format!("{STAKE_CHANGES_KEY}:{}", subnet_id)
+}
+
+fn stake_change_key(subnet_id: SubnetId, configuration_number: u64) -> String {
+    format!("{STAKE_CHANGES_KEY}:{}:{}", subnet_id, configuration_number)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -237,7 +247,7 @@ pub struct SubnetCheckpoint {
     pub checkpoint_number: u64,
     /// The block hash of the child subnet at which the checkpoint was cut
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
-    /// The block height of the checkpoint on Bitcoin
+    /// The block height of the checkpoint on the child subnet
     pub checkpoint_height: u64,
     /// The block height of the checkpoint on Bitcoin
     pub block_height: u64,
@@ -471,6 +481,52 @@ impl RootnetMessage {
     }
 }
 
+// Staking
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StakingChange {
+    Deposit {
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
+        amount: bitcoin::Amount,
+    },
+    Withdraw {
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
+        amount: bitcoin::Amount,
+    },
+    Join {
+        pubkey: bitcoin::secp256k1::PublicKey,
+    },
+}
+
+/// Stake change event emmited on the Bitcoin chain
+///
+/// These events are saved in db as seen on the chain
+/// However they will be returned to the consumer only
+/// after there was a checkpoint on Bitcoin where the
+/// stake changes were actually made (like rotating to)
+/// another multisig or such)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StakeChangeRequest {
+    /// Change request
+    pub change: StakingChange,
+    /// XOnlyPublicKey of the validator making requesting stake change
+    pub validator_xpk: XOnlyPublicKey,
+    /// Configuration number is practically an incremental "nonce"
+    /// of a single change request/event
+    pub configuration_number: u64,
+
+    /// The block height of the Bitcoin block where the change request was recorded
+    pub block_height: u64,
+    /// The block hash of the Bitcoin block where the change request was recorded
+    pub block_hash: BlockHash,
+    /// The block height of the child subnet at which the checkpoint was
+    pub checkpoint_block_height: Option<u64>,
+    /// The block hash of the child subnet at which the checkpoint was
+    pub checkpoint_block_hash: Option<BlockHash>,
+    pub txid: Txid,
+}
+
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
@@ -482,6 +538,7 @@ pub struct HeedDb {
     rootnet_msgs_db: HeedDatabase<Str, SerdeJson<RootnetMessage>>,
     transactions_db: HeedDatabase<Str, SerdeBincode<Vec<u8>>>,
     committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
+    stake_changes_db: HeedDatabase<Str, SerdeBincode<StakeChangeRequest>>,
 }
 
 impl HeedDb {
@@ -548,6 +605,9 @@ impl HeedDb {
             let committee_db = env
                 .open_database(&rtxn, Some("committee_db"))?
                 .ok_or(DbError::DbNotFound("committee_db".to_string()))?;
+            let stake_changes_db = env
+                .open_database(&rtxn, Some("stake_changes_db"))?
+                .ok_or(DbError::DbNotFound("stake_changes_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -559,6 +619,7 @@ impl HeedDb {
                 rootnet_msgs_db,
                 transactions_db,
                 committee_db,
+                stake_changes_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -570,6 +631,7 @@ impl HeedDb {
             let rootnet_msgs_db = env.create_database(&mut txn, Some("rootnet_msgs_db"))?;
             let transactions_db = env.create_database(&mut txn, Some("transactions_db"))?;
             let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
+            let stake_changes_db = env.create_database(&mut txn, Some("stake_changes_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -581,6 +643,7 @@ impl HeedDb {
                 rootnet_msgs_db,
                 transactions_db,
                 committee_db,
+                stake_changes_db,
             })
         }
     }
@@ -681,6 +744,50 @@ pub trait Database {
         committee_number: u64,
         committee: &SubnetCommittee,
     ) -> Result<(), DbError>;
+
+    // Stake changes
+    // Stake changes
+    fn get_stake_change(
+        &self,
+        subnet_id: SubnetId,
+        configuration_number: u64,
+    ) -> Result<Option<StakeChangeRequest>, DbError>;
+
+    fn get_all_stake_changes(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError>;
+
+    fn get_stake_changes_by_height(
+        &self,
+        subnet_id: SubnetId,
+        block_height: u64,
+    ) -> Result<Vec<StakeChangeRequest>, DbError>;
+
+    fn get_last_stake_change_configuration_number(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError>;
+
+    fn get_next_stake_change_configuration_number(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError>;
+
+    fn add_stake_change(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        stake_change: StakeChangeRequest,
+    ) -> Result<(), DbError>;
+
+    fn confirm_stake_changes(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        confirmed_block_height: u64,
+        confirmed_block_hash: BlockHash,
+    ) -> Result<Vec<StakeChangeRequest>, DbError>;
 }
 
 #[async_trait]
@@ -973,6 +1080,143 @@ impl Database for HeedDb {
         let key = committee_key(subnet_id, committee_number);
         self.committee_db.put(txn, &key, committee)?;
         Ok(())
+    }
+
+    // Stake changes
+
+    fn get_stake_change(
+        &self,
+        subnet_id: SubnetId,
+        configuration_number: u64,
+    ) -> Result<Option<StakeChangeRequest>, DbError> {
+        let key = stake_change_key(subnet_id, configuration_number);
+        let txn = self.env.read_txn()?;
+        let change = self.stake_changes_db.get(&txn, &key)?;
+        Ok(change)
+    }
+
+    fn get_all_stake_changes(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+
+        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+
+        let changes = changes_iter
+            .map(|res| res.map(|(_, change)| change))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(changes)
+    }
+
+    /// Returns all stake changes for a given subnet
+    /// for a given height, looking at *confirmed* block height
+    fn get_stake_changes_by_height(
+        &self,
+        subnet_id: SubnetId,
+        block_height: u64,
+    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+
+        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+
+        let changes = changes_iter
+            .map(|res| res.map(|(_, change)| change))
+            .filter_map(|res| match res {
+                Ok(change) => {
+                    if change
+                        .checkpoint_block_height
+                        .is_some_and(|cbh| cbh == block_height)
+                    {
+                        Some(Ok(change))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(changes)
+    }
+
+    fn get_last_stake_change_configuration_number(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Option<u64>, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+        let count: u64 = changes_iter
+            .count()
+            .try_into()
+            .map_err(|_| DbError::TypeConversionError("max stake changes reached".to_string()))?;
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(count - 1))
+    }
+
+    fn get_next_stake_change_configuration_number(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError> {
+        let last_number = self.get_last_stake_change_configuration_number(subnet_id)?;
+        let next_number = match last_number {
+            Some(n) => n + 1,
+            None => 0,
+        };
+
+        Ok(next_number)
+    }
+
+    fn add_stake_change(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        stake_change: StakeChangeRequest,
+    ) -> Result<(), DbError> {
+        let key = stake_change_key(subnet_id, stake_change.configuration_number);
+        trace!("Add stake change: {stake_change:#?}");
+        self.stake_changes_db.put(txn, &key, &stake_change)?;
+        Ok(())
+    }
+
+    fn confirm_stake_changes(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        confirmed_block_height: u64,
+        confirmed_block_hash: BlockHash,
+    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+        // Get all stake changes for the subnet
+        let stake_changes = self.get_all_stake_changes(subnet_id)?;
+
+        // Filter unconfirmed stake changes
+        let mut updated_changes = Vec::new();
+
+        for mut change in stake_changes {
+            // Check if the stake change is unconfirmed
+            if change.checkpoint_block_height.is_none() {
+                // Set the confirmation details
+                change.checkpoint_block_height = Some(confirmed_block_height);
+                change.checkpoint_block_hash = Some(confirmed_block_hash);
+
+                // Update in the database
+                let key = stake_change_key(subnet_id, change.configuration_number);
+                self.stake_changes_db.put(txn, &key, &change)?;
+
+                // Add to the list of updated changes
+                updated_changes.push(change);
+            }
+        }
+
+        Ok(updated_changes)
     }
 }
 

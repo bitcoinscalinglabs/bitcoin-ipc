@@ -515,7 +515,9 @@ where
                 join_subnet_msg.validate_for_subnet(&genesis_info, &subnet_state)?;
 
                 join_subnet_msg.validate()?;
-                if let Some(subnet) = join_subnet_msg.save_to_db(&self.db, block_height, txid)? {
+                if let Some(subnet) =
+                    join_subnet_msg.save_to_db(&self.db, block_height, block_hash, txid)?
+                {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
                     self.import_watchonly_address(committee_addr, label, block_time);
@@ -560,6 +562,12 @@ where
                 // we need it available for any batch transfer messages
                 let mut wtxn = self.db.write_txn()?;
                 self.db.save_transaction(&mut wtxn, tx)?;
+                self.db.confirm_stake_changes(
+                    &mut wtxn,
+                    msg.subnet_id,
+                    block_height,
+                    block_hash,
+                )?;
                 wtxn.commit().map_err(db::DbError::from)?;
 
                 info!(

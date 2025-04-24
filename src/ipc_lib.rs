@@ -488,6 +488,7 @@ impl IpcJoinSubnetMsg {
         &self,
         db: &D,
         block_height: u64,
+        block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<Option<db::SubnetState>, IpcLibError> {
         let mut genesis_info =
@@ -556,9 +557,41 @@ impl IpcJoinSubnetMsg {
 
             subnet.next_committee = Some(next_commitee);
 
+            let stake_change_configuration_number =
+                db.get_next_stake_change_configuration_number(self.subnet_id)?;
+
+            // Join
+            let stake_change_join = db::StakeChangeRequest {
+                change: db::StakingChange::Join {
+                    pubkey: self.pubkey.public_key(bitcoin::secp256k1::Parity::Even),
+                },
+                validator_xpk: self.pubkey,
+                block_height,
+                block_hash,
+                checkpoint_block_height: None,
+                checkpoint_block_hash: None,
+                configuration_number: stake_change_configuration_number,
+                txid,
+            };
+            // Deposit
+            let stake_change = db::StakeChangeRequest {
+                change: db::StakingChange::Deposit {
+                    amount: self.collateral,
+                },
+                validator_xpk: self.pubkey,
+                block_height,
+                block_hash,
+                checkpoint_block_height: None,
+                checkpoint_block_hash: None,
+                configuration_number: stake_change_configuration_number + 1,
+                txid,
+            };
+
             // Write to DB
             let mut wtxn = db.write_txn()?;
             db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet)?;
+            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change_join)?;
+            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
             wtxn.commit()?;
 
             Ok(None)

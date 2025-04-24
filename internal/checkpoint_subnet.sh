@@ -44,7 +44,7 @@ RANDOM_HASH=$(openssl rand -hex 32)
 CURRENT_BLOCK=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$CURRENT_BLOCK")
 
-DESTINATION_SUBNET_ID_1="/b4/t410fdmafb4l6rb2cqa5zass2qmdr67drvxejlkvpdca"
+DESTINATION_SUBNET_ID_1="/b4/t410flvvhb2htwqlujcxras5v5wludcmruhvxfueyiji"
 
 echo "Current block: $CURRENT_BLOCK ($BLOCK_HASH)"
 echo "Using checkpoint hash: $RANDOM_HASH"

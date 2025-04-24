@@ -168,6 +168,19 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getstakechanges",
+    "params": {
+			"subnet_id": "/b4/t410fpy5hpfsz5c3yve4r27eu7kew7fnfpjrdetgn46q",
+			"block_height": 1194
+    },
+    "id": 1
+}' | jq
+
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \

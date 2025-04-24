@@ -344,7 +344,10 @@ pub async fn get_rootnet_messages(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetRootnetMessagesParams>,
 ) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
-    info!("getrootnetmessages: {}", params.subnet_id);
+    info!(
+        "getrootnetmessages: {} at {}",
+        params.subnet_id, params.block_height
+    );
 
     // Check subnet exists
     data.db
@@ -910,6 +913,43 @@ pub async fn finalize_checkpoint_psbt(
     })
 }
 
+// Stake changes
+
+#[derive(Serialize, Deserialize)]
+pub struct GetStakeChangesParams {
+    subnet_id: SubnetId,
+    block_height: u64,
+}
+
+pub async fn get_stake_changes(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetStakeChangesParams>,
+) -> Result<Vec<db::StakeChangeRequest>, JsonRpcError> {
+    info!(
+        "getstakechanges: {} at {}",
+        params.subnet_id, params.block_height
+    );
+
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    data.db
+        .get_stake_changes_by_height(params.subnet_id, params.block_height)
+        .map_err(|e| {
+            error!("Error getting stake changes from Db: {}", e);
+            RpcError::DbError(e).into()
+        })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -930,8 +970,10 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
-        .with_method("dev_multisignpsbt", dev_multisign_psbt) // dev only
+        .with_method("dev_multisignpsbt", dev_multisign_psbt) // TODO make dev only
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
+        // stake changes
+        .with_method("getstakechanges", get_stake_changes)
         .finish()
 }
