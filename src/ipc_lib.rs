@@ -560,12 +560,15 @@ impl IpcJoinSubnetMsg {
             let stake_change_configuration_number =
                 db.get_next_stake_change_configuration_number(self.subnet_id)?;
 
+            let validator_subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
+
             // Join
             let stake_change_join = db::StakeChangeRequest {
                 change: db::StakingChange::Join {
                     pubkey: self.pubkey.public_key(bitcoin::secp256k1::Parity::Even),
                 },
                 validator_xpk: self.pubkey,
+                validator_subnet_address,
                 block_height,
                 block_hash,
                 checkpoint_block_height: None,
@@ -579,6 +582,7 @@ impl IpcJoinSubnetMsg {
                     amount: self.collateral,
                 },
                 validator_xpk: self.pubkey,
+                validator_subnet_address,
                 block_height,
                 block_hash,
                 checkpoint_block_height: None,

@@ -510,8 +510,10 @@ pub enum StakingChange {
 pub struct StakeChangeRequest {
     /// Change request
     pub change: StakingChange,
-    /// XOnlyPublicKey of the validator making requesting stake change
+    /// XOnlyPublicKey of the validator requesting stake change
     pub validator_xpk: XOnlyPublicKey,
+    /// The ethereum address of the validator pubkey
+    pub validator_subnet_address: alloy_primitives::Address,
     /// Configuration number is practically an incremental "nonce"
     /// of a single change request/event
     pub configuration_number: u64,
