@@ -1168,7 +1168,8 @@ impl Database for HeedDb {
         let last_number = self.get_last_stake_change_configuration_number(subnet_id)?;
         let next_number = match last_number {
             Some(n) => n + 1,
-            None => 0,
+            // Configuration number starts with 1
+            None => 1,
         };
 
         Ok(next_number)
