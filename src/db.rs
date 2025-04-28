@@ -1114,7 +1114,7 @@ impl Database for HeedDb {
     }
 
     /// Returns all stake changes for a given subnet
-    /// for a given height, looking at *confirmed* block height
+    /// for a given height
     fn get_stake_changes_by_height(
         &self,
         subnet_id: SubnetId,
@@ -1129,10 +1129,7 @@ impl Database for HeedDb {
             .map(|res| res.map(|(_, change)| change))
             .filter_map(|res| match res {
                 Ok(change) => {
-                    if change
-                        .checkpoint_block_height
-                        .is_some_and(|cbh| cbh == block_height)
-                    {
+                    if change.block_height == block_height {
                         Some(Ok(change))
                     } else {
                         None
