@@ -9,6 +9,7 @@ use log::error;
 use log::trace;
 use log::warn;
 use log::{debug, info};
+use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -398,7 +399,7 @@ impl IpcJoinSubnetMsg {
         // Check if the validator with this public key is already registered
         // and waiting in the next committee
         if subnet
-            .next_committee
+            .waiting_committee
             .as_ref()
             .is_some_and(|c| c.is_validator(&self.pubkey))
         {
@@ -539,7 +540,7 @@ impl IpcJoinSubnetMsg {
             }
 
             let mut next_commitee = subnet
-                .next_committee
+                .waiting_committee
                 .unwrap_or_else(|| subnet.committee.clone());
 
             if next_commitee.is_validator(&self.pubkey) {
@@ -554,8 +555,7 @@ impl IpcJoinSubnetMsg {
             }
 
             next_commitee.join_validator(&subnet.id, &new_validator)?;
-
-            subnet.next_committee = Some(next_commitee);
+            subnet.waiting_committee = Some(next_commitee.clone());
 
             let stake_change_configuration_number =
                 db.get_next_stake_change_configuration_number(self.subnet_id)?;
@@ -569,11 +569,13 @@ impl IpcJoinSubnetMsg {
                 },
                 validator_xpk: self.pubkey,
                 validator_subnet_address,
+                configuration_number: stake_change_configuration_number,
+                committee_after_change: next_commitee.clone(),
+
                 block_height,
                 block_hash,
                 checkpoint_block_height: None,
                 checkpoint_block_hash: None,
-                configuration_number: stake_change_configuration_number,
                 txid,
             };
             // Deposit
@@ -583,11 +585,13 @@ impl IpcJoinSubnetMsg {
                 },
                 validator_xpk: self.pubkey,
                 validator_subnet_address,
+                configuration_number: stake_change_configuration_number + 1,
+                committee_after_change: next_commitee.clone(),
+
                 block_height,
                 block_hash,
                 checkpoint_block_height: None,
                 checkpoint_block_hash: None,
-                configuration_number: stake_change_configuration_number + 1,
                 txid,
             };
 
@@ -1195,6 +1199,8 @@ pub struct IpcCheckpointSubnetMsg {
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// The checkpoint height of child chain
     pub checkpoint_height: u64,
+    /// Committee configuration number
+    pub next_committee_configuration_number: u64,
     /// Withdrawals
     #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
@@ -1286,18 +1292,22 @@ impl IpcCheckpointSubnetMsg {
     const MARKERS_LEN: usize = 2;
     // u64 length
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
+    // u64 length
+    const COMMITTEE_CONF_LEN: usize = std::mem::size_of::<u64>();
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
         + SubnetId::INNER_LEN
         + bitcoin::hashes::sha256::Hash::LEN
         + Self::MARKERS_LEN
-        + Self::HEIGHT_LEN;
+        + Self::HEIGHT_LEN
+        + Self::COMMITTEE_CONF_LEN;
 
     const TAG_OFFSET: usize = 0;
     const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
     const HASH_OFFSET: usize = Self::TXID_OFFSET + SubnetId::INNER_LEN;
     const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
     const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
+    const COMMITTEE_CONF_OFFSET: usize = Self::MARKERS_OFFSET + Self::MARKERS_LEN;
 
     fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
@@ -1321,6 +1331,10 @@ impl IpcCheckpointSubnetMsg {
         // Set marker values
         op_return_data[Self::MARKERS_OFFSET] = self.withdrawals.len().min(255) as u8; // Withdrawal count
         op_return_data[Self::MARKERS_OFFSET + 1] = self.transfers.len().min(255) as u8; // Transfer count
+
+        // Add committee configuration number
+        op_return_data[Self::COMMITTEE_CONF_OFFSET..]
+            .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
         let push_bytes: &bitcoin::script::PushBytes =
             (&op_return_data[..]).try_into().expect("the size is okay");
@@ -1701,7 +1715,7 @@ impl IpcCheckpointSubnetMsg {
     ///
     /// The checkpoint transaction has:
     /// 1. An OP_RETURN output with metadata in the format:
-    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 1-byte withdrawal count | 1-byte transfer count]
+    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 1-byte withdrawal count | 1-byte transfer count | 8-byte committee configuration number]
     /// 2. Withdrawal outputs for each withdrawal
     /// 3. Optional batch transfer commit output if transfers exist
     /// 4. Transfer outputs for each transfer
@@ -1770,6 +1784,13 @@ impl IpcCheckpointSubnetMsg {
         // Extract marker values
         let withdrawals_count = op_return_data[Self::MARKERS_OFFSET] as usize;
         let transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
+
+        // Extract committee configuration number
+        let committee_conf_bytes = &op_return_data[Self::COMMITTEE_CONF_OFFSET..];
+        let next_committee_configuration_number =
+            u64::from_le_bytes(committee_conf_bytes.try_into().map_err(|_| {
+                err("Failed to convert committee configuration number bytes to u64".to_string())
+            })?);
 
         // Check if we have enough outputs for all the withdrawals and transfers
         let expected_outputs = 1 + // metadata
@@ -1863,6 +1884,7 @@ impl IpcCheckpointSubnetMsg {
             subnet_id,
             checkpoint_hash,
             checkpoint_height,
+            next_committee_configuration_number,
             withdrawals,
             transfers,
             change_address,
@@ -1879,8 +1901,8 @@ impl IpcCheckpointSubnetMsg {
         &self,
         db: &D,
         block_height: u64,
+        block_hash: bitcoin::BlockHash,
         txid: Txid,
-        // batch_transfer_txid: Option<Txid>,
     ) -> Result<db::SubnetCheckpoint, IpcLibError> {
         // Get the current subnet state
         let mut subnet_state = db.get_subnet_state(self.subnet_id)?.ok_or_else(|| {
@@ -1888,6 +1910,62 @@ impl IpcCheckpointSubnetMsg {
         })?;
 
         let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
+        let last_committee_configuration_number = subnet_state.committee.configuration_number;
+
+        let stake_change = if
+        // If next_committee_configuration_number is zero, it "could mean" no change
+        self.next_committee_configuration_number.is_zero()
+            || self.next_committee_configuration_number == last_committee_configuration_number
+        {
+            // No committee rotation, no stake change
+            None
+        } else {
+            if self.next_committee_configuration_number < last_committee_configuration_number {
+                return Err(IpcValidateError::InvalidField(
+                    "next_committee_configuration_number",
+                    format!(
+                        "Next committee configuration number {} is less than the last one {}",
+                        self.next_committee_configuration_number,
+                        last_committee_configuration_number
+                    ),
+                )
+                .into());
+            }
+
+            let stake_change =
+                db.get_stake_change(self.subnet_id, self.next_committee_configuration_number)?;
+
+            if stake_change.is_none() {
+                return Err(IpcValidateError::InvalidField(
+                    "next_committee_configuration_number",
+                    format!(
+                        "Stake change for committee configuration number {} does not exist",
+                        self.next_committee_configuration_number
+                    ),
+                )
+                .into());
+            }
+
+            stake_change
+        };
+
+        let next_committee = stake_change.clone().map(|sc| sc.committee_after_change);
+
+        let (next_committee_number, next_configuration_number) =
+            if let Some(stake_change) = stake_change {
+                // Increment the committee number
+                // And use the new configuration number
+                (
+                    subnet_state.committee_number + 1,
+                    stake_change.configuration_number,
+                )
+            } else {
+                // No committee rotation, use the current committee number
+                (
+                    subnet_state.committee_number,
+                    subnet_state.committee.configuration_number,
+                )
+            };
 
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
@@ -1900,12 +1978,17 @@ impl IpcCheckpointSubnetMsg {
             batch_transfer_txid: None,
             batch_transfer_block_height: None,
             signed_committee_number: subnet_state.committee_number,
-            // No committee rotation yet
-            next_committee_number: subnet_state.committee_number,
+            next_committee_number,
+            next_configuration_number,
         };
 
         // Update the checkpoint number in subnet state
         subnet_state.last_checkpoint_number = Some(checkpoint_number);
+
+        // Update subnet state with the new committee
+        if let Some(next_committee) = &next_committee {
+            subnet_state.rotate_to_committee(next_committee.clone());
+        }
 
         // Begin a database transaction
         let mut wtxn = db.write_txn()?;
@@ -1913,6 +1996,24 @@ impl IpcCheckpointSubnetMsg {
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
         // Save the checkpoint record
         db.save_checkpoint(&mut wtxn, self.subnet_id, &checkpoint, checkpoint_number)?;
+        // Save new committee if changed
+        if let Some(next_committee) = &next_committee {
+            db.save_committee(
+                &mut wtxn,
+                self.subnet_id,
+                next_committee_number,
+                next_committee,
+            )?;
+
+            // Update the stake changes
+            db.confirm_stake_changes(
+                &mut wtxn,
+                self.subnet_id,
+                self.next_committee_configuration_number,
+                block_height,
+                block_hash,
+            )?;
+        }
 
         // Commit the transaction
         wtxn.commit()?;
@@ -3089,6 +3190,7 @@ mod checkpoint_msg_tests {
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 30, // arbitrary test number
         }
     }
 
@@ -3232,6 +3334,7 @@ mod checkpoint_msg_tests {
             withdrawals: vec![withdrawal, withdrawal2],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -3310,6 +3413,7 @@ mod checkpoint_msg_tests {
             withdrawals: vec![],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -3460,6 +3564,7 @@ mod checkpoint_msg_tests {
             withdrawals: vec![],
             transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;

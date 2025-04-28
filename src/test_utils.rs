@@ -126,6 +126,7 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
     let multisig_address = multisig_address.as_unchecked();
 
     let committee = db::SubnetCommittee {
+        configuration_number: 0,
         validators,
         threshold: min_validators,
         multisig_address: multisig_address.clone(),
@@ -136,7 +137,7 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         id: subnet_id,
         committee_number: 1,
         committee,
-        next_committee: None,
+        waiting_committee: None,
         last_checkpoint_number: None,
     }
 }

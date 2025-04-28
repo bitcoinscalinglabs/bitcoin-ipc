@@ -46,7 +46,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t410fpy5hpfsz5c3yve4r27eu7kew7fnfpjrdetgn46q",
+			"subnet_id": "/b4/t410fe53urhgvv6rfdevyyhz6s5p75lnq3w33za2zzdy",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -122,7 +122,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t410fup22efdbdpdg5rebem5f2cud6fegnm7qedmoknq"
+			"subnet_id": "/b4/t410fe53urhgvv6rfdevyyhz6s5p75lnq3w33za2zzdy"
     },
     "id": 1
 }' | jq

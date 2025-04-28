@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
 use thiserror::Error;
 
+/// Genesis committee configuration number
+const GENESIS_COMMITTEE_CONF_NUM: u64 = 0;
+
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
 // subnet_genesis_info:<subnet_id>
 const SUBNET_GENESIS_INFO_KEY: &str = "subnet_genesis_info:";
@@ -94,7 +97,7 @@ trait SubnetValidators {
     fn total_power(&self) -> Power;
     fn threshold(&self) -> Power;
     fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked>;
-    fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee;
+    fn to_committee(&self, subnet_id: &SubnetId, configuration_number: u64) -> SubnetCommittee;
 
     fn add_validator(&mut self, validator: &SubnetValidator) -> Result<(), DbError>;
     #[allow(unused)]
@@ -120,8 +123,9 @@ impl SubnetValidators for Vec<SubnetValidator> {
         multisig_address.into_unchecked()
     }
 
-    fn to_committee(&self, subnet_id: &SubnetId) -> SubnetCommittee {
+    fn to_committee(&self, subnet_id: &SubnetId, configuration_number: u64) -> SubnetCommittee {
         SubnetCommittee {
+            configuration_number,
             threshold: self.threshold(),
             validators: self.to_vec(),
             multisig_address: self.multisig_address(subnet_id),
@@ -164,6 +168,8 @@ impl SubnetValidators for Vec<SubnetValidator> {
 /// The committee of a subnet
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubnetCommittee {
+    /// The configuration number id of this committee
+    pub configuration_number: u64,
     /// The threshold for the multisig
     pub threshold: Power,
     /// The current list of validators, with their balances
@@ -233,6 +239,7 @@ impl SubnetCommittee {
         subnet_id: &SubnetId,
         validator: &SubnetValidator,
     ) -> Result<(), DbError> {
+        self.configuration_number += 1;
         self.validators.add_validator(validator)?;
         self.threshold = self.validators.threshold();
         self.multisig_address = self.validators.multisig_address(subnet_id);
@@ -261,6 +268,8 @@ pub struct SubnetCheckpoint {
     pub signed_committee_number: u64,
     /// The number of the next committee (different if rotation happened)
     pub next_committee_number: u64,
+    /// The next committee configuration number
+    pub next_configuration_number: u64,
 }
 
 /// The current state of a subnet
@@ -275,8 +284,15 @@ pub struct SubnetState {
     pub committee_number: u64,
     /// The current commitee
     pub committee: SubnetCommittee,
-    /// The next commitee, Some if it differs
-    pub next_committee: Option<SubnetCommittee>,
+    /// The waiting commitee, Some if it differ
+    ///
+    /// Waiting committee is the current committee plus
+    /// any stake change requests that are pending
+    /// Keep in mind that upon a checkpoint, not all
+    /// stake changes are guaranteed to be applied
+    /// We keep this waiting committee to check for
+    /// double-joins and such.
+    pub waiting_committee: Option<SubnetCommittee>,
     /// The number of the last checkpoint
     pub last_checkpoint_number: Option<u64>,
 }
@@ -307,19 +323,36 @@ impl SubnetState {
     }
 
     pub fn is_waiting_validator(&self, pubkey: &XOnlyPublicKey) -> bool {
-        self.next_committee
+        self.waiting_committee
             .as_ref()
             .is_some_and(|nc| nc.is_validator(pubkey))
     }
 
     pub fn needs_rotation(&self) -> bool {
-        self.next_committee
+        self.waiting_committee
             .as_ref()
             .is_some_and(|nc| self.committee != *nc)
     }
 
-    pub fn rotate_to_next_committee(&mut self) -> Result<(), DbError> {
-        if let Some(next_committee) = self.next_committee.take() {
+    pub fn rotate_to_committee(&mut self, new_committee: SubnetCommittee) {
+        if self.committee == new_committee {
+            return;
+        }
+
+        if self
+            .waiting_committee
+            .as_ref()
+            .is_some_and(|wc| *wc == new_committee)
+        {
+            self.waiting_committee = None
+        }
+
+        self.committee = new_committee;
+        self.committee_number += 1;
+    }
+
+    pub fn rotate_to_waiting_committee(&mut self) -> Result<(), DbError> {
+        if let Some(next_committee) = self.waiting_committee.take() {
             self.committee = next_committee;
             self.committee_number += 1;
             Ok(())
@@ -417,8 +450,10 @@ impl SubnetGenesisInfo {
             id: self.subnet_id,
             committee_number: 1,
             last_checkpoint_number: None,
-            committee: self.genesis_validators.to_committee(&self.subnet_id),
-            next_committee: None,
+            committee: self
+                .genesis_validators
+                .to_committee(&self.subnet_id, GENESIS_COMMITTEE_CONF_NUM),
+            waiting_committee: None,
         }
     }
 
@@ -517,6 +552,8 @@ pub struct StakeChangeRequest {
     /// Configuration number is practically an incremental "nonce"
     /// of a single change request/event
     pub configuration_number: u64,
+    /// State of the committee after the change was applied
+    pub committee_after_change: SubnetCommittee,
 
     /// The block height of the Bitcoin block where the change request was recorded
     pub block_height: u64,
@@ -787,9 +824,10 @@ pub trait Database {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
+        max_configuration_number: u64,
         confirmed_block_height: u64,
         confirmed_block_hash: BlockHash,
-    ) -> Result<Vec<StakeChangeRequest>, DbError>;
+    ) -> Result<(Option<StakeChangeRequest>, Vec<StakeChangeRequest>), DbError>;
 }
 
 #[async_trait]
@@ -1168,8 +1206,7 @@ impl Database for HeedDb {
         let last_number = self.get_last_stake_change_configuration_number(subnet_id)?;
         let next_number = match last_number {
             Some(n) => n + 1,
-            // Configuration number starts with 1
-            None => 1,
+            None => GENESIS_COMMITTEE_CONF_NUM + 1,
         };
 
         Ok(next_number)
@@ -1191,18 +1228,24 @@ impl Database for HeedDb {
         &self,
         txn: &mut RwTxn,
         subnet_id: SubnetId,
+        max_configuration_number: u64,
         confirmed_block_height: u64,
         confirmed_block_hash: BlockHash,
-    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+    ) -> Result<(Option<StakeChangeRequest>, Vec<StakeChangeRequest>), DbError> {
         // Get all stake changes for the subnet
         let stake_changes = self.get_all_stake_changes(subnet_id)?;
 
-        // Filter unconfirmed stake changes
-        let mut updated_changes = Vec::new();
+        // Filter unconfirmed stake changes that are up to the specified configuration number
+        let mut last_confirmed: Option<StakeChangeRequest> = None;
+        let mut confirmed_changes = Vec::new();
 
         for mut change in stake_changes {
-            // Check if the stake change is unconfirmed
-            if change.checkpoint_block_height.is_none() {
+            // Only process changes that:
+            // 1. Are not yet confirmed (checkpoint_block_height is None)
+            // 2. Have a configuration number <= max_configuration_number
+            if change.checkpoint_block_height.is_none()
+                && change.configuration_number <= max_configuration_number
+            {
                 // Set the confirmation details
                 change.checkpoint_block_height = Some(confirmed_block_height);
                 change.checkpoint_block_hash = Some(confirmed_block_hash);
@@ -1211,12 +1254,19 @@ impl Database for HeedDb {
                 let key = stake_change_key(subnet_id, change.configuration_number);
                 self.stake_changes_db.put(txn, &key, &change)?;
 
-                // Add to the list of updated changes
-                updated_changes.push(change);
+                // Update the last confirmed change if this one has a higher configuration number
+                if last_confirmed.as_ref().map_or(true, |last| {
+                    change.configuration_number > last.configuration_number
+                }) {
+                    last_confirmed = Some(change.clone());
+                }
+
+                // Add to the list of confirmed changes
+                confirmed_changes.push(change);
             }
         }
 
-        Ok(updated_changes)
+        Ok((last_confirmed, confirmed_changes))
     }
 }
 
@@ -1501,7 +1551,7 @@ mod tests {
         initial_validators.push(validator1);
         initial_validators.push(validator2);
 
-        let mut committee = initial_validators.to_committee(&subnet_id);
+        let mut committee = initial_validators.to_committee(&subnet_id, 0);
 
         // Verify initial state
         assert_eq!(committee.validators.len(), 2);
@@ -1599,20 +1649,20 @@ mod tests {
         let mut current_validators = Vec::new();
         current_validators.push(validator1.clone());
         current_validators.push(validator2.clone());
-        let current_committee = current_validators.to_committee(&subnet_id);
+        let current_committee = current_validators.to_committee(&subnet_id, 1);
 
         // Create next committee with validators 1 and 3
         let mut next_validators = Vec::new();
         next_validators.push(validator1.clone());
         next_validators.push(validator3.clone());
-        let next_committee = next_validators.to_committee(&subnet_id);
+        let next_committee = next_validators.to_committee(&subnet_id, 2);
 
         // Create subnet state
         let mut subnet_state = SubnetState {
             id: subnet_id,
             committee_number: 1,
             committee: current_committee.clone(),
-            next_committee: Some(next_committee.clone()),
+            waiting_committee: Some(next_committee.clone()),
             last_checkpoint_number: None,
         };
 
@@ -1626,7 +1676,7 @@ mod tests {
         assert!(!subnet_state.committee.is_validator(&pubkey3));
 
         // Perform rotation
-        subnet_state.rotate_to_next_committee().unwrap();
+        subnet_state.rotate_to_waiting_committee().unwrap();
 
         // Verify committee was updated
         assert_eq!(subnet_state.committee_number, 2); // Committee number incremented
@@ -1635,13 +1685,13 @@ mod tests {
         assert!(subnet_state.committee.is_validator(&pubkey3)); // New validator added
 
         // Verify next_committee was consumed
-        assert!(subnet_state.next_committee.is_none());
+        assert!(subnet_state.waiting_committee.is_none());
 
         // Verify needs_rotation now returns false
         assert!(!subnet_state.needs_rotation());
 
         // Verify error when trying to rotate with no next committee
-        let result = subnet_state.rotate_to_next_committee();
+        let result = subnet_state.rotate_to_waiting_committee();
         assert!(result.is_err());
 
         // Verify state didn't change after failed rotation
@@ -1718,8 +1768,8 @@ mod tests {
         validators_set2.push(validator1_set2);
         validators_set2.push(validator2_set2);
 
-        let committee1 = validators_set1.to_committee(&subnet_id);
-        let committee2 = validators_set2.to_committee(&subnet_id);
+        let committee1 = validators_set1.to_committee(&subnet_id, 0);
+        let committee2 = validators_set2.to_committee(&subnet_id, 0);
 
         // Verify both committees have the same validators (by pubkey)
         assert_eq!(committee1.pubkeys(), committee2.pubkeys());

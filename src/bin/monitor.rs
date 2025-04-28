@@ -556,18 +556,12 @@ where
                 debug!("Found IPC message: {:#?}", msg);
 
                 msg.validate()?;
-                let checkpoint = msg.save_to_db(&self.db, block_height, txid)?;
+                let checkpoint = msg.save_to_db(&self.db, block_height, block_hash, txid)?;
 
                 // Save the checkpoint tx to db
                 // we need it available for any batch transfer messages
                 let mut wtxn = self.db.write_txn()?;
                 self.db.save_transaction(&mut wtxn, tx)?;
-                self.db.confirm_stake_changes(
-                    &mut wtxn,
-                    msg.subnet_id,
-                    block_height,
-                    block_hash,
-                )?;
                 wtxn.commit().map_err(db::DbError::from)?;
 
                 info!(
