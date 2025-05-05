@@ -335,6 +335,13 @@ impl SubnetState {
     }
 
     pub fn rotate_to_committee(&mut self, new_committee: SubnetCommittee) {
+        trace!(
+            "subnet id {} rotating committees. prev={:?} next={:?}",
+            self.id,
+            self.committee,
+            new_committee
+        );
+
         if self.committee == new_committee {
             return;
         }
@@ -1255,9 +1262,10 @@ impl Database for HeedDb {
                 self.stake_changes_db.put(txn, &key, &change)?;
 
                 // Update the last confirmed change if this one has a higher configuration number
-                if last_confirmed.as_ref().map_or(true, |last| {
-                    change.configuration_number > last.configuration_number
-                }) {
+                if last_confirmed
+                    .as_ref()
+                    .is_none_or(|last| change.configuration_number > last.configuration_number)
+                {
                     last_confirmed = Some(change.clone());
                 }
 

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use bitcoin::BlockHash;
 use bitcoin_ipc::db::{self, Database, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
@@ -560,9 +560,32 @@ where
 
                 // Save the checkpoint tx to db
                 // we need it available for any batch transfer messages
-                let mut wtxn = self.db.write_txn()?;
-                self.db.save_transaction(&mut wtxn, tx)?;
-                wtxn.commit().map_err(db::DbError::from)?;
+                {
+                    let mut wtxn = self.db.write_txn()?;
+                    self.db.save_transaction(&mut wtxn, tx)?;
+                    wtxn.commit().map_err(db::DbError::from)?;
+                }
+
+                // import new address if the committee changed
+                if checkpoint.signed_committee_number != checkpoint.next_committee_number {
+                    // get the update subnet state from the database
+                    let subnet = self
+                        .db
+                        .get_subnet_state(msg.subnet_id)
+                        .map_err(MonitorError::DbError)?
+                        // Should never happen
+                        .ok_or(IpcValidateError::InvalidMsg(
+                            "Could not fetch subnet id after a checkpoint".to_string(),
+                        ))?;
+
+                    info!(
+                        "Committee changed for Subnet ID: {}, importing address.",
+                        msg.subnet_id
+                    );
+
+                    let (new_committee_addr, new_label) = subnet.committee_address_label();
+                    self.import_watchonly_address(new_committee_addr, new_label, block_time);
+                }
 
                 info!(
                     "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {}",

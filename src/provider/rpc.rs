@@ -12,6 +12,7 @@ use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::{error, info, trace};
+use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -489,6 +490,7 @@ pub async fn gen_multisig_spend_psbt(
         commitee_threshold,
         &committee_address,
         &unspent,
+        false,
         &[bitcoin::TxOut {
             value: params.amount,
             script_pubkey: recipient.script_pubkey(),
@@ -603,8 +605,48 @@ pub async fn gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
+    // assume no change in the committee
+    let mut next_committee = subnet.committee.clone();
+    let current_committee_configuration = subnet.committee.configuration_number;
+
+    // update next_committee if the configuration number changed
+    if msg.next_committee_configuration_number > current_committee_configuration {
+        next_committee = data
+            .db
+            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
+            .map_err(|e| {
+                error!("Error getting stake change from Db: {}", e);
+                RpcError::DbError(e)
+            })?
+            .ok_or(RpcError::InvalidParams(format!(
+                "Stake change with configuration number {} not found.",
+                msg.next_committee_configuration_number
+            )))?
+            .committee_after_change;
+
+        info!(
+            "Rotating committee to configuration number {} multisig address {}",
+            msg.next_committee_configuration_number,
+            next_committee.address_checked()
+        );
+    }
+    // no change if the configuration number is zero or the same
+    else if msg.next_committee_configuration_number.is_zero()
+        || msg.next_committee_configuration_number == current_committee_configuration
+    {
+        trace!("gen_checkpoint_psbt: no change to the committee configuration")
+    }
+    // error if the configuration number is less than the current one, unexpected
+    else {
+        return Err(RpcError::InvalidParams(format!(
+            "Invalid next committee configuration number: {}",
+            msg.next_committee_configuration_number
+        ))
+        .into());
+    }
+
     let unsigned_psbt = msg
-        .to_checkpoint_psbt(&subnet.committee, fee_rate, &unspent)
+        .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
         .map_err(|e| {
             error!(
                 "Error generating checkpoint psbt for subnet_id={}: {}",

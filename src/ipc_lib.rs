@@ -1585,9 +1585,13 @@ impl IpcCheckpointSubnetMsg {
 
     /// Makes a unsigned checkpoint transaction that includes checkpoint data
     /// withdrawals and transfers
+    ///
+    /// When the next_committee is different from the current committee,
+    /// all of the UTXOs are exhausted.
     pub fn to_checkpoint_psbt(
         &self,
         committee: &db::SubnetCommittee,
+        next_committee: &db::SubnetCommittee,
         fee_rate: bitcoin::FeeRate,
         unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     ) -> Result<bitcoin::Psbt, IpcLibError> {
@@ -1596,7 +1600,9 @@ impl IpcCheckpointSubnetMsg {
             self.subnet_id
         );
 
-        let committee_change_address = committee.address_checked();
+        // Check if committee rotation is happening
+        let exhaust_unspent = committee != next_committee;
+        let committee_change_address = next_committee.address_checked();
 
         let mut tx_outs = vec![];
 
@@ -1683,6 +1689,7 @@ impl IpcCheckpointSubnetMsg {
             committee.threshold,
             &committee_change_address,
             unspent,
+            exhaust_unspent,
             &tx_outs,
             &fee_rate,
         )?;
@@ -1693,8 +1700,9 @@ impl IpcCheckpointSubnetMsg {
             &self.subnet_id,
             &committee_keys,
             committee.threshold,
-            &committee.address_checked(),
+            &committee_change_address,
             unspent,
+            exhaust_unspent,
             &tx_outs,
             &fee_rate,
         )?;
@@ -1946,6 +1954,11 @@ impl IpcCheckpointSubnetMsg {
                 .into());
             }
 
+            debug!(
+                "Processing stake changes for checkpoint. Up to stake change {:?}",
+                stake_change
+            );
+
             stake_change
         };
 
@@ -2019,8 +2032,8 @@ impl IpcCheckpointSubnetMsg {
         wtxn.commit()?;
 
         debug!(
-            "Saved checkpoint #{} for subnet {} with txid {}",
-            checkpoint_number, self.subnet_id, txid
+            "Saved checkpoint #{} for subnet {} with txid {}. Checkpoint = {:?}",
+            checkpoint_number, self.subnet_id, txid, checkpoint
         );
 
         Ok(checkpoint)
@@ -3228,7 +3241,7 @@ mod checkpoint_msg_tests {
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3341,7 +3354,7 @@ mod checkpoint_msg_tests {
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3420,7 +3433,7 @@ mod checkpoint_msg_tests {
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3571,7 +3584,7 @@ mod checkpoint_msg_tests {
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
