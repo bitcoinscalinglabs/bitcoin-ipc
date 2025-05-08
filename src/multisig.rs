@@ -117,7 +117,10 @@ pub fn create_subnet_multisig_address(
 
 pub fn multisig_threshold(total_power: Power) -> Power {
     // TODO figure out threshold
-    (total_power / 2) + 1
+    // total_weight * 2 / 3 + 1
+    // see quorum_threshold in ipc
+    // (total_power / 2) + 1
+    total_power * 2 / 3 + 1
 }
 
 // TODO figure out scaling factor
