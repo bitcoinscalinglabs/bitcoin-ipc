@@ -46,7 +46,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t410frrlhcnglpz3ka6kcp4b2wltlxbugdaxiacw2vfq",
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -64,7 +64,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t410frrlhcnglpz3ka6kcp4b2wltlxbugdaxiacw2vfq",
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -140,7 +140,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t410frrlhcnglpz3ka6kcp4b2wltlxbugdaxiacw2vfq"
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq"
     },
     "id": 1
 }' | jq
@@ -193,8 +193,8 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getstakechanges",
     "params": {
-			"subnet_id": "/b4/t410fpy5hpfsz5c3yve4r27eu7kew7fnfpjrdetgn46q",
-			"block_height": 1194
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
+			"block_height": 1298
     },
     "id": 1
 }' | jq
