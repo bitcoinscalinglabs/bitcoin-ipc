@@ -239,7 +239,10 @@ impl SubnetCommittee {
         subnet_id: &SubnetId,
         validator: &SubnetValidator,
     ) -> Result<(), DbError> {
-        self.configuration_number += 1;
+        // Increase configuration number by 2
+        // since there is one stake change for the metadata (public key)
+        // and one stake change for the deposit
+        self.configuration_number += 2;
         self.validators.add_validator(validator)?;
         self.threshold = self.validators.threshold();
         self.multisig_address = self.validators.multisig_address(subnet_id);
