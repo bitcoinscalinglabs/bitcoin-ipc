@@ -1,0 +1,31 @@
+
+keystore_path = "~/.ipc"
+
+# Bitcoin Regtest
+[[subnets]]
+id = "/b4"
+
+[subnets.config]
+network_type = "btc"
+provider_http = "http://127.0.0.1:3033/api"
+auth_token = "validator4_auth_token"
+
+# Filecoin Calibration
+[[subnets]]
+id = "/r314159"
+
+[subnets.config]
+network_type = "fevm"
+provider_http = "https://api.calibration.node.glif.io/rpc/v1"
+gateway_addr = "0x1AEe8A878a22280fc2753b3C63571C8F895D2FE3"
+registry_addr = "0x0b4e239FF21b40120cDa817fba77bD1B366c1bcD"
+
+# Subnet template - uncomment and adjust before using
+# [[subnets]]
+# id = "/r314159/<SUBNET_ID>"
+
+# [subnets.config]
+# network_type = "fevm"
+# provider_http = "https://<RPC_ADDR>/"
+# gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
+# registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"

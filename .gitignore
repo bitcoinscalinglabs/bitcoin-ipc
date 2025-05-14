@@ -13,3 +13,6 @@ ipc_serde/target
 
 # DB directories
 /*_db
+
+# example .env files
+!internal/**/.env
