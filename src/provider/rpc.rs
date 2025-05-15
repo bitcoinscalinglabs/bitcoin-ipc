@@ -3,7 +3,7 @@ use crate::{
     db::{self, Database},
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
-        IpcPrefundSubnetMsg, IpcValidate, SubnetId,
+        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, NETWORK,
 };
@@ -955,6 +955,56 @@ pub async fn finalize_checkpoint_psbt(
     })
 }
 
+// Stake collateral
+
+#[derive(Serialize, Deserialize)]
+pub struct StakeCollateralResponse {
+    txid: bitcoin::Txid,
+}
+
+pub async fn stake_collateral(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcStakeCollateralMsg>,
+) -> Result<StakeCollateralResponse, JsonRpcError> {
+    info!(
+        "stakecollateral: {} {} {}",
+        msg.subnet_id, msg.pubkey, msg.amount
+    );
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid stake collateral message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_subnet(&subnet_state).map_err(|e| {
+        error!(
+            "Error validating stake collateral msg for subnet info: {}",
+            e
+        );
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    let txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(StakeCollateralResponse { txid })
+}
+
 // Stake changes
 
 #[derive(Serialize, Deserialize)]
@@ -1016,6 +1066,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
         // stake changes
+        .with_method("stakecollateral", stake_collateral)
         .with_method("getstakechanges", get_stake_changes)
         .finish()
 }

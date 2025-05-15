@@ -1,5 +1,6 @@
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
+use bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE;
 use bitcoin::Amount;
 use bitcoin::Transaction;
 use bitcoin::Txid;
@@ -49,6 +50,9 @@ pub const IPC_FUND_SUBNET_TAG: &str = "IPCFND";
 pub const IPC_CHECKPOINT_TAG: &str = "IPCCPT";
 pub const IPC_TRANSFER_TAG: &str = "IPCTFR";
 pub const IPC_DELETE_SUBNET_TAG: &str = "IPCDEL";
+pub const IPC_STAKE_TAG: &str = "IPCSTK";
+pub const IPC_UNSTAKE_TAG: &str = "IPCUST";
+pub const IPC_LEAVE_SUBNET_TAG: &str = "IPCLVE";
 
 // Static assertion to verify tag lengths at compile time
 const _: () = {
@@ -59,6 +63,9 @@ const _: () = {
     assert!(IPC_CHECKPOINT_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_TRANSFER_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_DELETE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_STAKE_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_UNSTAKE_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_LEAVE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
 };
 
 // Define the IPC tags enum
@@ -70,6 +77,9 @@ pub enum IpcTag {
     FundSubnet,
     CheckpointSubnet,
     BatchTransfer,
+    StakeCollateral,
+    UnstakeCollateral,
+    LeaveSubnet,
 }
 
 impl IpcTag {
@@ -81,6 +91,9 @@ impl IpcTag {
             Self::FundSubnet => IPC_FUND_SUBNET_TAG,
             Self::CheckpointSubnet => IPC_CHECKPOINT_TAG,
             Self::BatchTransfer => IPC_TRANSFER_TAG,
+            Self::StakeCollateral => IPC_STAKE_TAG,
+            Self::UnstakeCollateral => IPC_UNSTAKE_TAG,
+            Self::LeaveSubnet => IPC_LEAVE_SUBNET_TAG,
         }
     }
 }
@@ -539,11 +552,11 @@ impl IpcJoinSubnetMsg {
                 .into());
             }
 
-            let mut next_commitee = subnet
+            let mut next_committee = subnet
                 .waiting_committee
                 .unwrap_or_else(|| subnet.committee.clone());
 
-            if next_commitee.is_validator(&self.pubkey) {
+            if next_committee.is_validator(&self.pubkey) {
                 return Err(IpcValidateError::InvalidField(
                     "pubkey",
                     format!(
@@ -554,8 +567,8 @@ impl IpcJoinSubnetMsg {
                 .into());
             }
 
-            next_commitee.join_validator(&subnet.id, &new_validator)?;
-            subnet.waiting_committee = Some(next_commitee.clone());
+            next_committee.join_new_validator(&subnet.id, &new_validator)?;
+            subnet.waiting_committee = Some(next_committee.clone());
 
             let stake_change_configuration_number =
                 db.get_next_stake_change_configuration_number(self.subnet_id)?;
@@ -570,7 +583,7 @@ impl IpcJoinSubnetMsg {
                 validator_xpk: self.pubkey,
                 validator_subnet_address,
                 configuration_number: stake_change_configuration_number,
-                committee_after_change: next_commitee.clone(),
+                committee_after_change: next_committee.clone(),
 
                 block_height,
                 block_hash,
@@ -586,7 +599,7 @@ impl IpcJoinSubnetMsg {
                 validator_xpk: self.pubkey,
                 validator_subnet_address,
                 configuration_number: stake_change_configuration_number + 1,
-                committee_after_change: next_commitee.clone(),
+                committee_after_change: next_committee.clone(),
 
                 block_height,
                 block_hash,
@@ -2335,6 +2348,353 @@ impl IpcBatchTransferMsg {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcStakeCollateralMsg {
+    /// The subnet id of the subnet to stake
+    /// This is derived from 2nd output
+    /// that is sent to the subnet multisig address
+    pub subnet_id: SubnetId,
+    /// The amount to add to the validator stake
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub amount: bitcoin::Amount,
+    /// The pubkey of the validator
+    pub pubkey: bitcoin::XOnlyPublicKey,
+}
+
+impl IpcStakeCollateralMsg {
+    const MIN_STAKE_DIFF: f64 = 5.0;
+
+    // The total length of the op_return data - helper
+    const DATA_LEN: usize = IPC_TAG_LENGTH + SCHNORR_PUBLIC_KEY_SIZE;
+
+    pub fn validate_for_subnet(&self, subnet: &db::SubnetState) -> Result<(), IpcValidateError> {
+        // should never happen
+        if subnet.id != self.subnet_id {
+            return Err(IpcValidateError::InvalidField(
+                "subnet_id",
+                format!(
+                    "Subnet ID mismatch: expected {}, got {}",
+                    subnet.id, self.subnet_id
+                ),
+            ));
+        }
+
+        // Check if the validator with this public key is already registered
+        if !subnet.committee.is_validator(&self.pubkey) {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' must already be a validator in subnet {}",
+                self.pubkey, self.subnet_id,
+            )));
+        }
+
+        // Check diff of the collateral
+        let curr_collateral = subnet.total_collateral();
+        let new_collateral = curr_collateral + self.amount;
+        let diff = ((new_collateral.to_sat() as f64 - curr_collateral.to_sat() as f64)
+            / curr_collateral.to_sat() as f64)
+            * 100.0;
+
+        if diff < Self::MIN_STAKE_DIFF {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Stake addition must change the total collateral by at least {:.2}%. Current change: {:.2}%",
+                Self::MIN_STAKE_DIFF, diff
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn to_tx(
+        &self,
+        fee_rate: bitcoin::FeeRate,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Transaction, IpcLibError> {
+        //
+        // Create the first output: op_return with
+        // ipc tag, xonly pubkey of validator
+        //
+        let fund_tag: [u8; IPC_TAG_LENGTH] = IPC_STAKE_TAG
+            .as_bytes()
+            .try_into()
+            .expect("IPC_STAKE_TAG has incorrect length");
+        let pubkey: [u8; SCHNORR_PUBLIC_KEY_SIZE] = self.pubkey.serialize();
+
+        // Construct op_return data
+        let mut op_return_data = [0u8; Self::DATA_LEN];
+
+        op_return_data[0..IPC_TAG_LENGTH].copy_from_slice(&fund_tag);
+        op_return_data[IPC_TAG_LENGTH..].copy_from_slice(&pubkey);
+
+        // Make op_return script and txout
+        let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let data_value = op_return_script.minimal_non_dust_custom(fee_rate);
+        let data_tx_out = bitcoin::TxOut {
+            value: data_value,
+            script_pubkey: op_return_script,
+        };
+
+        //
+        // Create second output: pre-fund + pre-release script
+        //
+
+        let stake_tx_out = bitcoin::TxOut {
+            value: self.amount,
+            script_pubkey: multisig_address.script_pubkey(),
+        };
+
+        // Construct transaction
+
+        let tx_outs = vec![data_tx_out, stake_tx_out];
+        let fund_tx = bitcoin_utils::create_tx_from_txouts(tx_outs);
+        debug!("Fund TX: {fund_tx:?}");
+
+        Ok(fund_tx)
+    }
+
+    /// Parses an IpcStakeCollateralMsg from a Bitcoin transaction
+    pub fn from_tx<D: db::Database>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+        use bitcoin::blockdata::script::Instruction;
+
+        // Helper closure for error creation
+        let err = |msg: String| IpcLibError::MsgParseError(IPC_STAKE_TAG, msg);
+
+        // We expect minimum two outputs:
+        // 1. OP_RETURN with IPC tag and validator pubkey
+        // 2. Amount sent to the multisig address
+        if tx.output.len() < 2 {
+            return Err(err(format!(
+                "Expected at least 2 outputs for stake collateral message, found {}",
+                tx.output.len()
+            )));
+        }
+
+        // Get OP_RETURN data from first output
+        let op_return_data = tx.output[0]
+            .script_pubkey
+            .instructions_minimal()
+            .find_map(|ins| match ins {
+                Ok(Instruction::PushBytes(data)) => Some(data.as_bytes()),
+                _ => None,
+            })
+            .ok_or_else(|| err("First output must be OP_RETURN with pushdata".into()))?;
+
+        // Check data length
+        if op_return_data.len() != Self::DATA_LEN {
+            return Err(err(format!(
+                "Invalid OP_RETURN data length: expected {}, got {}",
+                Self::DATA_LEN,
+                op_return_data.len()
+            )));
+        }
+
+        // Check IPC tag
+        let tag_bytes = &op_return_data[0..IPC_TAG_LENGTH];
+        let expected_tag = IPC_STAKE_TAG.as_bytes();
+        if tag_bytes != expected_tag {
+            return Err(err(format!(
+                "Invalid IPC tag: expected {:?}, got {:?}",
+                expected_tag, tag_bytes
+            )));
+        }
+
+        // Extract validator pubkey
+        let pubkey_bytes = &op_return_data[IPC_TAG_LENGTH..];
+        let pubkey = XOnlyPublicKey::from_slice(pubkey_bytes)
+            .map_err(|e| err(format!("Invalid validator pubkey: {}", e)))?;
+
+        // Extract stake amount from the second output
+        let amount = tx.output[1].value;
+
+        let multisig_address = bitcoin::Address::from_script(&tx.output[1].script_pubkey, NETWORK)
+            .map_err(|_| err("Could not parse address from output 1".to_string()))?
+            .into_unchecked();
+
+        let subnet_id = match db.get_subnet_by_multisig_address(&multisig_address) {
+            Ok(Some(subnet)) => subnet.id,
+            Ok(None) => {
+                error!(
+                    "StakeCollateralMsg: Could not find subnet with multisig address {:?}.",
+                    multisig_address
+                );
+                return Err(err(format!(
+                    "StakeCollateralMsg: Could not find subnet with multisig address {:?}",
+                    multisig_address
+                )));
+            }
+            Err(e) => {
+                error!(
+	                "StakeCollateralMsg: Error while looking up subnet with multisig address {:?}: {}",
+	                multisig_address, e
+	            );
+                return Err(err(format!(
+                    "StakeCollateralMsg: Error while looking up subnet with multisig address {:?}: {}",
+                    multisig_address, e
+                )));
+            }
+        };
+
+        // Construct the message
+        Ok(Self {
+            subnet_id,
+            amount,
+            pubkey,
+        })
+    }
+
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Txid, IpcLibError> {
+        info!(
+            "Submitting stake collateral msg to bitcoin. Multisig address = {}. Amount={}",
+            multisig_address, self.amount
+        );
+
+        let fee_rate = get_fee_rate(rpc, None, None);
+        let stake_tx = self.to_tx(fee_rate, multisig_address)?;
+
+        // Construct, fund and sign the stake transaction
+        let stake_tx = crate::wallet::fund_tx(rpc, stake_tx, None)?;
+        trace!("Fund msg funded TX: {stake_tx:?}");
+        let stake_tx = crate::wallet::sign_tx(rpc, stake_tx)?;
+        trace!("Fund msg signed TX: {stake_tx:?}");
+
+        // Submit the stake transaction to the mempool
+
+        let stake_txid = stake_tx.compute_txid();
+        match submit_to_mempool(rpc, vec![stake_tx]) {
+            Ok(_) => {
+                info!(
+                    "Submitted stake collateral msg for subnet_id={} stake_txid={} amount={}",
+                    self.subnet_id, stake_txid, self.amount
+                );
+                Ok(stake_txid)
+            }
+            Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+        }
+    }
+
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        block_hash: bitcoin::BlockHash,
+        txid: Txid,
+    ) -> Result<(), IpcLibError> {
+        let genesis_info =
+            db.get_subnet_genesis_info(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} does not exist",
+                    self.subnet_id
+                )))?;
+
+        let mut subnet_state = db
+            .get_subnet_state(self.subnet_id)
+            .map_err(|e| {
+                error!("Error getting subnet info from Db: {}", e);
+                IpcValidateError::InvalidMsg(e.to_string())
+            })?
+            // should never happen
+            .ok_or_else(|| {
+                error!("Subnet {} not found, unexpected", self.subnet_id);
+                IpcValidateError::InvalidMsg(format!("Subnet {} not found.", self.subnet_id))
+            })?;
+
+        self.validate_for_subnet(&subnet_state)?;
+
+        // we clone and modify the validator
+        let mut validator = subnet_state
+            .committee
+            .validators
+            .iter()
+            .find(|v| v.pubkey == self.pubkey)
+            .ok_or(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key {} not part of committee",
+                self.pubkey
+            )))?
+            .clone();
+
+        let new_collateral = self.amount + validator.collateral;
+        let new_power = multisig::collateral_to_power(
+            &new_collateral,
+            &genesis_info.create_subnet_msg.min_validator_stake,
+        )?;
+
+        validator.collateral = new_collateral;
+        validator.power = new_power;
+
+        // Update the next committee or create one if it doesn't exist
+        let mut next_committee = subnet_state
+            .waiting_committee
+            .unwrap_or_else(|| subnet_state.committee.clone());
+
+        // Modify the validator in the next committee
+        next_committee.modify_validator(&self.subnet_id, &validator)?;
+
+        // Update the subnet state with the modified next committee
+        subnet_state.waiting_committee = Some(next_committee.clone());
+
+        let stake_change_configuration_number =
+            db.get_next_stake_change_configuration_number(self.subnet_id)?;
+
+        // Create a stake change request to track this change
+        let stake_change = db::StakeChangeRequest {
+            change: db::StakingChange::Deposit {
+                amount: self.amount,
+            },
+            validator_xpk: self.pubkey,
+            validator_subnet_address: validator.subnet_address,
+            configuration_number: stake_change_configuration_number,
+            committee_after_change: next_committee.clone(),
+            block_height,
+            block_hash,
+            checkpoint_block_height: None,
+            checkpoint_block_hash: None,
+            txid,
+        };
+
+        let mut wtxn = db.write_txn()?;
+
+        // Save the updated subnet state to the database
+        db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
+        // Add the stake change to the database
+        db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
+
+        wtxn.commit()?;
+
+        Ok(())
+    }
+}
+
+impl IpcValidate for IpcStakeCollateralMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        // Check subnet_id is not all zeros
+        if self.subnet_id == SubnetId::default() {
+            return Err(IpcValidateError::InvalidField(
+                "subnet_id",
+                "Subnet ID cannot be all zeros".to_string(),
+            ));
+        }
+
+        // Check collateral is not zero
+        if self.amount == Amount::ZERO {
+            return Err(IpcValidateError::InvalidField(
+                "amount",
+                "Amount amount must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcUnstakeCollateralMsg {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcLeaveSubnetMsg {}
+
 //
 // IPC Messages
 //
@@ -2348,6 +2708,9 @@ pub enum IpcMessage {
     FundSubnet(IpcFundSubnetMsg),
     CheckpointSubnet(IpcCheckpointSubnetMsg),
     BatchTransfer(IpcBatchTransferMsg),
+    StakeCollateral(IpcStakeCollateralMsg),
+    UnstakeCollateral(IpcUnstakeCollateralMsg),
+    LeaveSubnet(IpcLeaveSubnetMsg),
 }
 
 impl IpcMessage {
@@ -2389,6 +2752,13 @@ impl IpcMessage {
                 Err(IpcSerializeError::DeserializationError("Skip".to_string()))
             }
             IpcTag::FundSubnet => Err(IpcSerializeError::DeserializationError("Skip".to_string())),
+            IpcTag::StakeCollateral => {
+                Err(IpcSerializeError::DeserializationError("Skip".to_string()))
+            }
+            IpcTag::UnstakeCollateral => {
+                Err(IpcSerializeError::DeserializationError("Skip".to_string()))
+            }
+            IpcTag::LeaveSubnet => Err(IpcSerializeError::DeserializationError("Skip".to_string())),
         }
     }
 }
@@ -2624,6 +2994,7 @@ mod tests {
     };
     use crate::L1_NAME;
     use bitcoin::hex::DisplayHex;
+    use bitcoin::{Amount, XOnlyPublicKey};
     use fvm_shared::address::{set_current_network, Network as FvmNetwork};
 
     fn set_test_fvm_network() {
@@ -3163,7 +3534,7 @@ mod prefund_msg_tests {
 #[cfg(test)]
 mod checkpoint_msg_tests {
     use super::*;
-    use crate::{test_utils, DEFAULT_BTC_FEE_RATE};
+    use crate::{db::Database, test_utils, DEFAULT_BTC_FEE_RATE};
     use std::str::FromStr;
 
     fn create_test_checkpoint_msg() -> IpcCheckpointSubnetMsg {
@@ -3679,5 +4050,51 @@ mod checkpoint_msg_tests {
             batch_tx.is_some(),
             "Should have a batch transfer transaction"
         );
+    }
+
+    #[test]
+    fn test_stake_collateral_from_tx() {
+        let db = crate::db::tests::create_test_db();
+        let subnet_id = crate::test_utils::generate_subnet_id();
+        let subnet_state = crate::db::SubnetState {
+            id: subnet_id,
+            committee_number: 1,
+            committee: crate::db::SubnetCommittee {
+                configuration_number: 0,
+                threshold: 1,
+                validators: vec![],
+                multisig_address: bitcoin::Address::from_str(
+                    "bcrt1p2wqu7w8n8mnw37sl40u6y9tlpyy9hy6d2k4wt6r8ut7897ejl8fsgdhxzg",
+                )
+                .unwrap(),
+            },
+            waiting_committee: None,
+            last_checkpoint_number: None,
+        };
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            db.save_subnet_state(&mut wtxn, subnet_id, &subnet_state)
+                .expect("saves subnet");
+            wtxn.commit().expect("commits transaction");
+        }
+
+        let txbytes = hex::decode("020000000001019c40ba653f54403e8bfda357ccd6fff74746dea98d22316cd194544c27fe81ac0000000000fdffffff030000000000000000286a2649504353544b851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf460ec5300000000002251205381cf38f33ee6e8fa1fabf9a2157f09085b934d55aae5e867e2fc72fb32f9d31e03b229010000002251209acb5b5b3729a8f9ca2c2df76a6e600974f858352dbbca140e7e7d732e9da145024730440220316c97ebc27947c85e5ddec43d35075dc029b244188161265c4f540ceabd40d302200a7940cb366e46f1ba744ea84f1c34b6ade3fd3425f424099f19289fb64321ff012103fe6bbd509c039530b43c6c93524ec4d3df82da5de278096c095694166ccb828200000000").expect("Failed to parse transaction hex");
+
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&txbytes).expect("Failed to deserialize transaction");
+
+        let msg = IpcStakeCollateralMsg::from_tx(&db, &tx).expect("Should parse tx as msg");
+
+        assert_eq!(msg.amount, Amount::from_sat(5500000));
+        assert_eq!(
+            msg.pubkey,
+            XOnlyPublicKey::from_str(
+                "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
+            )
+            .unwrap()
+        );
+
+        dbg!(&msg);
     }
 }

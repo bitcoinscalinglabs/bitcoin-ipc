@@ -439,8 +439,18 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
-        } else if let Ok(batch_transfer_msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx) {
-            let ipc_message = IpcMessage::BatchTransfer(batch_transfer_msg);
+        } else if let Ok(msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx) {
+            let ipc_message = IpcMessage::BatchTransfer(msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
+        } else if let Ok(msg) = ipc_lib::IpcStakeCollateralMsg::from_tx(&self.db, tx) {
+            let ipc_message = IpcMessage::StakeCollateral(msg);
 
             match self
                 .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
@@ -634,6 +644,27 @@ where
                     msg.subnet_id, msg.checkpoint_txid, msg.transfers.len(),
                 );
 
+                Ok(())
+            }
+
+            IpcMessage::StakeCollateral(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
+                info!(
+                    "Processed StakeCollateral for Subnet ID: {} Validator XPK: {} Amount: {}",
+                    msg.subnet_id, msg.pubkey, msg.amount
+                );
+                Ok(())
+            }
+
+            IpcMessage::UnstakeCollateral(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+                Ok(())
+            }
+
+            IpcMessage::LeaveSubnet(msg) => {
+                debug!("Found IPC message: {:?}", msg);
                 Ok(())
             }
         }

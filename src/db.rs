@@ -234,7 +234,7 @@ impl SubnetCommittee {
         self.validators.iter().any(|v| &v.pubkey == pubkey)
     }
 
-    pub fn join_validator(
+    pub fn join_new_validator(
         &mut self,
         subnet_id: &SubnetId,
         validator: &SubnetValidator,
@@ -246,6 +246,37 @@ impl SubnetCommittee {
         self.validators.add_validator(validator)?;
         self.threshold = self.validators.threshold();
         self.multisig_address = self.validators.multisig_address(subnet_id);
+        Ok(())
+    }
+
+    pub fn modify_validator(
+        &mut self,
+        subnet_id: &SubnetId,
+        validator: &SubnetValidator,
+    ) -> Result<(), DbError> {
+        // Increase configuration number by 1
+        // since there is one stake change for stake/unstake
+        self.configuration_number += 1;
+
+        // Find the validator in the committee and update their information
+        let validator_position = self
+            .validators
+            .iter()
+            .position(|v| v.pubkey == validator.pubkey)
+            .ok_or_else(|| {
+                DbError::InvalidChange(format!(
+                    "Validator {} not found in committee",
+                    validator.pubkey
+                ))
+            })?;
+
+        // Replace the validator with the updated one
+        self.validators[validator_position] = validator.clone();
+
+        // Update the committee's threshold and multisig address
+        self.threshold = self.validators.threshold();
+        self.multisig_address = self.validators.multisig_address(subnet_id);
+
         Ok(())
     }
 }
@@ -816,7 +847,7 @@ pub trait Database {
     fn get_last_stake_change_configuration_number(
         &self,
         subnet_id: SubnetId,
-    ) -> Result<Option<u64>, DbError>;
+    ) -> Result<u64, DbError>;
 
     fn get_next_stake_change_configuration_number(
         &self,
@@ -933,6 +964,37 @@ impl Database for HeedDb {
                 return Ok(Some(subnet_state));
             }
         }
+
+        // TDOO reenable below functionality
+        // we probably want to know if this is an old multisig address and react
+        // appropriately, like ping old committee members to see if they are still
+        // active (if recent) or just ignore the msg
+        //
+        // // If not found in current committees, check old committees
+        // let iter = self.committee_db.iter(&txn)?;
+        // for item in iter {
+        //     let (key_str, committee) = item?;
+
+        //     // Check if this old committee's multisig address matches
+        //     if &committee.multisig_address == multisig_address {
+        //         // Parse the key to extract subnet ID and committee number
+        //         let parts: Vec<&str> = key_str.split(':').collect();
+        //         if parts.len() >= 3 {
+        //             // Format is "{COMMITTEE_KEY}:{subnet_id}:{committee_number}"
+        //             if let Ok(subnet_id) = parts[1].parse::<SubnetId>() {
+        //                 // Get the current subnet state for this subnet
+        //                 if let Some(subnet_state) = self.get_subnet_state(subnet_id)? {
+        //                     trace!(
+        //                            "Found multisig address {:?} in old committee (number unknown) for subnet {}",
+        //                            *multisig_address,
+        //                            subnet_id
+        //                        );
+        //                     return Ok(Some(subnet_state));
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
 
         Ok(None)
     }
@@ -1193,7 +1255,7 @@ impl Database for HeedDb {
     fn get_last_stake_change_configuration_number(
         &self,
         subnet_id: SubnetId,
-    ) -> Result<Option<u64>, DbError> {
+    ) -> Result<u64, DbError> {
         let prefix = stake_changes_prefix(subnet_id);
         let txn = self.env.read_txn()?;
         let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
@@ -1203,10 +1265,10 @@ impl Database for HeedDb {
             .map_err(|_| DbError::TypeConversionError("max stake changes reached".to_string()))?;
 
         if count == 0 {
-            return Ok(None);
+            return Ok(GENESIS_COMMITTEE_CONF_NUM);
         }
 
-        Ok(Some(count - 1))
+        Ok(count)
     }
 
     fn get_next_stake_change_configuration_number(
@@ -1214,12 +1276,7 @@ impl Database for HeedDb {
         subnet_id: SubnetId,
     ) -> Result<u64, DbError> {
         let last_number = self.get_last_stake_change_configuration_number(subnet_id)?;
-        let next_number = match last_number {
-            Some(n) => n + 1,
-            None => GENESIS_COMMITTEE_CONF_NUM + 1,
-        };
-
-        Ok(next_number)
+        Ok(last_number + 1)
     }
 
     fn add_stake_change(
@@ -1312,13 +1369,14 @@ pub enum DbError {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
-    use bitcoin::{hashes::Hash, Amount, BlockHash, Txid};
+    use crate::test_utils::generate_subnet_id;
+    use bitcoin::{hashes::Hash, key::Parity, Amount, BlockHash, Txid, XOnlyPublicKey};
     use std::str::FromStr;
     use tempfile::tempdir;
 
-    fn create_test_db() -> HeedDb {
+    pub fn create_test_db() -> HeedDb {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().to_str().unwrap();
         tokio::runtime::Runtime::new()
@@ -1327,16 +1385,13 @@ mod tests {
             .unwrap()
     }
 
-    fn create_rand_subnet_id() -> SubnetId {
-        SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
-    }
-    fn create_rand_txid() -> Txid {
+    pub fn create_rand_txid() -> Txid {
         Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
     }
-    fn create_rand_blockhash() -> BlockHash {
+    pub fn create_rand_blockhash() -> BlockHash {
         BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
     }
-    fn create_rand_addr() -> alloy_primitives::Address {
+    pub fn create_rand_addr() -> alloy_primitives::Address {
         alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
     }
 
@@ -1367,7 +1422,7 @@ mod tests {
     #[test_retry::retry(3)]
     fn test_rootnet_message_nonce() {
         let db = create_test_db();
-        let subnet_id = create_rand_subnet_id();
+        let subnet_id = generate_subnet_id();
         let block_height = 100;
 
         let ro_txn = db.env.read_txn().unwrap();
@@ -1462,7 +1517,7 @@ mod tests {
     #[test_retry::retry(3)]
     fn test_rootnet_message_nonce_many_messages() {
         let db = create_test_db();
-        let subnet_id = create_rand_subnet_id();
+        let subnet_id = generate_subnet_id();
         // Total number of messages
         let total_message_count = 100;
 
@@ -1526,7 +1581,7 @@ mod tests {
     #[test]
     fn test_subnet_committee_join_validator() {
         // Setup: Create a subnet ID and initial committee
-        let subnet_id = create_rand_subnet_id();
+        let subnet_id = generate_subnet_id();
 
         // Create initial validators
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -1586,7 +1641,9 @@ mod tests {
         };
 
         // Add the new validator
-        committee.join_validator(&subnet_id, &validator3).unwrap();
+        committee
+            .join_new_validator(&subnet_id, &validator3)
+            .unwrap();
 
         // Verify the validator was added
         assert_eq!(committee.validators.len(), 3);
@@ -1600,7 +1657,7 @@ mod tests {
         assert_ne!(committee.multisig_address, initial_address);
 
         // Try adding an existing validator (should fail)
-        let result = committee.join_validator(&subnet_id, &validator3);
+        let result = committee.join_new_validator(&subnet_id, &validator3);
         assert!(result.is_err());
 
         // Verify committee size didn't change after failed addition
@@ -1610,7 +1667,7 @@ mod tests {
     #[test]
     fn test_subnet_state_rotation() {
         // Setup: Create a subnet ID
-        let subnet_id = create_rand_subnet_id();
+        let subnet_id = generate_subnet_id();
 
         // Create validators for the current committee
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -1715,7 +1772,7 @@ mod tests {
     #[test]
     fn test_different_power_different_multisig() {
         // Setup: Create a subnet ID
-        let subnet_id = create_rand_subnet_id();
+        let subnet_id = generate_subnet_id();
 
         // Create validators
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -1740,7 +1797,7 @@ mod tests {
             pubkey: pubkey2,
             subnet_address: create_rand_addr(),
             power: 15, // Power of 15 for first set
-            collateral: Amount::from_sat(2_000_000),
+            collateral: Amount::from_sat(1_500_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
                 .unwrap(),
             ip: "127.0.0.1:8001".parse().unwrap(),
@@ -1794,5 +1851,287 @@ mod tests {
 
         // Verify the multisig addresses are different
         assert_ne!(committee1.multisig_address, committee2.multisig_address);
+    }
+
+    #[test]
+    fn test_committee_modify_validator() {
+        // Setup: Create a subnet ID and initial committee
+        let subnet_id = generate_subnet_id();
+
+        // Create secp context for key generation
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        // Create two validators
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        // Create the first validator
+        let validator1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10,
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: Txid::all_zeros(),
+        };
+
+        // Create the second validator
+        let validator2 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15,
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: Txid::all_zeros(),
+        };
+
+        // Create committee with two validators
+        let validators = vec![validator1.clone(), validator2.clone()];
+        let mut committee = validators.to_committee(&subnet_id, 1);
+
+        // Record the initial state
+        let initial_config_number = committee.configuration_number;
+        let initial_threshold = committee.threshold;
+        let initial_multisig = committee.multisig_address.clone();
+
+        // Create a modified version of validator1 with increased collateral and power
+        let mut modified_validator = validator1.clone();
+        modified_validator.collateral = Amount::from_sat(3_000_000);
+        modified_validator.power = 20;
+
+        // Modify the validator
+        let result = committee.modify_validator(&subnet_id, &modified_validator);
+        assert!(result.is_ok());
+
+        // Verify the committee state after modification
+        assert_eq!(committee.configuration_number, initial_config_number + 1);
+        assert_ne!(committee.threshold, initial_threshold);
+        assert_ne!(committee.multisig_address, initial_multisig);
+
+        // Check that the validator was updated correctly
+        let updated_validator = committee
+            .validators
+            .iter()
+            .find(|v| v.pubkey == pubkey1)
+            .unwrap();
+        assert_eq!(updated_validator.collateral, Amount::from_sat(3_000_000));
+        assert_eq!(updated_validator.power, 20);
+
+        // The second validator should remain unchanged
+        let unchanged_validator = committee
+            .validators
+            .iter()
+            .find(|v| v.pubkey == pubkey2)
+            .unwrap();
+        assert_eq!(unchanged_validator.collateral, Amount::from_sat(2_000_000));
+        assert_eq!(unchanged_validator.power, 15);
+    }
+
+    #[test]
+    fn test_committee_join_new_validator() {
+        // Setup: Create a subnet ID and initial committee
+        let subnet_id = generate_subnet_id();
+
+        // Create secp context for key generation
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        // Create an initial validator
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+
+        let validator1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10,
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create committee with one validator
+        let mut committee = vec![validator1].to_committee(&subnet_id, 1);
+
+        // Record the initial state
+        let initial_config_number = committee.configuration_number;
+        let initial_validator_count = committee.validators.len();
+        let initial_power = committee.total_power();
+
+        // Create a new validator to join
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        let new_validator = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15,
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Join the new validator
+        let result = committee.join_new_validator(&subnet_id, &new_validator);
+        assert!(result.is_ok());
+
+        // Verify the committee state after joining
+        assert_eq!(committee.configuration_number, initial_config_number + 2); // Increases by 2
+        assert_eq!(committee.validators.len(), initial_validator_count + 1);
+        assert_eq!(committee.total_power(), initial_power + new_validator.power);
+
+        // Verify the new validator is in the committee
+        let joined_validator = committee.validators.iter().find(|v| v.pubkey == pubkey2);
+        assert!(joined_validator.is_some());
+        assert_eq!(joined_validator.unwrap().power, 15);
+    }
+
+    #[test]
+    fn test_stake_change_configuration_number() {
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+
+        // Create validators
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (secret_key1, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let (secret_key2, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let pubkey1 = XOnlyPublicKey::from_keypair(&secret_key1.keypair(&secp)).0;
+        let pubkey2 = XOnlyPublicKey::from_keypair(&secret_key2.keypair(&secp)).0;
+
+        let validator1 = SubnetValidator {
+            pubkey: pubkey1,
+            subnet_address: create_rand_addr(),
+            power: 10, // Power of 10 for first set
+            collateral: Amount::from_sat(1_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        let validator2 = SubnetValidator {
+            pubkey: pubkey2,
+            subnet_address: create_rand_addr(),
+            power: 15,
+            collateral: Amount::from_sat(2_000_000),
+            backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
+                .unwrap(),
+            ip: "127.0.0.1:8001".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        };
+
+        // Create initial committee with two validators
+        let mut initial_validators = Vec::new();
+        initial_validators.push(validator1.clone());
+
+        let mut committee = initial_validators.to_committee(&subnet_id, 0);
+
+        // Initial check - should be GENESIS_COMMITTEE_CONF_NUM + 1
+        let next_conf_num = db
+            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .unwrap();
+        assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 1);
+
+        // Join new validator (should increase configuration by 2)
+        committee
+            .join_new_validator(&subnet_id, &validator2)
+            .unwrap();
+
+        // Create a stake change request for joining
+        let join_request = StakeChangeRequest {
+            change: StakingChange::Join {
+                pubkey: validator2.pubkey.public_key(Parity::Even),
+            },
+            validator_xpk: validator2.pubkey,
+            validator_subnet_address: validator2.subnet_address,
+            configuration_number: GENESIS_COMMITTEE_CONF_NUM + 1, // First change is metadata
+            committee_after_change: committee.clone(),
+            block_height: 100,
+            block_hash: BlockHash::all_zeros(),
+            checkpoint_block_height: None,
+            checkpoint_block_hash: None,
+            txid: Txid::all_zeros(),
+        };
+
+        // Create a stake change request for initial deposit
+        let deposit_request = StakeChangeRequest {
+            change: StakingChange::Deposit {
+                amount: validator2.collateral,
+            },
+            validator_xpk: validator2.pubkey,
+            validator_subnet_address: validator2.subnet_address,
+            configuration_number: GENESIS_COMMITTEE_CONF_NUM + 2, // Second change is deposit
+            committee_after_change: committee.clone(),
+            block_height: 100,
+            block_hash: BlockHash::all_zeros(),
+            checkpoint_block_height: None,
+            checkpoint_block_hash: None,
+            txid: Txid::all_zeros(),
+        };
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            // Store the join request
+            db.add_stake_change(&mut wtxn, subnet_id, join_request)
+                .unwrap();
+            // Store the deposit request
+            db.add_stake_change(&mut wtxn, subnet_id, deposit_request)
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Check the configuration number after adding validator
+        let next_conf_num = db
+            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .unwrap();
+        assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 3);
+
+        // Modify validator by increasing stake
+        let mut updated_validator = validator1.clone();
+        updated_validator.power = 20;
+        updated_validator.collateral = Amount::from_sat(2_000_000);
+
+        // Modify the validator in the committee
+        committee
+            .modify_validator(&subnet_id, &updated_validator)
+            .unwrap();
+
+        // Create a stake change request for the modification
+        let modify_request = StakeChangeRequest {
+            change: StakingChange::Deposit {
+                amount: Amount::from_sat(1_000_000), // Additional 0.01 BTC
+            },
+            validator_xpk: validator1.pubkey,
+            validator_subnet_address: validator1.subnet_address,
+            configuration_number: GENESIS_COMMITTEE_CONF_NUM + 3, // Third change
+            committee_after_change: committee.clone(),
+            block_height: 101,
+            block_hash: BlockHash::all_zeros(),
+            checkpoint_block_height: None,
+            checkpoint_block_hash: None,
+            txid: Txid::all_zeros(),
+        };
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            // Store the join request
+            db.add_stake_change(&mut wtxn, subnet_id, modify_request)
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Check the configuration number after modifying validator
+        let next_conf_num = db
+            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .unwrap();
+        assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 4);
     }
 }
