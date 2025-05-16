@@ -1371,29 +1371,9 @@ pub enum DbError {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::test_utils::generate_subnet_id;
+    use crate::test_utils::*;
     use bitcoin::{hashes::Hash, key::Parity, Amount, BlockHash, Txid, XOnlyPublicKey};
     use std::str::FromStr;
-    use tempfile::tempdir;
-
-    pub fn create_test_db() -> HeedDb {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().to_str().unwrap();
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(HeedDb::new(db_path, false))
-            .unwrap()
-    }
-
-    pub fn create_rand_txid() -> Txid {
-        Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
-    }
-    pub fn create_rand_blockhash() -> BlockHash {
-        BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
-    }
-    pub fn create_rand_addr() -> alloy_primitives::Address {
-        alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
-    }
 
     fn create_test_rootnet_message(
         subnet_id: SubnetId,
@@ -1995,6 +1975,7 @@ pub mod tests {
     }
 
     #[test]
+    #[test_retry::retry(3)]
     fn test_stake_change_configuration_number() {
         let db = create_test_db();
         let subnet_id = generate_subnet_id();

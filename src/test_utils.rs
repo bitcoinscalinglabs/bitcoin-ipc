@@ -2,7 +2,7 @@ use bitcoin::{
     hashes::Hash,
     key::{Keypair, Secp256k1},
     secp256k1::{PublicKey, SecretKey},
-    Txid, XOnlyPublicKey,
+    BlockHash, Txid, XOnlyPublicKey,
 };
 use rand::Rng;
 
@@ -140,4 +140,23 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         waiting_committee: None,
         last_checkpoint_number: None,
     }
+}
+
+pub fn create_test_db() -> crate::db::HeedDb {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_str().unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(crate::db::HeedDb::new(db_path, false))
+        .unwrap()
+}
+
+pub fn create_rand_txid() -> Txid {
+    Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+}
+pub fn create_rand_blockhash() -> BlockHash {
+    BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+}
+pub fn create_rand_addr() -> alloy_primitives::Address {
+    alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
 }

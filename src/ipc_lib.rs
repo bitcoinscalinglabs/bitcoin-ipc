@@ -1,4 +1,5 @@
 use bitcoin::address::NetworkUnchecked;
+
 use bitcoin::hashes::Hash;
 use bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE;
 use bitcoin::Amount;
@@ -1182,6 +1183,19 @@ pub struct IpcWithdrawal {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcUnstake {
+    /// The amount to unstake
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub amount: Amount,
+    /// The address to send collateral to
+    /// For now, this is the same as the validator's
+    /// backup_address they specify upon joining
+    pub address: bitcoin::Address<NetworkUnchecked>,
+    /// The pubkey of the validator in question
+    pub pubkey: bitcoin::XOnlyPublicKey,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IpcCrossSubnetTransfer {
     /// The amount to transfer
     #[serde(with = "bitcoin::amount::serde::as_sat")]
@@ -1214,6 +1228,9 @@ pub struct IpcCheckpointSubnetMsg {
     pub checkpoint_height: u64,
     /// Committee configuration number
     pub next_committee_configuration_number: u64,
+    /// Unstakes for validators leaving the subnet
+    #[serde(default)]
+    pub unstakes: Vec<IpcUnstake>,
     /// Withdrawals
     #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
@@ -1237,7 +1254,35 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
 
         // TODO validate that checkpoint height no duplicates?
 
-        // Ensure number of withdrawals and transfers doesn't exceed u8::MAX (255)
+        // Ensure number of unstakes, withdrawals and transfers doesn't exceed u8::MAX (255)
+        if self.unstakes.len() > u8::MAX as usize {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Number of unstakes ({}) exceeds maximum allowed ({})",
+                self.unstakes.len(),
+                u8::MAX
+            )));
+        }
+
+        // Check if the unstakes are valid
+        for unstake in &self.unstakes {
+            if unstake.amount == Amount::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "unstake.amount",
+                    "Unstake amount must be greater than zero".to_string(),
+                ));
+            }
+            if !unstake.address.is_valid_for_network(NETWORK) {
+                return Err(IpcValidateError::InvalidField(
+                    "unstake.address",
+                    format!(
+                        "Bitcoin address {:?} must be for the current network",
+                        unstake.address
+                    ),
+                ));
+            }
+        }
+
+        // Ensure number of withdrawals doesn't exceed u8::MAX (255)
         if self.withdrawals.len() > u8::MAX as usize {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Number of withdrawals ({}) exceeds maximum allowed ({})",
@@ -1301,8 +1346,8 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
 }
 
 impl IpcCheckpointSubnetMsg {
-    // Length of the withdrawal + transfer markers, 1 byte each
-    const MARKERS_LEN: usize = 2;
+    // Length of the withdrawal + transfer + unstake markers, 1 byte each
+    const MARKERS_LEN: usize = 3;
     // u64 length
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
     // u64 length
@@ -1344,6 +1389,7 @@ impl IpcCheckpointSubnetMsg {
         // Set marker values
         op_return_data[Self::MARKERS_OFFSET] = self.withdrawals.len().min(255) as u8; // Withdrawal count
         op_return_data[Self::MARKERS_OFFSET + 1] = self.transfers.len().min(255) as u8; // Transfer count
+        op_return_data[Self::MARKERS_OFFSET + 2] = self.unstakes.len().min(255) as u8; // Unstake count
 
         // Add committee configuration number
         op_return_data[Self::COMMITTEE_CONF_OFFSET..]
@@ -1365,7 +1411,7 @@ impl IpcCheckpointSubnetMsg {
 
     pub fn extract_markers_from_metadata_tx_out(
         tx_out: &bitcoin::TxOut,
-    ) -> Result<(u8, u8), IpcLibError> {
+    ) -> Result<(u8, u8, u8), IpcLibError> {
         let err = |msg: String| IpcLibError::MsgParseError(IPC_CHECKPOINT_TAG, msg);
 
         // Get OP_RETURN data from first output
@@ -1395,8 +1441,9 @@ impl IpcCheckpointSubnetMsg {
         // Extract the markers
         let withdrawal_count = op_return_data[Self::MARKERS_OFFSET];
         let transfer_count = op_return_data[Self::MARKERS_OFFSET + 1];
+        let unstake_count = op_return_data[Self::MARKERS_OFFSET + 2];
 
-        Ok((withdrawal_count, transfer_count))
+        Ok((withdrawal_count, transfer_count, unstake_count))
     }
 
     fn make_batched_transfer_data(&self) -> Result<Vec<u8>, IpcLibError> {
@@ -1550,10 +1597,10 @@ impl IpcCheckpointSubnetMsg {
             return None;
         }
 
-        // Calculate batch_transfer vout based on the number of withdrawals
-        // position after the metadata output and all withdrawal outputs
-        // i.e., 1 (metadata) + withdrawals.len() if present
-        let vout = 1 + self.withdrawals.len() as u32;
+        // Calculate batch_transfer vout based on the number of withdrawals and unstakes
+        // position after the metadata output, all withdrawal outputs and all unstake outputs
+        // i.e., 1 (metadata) + withdrawals.len() + unstakes.len() if present
+        let vout = 1 + self.withdrawals.len() as u32 + self.unstakes.len() as u32;
 
         Some(bitcoin::OutPoint { txid, vout })
     }
@@ -1633,6 +1680,23 @@ impl IpcCheckpointSubnetMsg {
             tx_outs.push(bitcoin::TxOut {
                 value: withdrawal.amount,
                 script_pubkey: withdrawal
+                    .address
+                    .clone()
+                    // safe to assume it's checked and panic otherwise
+                    // because of the validation beforehand
+                    .require_network(NETWORK)
+                    .expect("Address must be valid for network")
+                    .script_pubkey(),
+            });
+        }
+
+        //
+        // Add unstake outputs
+        //
+        for unstake in &self.unstakes {
+            tx_outs.push(bitcoin::TxOut {
+                value: unstake.amount,
+                script_pubkey: unstake
                     .address
                     .clone()
                     // safe to assume it's checked and panic otherwise
@@ -1805,6 +1869,7 @@ impl IpcCheckpointSubnetMsg {
         // Extract marker values
         let withdrawals_count = op_return_data[Self::MARKERS_OFFSET] as usize;
         let transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
+        let unstakes_count = op_return_data[Self::MARKERS_OFFSET + 2] as usize;
 
         // Extract committee configuration number
         let committee_conf_bytes = &op_return_data[Self::COMMITTEE_CONF_OFFSET..];
@@ -1813,9 +1878,10 @@ impl IpcCheckpointSubnetMsg {
                 err("Failed to convert committee configuration number bytes to u64".to_string())
             })?);
 
-        // Check if we have enough outputs for all the withdrawals and transfers
+        // Check if we have enough outputs for all the withdrawals, unstakes and transfers
         let expected_outputs = 1 + // metadata
                withdrawals_count + // withdrawals
+               unstakes_count + // unstakes
                (if transfers_count > 0 { 1 } else { 0 }) + // batch transfer commit (if needed)
                transfers_count; // transfers
 
@@ -1827,16 +1893,60 @@ impl IpcCheckpointSubnetMsg {
             )));
         }
 
+        let subnet = db
+            .get_subnet_state(subnet_id)?
+            .ok_or(err(format!("Subnet {} not found", subnet_id)))?;
+
         // Parse withdrawals
         let mut withdrawals = Vec::with_capacity(withdrawals_count);
         for i in 0..withdrawals_count {
             let txout = &tx.output[1 + i]; // 1-based index (after metadata)
             let amount = txout.value;
-            let address = bitcoin::Address::from_script(&txout.script_pubkey, NETWORK)
-                .map_err(|_| err(format!("Could not parse address from output {}", 1 + i)))?;
+            let address =
+                bitcoin::Address::from_script(&txout.script_pubkey, NETWORK).map_err(|_| {
+                    err(format!(
+                        "Could not parse address from withdrawal output {}",
+                        1 + i
+                    ))
+                })?;
             let address = address.into_unchecked();
 
             withdrawals.push(IpcWithdrawal { amount, address });
+        }
+
+        // Parse unstakes
+        let mut unstakes = Vec::with_capacity(unstakes_count);
+        for i in 0..unstakes_count {
+            let txout = &tx.output[1 + withdrawals_count + i]; // After metadata and withdrawals
+            let amount = txout.value;
+            let address =
+                bitcoin::Address::from_script(&txout.script_pubkey, NETWORK).map_err(|_| {
+                    err(format!(
+                        "Could not parse address from unstake output {}",
+                        1 + withdrawals_count + i
+                    ))
+                })?;
+            let address = address.into_unchecked();
+
+            let validator = subnet
+                .committee
+                .validators
+                .iter()
+                .find(|v| v.backup_address == address);
+
+            if validator.is_none() {
+                warn!("Subnet {} checkpoint: unstake present for a non-validator to address {}, skipping...", subnet_id, address.assume_checked());
+                continue;
+            }
+
+            let validator = validator.unwrap();
+            let pubkey = validator.pubkey;
+
+            unstakes.push(IpcUnstake {
+                amount,
+                address,
+                pubkey,
+            });
         }
 
         // Parse transfers
@@ -1844,8 +1954,8 @@ impl IpcCheckpointSubnetMsg {
 
         // If there are transfers, there should be a batch transfer commit output
         if transfers_count > 0 {
-            // Start after metadata + withdrawals + batch commit
-            let transfer_start_index = 1 + withdrawals_count + 1;
+            // Start after metadata + withdrawals + unstakes + batch commit
+            let transfer_start_index = 1 + withdrawals_count + unstakes_count + 1;
 
             for i in 0..transfers_count {
                 let txout = &tx.output[transfer_start_index + i];
@@ -1906,6 +2016,7 @@ impl IpcCheckpointSubnetMsg {
             checkpoint_hash,
             checkpoint_height,
             next_committee_configuration_number,
+            unstakes,
             withdrawals,
             transfers,
             change_address,
@@ -2238,7 +2349,7 @@ impl IpcBatchTransferMsg {
             )))?;
 
         // Extract withdrawal and transfer counts from checkpoint metadata
-        let (_withdrawal_count, transfer_count) =
+        let (_, _, transfer_count) =
             match IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(metadata_tx_out) {
                 Ok(counts) => counts,
                 Err(e) => {
@@ -3534,8 +3645,83 @@ mod prefund_msg_tests {
 #[cfg(test)]
 mod checkpoint_msg_tests {
     use super::*;
-    use crate::{db::Database, test_utils, DEFAULT_BTC_FEE_RATE};
+    use crate::{
+        db::Database,
+        test_utils::{self, create_test_db},
+        DEFAULT_BTC_FEE_RATE,
+    };
     use std::str::FromStr;
+
+    #[test]
+    fn test_checkpoint_with_unstakes() {
+        // Set up test database
+        let db = create_test_db();
+
+        // Create a test subnet
+        let subnet = test_utils::generate_subnet(3);
+        let committee = &subnet.committee;
+        let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+
+        // dbg!(&subnet);
+
+        // Save subnets to database
+        {
+            let mut wtxn = db.write_txn().expect("Should create transaction");
+            db.save_subnet_state(&mut wtxn, subnet.id, &subnet)
+                .expect("Should save subnet");
+            wtxn.commit().unwrap();
+        }
+
+        // Create checkpoint message with unstakes
+        let mut checkpoint_msg = create_test_checkpoint_msg();
+        // Update subnet i
+        checkpoint_msg.subnet_id = subnet.id;
+        // Remove transfers for this test
+        checkpoint_msg.transfers.clear();
+        // Update unstake address
+        checkpoint_msg.unstakes.first_mut().unwrap().address = subnet
+            .committee
+            .validators
+            .first()
+            .unwrap()
+            .backup_address
+            .clone();
+
+        // Verify the test checkpoint message has unstakes
+        assert!(!checkpoint_msg.unstakes.is_empty());
+        let original_unstakes = checkpoint_msg.unstakes.clone();
+
+        // Generate the transaction
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, committee, DEFAULT_BTC_FEE_RATE, &utxos)
+            .expect("Should create checkpoint PSBT");
+
+        let checkpoint_tx = checkpoint_psbt.extract_tx().expect("must extract tx");
+
+        dbg!(&checkpoint_tx);
+
+        // Parse the transaction back to a checkpoint message
+        let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &checkpoint_tx)
+            .expect("Should parse checkpoint message");
+        dbg!(&parsed_msg);
+
+        // Verify unstakes were correctly serialized and deserialized
+        assert_eq!(parsed_msg.unstakes.len(), original_unstakes.len());
+        for (i, unstake) in parsed_msg.unstakes.iter().enumerate() {
+            assert_eq!(unstake.amount, original_unstakes[i].amount);
+            assert_eq!(unstake.address, original_unstakes[i].address);
+            // Note: pubkey is not preserved in the checkpoint transaction
+        }
+
+        // Verify metadata and markers
+        let (withdrawal_count, transfer_count, unstake_count) =
+            IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&checkpoint_tx.output[0])
+                .expect("Should extract markers");
+
+        assert_eq!(withdrawal_count as usize, checkpoint_msg.withdrawals.len());
+        assert_eq!(transfer_count as usize, checkpoint_msg.transfers.len());
+        assert_eq!(unstake_count as usize, original_unstakes.len());
+    }
 
     fn create_test_checkpoint_msg() -> IpcCheckpointSubnetMsg {
         // Generate a subnet with 3 validators
@@ -3548,6 +3734,17 @@ mod checkpoint_msg_tests {
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
         )
         .unwrap();
+
+        // Create an unstake
+        let unstake = IpcUnstake {
+            amount: Amount::from_sat(40000),
+            address: bitcoin::Address::from_str("bcrt1qgtzpfqlfkz4nhkpvz2enqtucm2pzhdvlssxnss")
+                .unwrap(),
+            pubkey: bitcoin::XOnlyPublicKey::from_str(
+                "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
+            )
+            .unwrap(),
+        };
 
         // Create a withdrawal
         let withdrawal = IpcWithdrawal {
@@ -3571,6 +3768,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            unstakes: vec![unstake],
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
@@ -3656,8 +3854,14 @@ mod checkpoint_msg_tests {
             "Transfer count marker should be 1"
         );
 
-        // Should have at least 2 outputs (OP_RETURN + withdrawal)
-        assert_eq!(checkpoint_tx.output.len(), 5, "Should have 5 outputs");
+        // Check the unstake count marker
+        assert_eq!(
+            op_return_data[IpcCheckpointSubnetMsg::MARKERS_OFFSET + 2],
+            1,
+            "Unstake count marker should be 1"
+        );
+
+        assert_eq!(checkpoint_tx.output.len(), 6, "Should have 6 outputs");
 
         // Since we have transfers, we should have a batch transaction
         assert!(
@@ -3717,6 +3921,7 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             withdrawals: vec![withdrawal, withdrawal2],
             transfers: vec![],
+            unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
         };
@@ -3796,6 +4001,7 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             withdrawals: vec![],
             transfers: vec![],
+            unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
         };
@@ -3946,6 +4152,7 @@ mod checkpoint_msg_tests {
             checkpoint_hash,
             checkpoint_height: 50,
             withdrawals: vec![],
+            unstakes: vec![],
             transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
@@ -4054,7 +4261,7 @@ mod checkpoint_msg_tests {
 
     #[test]
     fn test_stake_collateral_from_tx() {
-        let db = crate::db::tests::create_test_db();
+        let db = crate::test_utils::create_test_db();
         let subnet_id = crate::test_utils::generate_subnet_id();
         let subnet_state = crate::db::SubnetState {
             id: subnet_id,
