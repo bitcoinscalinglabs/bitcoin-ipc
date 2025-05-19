@@ -3,7 +3,7 @@ use crate::{
     db::{self, Database},
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
-        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcValidate, SubnetId,
+        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, NETWORK,
 };
@@ -1005,6 +1005,54 @@ pub async fn stake_collateral(
     Ok(StakeCollateralResponse { txid })
 }
 
+// Stake collateral
+
+#[derive(Serialize, Deserialize)]
+pub struct UnstakeCollateralResponse {
+    txid: bitcoin::Txid,
+}
+
+pub async fn unstake_collateral(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcUnstakeCollateralMsg>,
+) -> Result<UnstakeCollateralResponse, JsonRpcError> {
+    info!(
+        "unstakecollateral: {} {} {}",
+        msg.subnet_id, msg.pubkey, msg.amount
+    );
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid unstake collateral message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_subnet(&subnet_state).map_err(|e| {
+        error!(
+            "Error validating unstake collateral msg for subnet info: {}",
+            e
+        );
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    let txid = msg
+        .submit_to_bitcoin(&data.btc_rpc)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(UnstakeCollateralResponse { txid })
+}
+
 // Stake changes
 
 #[derive(Serialize, Deserialize)]
@@ -1067,6 +1115,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
         // stake changes
         .with_method("stakecollateral", stake_collateral)
+        .with_method("unstakecollateral", unstake_collateral)
         .with_method("getstakechanges", get_stake_changes)
         .finish()
 }

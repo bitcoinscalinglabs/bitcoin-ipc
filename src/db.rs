@@ -101,7 +101,10 @@ trait SubnetValidators {
 
     fn add_validator(&mut self, validator: &SubnetValidator) -> Result<(), DbError>;
     #[allow(unused)]
-    fn rm_validator(&mut self, validator_xpk: &XOnlyPublicKey) -> Result<SubnetValidator, DbError>;
+    fn remove_validator(
+        &mut self,
+        validator_xpk: &XOnlyPublicKey,
+    ) -> Result<SubnetValidator, DbError>;
 }
 
 impl SubnetValidators for Vec<SubnetValidator> {
@@ -147,7 +150,10 @@ impl SubnetValidators for Vec<SubnetValidator> {
         Ok(())
     }
 
-    fn rm_validator(&mut self, validator_xpk: &XOnlyPublicKey) -> Result<SubnetValidator, DbError> {
+    fn remove_validator(
+        &mut self,
+        validator_xpk: &XOnlyPublicKey,
+    ) -> Result<SubnetValidator, DbError> {
         // Find the validator
         let position = self.iter().position(|v| &v.pubkey == validator_xpk);
 
@@ -272,6 +278,25 @@ impl SubnetCommittee {
 
         // Replace the validator with the updated one
         self.validators[validator_position] = validator.clone();
+
+        // Update the committee's threshold and multisig address
+        self.threshold = self.validators.threshold();
+        self.multisig_address = self.validators.multisig_address(subnet_id);
+
+        Ok(())
+    }
+
+    pub fn remove_validator(
+        &mut self,
+        subnet_id: &SubnetId,
+        pubkey: &XOnlyPublicKey,
+    ) -> Result<(), DbError> {
+        // Increase configuration number by 1
+        // since there is one stake change for stake/unstake
+        self.configuration_number += 1;
+
+        // Remove the validator from the committee
+        self.validators.remove_validator(pubkey)?;
 
         // Update the committee's threshold and multisig address
         self.threshold = self.validators.threshold();
