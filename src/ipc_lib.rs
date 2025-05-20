@@ -1228,15 +1228,15 @@ pub struct IpcCheckpointSubnetMsg {
     pub checkpoint_height: u64,
     /// Committee configuration number
     pub next_committee_configuration_number: u64,
-    /// Unstakes for validators leaving the subnet
-    #[serde(default)]
-    pub unstakes: Vec<IpcUnstake>,
     /// Withdrawals
     #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
     /// Cross-subnet transfers
     #[serde(default)]
     pub transfers: Vec<IpcCrossSubnetTransfer>,
+    /// Unstakes for validators leaving the subnet
+    #[serde(default, skip_deserializing)]
+    pub unstakes: Vec<IpcUnstake>,
     /// Optional change address (multisig)
     #[serde(skip_deserializing)]
     pub change_address: Option<bitcoin::Address<NetworkUnchecked>>,
@@ -1691,23 +1691,6 @@ impl IpcCheckpointSubnetMsg {
         }
 
         //
-        // Add unstake outputs
-        //
-        for unstake in &self.unstakes {
-            tx_outs.push(bitcoin::TxOut {
-                value: unstake.amount,
-                script_pubkey: unstake
-                    .address
-                    .clone()
-                    // safe to assume it's checked and panic otherwise
-                    // because of the validation beforehand
-                    .require_network(NETWORK)
-                    .expect("Address must be valid for network")
-                    .script_pubkey(),
-            });
-        }
-
-        //
         // Add batched transfer output commit tx, if present
         //
         let has_transfers = !self.transfers.is_empty();
@@ -1753,6 +1736,23 @@ impl IpcCheckpointSubnetMsg {
                         .script_pubkey(),
                 });
             }
+        }
+
+        //
+        // Add unstake outputs
+        //
+        for unstake in &self.unstakes {
+            tx_outs.push(bitcoin::TxOut {
+                value: unstake.amount,
+                script_pubkey: unstake
+                    .address
+                    .clone()
+                    // safe to assume it's checked and panic otherwise
+                    // because of the validation beforehand
+                    .require_network(NETWORK)
+                    .expect("Address must be valid for network")
+                    .script_pubkey(),
+            });
         }
 
         //
@@ -2349,7 +2349,7 @@ impl IpcBatchTransferMsg {
             )))?;
 
         // Extract withdrawal and transfer counts from checkpoint metadata
-        let (_, _, transfer_count) =
+        let (_, transfer_count, _) =
             match IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(metadata_tx_out) {
                 Ok(counts) => counts,
                 Err(e) => {

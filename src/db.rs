@@ -851,7 +851,7 @@ pub trait Database {
     ) -> Result<(), DbError>;
 
     // Stake changes
-    // Stake changes
+
     fn get_stake_change(
         &self,
         subnet_id: SubnetId,
@@ -859,6 +859,11 @@ pub trait Database {
     ) -> Result<Option<StakeChangeRequest>, DbError>;
 
     fn get_all_stake_changes(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError>;
+
+    fn get_unconfirmed_stake_changes(
         &self,
         subnet_id: SubnetId,
     ) -> Result<Vec<StakeChangeRequest>, DbError>;
@@ -1243,6 +1248,32 @@ impl Database for HeedDb {
 
         let changes = changes_iter
             .map(|res| res.map(|(_, change)| change))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(changes)
+    }
+
+    fn get_unconfirmed_stake_changes(
+        &self,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+        let txn = self.env.read_txn()?;
+
+        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+
+        let changes = changes_iter
+            .map(|res| res.map(|(_, change)| change))
+            .filter_map(|res| match res {
+                Ok(change) => {
+                    if change.checkpoint_block_height.is_none() {
+                        Some(Ok(change))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(changes)

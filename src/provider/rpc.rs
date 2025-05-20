@@ -1,8 +1,8 @@
 use crate::{
     bitcoin_utils,
-    db::{self, Database},
+    db::{self, Database, StakingChange},
     ipc_lib::{
-        IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
+        self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
         IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, NETWORK,
@@ -568,6 +568,12 @@ pub async fn gen_checkpoint_psbt(
         );
     }
 
+    if !msg.unstakes.len().is_zero() {
+        return Err(
+            RpcError::InvalidParams("Specifying unstakes not supported".to_string()).into(),
+        );
+    }
+
     // Check subnet exists
     let subnet = data
         .db
@@ -608,8 +614,9 @@ pub async fn gen_checkpoint_psbt(
     // assume no change in the committee
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
+    // let mut unstakes = vec![];
 
-    // update next_committee if the configuration number changed
+    // update next_committee and process unstakes if the configuration number changed
     if msg.next_committee_configuration_number > current_committee_configuration {
         next_committee = data
             .db
@@ -624,11 +631,55 @@ pub async fn gen_checkpoint_psbt(
             )))?
             .committee_after_change;
 
+        // Get unconfirmed/unprocessed unstakes
+        let unconfirmed_stake_changes = data
+            .db
+            .get_unconfirmed_stake_changes(msg.subnet_id)
+            .map_err(|e| {
+                error!("Error getting unconfirmed stake changes from Db: {}", e);
+                RpcError::DbError(e)
+            })?;
+        let unstakes = unconfirmed_stake_changes
+            .iter()
+            .filter_map(|sc| {
+                let validator = subnet
+                    .committee
+                    .validators
+                    .iter()
+                    .find(|v| v.pubkey == sc.validator_xpk);
+
+                let address = match validator {
+                    Some(v) => v.backup_address.clone(),
+                    None => {
+                        error!(
+                            "Validator {} not found in committee for a stake change, skipping",
+                            sc.validator_xpk
+                        );
+                        return None;
+                    }
+                };
+
+                match sc.change {
+                    StakingChange::Withdraw { amount } => Some(ipc_lib::IpcUnstake {
+                        amount,
+                        address,
+                        pubkey: sc.validator_xpk,
+                    }),
+                    _ => {
+                        return None;
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        msg.unstakes = unstakes;
+
         info!(
             "Rotating committee to configuration number {} multisig address {}",
             msg.next_committee_configuration_number,
             next_committee.address_checked()
         );
+        info!("Processing {} unstakes.", msg.unstakes.len());
     }
     // no change if the configuration number is zero or the same
     else if msg.next_committee_configuration_number.is_zero()
