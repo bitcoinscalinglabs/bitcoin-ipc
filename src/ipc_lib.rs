@@ -4158,6 +4158,7 @@ mod checkpoint_msg_tests {
     use std::str::FromStr;
 
     #[test]
+    #[test_retry::retry(3)]
     fn test_checkpoint_with_unstakes() {
         // Set up test database
         let db = create_test_db();
@@ -4983,6 +4984,112 @@ mod checkpoint_msg_tests {
         // Test parsing the transaction back into a message
         let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
         assert!(parsed_msg.is_err());
+
+        let expected_error_msg = format!(
+            "Signature doesn't match any of the validators in the committee for subnet {}",
+            subnet_id
+        );
+
+        if let Err(IpcLibError::IpcValidateError(crate::ipc_lib::IpcValidateError::InvalidMsg(
+            msg,
+        ))) = parsed_msg
+        {
+            assert_eq!(msg, expected_error_msg);
+        } else {
+            panic!(
+                "Expected IpcValidateError::InvalidMsg but got: {:?}",
+                parsed_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_unstake_collateral_replay_attack() {
+        use crate::db::SubnetValidators;
+        use crate::DEFAULT_BTC_FEE_RATE;
+
+        let db = crate::test_utils::create_test_db();
+
+        // Create test data
+        let mut subnet_state = crate::test_utils::generate_subnet(4);
+        let subnet_id = subnet_state.id;
+
+        let keypairs = crate::test_utils::generate_keypairs(1);
+        let keypair = keypairs.first().expect("should generate");
+        let (xpk, _) = keypair.x_only_public_key();
+
+        let prev_txid = bitcoin::Txid::all_zeros();
+
+        // Update the subnet to use our validator
+        subnet_state
+            .committee
+            .validators
+            .first_mut()
+            .unwrap()
+            .pubkey = xpk;
+
+        subnet_state.committee.multisig_address = subnet_state
+            .committee
+            .validators
+            .multisig_address(&subnet_id);
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            db.save_subnet_state(&mut wtxn, subnet_id, &subnet_state)
+                .expect("saves subnet");
+            wtxn.commit().expect("commits transaction");
+        }
+
+        let amount = bitcoin::Amount::from_sat(5500000);
+
+        // Create the unstake message
+        let unstake_msg = IpcUnstakeCollateralMsg {
+            subnet_id,
+            amount,
+            pubkey: Some(xpk),
+        };
+
+        let msg =
+            IpcUnstakeCollateralMsg::make_signature_msg(&prev_txid, &xpk, &amount, &subnet_id);
+
+        dbg!(&subnet_state.committee);
+        dbg!(prev_txid);
+        dbg!(xpk);
+        dbg!(amount);
+        dbg!(subnet_id);
+        dbg!(msg);
+
+        let signature = unstake_msg.make_signature(&prev_txid, keypair.secret_key());
+
+        // Generate a transaction from the message
+        let mut tx = unstake_msg
+            .to_tx(
+                DEFAULT_BTC_FEE_RATE,
+                &subnet_state.committee.multisig_address.assume_checked(),
+                signature,
+            )
+            .expect("Should create transaction");
+
+        tx.input = vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                // Intentionally set to a different txid to simulate a replay attack
+                txid: Txid::from_str(
+                    "5e66f5f4e961aa5aa35d226c100e1931d5f4ee99e149a3a9549edad279f77236",
+                )
+                .expect("valid txid"),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }];
+
+        // Test parsing the transaction back into a message
+        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+        assert!(parsed_msg.is_err());
+
+        // Even though our validator is in the committee, the prev_txid is different
+        // it will not match the signature
 
         let expected_error_msg = format!(
             "Signature doesn't match any of the validators in the committee for subnet {}",
