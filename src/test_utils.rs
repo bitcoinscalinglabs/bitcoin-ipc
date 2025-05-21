@@ -56,7 +56,7 @@ pub fn generate_subnet_id() -> SubnetId {
     SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
 }
 
-pub fn generate_subnet(n: usize) -> db::SubnetState {
+pub fn generate_subnet(n_val: usize) -> db::SubnetState {
     use crate::{
         db, eth_utils::eth_addr_from_x_only_pubkey, multisig::create_subnet_multisig_address,
         NETWORK,
@@ -65,10 +65,10 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::str::FromStr;
 
-    assert!(n >= 1, "n must be at least 1");
+    assert!(n_val >= 1, "number of validators must be at least 1");
 
     let subnet_id = generate_subnet_id();
-    let keypairs = generate_keypairs(n);
+    let keypairs = generate_keypairs(n_val);
 
     // Create subnet validators
     let validators: Vec<db::SubnetValidator> = keypairs
@@ -108,7 +108,7 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         .collect();
 
     // Create subnet parameters
-    let min_validators = std::cmp::max(1, n / 2) as Power; // Set threshold to n/2 rounded up
+    let min_validators = std::cmp::max(1, n_val / 2) as Power; // Set threshold to n/2 rounded up
 
     // Create committee
     let secp = bitcoin::secp256k1::Secp256k1::new();

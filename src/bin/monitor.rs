@@ -673,7 +673,7 @@ where
                 msg.validate()?;
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
                 info!(
-                    "Processed UnstakeCollateral for Subnet ID: {} Validator XPK: {} Amount: {}",
+                    "Processed UnstakeCollateral for Subnet ID: {} Validator XPK: {:?} Amount: {}",
                     msg.subnet_id, msg.pubkey, msg.amount
                 );
                 Ok(())

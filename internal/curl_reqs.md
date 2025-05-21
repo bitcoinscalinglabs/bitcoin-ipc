@@ -46,7 +46,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t410fnt3bocognsddcsd4dvu3amu4tw3eokzvajwakaa",
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -82,7 +82,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "stakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fnt3bocognsddcsd4dvu3amu4tw3eokzvajwakaa",
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
 			"amount": 6500000,
 			"pubkey": "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
     },
@@ -98,7 +98,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "stakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fnt3bocognsddcsd4dvu3amu4tw3eokzvajwakaa",
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
 			"amount": 6500000,
 			"pubkey": "e327a66b169732bde49d827d90781327af558fc12d5cd2d5004e7551ec00c662"
     },
@@ -114,9 +114,8 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "unstakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fnt3bocognsddcsd4dvu3amu4tw3eokzvajwakaa",
-			"amount": 4500000,
-			"pubkey": "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
+			"amount": 4200000
     },
     "id": 1
 }' | jq
@@ -189,7 +188,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t410fertekptrvemo3wddyaht6v2pqykjdjieorit6ha"
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby"
     },
     "id": 1
 }' | jq
@@ -242,7 +241,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getstakechanges",
     "params": {
-			"subnet_id": "/b4/t410fnt3bocognsddcsd4dvu3amu4tw3eokzvajwakaa",
+			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
 			"block_height": 162
     },
     "id": 1

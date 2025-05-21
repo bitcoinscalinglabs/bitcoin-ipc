@@ -1,7 +1,7 @@
 use bitcoin::address::NetworkUnchecked;
 
 use bitcoin::hashes::Hash;
-use bitcoin::key::constants::SCHNORR_PUBLIC_KEY_SIZE;
+use bitcoin::key::constants::{SCHNORR_PUBLIC_KEY_SIZE, SCHNORR_SIGNATURE_SIZE};
 use bitcoin::Amount;
 use bitcoin::Transaction;
 use bitcoin::Txid;
@@ -1395,6 +1395,7 @@ impl IpcCheckpointSubnetMsg {
         op_return_data[Self::COMMITTEE_CONF_OFFSET..]
             .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
+        // Required to do since [u8; 77] for some reason doesn't implement pusbytes
         let push_bytes: &bitcoin::script::PushBytes =
             (&op_return_data[..]).try_into().expect("the size is okay");
 
@@ -2793,7 +2794,7 @@ impl IpcValidate for IpcStakeCollateralMsg {
         if self.amount == Amount::ZERO {
             return Err(IpcValidateError::InvalidField(
                 "amount",
-                "Amount amount must be greater than zero".to_string(),
+                "Amount must be greater than zero".to_string(),
             ));
         }
 
@@ -2811,13 +2812,13 @@ pub struct IpcUnstakeCollateralMsg {
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub amount: bitcoin::Amount,
     /// The pubkey of the validator
-    pub pubkey: bitcoin::XOnlyPublicKey,
+    #[serde(skip_deserializing)]
+    pub pubkey: Option<bitcoin::XOnlyPublicKey>,
 }
 
 impl IpcUnstakeCollateralMsg {
     // The total length of the op_return data - helper
-    const DATA_LEN: usize =
-        IPC_TAG_LENGTH + SubnetId::INNER_LEN + Amount::SIZE + SCHNORR_PUBLIC_KEY_SIZE;
+    const DATA_LEN: usize = IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE + Amount::SIZE;
 
     pub fn validate_for_subnet(&self, subnet: &db::SubnetState) -> Result<(), IpcValidateError> {
         // should never happen
@@ -2832,11 +2833,22 @@ impl IpcUnstakeCollateralMsg {
         }
 
         // Check if the validator with this public key is already registered
-        if !subnet.committee.is_validator(&self.pubkey) {
-            return Err(IpcValidateError::InvalidMsg(format!(
-                "Validator with public key '{}' must already be a validator in subnet {}",
-                self.pubkey, self.subnet_id,
-            )));
+        // NOTE: don't remove
+        match self.pubkey {
+            Some(pubkey) => {
+                if !subnet.committee.is_validator(&pubkey) {
+                    return Err(IpcValidateError::InvalidMsg(format!(
+                        "Validator with public key '{}' must already be a validator in subnet {}",
+                        pubkey, self.subnet_id,
+                    )));
+                }
+            }
+            None => {
+                return Err(IpcValidateError::InvalidField(
+                    "pubkey",
+                    "Validator public key is required".to_string(),
+                ));
+            }
         }
 
         // Check if the amount is not more than the current collateral
@@ -2869,41 +2881,96 @@ impl IpcUnstakeCollateralMsg {
         Ok(())
     }
 
-    pub fn to_tx(&self, fee_rate: bitcoin::FeeRate) -> Result<Transaction, IpcLibError> {
+    /// See `make_signature` for information
+    fn make_signature_msg(
+        prev_txid: &Txid,
+        pubkey: &bitcoin::XOnlyPublicKey,
+        amount: &bitcoin::Amount,
+        subnet_id: &SubnetId,
+    ) -> bitcoin::secp256k1::Message {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(prev_txid.as_byte_array().as_slice());
+        msg.extend_from_slice(&pubkey.serialize());
+        msg.extend_from_slice(&amount.to_sat().to_be_bytes());
+        msg.extend_from_slice(subnet_id.txid20().as_ref());
+
+        let msg = bitcoin::hashes::sha256::Hash::hash(&msg);
+        bitcoin::secp256k1::Message::from_digest(msg.to_byte_array())
+    }
+
+    /// Returns a signature to be embedded in the OP_RETURN output
+    /// Confirming it's valid and signed by the validator making the request
+    ///
+    /// The signature is signing the following message:
+    /// prev_txid || xpubkey || unstake_amount || subnet_id
+    ///
+    /// This is to prevent replay attacks, since the tx inputs
+    /// are not enforced or verified
+    pub(crate) fn make_signature(
+        &self,
+        prev_txid: &Txid,
+        secret_key: bitcoin::secp256k1::SecretKey,
+    ) -> bitcoin::secp256k1::schnorr::Signature {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (pubkey, _) = secret_key.x_only_public_key(&secp);
+        let msg = Self::make_signature_msg(prev_txid, &pubkey, &self.amount, &self.subnet_id);
+
+        // Sign the message with the secret key
+        // and return the signature
+        secp.sign_schnorr(&msg, &secret_key.keypair(&secp))
+    }
+
+    pub fn to_tx(
+        &self,
+        fee_rate: bitcoin::FeeRate,
+        multisig_address: &bitcoin::Address,
+        signature: bitcoin::secp256k1::schnorr::Signature,
+    ) -> Result<Transaction, IpcLibError> {
         //
-        // Create the output: op_return with
-        // ipc tag, subnet_id, amount, xonly pubkey of validator
+        // Create the first output: op_return with
+        // ipc tag, schnorr signature, amount
         //
         let tag: [u8; IPC_TAG_LENGTH] = IPC_UNSTAKE_TAG
             .as_bytes()
             .try_into()
             .expect("IPC_UNSTAKE_TAG has incorrect length");
-        let subnet_id_txid: [u8; SubnetId::INNER_LEN] = self.subnet_id.txid20();
         let amount = self.amount.to_sat().to_be_bytes();
-        let pubkey: [u8; SCHNORR_PUBLIC_KEY_SIZE] = self.pubkey.serialize();
+
+        let sig_bytes = signature.as_ref();
 
         // Construct op_return data
         let mut op_return_data = [0u8; Self::DATA_LEN];
 
         op_return_data[0..IPC_TAG_LENGTH].copy_from_slice(&tag);
-        op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SubnetId::INNER_LEN]
-            .copy_from_slice(&subnet_id_txid);
-        op_return_data[IPC_TAG_LENGTH + SubnetId::INNER_LEN
-            ..IPC_TAG_LENGTH + SubnetId::INNER_LEN + Amount::SIZE]
-            .copy_from_slice(&amount);
-        op_return_data[IPC_TAG_LENGTH + SubnetId::INNER_LEN + Amount::SIZE..]
-            .copy_from_slice(&pubkey);
+        op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE]
+            .copy_from_slice(sig_bytes);
+        op_return_data[IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE..].copy_from_slice(&amount);
+
+        // Required to do since [u8; 78] for some reason doesn't implement pusbytes
+        let push_bytes: &bitcoin::script::PushBytes =
+            (&op_return_data[..]).try_into().expect("the size is okay");
 
         // Make op_return script and txout
-        let op_return_script = bitcoin_utils::make_op_return_script(op_return_data);
+        let op_return_script = bitcoin_utils::make_op_return_script(push_bytes);
         let data_value = op_return_script.minimal_non_dust_custom(fee_rate);
         let data_tx_out = bitcoin::TxOut {
             value: data_value,
             script_pubkey: op_return_script,
         };
 
+        //
+        // Create second output: amount sent to the subnet multisig address
+        //
+        let multisig_tx_out = bitcoin::TxOut {
+            // TODO check this dust calculation?
+            value: multisig_address
+                .script_pubkey()
+                .minimal_non_dust_custom(fee_rate),
+            script_pubkey: multisig_address.script_pubkey(),
+        };
+
         // Construct transaction
-        let tx_outs = vec![data_tx_out];
+        let tx_outs = vec![data_tx_out, multisig_tx_out];
         let tx = bitcoin_utils::create_tx_from_txouts(tx_outs);
         debug!("Unstake TX: {tx:?}");
 
@@ -2911,17 +2978,18 @@ impl IpcUnstakeCollateralMsg {
     }
 
     /// Parses an IpcUnstakeCollateralMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::Database>(_db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::Database>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
         let err = |msg: String| IpcLibError::MsgParseError(IPC_UNSTAKE_TAG, msg);
 
-        // We expect at least one output:
-        // 1. OP_RETURN with IPC tag, subnet_id, amount and validator pubkey
-        if tx.output.is_empty() {
+        // We expect at least two outputs:
+        // 1. OP_RETURN with IPC tag, signature, and amount
+        // 2. Output to the subnet multisig address
+        if tx.output.len() < 2 {
             return Err(err(format!(
-                "Expected at least 1 output for unstake collateral message, found {}",
+                "Expected at least 2 outputs for unstake collateral message, found {}",
                 tx.output.len()
             )));
         }
@@ -2955,15 +3023,13 @@ impl IpcUnstakeCollateralMsg {
             )));
         }
 
-        // Extract subnet ID
-        let subnet_id_bytes = &op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SubnetId::INNER_LEN];
-        let mut txid20 = [0u8; SubnetId::INNER_LEN];
-        txid20.copy_from_slice(subnet_id_bytes);
-        let subnet_id = SubnetId::from_txid20(&txid20);
+        // Extract signature
+        let sig_bytes = &op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE];
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes)
+            .map_err(|e| err(format!("Invalid schnorr signature: {}", e)))?;
 
         // Extract amount
-        let amount_bytes = &op_return_data[IPC_TAG_LENGTH + SubnetId::INNER_LEN
-            ..IPC_TAG_LENGTH + SubnetId::INNER_LEN + Amount::SIZE];
+        let amount_bytes = &op_return_data[IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE..];
         let amount_sat = u64::from_be_bytes(
             amount_bytes
                 .try_into()
@@ -2971,31 +3037,125 @@ impl IpcUnstakeCollateralMsg {
         );
         let amount = Amount::from_sat(amount_sat);
 
-        // Extract validator pubkey
-        let pubkey_bytes = &op_return_data[IPC_TAG_LENGTH + SubnetId::INNER_LEN + Amount::SIZE..];
-        let pubkey = XOnlyPublicKey::from_slice(pubkey_bytes)
-            .map_err(|e| err(format!("Invalid validator pubkey: {}", e)))?;
+        let multisig_address = bitcoin::Address::from_script(&tx.output[1].script_pubkey, NETWORK)
+            .map_err(|_| err("Could not parse address from output 1".to_string()))?
+            .into_unchecked();
+
+        let subnet = match db.get_subnet_by_multisig_address(&multisig_address) {
+            Ok(Some(subnet)) => subnet,
+            Ok(None) => {
+                error!(
+                    "StakeCollateralMsg: Could not find subnet with multisig address {:?}.",
+                    multisig_address
+                );
+                return Err(err(format!(
+                    "StakeCollateralMsg: Could not find subnet with multisig address {:?}",
+                    multisig_address
+                )));
+            }
+            Err(e) => {
+                error!(
+	                "StakeCollateralMsg: Error while looking up subnet with multisig address {:?}: {}",
+	                multisig_address, e
+	            );
+                return Err(err(format!(
+                    "StakeCollateralMsg: Error while looking up subnet with multisig address {:?}: {}",
+                    multisig_address, e
+                )));
+            }
+        };
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        let prev_txid = tx
+            .input
+            .first()
+            .ok_or(err("No inputs in the transaction".to_string()))?
+            .previous_output
+            .txid;
+
+        let validator = subnet
+            .committee
+            .validators
+            .iter()
+            .find(|v| {
+                let msg = IpcUnstakeCollateralMsg::make_signature_msg(
+                    &prev_txid, &v.pubkey, &amount, &subnet.id,
+                );
+
+                // dbg!(prev_txid);
+                // dbg!(v.pubkey);
+                // dbg!(amount);
+                // dbg!(subnet.id);
+                // dbg!(msg);
+
+                secp.verify_schnorr(&signature, &msg, &v.pubkey).is_ok()
+            })
+            .ok_or(IpcValidateError::InvalidMsg(format!(
+                "Signature doesn't match any of the validators in the committee for subnet {}",
+                subnet.id
+            )))?;
+
+        debug!(
+            "Unstake request matches validator xpk {} from signature",
+            validator.pubkey
+        );
 
         // Construct the message
         Ok(Self {
-            subnet_id,
+            subnet_id: subnet.id,
             amount,
-            pubkey,
+            pubkey: Some(validator.pubkey),
         })
     }
 
-    pub fn submit_to_bitcoin(&self, rpc: &bitcoincore_rpc::Client) -> Result<Txid, IpcLibError> {
+    /// Submits the unstake transaction to Bitcoin
+    /// It accepts the current subnet multisig address to send some non-dust amount
+    /// to identify the subnet
+    ///
+    /// First output of the transaction includes the signature of the validator
+    /// thus we accept the secret key of the validator
+    ///
+    /// The signature also includes the prev_txid (of the first input) to prevent
+    /// replay attacks. This function first funds the tx
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+        secret_key: bitcoin::secp256k1::SecretKey,
+    ) -> Result<Txid, IpcLibError> {
         info!(
-            "Submitting unstake collateral msg to bitcoin. Validaor XPK = {} Amount={}",
-            self.pubkey, self.amount
+            "Submitting unstake collateral msg to bitcoin. Multisig address = {} Validator XPK = {:?} Amount={}",
+            multisig_address, self.pubkey, self.amount
         );
 
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&[0; 64])
+            .expect("All-zero valid signature");
+
         let fee_rate = get_fee_rate(rpc, None, None);
-        let tx = self.to_tx(fee_rate)?;
+        let tx = self.to_tx(fee_rate, multisig_address, signature)?;
 
         // Construct, fund and sign the stake transaction
-        let tx = crate::wallet::fund_tx(rpc, tx, None)?;
-        trace!("Unstake msg funded TX: {tx:?}");
+        let mut tx = crate::wallet::fund_tx(rpc, tx, None)?;
+        trace!("Unstake msg funded TX (empty signature): {tx:?}");
+
+        let first_prev_txid = tx
+            .input
+            .first()
+            .ok_or(IpcLibError::MsgParseError(
+                IPC_UNSTAKE_TAG,
+                "No inputs in the transaction".to_string(),
+            ))?
+            .previous_output
+            .txid;
+
+        // Update the signature with the correct one
+        let signature = self.make_signature(&first_prev_txid, secret_key);
+        let tx_with_signature = self.to_tx(fee_rate, multisig_address, signature)?;
+
+        // Update our funded tx's first output which has the updated signature
+        tx.output[0] = tx_with_signature.output[0].clone();
+
         let tx = crate::wallet::sign_tx(rpc, tx)?;
         trace!("Unstake msg signed TX: {tx:?}");
 
@@ -3042,15 +3202,18 @@ impl IpcUnstakeCollateralMsg {
 
         self.validate_for_subnet(&subnet_state)?;
 
+        // checked before in validate_for_subnet
+        let pubkey = self.pubkey.expect("pubkey should be present");
+
         // we clone and modify the validator
         let mut validator = subnet_state
             .committee
             .validators
             .iter()
-            .find(|v| v.pubkey == self.pubkey)
+            .find(|v| v.pubkey == pubkey)
             .ok_or(IpcValidateError::InvalidMsg(format!(
                 "Validator with public key {} not part of committee",
-                self.pubkey
+                pubkey
             )))?
             .clone();
 
@@ -3078,10 +3241,10 @@ impl IpcUnstakeCollateralMsg {
 
         if new_power == 0 {
             // Remove the validator from the committee if power is zero
-            next_committee.remove_validator(&self.subnet_id, &self.pubkey)?;
+            next_committee.remove_validator(&self.subnet_id, &pubkey)?;
             info!(
                 "Subnet={} Removed validator {} from committee",
-                self.subnet_id, self.pubkey
+                self.subnet_id, pubkey
             );
         } else {
             // Modify the validator in the next committee
@@ -3099,7 +3262,7 @@ impl IpcUnstakeCollateralMsg {
             change: db::StakingChange::Withdraw {
                 amount: self.amount,
             },
-            validator_xpk: self.pubkey,
+            validator_xpk: pubkey,
             validator_subnet_address: validator.subnet_address,
             configuration_number: stake_change_configuration_number,
             committee_after_change: next_committee.clone(),
@@ -3137,7 +3300,7 @@ impl IpcValidate for IpcUnstakeCollateralMsg {
         if self.amount == Amount::ZERO {
             return Err(IpcValidateError::InvalidField(
                 "amount",
-                "Amount amount must be greater than zero".to_string(),
+                "Amount must be greater than zero".to_string(),
             ));
         }
 
@@ -4649,30 +4812,80 @@ mod checkpoint_msg_tests {
 
     #[test]
     fn test_unstake_collateral_from_tx() {
+        use crate::db::SubnetValidators;
         use crate::DEFAULT_BTC_FEE_RATE;
 
         let db = crate::test_utils::create_test_db();
-        use std::str::FromStr;
 
         // Create test data
-        let subnet_id = crate::test_utils::generate_subnet_id();
-        let validator_pubkey = bitcoin::XOnlyPublicKey::from_str(
-            "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
-        )
-        .unwrap();
+        let mut subnet_state = crate::test_utils::generate_subnet(4);
+        let subnet_id = subnet_state.id;
+
+        let keypairs = crate::test_utils::generate_keypairs(1);
+        let keypair = keypairs.first().expect("should generate");
+        let (xpk, _) = keypair.x_only_public_key();
+
+        let prev_txid = bitcoin::Txid::all_zeros();
+
+        // Update the subnet to use our validator
+        subnet_state
+            .committee
+            .validators
+            .first_mut()
+            .unwrap()
+            .pubkey = xpk;
+
+        subnet_state.committee.multisig_address = subnet_state
+            .committee
+            .validators
+            .multisig_address(&subnet_id);
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            db.save_subnet_state(&mut wtxn, subnet_id, &subnet_state)
+                .expect("saves subnet");
+            wtxn.commit().expect("commits transaction");
+        }
+
         let amount = bitcoin::Amount::from_sat(5500000);
 
         // Create the unstake message
         let unstake_msg = IpcUnstakeCollateralMsg {
             subnet_id,
             amount,
-            pubkey: validator_pubkey,
+            pubkey: Some(xpk),
         };
 
+        let msg =
+            IpcUnstakeCollateralMsg::make_signature_msg(&prev_txid, &xpk, &amount, &subnet_id);
+
+        dbg!(&subnet_state.committee);
+        dbg!(prev_txid);
+        dbg!(xpk);
+        dbg!(amount);
+        dbg!(subnet_id);
+        dbg!(msg);
+
+        let signature = unstake_msg.make_signature(&prev_txid, keypair.secret_key());
+
         // Generate a transaction from the message
-        let tx = unstake_msg
-            .to_tx(DEFAULT_BTC_FEE_RATE)
+        let mut tx = unstake_msg
+            .to_tx(
+                DEFAULT_BTC_FEE_RATE,
+                &subnet_state.committee.multisig_address.assume_checked(),
+                signature,
+            )
             .expect("Should create transaction");
+
+        tx.input = vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: prev_txid,
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }];
 
         // Test parsing the transaction back into a message
         let parsed_msg =
@@ -4681,7 +4894,7 @@ mod checkpoint_msg_tests {
         // Verify the parsed message matches the original
         assert_eq!(parsed_msg.subnet_id, subnet_id);
         assert_eq!(parsed_msg.amount, amount);
-        assert_eq!(parsed_msg.pubkey, validator_pubkey);
+        assert_eq!(parsed_msg.pubkey, Some(xpk));
 
         // Print debug info
         println!("Original subnet_id: {}", subnet_id);
@@ -4700,6 +4913,92 @@ mod checkpoint_msg_tests {
 
         assert_eq!(parsed_msg_from_hex.subnet_id, subnet_id);
         assert_eq!(parsed_msg_from_hex.amount, amount);
-        assert_eq!(parsed_msg_from_hex.pubkey, validator_pubkey);
+        assert_eq!(parsed_msg_from_hex.pubkey, Some(xpk));
+    }
+
+    #[test]
+    fn test_unstake_collateral_unknown_signature() {
+        use crate::DEFAULT_BTC_FEE_RATE;
+
+        let db = crate::test_utils::create_test_db();
+
+        // Create test data
+        let subnet_state = crate::test_utils::generate_subnet(4);
+        let subnet_id = subnet_state.id;
+
+        // Intentionaly don't add this validator to the subnet committee
+        let keypairs = crate::test_utils::generate_keypairs(1);
+        let keypair = keypairs.first().expect("should generate");
+        let (xpk, _) = keypair.x_only_public_key();
+
+        let prev_txid = bitcoin::Txid::all_zeros();
+
+        {
+            let mut wtxn = db.write_txn().unwrap();
+            db.save_subnet_state(&mut wtxn, subnet_id, &subnet_state)
+                .expect("saves subnet");
+            wtxn.commit().expect("commits transaction");
+        }
+
+        let amount = bitcoin::Amount::from_sat(5500000);
+
+        // Create the unstake message
+        let unstake_msg = IpcUnstakeCollateralMsg {
+            subnet_id,
+            amount,
+            pubkey: Some(xpk),
+        };
+
+        let msg =
+            IpcUnstakeCollateralMsg::make_signature_msg(&prev_txid, &xpk, &amount, &subnet_id);
+
+        dbg!(&subnet_state.committee);
+        dbg!(prev_txid);
+        dbg!(xpk);
+        dbg!(amount);
+        dbg!(subnet_id);
+        dbg!(msg);
+
+        let signature = unstake_msg.make_signature(&prev_txid, keypair.secret_key());
+
+        // Generate a transaction from the message
+        let mut tx = unstake_msg
+            .to_tx(
+                DEFAULT_BTC_FEE_RATE,
+                &subnet_state.committee.multisig_address.assume_checked(),
+                signature,
+            )
+            .expect("Should create transaction");
+
+        tx.input = vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: prev_txid,
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }];
+
+        // Test parsing the transaction back into a message
+        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+        assert!(parsed_msg.is_err());
+
+        let expected_error_msg = format!(
+            "Signature doesn't match any of the validators in the committee for subnet {}",
+            subnet_id
+        );
+
+        if let Err(IpcLibError::IpcValidateError(crate::ipc_lib::IpcValidateError::InvalidMsg(
+            msg,
+        ))) = parsed_msg
+        {
+            assert_eq!(msg, expected_error_msg);
+        } else {
+            panic!(
+                "Expected IpcValidateError::InvalidMsg but got: {:?}",
+                parsed_msg
+            );
+        }
     }
 }

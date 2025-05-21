@@ -665,9 +665,7 @@ pub async fn gen_checkpoint_psbt(
                         address,
                         pubkey: sc.validator_xpk,
                     }),
-                    _ => {
-                        return None;
-                    }
+                    _ => None,
                 }
             })
             .collect::<Vec<_>>();
@@ -1065,12 +1063,21 @@ pub struct UnstakeCollateralResponse {
 
 pub async fn unstake_collateral(
     data: Data<Arc<ServerData>>,
-    Params(msg): Params<IpcUnstakeCollateralMsg>,
+    Params(mut msg): Params<IpcUnstakeCollateralMsg>,
 ) -> Result<UnstakeCollateralResponse, JsonRpcError> {
-    info!(
-        "unstakecollateral: {} {} {}",
-        msg.subnet_id, msg.pubkey, msg.amount
-    );
+    info!("unstakecollateral: {} {}", msg.subnet_id, msg.amount);
+
+    let (validator_xpk, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
+    msg.pubkey = Some(validator_xpk);
 
     if let Err(err) = msg.validate() {
         error!("Invalid unstake collateral message={msg:?}: {err}");
@@ -1097,8 +1104,10 @@ pub async fn unstake_collateral(
         RpcError::InvalidParams(e.to_string())
     })?;
 
+    let multisig_address = subnet_state.multisig_address();
+
     let txid = msg
-        .submit_to_bitcoin(&data.btc_rpc)
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     Ok(UnstakeCollateralResponse { txid })

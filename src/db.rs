@@ -93,7 +93,7 @@ pub struct SubnetValidator {
     pub join_txid: bitcoin::Txid,
 }
 
-trait SubnetValidators {
+pub(crate) trait SubnetValidators {
     fn total_power(&self) -> Power;
     fn threshold(&self) -> Power;
     fn multisig_address(&self, subnet_id: &SubnetId) -> Address<NetworkUnchecked>;
