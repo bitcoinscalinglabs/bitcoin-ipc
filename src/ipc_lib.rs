@@ -2832,11 +2832,16 @@ impl IpcUnstakeCollateralMsg {
             ));
         }
 
+        let committee = subnet
+            .waiting_committee
+            .clone()
+            .unwrap_or(subnet.committee.clone());
+
         // Check if the validator with this public key is already registered
-        // NOTE: don't remove
+        // NOTE: mandatory check here
         match self.pubkey {
             Some(pubkey) => {
-                if !subnet.committee.is_validator(&pubkey) {
+                if !committee.is_validator(&pubkey) {
                     return Err(IpcValidateError::InvalidMsg(format!(
                         "Validator with public key '{}' must already be a validator in subnet {}",
                         pubkey, self.subnet_id,
@@ -3205,9 +3210,13 @@ impl IpcUnstakeCollateralMsg {
         // checked before in validate_for_subnet
         let pubkey = self.pubkey.expect("pubkey should be present");
 
+        let committee = subnet_state
+            .waiting_committee
+            .clone()
+            .unwrap_or(subnet_state.committee.clone());
+
         // we clone and modify the validator
-        let mut validator = subnet_state
-            .committee
+        let mut validator = committee
             .validators
             .iter()
             .find(|v| v.pubkey == pubkey)
@@ -3226,29 +3235,46 @@ impl IpcUnstakeCollateralMsg {
                     self.amount, validator.collateral
                 )))?;
 
-        let new_power = multisig::collateral_to_power(
+        use crate::multisig::MultisigError;
+
+        // The amount user specified to unstake
+        // in case the remaining collateral is too low, we will withdraw all
+        // of the funds
+        let mut withdraw_amount = self.amount;
+
+        let (new_power, sufficient_to_participate) = match multisig::collateral_to_power(
             &new_collateral,
             &genesis_info.create_subnet_msg.min_validator_stake,
-        )?;
-
-        validator.collateral = new_collateral;
-        validator.power = new_power;
+        ) {
+            Ok(power) => (power, true),
+            Err(MultisigError::InsufficientCollateral) => (0, false),
+            Err(e) => return Err(e.into()),
+        };
 
         // Update the next committee or create one if it doesn't exist
         let mut next_committee = subnet_state
             .waiting_committee
             .unwrap_or_else(|| subnet_state.committee.clone());
 
-        if new_power == 0 {
+        if new_power == 0 || !sufficient_to_participate {
+            // If power is insufficient to be in committee,
+            // withdraw all the collateral
+            withdraw_amount = validator.collateral;
             // Remove the validator from the committee if power is zero
             next_committee.remove_validator(&self.subnet_id, &pubkey)?;
             info!(
-                "Subnet={} Removed validator {} from committee",
-                self.subnet_id, pubkey
+                "Subnet={} Validator XPK {} left the committee by withdrawing {} collateral",
+                self.subnet_id, pubkey, self.amount
             );
         } else {
             // Modify the validator in the next committee
+            validator.collateral = new_collateral;
+            validator.power = new_power;
             next_committee.modify_validator(&self.subnet_id, &validator)?;
+            info!(
+                "Subnet={} Validator XPK {} updated collateral to {}",
+                self.subnet_id, pubkey, self.amount
+            );
         }
 
         // Update the subnet state with the modified next committee
@@ -3260,7 +3286,7 @@ impl IpcUnstakeCollateralMsg {
         // Create a stake change request to track this change
         let stake_change = db::StakeChangeRequest {
             change: db::StakingChange::Withdraw {
-                amount: self.amount,
+                amount: withdraw_amount,
             },
             validator_xpk: pubkey,
             validator_subnet_address: validator.subnet_address,

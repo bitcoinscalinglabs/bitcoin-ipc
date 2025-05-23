@@ -115,14 +115,9 @@ pub fn generate_subnet(n_val: usize) -> db::SubnetState {
     let committee_keys: Vec<WeightedKey> = validators.iter().map(|v| (v.pubkey, 1)).collect();
 
     // Create multisig address
-    let multisig_address = create_subnet_multisig_address(
-        &secp,
-        &subnet_id,
-        &committee_keys,
-        min_validators.into(),
-        NETWORK,
-    )
-    .unwrap();
+    let multisig_address =
+        create_subnet_multisig_address(&secp, &subnet_id, &committee_keys, min_validators, NETWORK)
+            .unwrap();
     let multisig_address = multisig_address.as_unchecked();
 
     let committee = db::SubnetCommittee {

@@ -1864,13 +1864,8 @@ pub mod tests {
         };
 
         // Create the two committees
-        let mut validators_set1 = Vec::new();
-        validators_set1.push(validator1_set1);
-        validators_set1.push(validator2_set1);
-
-        let mut validators_set2 = Vec::new();
-        validators_set2.push(validator1_set2);
-        validators_set2.push(validator2_set2);
+        let validators_set1 = vec![validator1_set1, validator2_set1];
+        let validators_set2 = vec![validator1_set2, validator2_set2];
 
         let committee1 = validators_set1.to_committee(&subnet_id, 0);
         let committee2 = validators_set2.to_committee(&subnet_id, 0);
@@ -2073,7 +2068,7 @@ pub mod tests {
 
         // Initial check - should be GENESIS_COMMITTEE_CONF_NUM + 1
         let next_conf_num = db
-            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .get_next_stake_change_configuration_number(subnet_id)
             .unwrap();
         assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 1);
 
@@ -2127,7 +2122,7 @@ pub mod tests {
 
         // Check the configuration number after adding validator
         let next_conf_num = db
-            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .get_next_stake_change_configuration_number(subnet_id)
             .unwrap();
         assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 3);
 
@@ -2167,7 +2162,7 @@ pub mod tests {
 
         // Check the configuration number after modifying validator
         let next_conf_num = db
-            .get_next_stake_change_configuration_number(subnet_id.clone())
+            .get_next_stake_change_configuration_number(subnet_id)
             .unwrap();
         assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 4);
     }

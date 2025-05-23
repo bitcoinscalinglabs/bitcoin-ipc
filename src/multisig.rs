@@ -1780,7 +1780,7 @@ mod psbt_tests {
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            required_sigs.try_into().unwrap(),
+            required_sigs.into(),
             &psbt_signed_twice,
         )
         .expect("Failed to finalize PSBT");
@@ -1823,7 +1823,7 @@ mod psbt_tests {
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            threshold.into(),
+            threshold,
             NETWORK,
         )
         .unwrap();
