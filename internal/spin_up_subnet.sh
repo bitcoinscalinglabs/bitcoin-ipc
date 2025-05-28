@@ -95,6 +95,7 @@ run_validator() {
 run_validator 2 26756 26757 8645 26755 &
 run_validator 3 26856 26857 8745 26855 &
 run_validator 4 26956 26957 8845 26955 &
+run_validator 5 27056 27057 8945 27055 &
 
 # Wait for all background processes to complete
 wait

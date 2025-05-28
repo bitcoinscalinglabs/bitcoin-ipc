@@ -117,7 +117,10 @@ pub fn create_subnet_multisig_address(
 
 pub fn multisig_threshold(total_power: Power) -> Power {
     // TODO figure out threshold
-    (total_power / 2) + 1
+    // total_weight * 2 / 3 + 1
+    // see quorum_threshold in ipc
+    // (total_power / 2) + 1
+    total_power * 2 / 3 + 1
 }
 
 // TODO figure out scaling factor
@@ -269,6 +272,7 @@ pub fn construct_spend_unsigned_transaction(
     threshold: Power,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
+    exhaust_unspent: bool,
     tx_outs: &[TxOut],
     fee_rate: &FeeRate,
 ) -> Result<Transaction, MultisigError> {
@@ -284,58 +288,149 @@ pub fn construct_spend_unsigned_transaction(
 
     let non_dust_change_tx_out =
         bitcoin::TxOut::minimal_non_dust(committee_change_address.script_pubkey());
+    if exhaust_unspent {
+        // Use all UTXOs as inputs
+        if unspent.is_empty() {
+            return Err(MultisigError::CoinSelectionFailed(
+                "No UTXOs available".to_string(),
+            ));
+        }
 
-    // Create base outputs functionally by concatenating vectors
-    let outputs = [tx_outs, &[non_dust_change_tx_out]].concat();
+        // Calculate total input amount from all UTXOs
+        let total_input_amount = unspent.iter().map(|utxo| utxo.amount).sum::<Amount>();
 
-    // Calculate the total amount to spend, including the potential change output
-    // TODO: should we include the change output in the amount, even though
-    // we're not sure if it will be added?
-    let amount = outputs.iter().map(|tx_out| tx_out.value).sum::<Amount>();
+        // Calculate total output amount from specified tx_outs
+        let total_output_amount = tx_outs.iter().map(|tx_out| tx_out.value).sum::<Amount>();
 
-    // base transaction, assume a change output
-    let base_tx = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![],
-        output: outputs,
-    };
-    let base_tx_weight = base_tx.weight();
+        // Ensure we have enough funds for the specified outputs
+        if total_input_amount < total_output_amount {
+            return Err(MultisigError::CoinSelectionFailed(
+                "Insufficient funds to cover outputs".to_string(),
+            ));
+        }
 
-    // coin selection from utxos
-    let (selected_utxos, change) = select_coins(
-        amount,
-        unspent,
-        *fee_rate,
-        base_tx_weight,
-        spending_weight_per_input,
-        committee_change_address,
-    )?;
+        // Create inputs from all UTXOs
+        let inputs = unspent
+            .iter()
+            .map(|utxo| TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect::<Vec<TxIn>>();
 
-    let inputs = selected_utxos
-        .iter()
-        .map(|utxo| TxIn {
-            previous_output: bitcoin::OutPoint {
-                txid: utxo.txid,
-                vout: utxo.vout,
+        // Start with the transaction containing all inputs and specified outputs
+        let mut spend_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: tx_outs.to_vec(),
+        };
+
+        // Create a tentative transaction with potential change output to estimate fees
+        let mut tentative_tx = spend_tx.clone();
+        tentative_tx.output.push(TxOut {
+            value: Amount::from_sat(1), // Placeholder value
+            script_pubkey: committee_change_address.script_pubkey(),
+        });
+
+        // Calculate fee with the correct witness weight
+        let fee = fee_rate
+            .fee_wu(
+                tentative_tx.weight()
+                    + Weight::from_witness_data_size(
+                        spend_witness_size as u64 * unspent.len() as u64,
+                    ),
+            )
+            .expect("fee calculation shouldn't overflow");
+
+        // Calculate remaining amount after outputs and fees
+        let remaining = match total_input_amount.checked_sub(total_output_amount) {
+            Some(remainder) => match remainder.checked_sub(fee) {
+                Some(after_fee) => after_fee,
+                None => {
+                    return Err(MultisigError::CoinSelectionFailed(
+                        "Insufficient funds to cover outputs and fees".to_string(),
+                    ))
+                }
             },
-            script_sig: ScriptBuf::new(),
-            sequence: bitcoin::Sequence::MAX,
-            witness: Witness::new(),
-        })
-        .collect::<Vec<TxIn>>();
+            None => {
+                return Err(MultisigError::CoinSelectionFailed(
+                    "Insufficient funds to cover outputs".to_string(),
+                ))
+            }
+        };
 
-    let mut spend_tx = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: inputs,
-        output: tx_outs.to_vec(),
-    };
-    if let Some(change_tx_out) = change {
-        spend_tx.output.push(change_tx_out);
+        // Only add the change output if it's above the dust threshold
+        if remaining > non_dust_change_tx_out.value {
+            spend_tx.output.push(TxOut {
+                value: remaining,
+                script_pubkey: committee_change_address.script_pubkey(),
+            });
+        } else {
+            trace!(
+                "Change amount {} is dust, not creating change output",
+                remaining
+            );
+            // The dust becomes an additional fee
+        }
+
+        debug!("Multisig Spend Transaction {:?}", &spend_tx);
+
+        Ok(spend_tx)
+    } else {
+        // Original behavior: select just enough UTXOs to cover the outputs
+        // Calculate the total amount to spend for the outputs
+        let amount = tx_outs.iter().map(|tx_out| tx_out.value).sum::<Amount>();
+
+        // base transaction, assume a change output
+        let base_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: [tx_outs, &[non_dust_change_tx_out]].concat(),
+        };
+        let base_tx_weight = base_tx.weight();
+
+        // coin selection from utxos
+        let (selected_utxos, change) = select_coins(
+            amount,
+            unspent,
+            *fee_rate,
+            base_tx_weight,
+            spending_weight_per_input,
+            committee_change_address,
+        )?;
+
+        let inputs = selected_utxos
+            .iter()
+            .map(|utxo| TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect::<Vec<TxIn>>();
+
+        let mut spend_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: tx_outs.to_vec(),
+        };
+        if let Some(change_tx_out) = change {
+            spend_tx.output.push(change_tx_out);
+        }
+
+        Ok(spend_tx)
     }
-
-    Ok(spend_tx)
 }
 
 /// Constructs a PSBT for spending a multisig output
@@ -347,6 +442,7 @@ pub fn construct_spend_psbt(
     committee_threshold: Power,
     committee_change_address: &Address,
     unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
+    exhaust_unspent: bool,
     tx_outs: &[TxOut],
     fee_rate: &FeeRate,
 ) -> Result<bitcoin::Psbt, MultisigError> {
@@ -358,6 +454,7 @@ pub fn construct_spend_psbt(
         committee_threshold,
         committee_change_address,
         unspent,
+        exhaust_unspent,
         tx_outs,
         fee_rate,
     )?;
@@ -1475,6 +1572,7 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &vec![utxo],
+            false,
             &[bitcoin::TxOut {
                 value: spend_amount,
                 script_pubkey: destination.script_pubkey(),
@@ -1632,6 +1730,7 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &vec![utxo.clone()],
+            false,
             &[tx_out],
             &fee_rate,
         )
@@ -1822,6 +1921,7 @@ mod psbt_tests {
             2,                 // required signatures
             &multisig_address, // Use the same address for change
             &utxos,
+            false,
             &[tx_out],
             &fee_rate,
         )
@@ -2206,5 +2306,218 @@ mod multisig_weighted_tests {
             );
             println!("Test case 4 passed: Heavy (10) + Medium validator (5) = 15 power exceeds threshold");
         }
+    }
+}
+
+#[cfg(test)]
+mod exhaust_unspent_tests {
+    use super::*;
+    use crate::test_utils::{generate_keypairs, generate_subnet_id};
+    use bitcoin::Amount;
+    use bitcoincore_rpc::json::ListUnspentResultEntry;
+    use std::str::FromStr;
+
+    fn create_test_utxo(amount: u64, txid: &str, vout: u32) -> ListUnspentResultEntry {
+        ListUnspentResultEntry {
+            txid: txid.parse().unwrap(),
+            vout,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: ScriptBuf::new(),
+            amount: Amount::from_sat(amount),
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        }
+    }
+
+    #[test]
+    fn test_exhaust_unspent() {
+        let secp = Secp256k1::new();
+
+        // Create committee keys
+        let keypairs = generate_keypairs(3);
+        let committee_keys: Vec<WeightedKey> = keypairs
+            .iter()
+            .map(|kp| (kp.x_only_public_key().0, 1))
+            .collect();
+
+        // Generate subnet ID and address
+        let subnet_id = generate_subnet_id();
+        let network = bitcoin::Network::Regtest;
+        let committee_address = create_subnet_multisig_address(
+            &secp,
+            &subnet_id,
+            &committee_keys,
+            2, // threshold
+            network,
+        )
+        .unwrap();
+
+        // Create UTXOs with different amounts
+        let utxos = vec![
+            create_test_utxo(
+                5000,
+                "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e",
+                0,
+            ),
+            create_test_utxo(
+                3000,
+                "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1",
+                0,
+            ),
+            create_test_utxo(
+                9000,
+                "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+                0,
+            ),
+        ];
+
+        // Calculate total input amount
+        let total_input_amount = utxos.iter().map(|utxo| utxo.amount).sum::<Amount>();
+
+        // Define output
+        let destination = Address::from_str("bcrt1qzswe5l7xyzvgfn4v9s96r3cxtlxhq87x2etpp7")
+            .unwrap()
+            .assume_checked();
+
+        let output_amount = Amount::from_sat(1000);
+        let tx_out = TxOut {
+            value: output_amount,
+            script_pubkey: destination.script_pubkey(),
+        };
+
+        let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+
+        // Case 1: Normal spend (don't exhaust UTXOs)
+        let tx_normal = construct_spend_unsigned_transaction(
+            &committee_keys,
+            2, // threshold
+            &committee_address,
+            &utxos,
+            false, // don't exhaust
+            &[tx_out.clone()],
+            &fee_rate,
+        )
+        .unwrap();
+
+        // Should select just enough UTXOs to cover the output
+        assert!(
+            tx_normal.input.len() < utxos.len(),
+            "Normal spend should not use all UTXOs, used {} of {}",
+            tx_normal.input.len(),
+            utxos.len()
+        );
+
+        // Case 2: Exhaust UTXOs
+        let tx_exhaust = construct_spend_unsigned_transaction(
+            &committee_keys,
+            2, // threshold
+            &committee_address,
+            &utxos,
+            true, // exhaust all UTXOs
+            &[tx_out.clone()],
+            &fee_rate,
+        )
+        .unwrap();
+
+        // Should use all UTXOs
+        assert_eq!(
+            tx_exhaust.input.len(),
+            utxos.len(),
+            "Exhaust spend should use all UTXOs"
+        );
+
+        // Should have exactly one change output plus the specified output
+        assert_eq!(
+            tx_exhaust.output.len(),
+            2,
+            "Exhaust spend should have original output plus change"
+        );
+
+        // Verify the change goes to the committee address
+        assert_eq!(
+            tx_exhaust.output[1].script_pubkey,
+            committee_address.script_pubkey(),
+            "Change output has incorrect script pubkey"
+        );
+
+        // Verify change amount is approximately what we expect
+        // (total_inputs - output_amount - fees)
+        let change_output_amount = tx_exhaust.output[1].value;
+        let spent_amount = output_amount;
+        let fee_estimate = fee_rate.fee_wu(tx_exhaust.weight()).unwrap();
+
+        assert!(
+            change_output_amount < total_input_amount - spent_amount,
+            "Change amount should be less than total input minus spent amount"
+        );
+
+        // Check that the change plus output plus estimated fee is approximately equal to total input
+        let total_accounted_for = change_output_amount + spent_amount + fee_estimate;
+        let margin = Amount::from_sat(600); // Allow for a small margin of error in fee calculation
+
+        assert!(
+            total_accounted_for <= total_input_amount,
+            "Total outputs plus fee ({}) should not exceed total input ({})",
+            total_accounted_for,
+            total_input_amount
+        );
+
+        dbg!(&tx_exhaust);
+        dbg!(total_input_amount - total_accounted_for);
+
+        assert!(
+            total_input_amount - total_accounted_for <= margin,
+            "Difference between total input and (outputs + fee) should be small"
+        );
+
+        // Case 3: Exhaust UTXOs with multiple outputs
+        let tx_out2 = TxOut {
+            value: Amount::from_sat(2000),
+            script_pubkey: destination.script_pubkey(),
+        };
+
+        let tx_exhaust_multi = construct_spend_unsigned_transaction(
+            &committee_keys,
+            2, // threshold
+            &committee_address,
+            &utxos,
+            true, // exhaust all UTXOs
+            &[tx_out, tx_out2],
+            &fee_rate,
+        )
+        .unwrap();
+
+        // Should have exactly one change output plus the two specified outputs
+        assert_eq!(
+            tx_exhaust_multi.output.len(),
+            3,
+            "Exhaust spend with multiple outputs should have all outputs plus change"
+        );
+
+        // Verify change amount reflects all outputs
+        let total_outputs = tx_exhaust_multi
+            .output
+            .iter()
+            .filter(|out| out.script_pubkey != committee_address.script_pubkey())
+            .map(|out| out.value)
+            .sum::<Amount>();
+
+        let multi_change_output_amount = tx_exhaust_multi
+            .output
+            .iter()
+            .find(|out| out.script_pubkey == committee_address.script_pubkey())
+            .map(|out| out.value)
+            .unwrap();
+
+        assert!(
+            multi_change_output_amount < total_input_amount - total_outputs,
+            "Multi-output change amount should be less than total input minus all outputs"
+        );
     }
 }

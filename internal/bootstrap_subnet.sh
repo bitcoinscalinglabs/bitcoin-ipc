@@ -42,7 +42,7 @@ CREATE_OUTPUT=$(curl -s -X POST "$API_URL" \
           \"min_validator_stake\": $MIN_VAL,
           \"min_validators\": 4,
           \"bottomup_check_period\": 50,
-          \"active_validators_limit\": 4,
+          \"active_validators_limit\": 10,
           \"min_cross_msg_fee\": 200,
           \"whitelist\": [
               \"5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268\",

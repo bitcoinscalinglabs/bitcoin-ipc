@@ -9,6 +9,7 @@ use log::error;
 use log::trace;
 use log::warn;
 use log::{debug, info};
+use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -324,19 +325,10 @@ pub struct IpcJoinSubnetMsg {
 
 impl IpcJoinSubnetMsg {
     /// Validates the join subnet message, for the given genesis info
-    pub fn validate_for_genesis_info(
+    pub fn validate_pre_bootstrap(
         &self,
         genesis_info: &db::SubnetGenesisInfo,
     ) -> Result<(), IpcValidateError> {
-        // Check if the subnet is already bootstrapped
-        if genesis_info.bootstrapped {
-            // TODO handle when subnet already bootstrapped
-            return Err(IpcValidateError::InvalidMsg(format!(
-                "Subnet {} is already bootstrapped.",
-                self.subnet_id
-            )));
-        }
-
         // Check if the collateral is at least the minimum validator stake
         if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
             return Err(IpcValidateError::InvalidField(
@@ -368,11 +360,79 @@ impl IpcJoinSubnetMsg {
         {
             return Err(IpcValidateError::InvalidField(
                 "pubkey",
-                "Validator with this public key already registered in subnet".to_string(),
+                format!(
+                    "Validator with public key '{}' already registered in subnet",
+                    self.pubkey
+                ),
             ));
         }
 
         Ok(())
+    }
+
+    /// Validates the join subnet message, for the given genesis info
+    /// and current subnet state
+    pub fn validate_post_bootstrap(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
+        // Check if the collateral is at least the minimum validator stake
+        if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
+            return Err(IpcValidateError::InvalidField(
+                "collateral",
+                format!(
+                    "Collateral must be at least {}, supplied {}",
+                    genesis_info.create_subnet_msg.min_validator_stake, self.collateral,
+                ),
+            ));
+        }
+
+        // Check if the validator with this public key is already registered
+        if subnet.committee.is_validator(&self.pubkey) {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' already registered in subnet",
+                self.pubkey
+            )));
+        }
+
+        // Check if the validator with this public key is already registered
+        // and waiting in the next committee
+        if subnet
+            .waiting_committee
+            .as_ref()
+            .is_some_and(|c| c.is_validator(&self.pubkey))
+        {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' already registered in subnet, waiting for next committee",
+                self.pubkey
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates the join subnet message, for the given genesis info
+    pub fn validate_for_subnet(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &Option<db::SubnetState>,
+    ) -> Result<(), IpcValidateError> {
+        if let Some(subnet) = subnet {
+            if subnet.id != self.subnet_id {
+                return Err(IpcValidateError::InvalidField(
+                    "subnet_id",
+                    format!(
+                        "Subnet ID mismatch: expected {}, got {}",
+                        subnet.id, self.subnet_id
+                    ),
+                ));
+            }
+
+            self.validate_post_bootstrap(genesis_info, subnet)
+        } else {
+            self.validate_pre_bootstrap(genesis_info)
+        }
     }
 
     /// Submits the join subnet message to the Bitcoin network
@@ -422,11 +482,14 @@ impl IpcJoinSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
-    /// Returning SubnetState if the subnet is bootstrapped
+    /// Returning SubnetState *only* if the subnet is bootstrapped
+    ///
+    /// It will return None if processed for an already bootstrapped subnet
     pub fn save_to_db<D: db::Database>(
         &self,
         db: &D,
         block_height: u64,
+        block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<Option<db::SubnetState>, IpcLibError> {
         let mut genesis_info =
@@ -436,7 +499,12 @@ impl IpcJoinSubnetMsg {
                     self.subnet_id
                 )))?;
 
-        self.validate_for_genesis_info(&genesis_info)?;
+        let subnet_state = db.get_subnet_state(self.subnet_id).map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            IpcValidateError::InvalidMsg(e.to_string())
+        })?;
+
+        self.validate_for_subnet(&genesis_info, &subnet_state)?;
 
         let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
@@ -455,29 +523,121 @@ impl IpcJoinSubnetMsg {
             join_txid: txid,
         };
         trace!("Processing {self:?}, adding new validator {new_validator:?}");
-        genesis_info.genesis_validators.push(new_validator);
-
-        // Write to DB
-        let mut wtxn = db.write_txn()?;
 
         //
-        // Check if the subnet is bootstrapped
+        // Handle post-bootstrap case
         //
-        if genesis_info.enough_to_bootstrap() {
-            trace!("Subnet {} bootstrapped", self.subnet_id);
-            genesis_info.bootstrapped = true;
-            genesis_info.genesis_block_height = Some(block_height);
+        if let Some(mut subnet) = subnet_state {
+            if subnet.is_validator(&self.pubkey) {
+                return Err(IpcValidateError::InvalidField(
+                    "pubkey",
+                    format!(
+                        "Validator with public key '{}' already registered in subnet",
+                        self.pubkey
+                    ),
+                )
+                .into());
+            }
 
-            // Save the newly create subnet state
-            let subnet_state = genesis_info.to_subnet();
-            db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+            let mut next_commitee = subnet
+                .waiting_committee
+                .unwrap_or_else(|| subnet.committee.clone());
+
+            if next_commitee.is_validator(&self.pubkey) {
+                return Err(IpcValidateError::InvalidField(
+                    "pubkey",
+                    format!(
+						"Validator with public key '{}' already registered in subnet, waiting in next committee.",
+						self.pubkey
+					),
+                )
+                .into());
+            }
+
+            next_commitee.join_validator(&subnet.id, &new_validator)?;
+            subnet.waiting_committee = Some(next_commitee.clone());
+
+            let stake_change_configuration_number =
+                db.get_next_stake_change_configuration_number(self.subnet_id)?;
+
+            let validator_subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
+
+            // Join
+            let stake_change_join = db::StakeChangeRequest {
+                change: db::StakingChange::Join {
+                    pubkey: self.pubkey.public_key(bitcoin::secp256k1::Parity::Even),
+                },
+                validator_xpk: self.pubkey,
+                validator_subnet_address,
+                configuration_number: stake_change_configuration_number,
+                committee_after_change: next_commitee.clone(),
+
+                block_height,
+                block_hash,
+                checkpoint_block_height: None,
+                checkpoint_block_hash: None,
+                txid,
+            };
+            // Deposit
+            let stake_change = db::StakeChangeRequest {
+                change: db::StakingChange::Deposit {
+                    amount: self.collateral,
+                },
+                validator_xpk: self.pubkey,
+                validator_subnet_address,
+                configuration_number: stake_change_configuration_number + 1,
+                committee_after_change: next_commitee.clone(),
+
+                block_height,
+                block_hash,
+                checkpoint_block_height: None,
+                checkpoint_block_hash: None,
+                txid,
+            };
+
+            // Write to DB
+            let mut wtxn = db.write_txn()?;
+            db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet)?;
+            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change_join)?;
+            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
             wtxn.commit()?;
-            Ok(Some(subnet_state))
-        } else {
-            db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
-            wtxn.commit()?;
+
             Ok(None)
+        }
+        //
+        // Handle pre-bootstrap case
+        //
+        else {
+            genesis_info.genesis_validators.push(new_validator);
+
+            // Write to DB
+            let mut wtxn = db.write_txn()?;
+
+            //
+            // Check if the subnet is bootstrapped
+            //
+            if genesis_info.enough_to_bootstrap() {
+                info!("Subnet ID: {} has been bootstrapped", self.subnet_id);
+                genesis_info.bootstrapped = true;
+                genesis_info.genesis_block_height = Some(block_height);
+
+                // Save the newly create subnet state
+                let subnet_state = genesis_info.to_subnet();
+                db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
+                db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+                db.save_committee(
+                    &mut wtxn,
+                    self.subnet_id,
+                    subnet_state.committee_number,
+                    &subnet_state.committee,
+                )?;
+                wtxn.commit()?;
+                Ok(Some(subnet_state))
+            } else {
+                db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
+                wtxn.commit()?;
+                Ok(None)
+            }
         }
     }
 }
@@ -1039,6 +1199,8 @@ pub struct IpcCheckpointSubnetMsg {
     pub checkpoint_hash: bitcoin::hashes::sha256::Hash,
     /// The checkpoint height of child chain
     pub checkpoint_height: u64,
+    /// Committee configuration number
+    pub next_committee_configuration_number: u64,
     /// Withdrawals
     #[serde(default)]
     pub withdrawals: Vec<IpcWithdrawal>,
@@ -1130,18 +1292,22 @@ impl IpcCheckpointSubnetMsg {
     const MARKERS_LEN: usize = 2;
     // u64 length
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
+    // u64 length
+    const COMMITTEE_CONF_LEN: usize = std::mem::size_of::<u64>();
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
         + SubnetId::INNER_LEN
         + bitcoin::hashes::sha256::Hash::LEN
         + Self::MARKERS_LEN
-        + Self::HEIGHT_LEN;
+        + Self::HEIGHT_LEN
+        + Self::COMMITTEE_CONF_LEN;
 
     const TAG_OFFSET: usize = 0;
     const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
     const HASH_OFFSET: usize = Self::TXID_OFFSET + SubnetId::INNER_LEN;
     const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
     const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
+    const COMMITTEE_CONF_OFFSET: usize = Self::MARKERS_OFFSET + Self::MARKERS_LEN;
 
     fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
@@ -1165,6 +1331,10 @@ impl IpcCheckpointSubnetMsg {
         // Set marker values
         op_return_data[Self::MARKERS_OFFSET] = self.withdrawals.len().min(255) as u8; // Withdrawal count
         op_return_data[Self::MARKERS_OFFSET + 1] = self.transfers.len().min(255) as u8; // Transfer count
+
+        // Add committee configuration number
+        op_return_data[Self::COMMITTEE_CONF_OFFSET..]
+            .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
         let push_bytes: &bitcoin::script::PushBytes =
             (&op_return_data[..]).try_into().expect("the size is okay");
@@ -1415,9 +1585,13 @@ impl IpcCheckpointSubnetMsg {
 
     /// Makes a unsigned checkpoint transaction that includes checkpoint data
     /// withdrawals and transfers
+    ///
+    /// When the next_committee is different from the current committee,
+    /// all of the UTXOs are exhausted.
     pub fn to_checkpoint_psbt(
         &self,
         committee: &db::SubnetCommittee,
+        next_committee: &db::SubnetCommittee,
         fee_rate: bitcoin::FeeRate,
         unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     ) -> Result<bitcoin::Psbt, IpcLibError> {
@@ -1425,6 +1599,10 @@ impl IpcCheckpointSubnetMsg {
             "Creating checkpoint transactions for subnet_id={}",
             self.subnet_id
         );
+
+        // Check if committee rotation is happening
+        let exhaust_unspent = committee != next_committee;
+        let committee_change_address = next_committee.address_checked();
 
         let mut tx_outs = vec![];
 
@@ -1509,8 +1687,9 @@ impl IpcCheckpointSubnetMsg {
         let checkpoint_tx = multisig::construct_spend_unsigned_transaction(
             &committee_keys,
             committee.threshold,
-            &committee.address_checked(),
+            &committee_change_address,
             unspent,
+            exhaust_unspent,
             &tx_outs,
             &fee_rate,
         )?;
@@ -1521,8 +1700,9 @@ impl IpcCheckpointSubnetMsg {
             &self.subnet_id,
             &committee_keys,
             committee.threshold,
-            &committee.address_checked(),
+            &committee_change_address,
             unspent,
+            exhaust_unspent,
             &tx_outs,
             &fee_rate,
         )?;
@@ -1543,7 +1723,7 @@ impl IpcCheckpointSubnetMsg {
     ///
     /// The checkpoint transaction has:
     /// 1. An OP_RETURN output with metadata in the format:
-    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 1-byte withdrawal count | 1-byte transfer count]
+    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 1-byte withdrawal count | 1-byte transfer count | 8-byte committee configuration number]
     /// 2. Withdrawal outputs for each withdrawal
     /// 3. Optional batch transfer commit output if transfers exist
     /// 4. Transfer outputs for each transfer
@@ -1612,6 +1792,13 @@ impl IpcCheckpointSubnetMsg {
         // Extract marker values
         let withdrawals_count = op_return_data[Self::MARKERS_OFFSET] as usize;
         let transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
+
+        // Extract committee configuration number
+        let committee_conf_bytes = &op_return_data[Self::COMMITTEE_CONF_OFFSET..];
+        let next_committee_configuration_number =
+            u64::from_le_bytes(committee_conf_bytes.try_into().map_err(|_| {
+                err("Failed to convert committee configuration number bytes to u64".to_string())
+            })?);
 
         // Check if we have enough outputs for all the withdrawals and transfers
         let expected_outputs = 1 + // metadata
@@ -1705,6 +1892,7 @@ impl IpcCheckpointSubnetMsg {
             subnet_id,
             checkpoint_hash,
             checkpoint_height,
+            next_committee_configuration_number,
             withdrawals,
             transfers,
             change_address,
@@ -1721,8 +1909,8 @@ impl IpcCheckpointSubnetMsg {
         &self,
         db: &D,
         block_height: u64,
+        block_hash: bitcoin::BlockHash,
         txid: Txid,
-        // batch_transfer_txid: Option<Txid>,
     ) -> Result<db::SubnetCheckpoint, IpcLibError> {
         // Get the current subnet state
         let mut subnet_state = db.get_subnet_state(self.subnet_id)?.ok_or_else(|| {
@@ -1730,6 +1918,67 @@ impl IpcCheckpointSubnetMsg {
         })?;
 
         let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
+        let last_committee_configuration_number = subnet_state.committee.configuration_number;
+
+        let stake_change = if
+        // If next_committee_configuration_number is zero, it "could mean" no change
+        self.next_committee_configuration_number.is_zero()
+            || self.next_committee_configuration_number == last_committee_configuration_number
+        {
+            // No committee rotation, no stake change
+            None
+        } else {
+            if self.next_committee_configuration_number < last_committee_configuration_number {
+                return Err(IpcValidateError::InvalidField(
+                    "next_committee_configuration_number",
+                    format!(
+                        "Next committee configuration number {} is less than the last one {}",
+                        self.next_committee_configuration_number,
+                        last_committee_configuration_number
+                    ),
+                )
+                .into());
+            }
+
+            let stake_change =
+                db.get_stake_change(self.subnet_id, self.next_committee_configuration_number)?;
+
+            if stake_change.is_none() {
+                return Err(IpcValidateError::InvalidField(
+                    "next_committee_configuration_number",
+                    format!(
+                        "Stake change for committee configuration number {} does not exist",
+                        self.next_committee_configuration_number
+                    ),
+                )
+                .into());
+            }
+
+            debug!(
+                "Processing stake changes for checkpoint. Up to stake change {:?}",
+                stake_change
+            );
+
+            stake_change
+        };
+
+        let next_committee = stake_change.clone().map(|sc| sc.committee_after_change);
+
+        let (next_committee_number, next_configuration_number) =
+            if let Some(stake_change) = stake_change {
+                // Increment the committee number
+                // And use the new configuration number
+                (
+                    subnet_state.committee_number + 1,
+                    stake_change.configuration_number,
+                )
+            } else {
+                // No committee rotation, use the current committee number
+                (
+                    subnet_state.committee_number,
+                    subnet_state.committee.configuration_number,
+                )
+            };
 
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
@@ -1742,12 +1991,17 @@ impl IpcCheckpointSubnetMsg {
             batch_transfer_txid: None,
             batch_transfer_block_height: None,
             signed_committee_number: subnet_state.committee_number,
-            // No committee rotation yet
-            next_committee_number: subnet_state.committee_number,
+            next_committee_number,
+            next_configuration_number,
         };
 
         // Update the checkpoint number in subnet state
         subnet_state.last_checkpoint_number = Some(checkpoint_number);
+
+        // Update subnet state with the new committee
+        if let Some(next_committee) = &next_committee {
+            subnet_state.rotate_to_committee(next_committee.clone());
+        }
 
         // Begin a database transaction
         let mut wtxn = db.write_txn()?;
@@ -1755,13 +2009,31 @@ impl IpcCheckpointSubnetMsg {
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
         // Save the checkpoint record
         db.save_checkpoint(&mut wtxn, self.subnet_id, &checkpoint, checkpoint_number)?;
+        // Save new committee if changed
+        if let Some(next_committee) = &next_committee {
+            db.save_committee(
+                &mut wtxn,
+                self.subnet_id,
+                next_committee_number,
+                next_committee,
+            )?;
+
+            // Update the stake changes
+            db.confirm_stake_changes(
+                &mut wtxn,
+                self.subnet_id,
+                self.next_committee_configuration_number,
+                block_height,
+                block_hash,
+            )?;
+        }
 
         // Commit the transaction
         wtxn.commit()?;
 
         debug!(
-            "Saved checkpoint #{} for subnet {} with txid {}",
-            checkpoint_number, self.subnet_id, txid
+            "Saved checkpoint #{} for subnet {} with txid {}. Checkpoint = {:?}",
+            checkpoint_number, self.subnet_id, txid, checkpoint
         );
 
         Ok(checkpoint)
@@ -2931,6 +3203,7 @@ mod checkpoint_msg_tests {
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 30, // arbitrary test number
         }
     }
 
@@ -2968,7 +3241,7 @@ mod checkpoint_msg_tests {
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3074,13 +3347,14 @@ mod checkpoint_msg_tests {
             withdrawals: vec![withdrawal, withdrawal2],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3152,13 +3426,14 @@ mod checkpoint_msg_tests {
             withdrawals: vec![],
             transfers: vec![],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 
@@ -3302,13 +3577,14 @@ mod checkpoint_msg_tests {
             withdrawals: vec![],
             transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
             change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
 
         // Generate transactions
         let checkpoint_psbt = checkpoint_msg
-            .to_checkpoint_psbt(committee, fee_rate, &utxos)
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
             .unwrap();
         let checkpoint_tx = checkpoint_psbt.unsigned_tx.clone();
 

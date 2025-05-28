@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use bitcoin::BlockHash;
 use bitcoin_ipc::db::{self, Database, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
@@ -495,26 +495,38 @@ where
                 };
                 debug!("Found IPC message: {:?}", join_subnet_msg);
 
-                let mut bootstraped = false;
+                let genesis_info = self
+                    .db
+                    .get_subnet_genesis_info(join_subnet_msg.subnet_id)
+                    .map_err(|e| {
+                        error!("Error getting subnet info from Db: {}", e);
+                        MonitorError::DbError(e)
+                    })?
+                    .ok_or(ipc_lib::IpcValidateError::InvalidMsg(format!(
+                        "Subnet {} not found.",
+                        join_subnet_msg.subnet_id
+                    )))?;
+
+                let subnet_state = self
+                    .db
+                    .get_subnet_state(join_subnet_msg.subnet_id)
+                    .map_err(MonitorError::DbError)?;
+
+                join_subnet_msg.validate_for_subnet(&genesis_info, &subnet_state)?;
 
                 join_subnet_msg.validate()?;
-                if let Some(subnet) = join_subnet_msg.save_to_db(&self.db, block_height, txid)? {
+                if let Some(subnet) =
+                    join_subnet_msg.save_to_db(&self.db, block_height, block_hash, txid)?
+                {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
                     self.import_watchonly_address(committee_addr, label, block_time);
-                    bootstraped = true;
                 }
 
                 info!(
                     "Processed JoinSubnet for Subnet ID: {} Validator XPK: {} Collateral: {}",
                     join_subnet_msg.subnet_id, join_subnet_msg.pubkey, join_subnet_msg.collateral
                 );
-                if bootstraped {
-                    info!(
-                        "Subnet ID: {} has been bootstrapped",
-                        join_subnet_msg.subnet_id
-                    );
-                }
                 Ok(())
             }
 
@@ -544,13 +556,36 @@ where
                 debug!("Found IPC message: {:#?}", msg);
 
                 msg.validate()?;
-                let checkpoint = msg.save_to_db(&self.db, block_height, txid)?;
+                let checkpoint = msg.save_to_db(&self.db, block_height, block_hash, txid)?;
 
                 // Save the checkpoint tx to db
                 // we need it available for any batch transfer messages
-                let mut wtxn = self.db.write_txn()?;
-                self.db.save_transaction(&mut wtxn, tx)?;
-                wtxn.commit().map_err(db::DbError::from)?;
+                {
+                    let mut wtxn = self.db.write_txn()?;
+                    self.db.save_transaction(&mut wtxn, tx)?;
+                    wtxn.commit().map_err(db::DbError::from)?;
+                }
+
+                // import new address if the committee changed
+                if checkpoint.signed_committee_number != checkpoint.next_committee_number {
+                    // get the update subnet state from the database
+                    let subnet = self
+                        .db
+                        .get_subnet_state(msg.subnet_id)
+                        .map_err(MonitorError::DbError)?
+                        // Should never happen
+                        .ok_or(IpcValidateError::InvalidMsg(
+                            "Could not fetch subnet id after a checkpoint".to_string(),
+                        ))?;
+
+                    info!(
+                        "Committee changed for Subnet ID: {}, importing address.",
+                        msg.subnet_id
+                    );
+
+                    let (new_committee_addr, new_label) = subnet.committee_address_label();
+                    self.import_watchonly_address(new_committee_addr, new_label, block_time);
+                }
 
                 info!(
                     "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {}",

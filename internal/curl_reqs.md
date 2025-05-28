@@ -37,6 +37,42 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
+# join new validator
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "joinsubnet",
+    "params": {
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
+			"collateral": 20000000,
+			"ip": "66.222.44.55:8080",
+			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+			"pubkey": "e327a66b169732bde49d827d90781327af558fc12d5cd2d5004e7551ec00c662"
+    },
+    "id": 1
+}' | jq
+
+# join new validator 2
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "joinsubnet",
+    "params": {
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
+			"collateral": 20000000,
+			"ip": "66.222.44.55:8080",
+			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
+			"pubkey": "71ac1eb874233999e11cd050f388f1dd6da9b446180fdf9b06740419cc487b6f"
+    },
+    "id": 1
+}' | jq
+
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
@@ -97,14 +133,14 @@ curl -X POST http://localhost:3030/api \
 	"id": 1
 }' | jq
 
-curl -X POST http://localhost:3030/api \
+curl -X POST http://localhost:3040/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
 -d '{
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm"
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq"
     },
     "id": 1
 }' | jq
@@ -146,6 +182,19 @@ curl -X POST http://localhost:3030/api \
     "params": {
 			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
 			"block_height": 235
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getstakechanges",
+    "params": {
+			"subnet_id": "/b4/t410f3iid2fasqwb75plfaaoqbds4fwdu6btidyk7lwq",
+			"block_height": 1298
     },
     "id": 1
 }' | jq

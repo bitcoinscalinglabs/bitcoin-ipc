@@ -12,6 +12,7 @@ use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
 use log::{error, info, trace};
+use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -180,10 +181,16 @@ pub async fn join_subnet(
             msg.subnet_id
         )))?;
 
-    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
-        error!("Error validating join msg for subnet info: {}", e);
-        RpcError::InvalidParams(e.to_string())
+    let subnet_state = data.db.get_subnet_state(msg.subnet_id).map_err(|e| {
+        error!("Error getting subnet info from Db: {}", e);
+        RpcError::DbError(e)
     })?;
+
+    msg.validate_for_subnet(&genesis_info, &subnet_state)
+        .map_err(|e| {
+            error!("Error validating join msg for subnet info: {}", e);
+            RpcError::InvalidParams(e.to_string())
+        })?;
 
     // TODO this check should be done in the Db
     let multisig_address = &genesis_info.multisig_address();
@@ -338,7 +345,10 @@ pub async fn get_rootnet_messages(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetRootnetMessagesParams>,
 ) -> Result<Vec<db::RootnetMessage>, JsonRpcError> {
-    info!("getrootnetmessages: {}", params.subnet_id);
+    info!(
+        "getrootnetmessages: {} at {}",
+        params.subnet_id, params.block_height
+    );
 
     // Check subnet exists
     data.db
@@ -480,6 +490,7 @@ pub async fn gen_multisig_spend_psbt(
         commitee_threshold,
         &committee_address,
         &unspent,
+        false,
         &[bitcoin::TxOut {
             value: params.amount,
             script_pubkey: recipient.script_pubkey(),
@@ -594,8 +605,48 @@ pub async fn gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
+    // assume no change in the committee
+    let mut next_committee = subnet.committee.clone();
+    let current_committee_configuration = subnet.committee.configuration_number;
+
+    // update next_committee if the configuration number changed
+    if msg.next_committee_configuration_number > current_committee_configuration {
+        next_committee = data
+            .db
+            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
+            .map_err(|e| {
+                error!("Error getting stake change from Db: {}", e);
+                RpcError::DbError(e)
+            })?
+            .ok_or(RpcError::InvalidParams(format!(
+                "Stake change with configuration number {} not found.",
+                msg.next_committee_configuration_number
+            )))?
+            .committee_after_change;
+
+        info!(
+            "Rotating committee to configuration number {} multisig address {}",
+            msg.next_committee_configuration_number,
+            next_committee.address_checked()
+        );
+    }
+    // no change if the configuration number is zero or the same
+    else if msg.next_committee_configuration_number.is_zero()
+        || msg.next_committee_configuration_number == current_committee_configuration
+    {
+        trace!("gen_checkpoint_psbt: no change to the committee configuration")
+    }
+    // error if the configuration number is less than the current one, unexpected
+    else {
+        return Err(RpcError::InvalidParams(format!(
+            "Invalid next committee configuration number: {}",
+            msg.next_committee_configuration_number
+        ))
+        .into());
+    }
+
     let unsigned_psbt = msg
-        .to_checkpoint_psbt(&subnet.committee, fee_rate, &unspent)
+        .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
         .map_err(|e| {
             error!(
                 "Error generating checkpoint psbt for subnet_id={}: {}",
@@ -904,6 +955,43 @@ pub async fn finalize_checkpoint_psbt(
     })
 }
 
+// Stake changes
+
+#[derive(Serialize, Deserialize)]
+pub struct GetStakeChangesParams {
+    subnet_id: SubnetId,
+    block_height: u64,
+}
+
+pub async fn get_stake_changes(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetStakeChangesParams>,
+) -> Result<Vec<db::StakeChangeRequest>, JsonRpcError> {
+    info!(
+        "getstakechanges: {} at {}",
+        params.subnet_id, params.block_height
+    );
+
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    data.db
+        .get_stake_changes_by_height(params.subnet_id, params.block_height)
+        .map_err(|e| {
+            error!("Error getting stake changes from Db: {}", e);
+            RpcError::DbError(e).into()
+        })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -924,8 +1012,10 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
-        .with_method("dev_multisignpsbt", dev_multisign_psbt) // dev only
+        .with_method("dev_multisignpsbt", dev_multisign_psbt) // TODO make dev only
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
+        // stake changes
+        .with_method("getstakechanges", get_stake_changes)
         .finish()
 }

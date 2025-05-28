@@ -22,12 +22,14 @@ API_URL="http://localhost:${PORT}/api"
 
 # Check if a subnet ID is provided as an argument
 if [ -z "$1" ]; then
-  echo "Usage: $0 <subnet_id>"
+  echo "Usage: $0 <subnet_id> [configuration_number]"
   exit 1
 fi
 
 SUBNET_ID="$1"
+CONFIGURATION_NUMBER="${2:-0}"
 echo "Working with subnet: $SUBNET_ID"
+echo "Configuration number: $CONFIGURATION_NUMBER"
 
 # Secret keys for signing (validator private keys)
 SECRET_KEYS=(
@@ -44,7 +46,7 @@ RANDOM_HASH=$(openssl rand -hex 32)
 CURRENT_BLOCK=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$CURRENT_BLOCK")
 
-DESTINATION_SUBNET_ID_1="/b4/t410fdmafb4l6rb2cqa5zass2qmdr67drvxejlkvpdca"
+DESTINATION_SUBNET_ID_1="/b4/t410flvvhb2htwqlujcxras5v5wludcmruhvxfueyiji"
 
 echo "Current block: $CURRENT_BLOCK ($BLOCK_HASH)"
 echo "Using checkpoint hash: $RANDOM_HASH"
@@ -59,6 +61,7 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
         \"subnet_id\": \"$SUBNET_ID\",
         \"checkpoint_hash\": \"$RANDOM_HASH\",
         \"checkpoint_height\": 50,
+        \"next_committee_configuration_number\": $CONFIGURATION_NUMBER,
         \"withdrawals\": [
             {
                 \"amount\": 25000,
