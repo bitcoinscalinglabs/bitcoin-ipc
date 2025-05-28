@@ -150,6 +150,9 @@ pub fn collateral_to_power(amount: &Amount, min_amount: &Amount) -> Result<Power
 /// Calculates the size in bytes of witness elements for spending a multisig utxo
 /// Calculates the "worst case" size, assuming all public keys' signatures are included
 /// Useful for fee calculations.
+//
+// NOTE: this is quite sensitive as it's not easy to change if the multisig script is changed
+// maybe consider using a real transaction to calculate the size at compile time?
 pub fn multisig_spend_max_witness_size(public_keys: &[WeightedKey], threshold: Power) -> usize {
     let committee_size = public_keys.len();
 
@@ -322,6 +325,9 @@ pub fn construct_spend_unsigned_transaction(
                 witness: Witness::new(),
             })
             .collect::<Vec<TxIn>>();
+
+        // TODO filter out inputs which are not profitable to transfer
+        // ie. small inputs
 
         // Start with the transaction containing all inputs and specified outputs
         let mut spend_tx = Transaction {
@@ -1774,7 +1780,7 @@ mod psbt_tests {
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            required_sigs.try_into().unwrap(),
+            required_sigs.into(),
             &psbt_signed_twice,
         )
         .expect("Failed to finalize PSBT");
@@ -1817,7 +1823,7 @@ mod psbt_tests {
             &secp,
             &subnet_id,
             &committee_pubkeys,
-            threshold.into(),
+            threshold,
             NETWORK,
         )
         .unwrap();

@@ -1,9 +1,9 @@
 use crate::{
     bitcoin_utils,
-    db::{self, Database},
+    db::{self, Database, StakingChange},
     ipc_lib::{
-        IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
-        IpcPrefundSubnetMsg, IpcValidate, SubnetId,
+        self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
+        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, NETWORK,
 };
@@ -568,6 +568,12 @@ pub async fn gen_checkpoint_psbt(
         );
     }
 
+    if !msg.unstakes.len().is_zero() {
+        return Err(
+            RpcError::InvalidParams("Specifying unstakes not supported".to_string()).into(),
+        );
+    }
+
     // Check subnet exists
     let subnet = data
         .db
@@ -608,8 +614,9 @@ pub async fn gen_checkpoint_psbt(
     // assume no change in the committee
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
+    // let mut unstakes = vec![];
 
-    // update next_committee if the configuration number changed
+    // update next_committee and process unstakes if the configuration number changed
     if msg.next_committee_configuration_number > current_committee_configuration {
         next_committee = data
             .db
@@ -624,11 +631,53 @@ pub async fn gen_checkpoint_psbt(
             )))?
             .committee_after_change;
 
+        // Get unconfirmed/unprocessed unstakes
+        let unconfirmed_stake_changes = data
+            .db
+            .get_unconfirmed_stake_changes(msg.subnet_id)
+            .map_err(|e| {
+                error!("Error getting unconfirmed stake changes from Db: {}", e);
+                RpcError::DbError(e)
+            })?;
+        let unstakes = unconfirmed_stake_changes
+            .iter()
+            .filter_map(|sc| {
+                let validator = subnet
+                    .committee
+                    .validators
+                    .iter()
+                    .find(|v| v.pubkey == sc.validator_xpk);
+
+                let address = match validator {
+                    Some(v) => v.backup_address.clone(),
+                    None => {
+                        error!(
+                            "Validator {} not found in committee for a stake change, skipping",
+                            sc.validator_xpk
+                        );
+                        return None;
+                    }
+                };
+
+                match sc.change {
+                    StakingChange::Withdraw { amount } => Some(ipc_lib::IpcUnstake {
+                        amount,
+                        address,
+                        pubkey: sc.validator_xpk,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        msg.unstakes = unstakes;
+
         info!(
             "Rotating committee to configuration number {} multisig address {}",
             msg.next_committee_configuration_number,
             next_committee.address_checked()
         );
+        info!("Processing {} unstakes.", msg.unstakes.len());
     }
     // no change if the configuration number is zero or the same
     else if msg.next_committee_configuration_number.is_zero()
@@ -955,6 +1004,128 @@ pub async fn finalize_checkpoint_psbt(
     })
 }
 
+// Stake collateral
+
+#[derive(Serialize, Deserialize)]
+pub struct StakeCollateralResponse {
+    txid: bitcoin::Txid,
+}
+
+pub async fn stake_collateral(
+    data: Data<Arc<ServerData>>,
+    Params(msg): Params<IpcStakeCollateralMsg>,
+) -> Result<StakeCollateralResponse, JsonRpcError> {
+    info!(
+        "stakecollateral: {} {} {}",
+        msg.subnet_id, msg.pubkey, msg.amount
+    );
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid stake collateral message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_subnet(&subnet_state).map_err(|e| {
+        error!(
+            "Error validating stake collateral msg for subnet info: {}",
+            e
+        );
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    let txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(StakeCollateralResponse { txid })
+}
+
+// Stake collateral
+
+#[derive(Serialize, Deserialize)]
+pub struct UnstakeCollateralResponse {
+    txid: bitcoin::Txid,
+}
+
+pub async fn unstake_collateral(
+    data: Data<Arc<ServerData>>,
+    Params(mut msg): Params<IpcUnstakeCollateralMsg>,
+) -> Result<UnstakeCollateralResponse, JsonRpcError> {
+    info!("unstakecollateral: {} {}", msg.subnet_id, msg.amount);
+
+    let (validator_xpk, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
+    msg.pubkey = Some(validator_xpk);
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid unstake collateral message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_subnet(&genesis_info, &subnet_state)
+        .map_err(|e| {
+            error!(
+                "Error validating unstake collateral msg for subnet info: {}",
+                e
+            );
+            RpcError::InvalidParams(e.to_string())
+        })?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    let txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(UnstakeCollateralResponse { txid })
+}
+
 // Stake changes
 
 #[derive(Serialize, Deserialize)]
@@ -1016,6 +1187,8 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
         // stake changes
+        .with_method("stakecollateral", stake_collateral)
+        .with_method("unstakecollateral", unstake_collateral)
         .with_method("getstakechanges", get_stake_changes)
         .finish()
 }

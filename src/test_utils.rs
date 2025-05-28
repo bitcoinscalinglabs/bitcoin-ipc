@@ -2,7 +2,7 @@ use bitcoin::{
     hashes::Hash,
     key::{Keypair, Secp256k1},
     secp256k1::{PublicKey, SecretKey},
-    Txid, XOnlyPublicKey,
+    BlockHash, Txid, XOnlyPublicKey,
 };
 use rand::Rng;
 
@@ -56,7 +56,7 @@ pub fn generate_subnet_id() -> SubnetId {
     SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
 }
 
-pub fn generate_subnet(n: usize) -> db::SubnetState {
+pub fn generate_subnet(n_val: usize) -> db::SubnetState {
     use crate::{
         db, eth_utils::eth_addr_from_x_only_pubkey, multisig::create_subnet_multisig_address,
         NETWORK,
@@ -65,10 +65,10 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::str::FromStr;
 
-    assert!(n >= 1, "n must be at least 1");
+    assert!(n_val >= 1, "number of validators must be at least 1");
 
     let subnet_id = generate_subnet_id();
-    let keypairs = generate_keypairs(n);
+    let keypairs = generate_keypairs(n_val);
 
     // Create subnet validators
     let validators: Vec<db::SubnetValidator> = keypairs
@@ -108,21 +108,16 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         .collect();
 
     // Create subnet parameters
-    let min_validators = std::cmp::max(1, n / 2) as Power; // Set threshold to n/2 rounded up
+    let min_validators = std::cmp::max(1, n_val / 2) as Power; // Set threshold to n/2 rounded up
 
     // Create committee
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let committee_keys: Vec<WeightedKey> = validators.iter().map(|v| (v.pubkey, 1)).collect();
 
     // Create multisig address
-    let multisig_address = create_subnet_multisig_address(
-        &secp,
-        &subnet_id,
-        &committee_keys,
-        min_validators.into(),
-        NETWORK,
-    )
-    .unwrap();
+    let multisig_address =
+        create_subnet_multisig_address(&secp, &subnet_id, &committee_keys, min_validators, NETWORK)
+            .unwrap();
     let multisig_address = multisig_address.as_unchecked();
 
     let committee = db::SubnetCommittee {
@@ -140,4 +135,23 @@ pub fn generate_subnet(n: usize) -> db::SubnetState {
         waiting_committee: None,
         last_checkpoint_number: None,
     }
+}
+
+pub fn create_test_db() -> crate::db::HeedDb {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_str().unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(crate::db::HeedDb::new(db_path, false))
+        .unwrap()
+}
+
+pub fn create_rand_txid() -> Txid {
+    Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+}
+pub fn create_rand_blockhash() -> BlockHash {
+    BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
+}
+pub fn create_rand_addr() -> alloy_primitives::Address {
+    alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
 }
