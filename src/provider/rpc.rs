@@ -1084,6 +1084,18 @@ pub async fn unstake_collateral(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
     let subnet_state = data
         .db
         .get_subnet_state(msg.subnet_id)
@@ -1096,13 +1108,14 @@ pub async fn unstake_collateral(
             msg.subnet_id
         )))?;
 
-    msg.validate_for_subnet(&subnet_state).map_err(|e| {
-        error!(
-            "Error validating unstake collateral msg for subnet info: {}",
-            e
-        );
-        RpcError::InvalidParams(e.to_string())
-    })?;
+    msg.validate_for_subnet(&genesis_info, &subnet_state)
+        .map_err(|e| {
+            error!(
+                "Error validating unstake collateral msg for subnet info: {}",
+                e
+            );
+            RpcError::InvalidParams(e.to_string())
+        })?;
 
     let multisig_address = subnet_state.multisig_address();
 

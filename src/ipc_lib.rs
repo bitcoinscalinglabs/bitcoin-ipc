@@ -2820,9 +2820,13 @@ impl IpcUnstakeCollateralMsg {
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE + Amount::SIZE;
 
-    pub fn validate_for_subnet(&self, subnet: &db::SubnetState) -> Result<(), IpcValidateError> {
+    pub fn validate_for_subnet(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
         // should never happen
-        if subnet.id != self.subnet_id {
+        if subnet.id != self.subnet_id || genesis_info.subnet_id != self.subnet_id {
             return Err(IpcValidateError::InvalidField(
                 "subnet_id",
                 format!(
@@ -2839,7 +2843,7 @@ impl IpcUnstakeCollateralMsg {
 
         // Check if the validator with this public key is already registered
         // NOTE: mandatory check here
-        match self.pubkey {
+        let pubkey = match self.pubkey {
             Some(pubkey) => {
                 if !committee.is_validator(&pubkey) {
                     return Err(IpcValidateError::InvalidMsg(format!(
@@ -2847,6 +2851,8 @@ impl IpcUnstakeCollateralMsg {
                         pubkey, self.subnet_id,
                     )));
                 }
+
+                pubkey
             }
             None => {
                 return Err(IpcValidateError::InvalidField(
@@ -2854,7 +2860,7 @@ impl IpcUnstakeCollateralMsg {
                     "Validator public key is required".to_string(),
                 ));
             }
-        }
+        };
 
         // Check if the amount is not more than the current collateral
         if self.amount > subnet.total_collateral() {
@@ -2865,8 +2871,45 @@ impl IpcUnstakeCollateralMsg {
             )));
         }
 
-        // TODO check rest of collateral is not < min
-        // TODO check if validator is leaving?
+        // Check rest of collateral is not less than the minimum required
+        // for a validator to participate in the committee
+        let validator = committee
+            .validators
+            .iter()
+            .find(|v| v.pubkey == pubkey)
+            .ok_or(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key {} not part of committee",
+                pubkey
+            )))?;
+
+        let new_collateral =
+            validator
+                .collateral
+                .checked_sub(self.amount)
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "Amount {} is greater than current validator collateral {}",
+                    self.amount, validator.collateral
+                )))?;
+
+        let (_, sufficient_to_participate) = match multisig::collateral_to_power(
+            &new_collateral,
+            &genesis_info.create_subnet_msg.min_validator_stake,
+        ) {
+            Ok(power) => (power, true),
+            Err(crate::multisig::MultisigError::InsufficientCollateral) => (0, false),
+            Err(_) => {
+                return Err(IpcValidateError::InvalidMsg(
+                    "Collateral too high".to_string(),
+                ))
+            }
+        };
+
+        if !sufficient_to_participate {
+            return Err(IpcValidateError::InvalidMsg(format!(
+				"Validator with public key {} has insufficient collateral to participate in the committee after unstaking {}. Please unstake all.",
+				pubkey, self.amount
+			)));
+        }
 
         // TODO Check diff of the collateral
         // TODO this is a temporary solution, should revisit
@@ -3205,7 +3248,7 @@ impl IpcUnstakeCollateralMsg {
                 IpcValidateError::InvalidMsg(format!("Subnet {} not found.", self.subnet_id))
             })?;
 
-        self.validate_for_subnet(&subnet_state)?;
+        self.validate_for_subnet(&genesis_info, &subnet_state)?;
 
         // checked before in validate_for_subnet
         let pubkey = self.pubkey.expect("pubkey should be present");
@@ -3240,8 +3283,6 @@ impl IpcUnstakeCollateralMsg {
         // The amount user specified to unstake
         // in case the remaining collateral is too low, we will withdraw all
         // of the funds
-        let mut withdraw_amount = self.amount;
-
         let (new_power, sufficient_to_participate) = match multisig::collateral_to_power(
             &new_collateral,
             &genesis_info.create_subnet_msg.min_validator_stake,
@@ -3257,9 +3298,6 @@ impl IpcUnstakeCollateralMsg {
             .unwrap_or_else(|| subnet_state.committee.clone());
 
         if new_power == 0 || !sufficient_to_participate {
-            // If power is insufficient to be in committee,
-            // withdraw all the collateral
-            withdraw_amount = validator.collateral;
             // Remove the validator from the committee if power is zero
             next_committee.remove_validator(&self.subnet_id, &pubkey)?;
             info!(
@@ -3286,7 +3324,7 @@ impl IpcUnstakeCollateralMsg {
         // Create a stake change request to track this change
         let stake_change = db::StakeChangeRequest {
             change: db::StakingChange::Withdraw {
-                amount: withdraw_amount,
+                amount: self.amount,
             },
             validator_xpk: pubkey,
             validator_subnet_address: validator.subnet_address,
