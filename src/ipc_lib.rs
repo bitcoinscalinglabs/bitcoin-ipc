@@ -2491,14 +2491,8 @@ impl IpcStakeCollateralMsg {
             ));
         }
 
-        // Get the latest committee (waiting or current)
-        let committee = subnet
-            .waiting_committee
-            .clone()
-            .unwrap_or(subnet.committee.clone());
-
         // Check if the validator with this public key is already registered
-        if !committee.is_validator(&self.pubkey) {
+        if !subnet.latest_committee().is_validator(&self.pubkey) {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Validator with public key '{}' must already be a validator in subnet {}",
                 self.pubkey, self.subnet_id,
@@ -2842,11 +2836,7 @@ impl IpcUnstakeCollateralMsg {
             ));
         }
 
-        // Get the latest committee (waiting or current)
-        let committee = subnet
-            .waiting_committee
-            .clone()
-            .unwrap_or(subnet.committee.clone());
+        let committee = subnet.latest_committee();
 
         // Check if the validator with this public key is already registered
         // NOTE: mandatory check here

@@ -393,6 +393,10 @@ impl SubnetState {
             .is_some_and(|nc| self.committee != *nc)
     }
 
+    pub fn latest_committee(&self) -> &SubnetCommittee {
+        self.waiting_committee.as_ref().unwrap_or(&self.committee)
+    }
+
     pub fn rotate_to_committee(&mut self, new_committee: SubnetCommittee) {
         trace!(
             "subnet id {} rotating committees. prev={:?} next={:?}",
