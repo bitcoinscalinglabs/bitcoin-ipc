@@ -106,23 +106,12 @@ pub async fn get_block_count(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpc
 }
 
 pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
-    let client = data.btc_rpc.as_ref();
+    let last_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last processed block from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
 
-    match client.get_block_count() {
-        Ok(current_height) => {
-            let confirmed_block_height =
-                match bitcoin_utils::get_confirmed_from_height(current_height) {
-                    Some(height) => height,
-                    None => {
-                        return Err(JsonRpcError::internal(
-                            "Not enough blocks to have a confirmed block",
-                        ))
-                    }
-                };
-            Ok(confirmed_block_height)
-        }
-        Err(e) => Err(JsonRpcError::internal(e)),
-    }
+    Ok(last_block_height)
 }
 
 //
