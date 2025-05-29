@@ -2718,7 +2718,7 @@ impl IpcStakeCollateralMsg {
 
         // we clone and modify the validator
         let mut validator = subnet_state
-            .committee
+            .latest_committee()
             .validators
             .iter()
             .find(|v| v.pubkey == self.pubkey)
@@ -3250,10 +3250,7 @@ impl IpcUnstakeCollateralMsg {
         // checked before in validate_for_subnet
         let pubkey = self.pubkey.expect("pubkey should be present");
 
-        let committee = subnet_state
-            .waiting_committee
-            .clone()
-            .unwrap_or(subnet_state.committee.clone());
+        let committee = subnet_state.latest_committee();
 
         // we clone and modify the validator
         let mut validator = committee
@@ -3290,9 +3287,7 @@ impl IpcUnstakeCollateralMsg {
         };
 
         // Update the next committee or create one if it doesn't exist
-        let mut next_committee = subnet_state
-            .waiting_committee
-            .unwrap_or_else(|| subnet_state.committee.clone());
+        let mut next_committee = subnet_state.latest_committee().clone();
 
         if new_power == 0 || !sufficient_to_participate {
             // Remove the validator from the committee if power is zero
