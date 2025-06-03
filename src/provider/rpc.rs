@@ -638,6 +638,14 @@ pub async fn gen_bootstrap_handover(
                 RpcError::InternalError(e.to_string())
             })?;
 
+    if unspent.is_empty() {
+        return Err(RpcError::InvalidParams(format!(
+            "No unspent outputs found for whitelist multisig address {}. The handover was possibly already done.",
+            whitelist_multisig_addr
+        ))
+        .into());
+    }
+
     debug!("Unspent for whitelist multisig: {:?}", unspent);
 
     // Create the handover PSBT
