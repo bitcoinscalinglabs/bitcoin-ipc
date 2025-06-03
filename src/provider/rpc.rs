@@ -5,13 +5,13 @@ use crate::{
         self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
         IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
-    multisig, NETWORK,
+    multisig, wallet, NETWORK,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::{error, info, trace};
+use log::{debug, error, info, trace, warn};
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -519,6 +519,171 @@ pub async fn gen_multisig_spend_psbt(
     })
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PostBoostrapHandoverParams {
+    subnet_id: SubnetId,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PostBoostrapHandoverResponse {
+    unsigned_psbt: bitcoin::Psbt,
+    unsigned_psbt_base64: String,
+    psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
+}
+
+pub async fn gen_bootstrap_handover(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<PostBoostrapHandoverParams>,
+) -> Result<PostBoostrapHandoverResponse, JsonRpcError> {
+    info!("post_bootstrap_handover: {:?}", params);
+
+    let (validator_xonly_pubkey, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
+    // Check genesis info
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    // Check subnet exists
+    let subnet = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    // Check if self is a validator in the subnet
+    if !subnet.is_validator(&validator_xonly_pubkey) {
+        error!("Configured validator isn't a validator in the specified subnet.");
+        return Err(RpcError::InvalidParams(
+            "Configured validator isn't a validator in the specified subnet.".to_string(),
+        )
+        .into());
+    }
+
+    if subnet.last_checkpoint_number.is_some() {
+        // NOTE: we should accept to bootstrap handover even if the subnet already has checkpoints
+        // normally it should be done before the first checkpoint is posted, but in an
+        // exceptional case better to handover to the 2nd committee then not at all?
+        // if subnet.last_checkpoint_number.is_some() {
+        //     error!(
+        //         "Subnet {} already has checkpoints, cannot post bootstrap handover.",
+        //         params.subnet_id
+        //     );
+        //     return Err(RpcError::InvalidParams(format!(
+        //         "Subnet {} already has checkpoints, cannot post bootstrap handover.",
+        //         params.subnet_id
+        //     ))
+        //     .into());
+        // }
+
+        warn!(
+            "Subnet {} already has checkpoints, but proceeding with bootstrap handover.",
+            params.subnet_id
+        );
+    }
+
+    // Collect committee information
+
+    let committee_address = subnet
+        .committee
+        .multisig_address
+        .clone()
+        .require_network(NETWORK)
+        .expect("Multisig should be valid for saved subnet genesis info");
+
+    // Collect whitelist collateral
+
+    let whitelist_keys: Vec<multisig::WeightedKey> = genesis_info
+        .create_subnet_msg
+        .whitelist
+        .iter()
+        // Each key has the same weight
+        .map(|xpk| (*xpk, 1))
+        .collect::<Vec<_>>();
+    let whitelist_threshold: u32 = genesis_info.create_subnet_msg.min_validators.into();
+    let whitelist_multisig_addr = genesis_info
+        .create_subnet_msg
+        .multisig_address_from_whitelist(&params.subnet_id)
+        .map_err(|e| {
+            error!("Error creating multisig address from whitelist: {}", e);
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    let unspent =
+        wallet::get_unspent_for_address(&data.btc_watchonly_rpc, &whitelist_multisig_addr)
+            .map_err(|e| {
+                error!("Error getting unspent for whitelist multisig: {}", e);
+                RpcError::InternalError(e.to_string())
+            })?;
+
+    debug!("Unspent for whitelist multisig: {:?}", unspent);
+
+    // Create the handover PSBT
+
+    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    let unsigned_psbt = multisig::construct_spend_psbt(
+        &secp,
+        &params.subnet_id,
+        &whitelist_keys,
+        whitelist_threshold,
+        &committee_address,
+        &unspent,
+        true,
+        &[],
+        &fee_rate,
+    )
+    .map_err(|e| {
+        error!(
+            "Error generating multisig spend psbt for subnet_id={}: {}",
+            &params.subnet_id, e
+        );
+        RpcError::InternalError(e.to_string())
+    })?;
+
+    let validator_keypair = validator_sk.keypair(&secp);
+
+    let (_, psbt_inputs_signatures) =
+        multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
+            |e| {
+                error!(
+                    "Error signing multisig spend psbt for subnet_id={}: {}",
+                    &params.subnet_id, e
+                );
+                RpcError::InternalError(e.to_string())
+            },
+        )?;
+
+    Ok(PostBoostrapHandoverResponse {
+        unsigned_psbt: unsigned_psbt.clone(),
+        unsigned_psbt_base64: BASE64_STANDARD.encode(unsigned_psbt.serialize()),
+        psbt_inputs_signatures,
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct GenCheckpointPsbtResponse {
     // Checkpoint
@@ -603,7 +768,6 @@ pub async fn gen_checkpoint_psbt(
     // assume no change in the committee
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
-    // let mut unstakes = vec![];
 
     // update next_committee and process unstakes if the configuration number changed
     if msg.next_committee_configuration_number > current_committee_configuration {
@@ -993,6 +1157,146 @@ pub async fn finalize_checkpoint_psbt(
     })
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct FinalizeBootstrapHandoverParams {
+    subnet_id: SubnetId,
+    unsigned_psbt_base64: String,
+    signatures: Vec<(
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    )>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FinalizeBootstrapHandoverResponse {
+    tx: bitcoin::Transaction,
+    txid: String,
+    tx_hex: String,
+}
+
+pub async fn finalize_bootstrap_handover(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<FinalizeBootstrapHandoverParams>,
+) -> Result<FinalizeBootstrapHandoverResponse, JsonRpcError> {
+    info!(
+        "finalize_bootstrap_handover for subnet {}",
+        params.subnet_id
+    );
+
+    // Check genesis info
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet genesis info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    // Get whitelist multisig info for signature verification
+    let whitelist_keys: Vec<multisig::WeightedKey> = genesis_info
+        .create_subnet_msg
+        .whitelist
+        .iter()
+        // Each key has the same weight
+        .map(|xpk| (*xpk, 1))
+        .collect::<Vec<_>>();
+    let whitelist_threshold: u32 = genesis_info.create_subnet_msg.min_validators.into();
+
+    // Decode base64 PSBT
+    let psbt_bytes = BASE64_STANDARD
+        .decode(params.unsigned_psbt_base64.as_bytes())
+        .map_err(|e| {
+            error!("Invalid base64 format for PSBT: {}", e);
+            RpcError::InvalidParams(format!("Invalid base64 format for PSBT: {}", e))
+        })?;
+
+    // Deserialize PSBT
+    let unsigned_psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|e| {
+        error!("Invalid PSBT format: {}", e);
+        RpcError::InvalidParams(format!("Invalid PSBT format: {}", e))
+    })?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    // Create a map of provided signatures indexed by public key
+    let signatures_map: std::collections::HashMap<
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    > = params.signatures.into_iter().collect();
+
+    // Prepare signature sets in the same order as whitelist keys
+    let mut signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> =
+        Vec::with_capacity(whitelist_keys.len());
+
+    // Check if any unrecognized public keys were provided
+    for pubkey in signatures_map.keys() {
+        if !whitelist_keys
+            .iter()
+            .any(|(whitelist_key, _)| whitelist_key == pubkey)
+        {
+            error!("Unrecognized public key in signatures: {}", pubkey);
+            return Err(RpcError::InvalidParams(format!(
+                "Unrecognized public key in signatures: {}",
+                pubkey
+            ))
+            .into());
+        }
+    }
+
+    // For each whitelist key, get the corresponding signatures or use empty set
+    for (pubkey, _) in &whitelist_keys {
+        let sigs = match signatures_map.get(pubkey) {
+            Some(sigs) => sigs.as_slice(),
+            None => &[],
+        };
+        signature_sets.push(sigs);
+    }
+
+    // Finalize the PSBT using multisig::finalize_spend_psbt_from_sigs
+    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(
+        &secp,
+        &params.subnet_id,
+        &whitelist_keys,
+        whitelist_threshold,
+        &unsigned_psbt,
+        &signature_sets,
+    )
+    .map_err(|e| {
+        error!("Error finalizing bootstrap handover PSBT: {}", e);
+        RpcError::InternalError(e.to_string())
+    })?;
+
+    // Convert transaction to hex
+    let tx_hex = hex::encode(bitcoin::consensus::serialize(&finalized_tx));
+
+    // Get transaction ID
+    let txid = finalized_tx.compute_txid().to_string();
+
+    trace!("bootstrap_handover_txid = {}", txid);
+
+    // Send the transaction to the Bitcoin network
+    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![finalized_tx.clone()]).map_err(|e| {
+        error!(
+            "Error sending bootstrap handover transaction to Bitcoin network: {}",
+            e
+        );
+        RpcError::InternalError(format!(
+            "Error sending bootstrap handover transaction to Bitcoin network: {}",
+            e
+        ))
+    })?;
+
+    Ok(FinalizeBootstrapHandoverResponse {
+        tx: finalized_tx,
+        txid,
+        tx_hex,
+    })
+}
+
 // Stake collateral
 
 #[derive(Serialize, Deserialize)]
@@ -1170,6 +1474,8 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getrootnetmessages", get_rootnet_messages)
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
+        .with_method("genbootstraphandover", gen_bootstrap_handover)
+        .with_method("finalizebootstraphandover", finalize_bootstrap_handover)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
         .with_method("dev_multisignpsbt", dev_multisign_psbt) // TODO make dev only
