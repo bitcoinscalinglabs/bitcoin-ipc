@@ -248,6 +248,8 @@ impl SubnetCommittee {
         // Increase configuration number by 2
         // since there is one stake change for the metadata (public key)
         // and one stake change for the deposit
+        //
+        // This is *required* to match the IPC contract logic
         self.configuration_number += 2;
         self.validators.add_validator(validator)?;
         self.threshold = self.validators.threshold();

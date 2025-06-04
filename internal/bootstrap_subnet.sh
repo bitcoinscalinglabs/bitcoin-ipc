@@ -144,8 +144,8 @@ BLOCK_NUM=$(bitcoin-cli getblockcount)
 BLOCK_HASH=$(bitcoin-cli getblockhash "$BLOCK_NUM")
 echo "Subnet bootstrapped in block number ${BLOCK_NUM} (hash: ${BLOCK_HASH})"
 
-MIN_FUND_VAL=6000000000
-MAX_FUND_VAL=8000000000
+MIN_FUND_VAL=60000000
+MAX_FUND_VAL=80000000
 
 fund_subnet() {
     local subnet_id=$1
