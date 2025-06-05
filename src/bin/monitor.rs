@@ -14,8 +14,7 @@ use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
-// TODO make configurable
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -67,11 +66,16 @@ async fn main() {
 
     let cancel_token = CancellationToken::new();
 
+    // Set poll interval
+    let poll_interval = std::env::var("MONITOR_POLL_INTERVAL")
+        .map(|s| Duration::from_secs(s.parse::<u64>().unwrap_or(DEFAULT_POLL_INTERVAL.as_secs())))
+        .unwrap_or(DEFAULT_POLL_INTERVAL);
+
     let mut monitor = Monitor::new(
         db,
         btc_rpc,
         btc_watchonly_rpc,
-        POLL_INTERVAL,
+        poll_interval,
         cancel_token.clone(),
     );
 
