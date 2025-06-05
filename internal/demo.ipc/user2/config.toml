@@ -8,8 +8,8 @@ id = "/b4"
 
 [subnets.config]
 network_type = "btc"
-provider_http = "http://127.0.0.1:3040/api"
-auth_token = "asda123123jhaskjdhgbjsjhdj"
+provider_http = "http://127.0.0.1:3041/api"
+auth_token = "user2_auth_token"
 
 # Subnet A
 [[subnets]]

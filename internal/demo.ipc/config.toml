@@ -9,7 +9,7 @@ id = "/b4"
 [subnets.config]
 network_type = "btc"
 provider_http = "http://127.0.0.1:3040/api"
-auth_token = "asda123123jhaskjdhgbjsjhdj"
+auth_token = "user1_auth_token"
 
 # Subnet A
 [[subnets]]
