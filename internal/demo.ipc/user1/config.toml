@@ -1,4 +1,4 @@
-# Default user configuration
+# User 1 configuration
 
 keystore_path = "~/.ipc"
 
