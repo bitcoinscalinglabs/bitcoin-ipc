@@ -1,5 +1,5 @@
 ```sh
-curl -X POST http://localhost:3030/api \
+curl -X POST http://localhost:3040/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
 -d '{
@@ -28,7 +28,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"collateral": 200000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -46,7 +46,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"collateral": 20000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -57,7 +57,6 @@ curl -X POST http://localhost:3040/api \
 
 # join new validator 2
 
-curl -X POST http://localhost:3040/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
 -d '{
@@ -65,7 +64,7 @@ curl -X POST http://localhost:3040/api \
     "method": "joinsubnet",
     "params": {
 			"subnet_id": "/b4/t410fertekptrvemo3wddyaht6v2pqykjdjieorit6ha",
-			"collateral": 20000000,
+			"collateral": 21000000,
 			"ip": "66.222.44.55:8080",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
 			"pubkey": "71ac1eb874233999e11cd050f388f1dd6da9b446180fdf9b06740419cc487b6f"
@@ -82,9 +81,23 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "stakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"amount": 6500000,
 			"pubkey": "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "stakecollateral",
+    "params": {
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
+			"amount": 8500000,
+			"pubkey": "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0"
     },
     "id": 1
 }' | jq
@@ -98,8 +111,8 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "stakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
-			"amount": 6500000,
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
+			"amount": 4500000,
 			"pubkey": "e327a66b169732bde49d827d90781327af558fc12d5cd2d5004e7551ec00c662"
     },
     "id": 1
@@ -114,8 +127,8 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "unstakecollateral",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
-			"amount": 4200000
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
+			"amount": 2000000
     },
     "id": 1
 }' | jq
@@ -128,7 +141,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"collateral": 110000000,
 			"ip": "66.222.44.55:8081",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -144,7 +157,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"collateral": 150000000,
 			"ip": "66.222.44.55:8082",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -160,7 +173,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "joinsubnet",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"collateral": 180000000,
 			"ip": "66.222.44.55:8083",
 			"backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
@@ -188,7 +201,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby"
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy"
     },
     "id": 1
 }' | jq
@@ -228,7 +241,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "getrootnetmessages",
     "params": {
-			"subnet_id": "/b4/t420fmsv2gwpnksrxob6yij4wi6iuu2pg4vowy6xopfembcl6axt5ocqtymspsm",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"block_height": 235
     },
     "id": 1
@@ -241,7 +254,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getstakechanges",
     "params": {
-			"subnet_id": "/b4/t410fbbjlqjgx6cyr466yevwd4bp54mbpchkfafeuaby",
+			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy",
 			"block_height": 162
     },
     "id": 1
@@ -257,6 +270,30 @@ curl -X POST http://localhost:3030/api \
 			"subnet_id": "/b4/t420fxm3vljgrnt4az4nbhwo74ih3b4lce2ecfzfrytqtzfnulhjfuagct52yci",
 			"recipient": "bcrt1q3pw5xfrph88qgd4uwmwgw5xh60np6mdcdd2h5k",
 			"amount": 20000000
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "genbootstraphandover",
+    "params": {
+			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer validator1_auth_token" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "genbootstraphandover",
+    "params": {
+			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
     },
     "id": 1
 }' | jq
