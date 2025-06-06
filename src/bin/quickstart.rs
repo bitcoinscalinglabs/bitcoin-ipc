@@ -1,4 +1,7 @@
+use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use hex;
 use include_dir::{include_dir, Dir};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io;
@@ -6,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 static DEMO_IPC: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/internal/demo.ipc");
+
+use bitcoin_ipc::eth_utils::eth_addr_from_x_only_pubkey;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct KeystoreEntry {
+    address: String,
+    private_key: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,12 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup Bitcoin wallets
     setup_bitcoin_wallets().await?;
 
+    // Print validator/user addresses and public keys
+    print_validator_user_keys(&ipc_dir)?;
+
     Ok(())
 }
 
 async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Setting up Bitcoin wallets...");
-
     // Check if default wallet already exists
     let wallet_check = Command::new("bitcoin-cli")
         .args(&["--rpcwallet=default", "getwalletinfo"])
@@ -64,7 +76,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     if wallets_exist {
-        println!("Default wallet exists, skipping wallet creation");
+        println!("Default wallet exists, skipping wallet creation.");
 
         // Load all wallets
         for wallet in &wallet_names {
@@ -119,7 +131,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Check and print balances
-    println!("Checking wallet balances...");
+    println!("\n=== Bitcoin wallet balances ===");
     for wallet in &wallet_names {
         check_wallet_balance(wallet).await?;
     }
@@ -169,7 +181,7 @@ async fn check_wallet_balance(wallet_name: &str) -> Result<(), Box<dyn std::erro
 
     if output.status.success() {
         let balance = String::from_utf8(output.stdout)?.trim().to_string();
-        println!("Wallet {:<12}\tbalance: {} BTC", wallet_name, balance);
+        println!("{:<12}\tbalance: {} BTC", wallet_name, balance);
     } else {
         println!(
             "Failed to get balance for wallet {}: {}",
@@ -217,6 +229,83 @@ fn process_env_files(dir: &Path, home_dir: &str) -> io::Result<()> {
             println!("Processed .env file: {}", path.display());
         }
     }
+
+    Ok(())
+}
+
+fn print_validator_user_keys(ipc_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let keystore_path = ipc_dir.join("btc_keystore.json");
+
+    if !keystore_path.exists() {
+        println!("Keystore file not found at: {}", keystore_path.display());
+        return Ok(());
+    }
+
+    let keystore_content = fs::read_to_string(&keystore_path)?;
+    let keystore: Vec<KeystoreEntry> = serde_json::from_str(&keystore_content)?;
+
+    let labels = vec![
+        "validator1",
+        "validator2",
+        "validator3",
+        "validator4",
+        "validator5",
+        "validator6",
+        "user1",
+        "user2",
+    ];
+
+    println!("\n=== Validator/User Keys and Addresses ===");
+    println!(
+        "{:<12} {:<42} {:<66}",
+        "Label", "ETH Address", "X-Only PubKey"
+    );
+    println!("{}", "=".repeat(120));
+
+    let secp = Secp256k1::new();
+    let mut whitelist_xpks = Vec::new();
+
+    for (i, entry) in keystore.iter().enumerate() {
+        if i >= labels.len() {
+            break;
+        }
+
+        let label = labels[i];
+
+        // Parse private key
+        let sk_hex = entry
+            .private_key
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(&entry.private_key);
+        let sk_bytes = hex::decode(sk_hex)?;
+        let secret_key = SecretKey::from_slice(&sk_bytes)?;
+
+        // Derive x-only public key
+        let (x_only_pubkey, _) = secret_key.x_only_public_key(&secp);
+
+        // Collect first 4 validator x-only public keys for whitelist
+        if i < 4 {
+            whitelist_xpks.push(x_only_pubkey.to_string());
+        }
+
+        // Derive Ethereum address
+        let eth_address = eth_addr_from_x_only_pubkey(x_only_pubkey);
+
+        println!(
+            "{:<12} {:<42} {:<66}",
+            label,
+            format!("0x{:x}", eth_address),
+            x_only_pubkey.to_string()
+        );
+    }
+
+    println!("{}", "=".repeat(120));
+
+    // Print recommended whitelist (first 4 validators' x-only public keys)
+    println!("\n=== Recommended Whitelist (First 4 Validators) ===");
+    println!("{}", whitelist_xpks.join(","));
+    println!();
 
     Ok(())
 }
