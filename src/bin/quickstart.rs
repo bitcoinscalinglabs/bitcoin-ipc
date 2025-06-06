@@ -75,11 +75,11 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
             if output.status.success() {
                 println!("Loaded wallet: {}", wallet);
             } else {
-                println!(
-                    "Failed to load wallet {}: {}",
-                    wallet,
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                let error_message = String::from_utf8_lossy(&output.stderr);
+
+                if !error_message.contains("already loaded") {
+                    println!("Failed to load wallet {}: {}", wallet, error_message);
+                }
             }
         }
     } else {
