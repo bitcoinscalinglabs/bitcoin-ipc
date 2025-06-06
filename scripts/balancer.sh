@@ -5,8 +5,9 @@ fi
 
 SUBNET_ID=$1
 
+clear
 while true; do
-	clear
+	clear # tput cup 0 0
     ../ipc/target/release/ipc-cli wallet balances --subnet "$SUBNET_ID" --wallet-type btc
     sleep 2
 done

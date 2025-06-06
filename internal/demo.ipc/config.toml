@@ -1,0 +1,37 @@
+# Default user configuration
+
+keystore_path = "~/.ipc"
+
+# Bitcoin Regtest
+[[subnets]]
+id = "/b4"
+
+[subnets.config]
+network_type = "btc"
+provider_http = "http://127.0.0.1:3040/api"
+auth_token = "user1_auth_token"
+
+# Subnet A
+[[subnets]]
+id = "/b4/t410f3nguw4aj2i4osdjdf57rysam22cg5zs7y6zd3jq"
+
+[subnets.config]
+network_type = "fevm"
+provider_http = "http://localhost:8545/"
+gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
+registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
+
+# Subnet B
+[[subnets]]
+id = "/b4/t410ffx4pmxtt2xtcvqynbuayjlqecys7tqdlfbwyw2i"
+
+[subnets.config]
+network_type = "fevm"
+provider_http = "http://localhost:9545/"
+gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
+registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
+
+[tracing]
+
+[tracing.console]
+level = "trace"

@@ -155,3 +155,34 @@ pub fn create_rand_blockhash() -> BlockHash {
 pub fn create_rand_addr() -> alloy_primitives::Address {
     alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{eth_utils::evm_address_to_delegated_fvm, ipc_lib::L1_DELEGATED_NAMESPACE};
+
+    use super::*;
+
+    #[test]
+    fn generate_keypairs_for_testing() {
+        let keypairs = generate_keypairs(2);
+
+        for keypair in keypairs.iter() {
+            let (x_only, _parity) = keypair.x_only_public_key();
+            let addr = alloy_primitives::Address::from_raw_public_key(
+                &keypair.public_key().serialize_uncompressed()[1..],
+            );
+
+            println!(
+                "SK = {}\nXPK = {}\nADDR = {}\nFIL = {}\n",
+                keypair.secret_key().display_secret(),
+                x_only,
+                addr,
+                evm_address_to_delegated_fvm(&addr, L1_DELEGATED_NAMESPACE),
+            );
+        }
+
+        assert!(true);
+        // uncomment next line to fail the test and print the keypairs
+        // assert!(false);
+    }
+}
