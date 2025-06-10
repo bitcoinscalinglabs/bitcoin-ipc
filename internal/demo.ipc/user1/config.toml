@@ -13,7 +13,7 @@ auth_token = "user1_auth_token"
 
 # Subnet A
 [[subnets]]
-id = "/b4/t410f3nguw4aj2i4osdjdf57rysam22cg5zs7y6zd3jq"
+id = "/b4/t410fyi77izvsakigfjnocb7f3hm52bjdeb76jayo4ti"
 
 [subnets.config]
 network_type = "fevm"
@@ -23,7 +23,7 @@ registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
 
 # Subnet B
 [[subnets]]
-id = "/b4/t410ffx4pmxtt2xtcvqynbuayjlqecys7tqdlfbwyw2i"
+id = "/b4/t410ftkmrmongfxyrefwgpyz524taorvrijfwfzrfwgy"
 
 [subnets.config]
 network_type = "fevm"
