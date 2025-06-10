@@ -1,5 +1,4 @@
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
-use hex;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -55,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     // Check if default wallet already exists
     let wallet_check = Command::new("bitcoin-cli")
-        .args(&["--rpcwallet=default", "getwalletinfo"])
+        .args(["--rpcwallet=default", "getwalletinfo"])
         .output();
 
     let wallets_exist = match wallet_check {
@@ -70,7 +69,6 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         "validator3",
         "validator4",
         "validator5",
-        "validator6",
         "user1",
         "user2",
     ];
@@ -81,7 +79,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         // Load all wallets
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(&["loadwallet", wallet])
+                .args(["loadwallet", wallet])
                 .output()?;
 
             if output.status.success() {
@@ -100,7 +98,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         // Create wallets
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(&["createwallet", wallet])
+                .args(["createwallet", wallet])
                 .output()?;
 
             if output.status.success() {
@@ -142,7 +140,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
 async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::error::Error>> {
     // Get new address for the wallet
     let address_output = Command::new("bitcoin-cli")
-        .args(&[&format!("--rpcwallet={}", wallet_name), "getnewaddress"])
+        .args([&format!("--rpcwallet={}", wallet_name), "getnewaddress"])
         .output()?;
 
     if !address_output.status.success() {
@@ -158,7 +156,7 @@ async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::
 
     // Generate blocks to the address
     let generate_output = Command::new("bitcoin-cli")
-        .args(&["generatetoaddress", &blocks.to_string(), &address])
+        .args(["generatetoaddress", &blocks.to_string(), &address])
         .output()?;
 
     if generate_output.status.success() {
@@ -176,7 +174,7 @@ async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::
 
 async fn check_wallet_balance(wallet_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("bitcoin-cli")
-        .args(&[&format!("--rpcwallet={}", wallet_name), "getbalance"])
+        .args([&format!("--rpcwallet={}", wallet_name), "getbalance"])
         .output()?;
 
     if output.status.success() {
@@ -244,13 +242,12 @@ fn print_validator_user_keys(ipc_dir: &Path) -> Result<(), Box<dyn std::error::E
     let keystore_content = fs::read_to_string(&keystore_path)?;
     let keystore: Vec<KeystoreEntry> = serde_json::from_str(&keystore_content)?;
 
-    let labels = vec![
+    let labels = [
         "validator1",
         "validator2",
         "validator3",
         "validator4",
         "validator5",
-        "validator6",
         "user1",
         "user2",
     ];
