@@ -52,13 +52,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if default wallet already exists
-    let wallet_check = Command::new("bitcoin-cli")
-        .args(["--rpcwallet=default", "getwalletinfo"])
+    // Check if default wallet already exists by trying to load it first
+    let wallet_load = Command::new("bitcoin-cli")
+        .args(["loadwallet", "default"])
         .output();
 
-    let wallets_exist = match wallet_check {
-        Ok(output) => output.status.success(),
+    let wallets_exist = match wallet_load {
+        Ok(output) => {
+            if output.status.success() {
+                true // Successfully loaded, so it exists
+            } else {
+                let error_message = String::from_utf8_lossy(&output.stderr);
+                // If already loaded, it exists. If path doesn't exist, it doesn't exist.
+                !error_message.contains("path does not exist")
+            }
+        }
         Err(_) => false,
     };
 
