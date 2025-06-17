@@ -2901,10 +2901,10 @@ impl IpcUnstakeCollateralMsg {
             }
         };
 
-        if !sufficient_to_participate {
+        if !sufficient_to_participate && self.amount != validator.collateral {
             return Err(IpcValidateError::InvalidMsg(format!(
-				"Validator with public key {} has insufficient collateral to participate in the committee after unstaking {}. Please unstake all.",
-				pubkey, self.amount
+				"Validator with public key {} has insufficient collateral to participate in the committee after unstaking {}. Please unstake all {}.",
+				pubkey, self.amount, validator.collateral,
 			)));
         }
 
