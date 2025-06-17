@@ -64,7 +64,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let error_message = String::from_utf8_lossy(&output.stderr);
                 // If already loaded, it exists. If path doesn't exist, it doesn't exist.
-                !error_message.contains("path does not exist")
+                !error_message.contains("Path does not exist.")
             }
         }
         Err(_) => false,
