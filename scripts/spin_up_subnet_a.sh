@@ -99,3 +99,8 @@ run_validator 4 26956 26957 8845 26955 "$API_URL_4" "$BEARER_TOKEN_4" &
 wait
 
 echo "All validators have been started!"
+
+echo ""
+echo "To save bootstrap information, run the following commands:"
+echo "export CometBftID=$COMETBFT_ID"
+echo "export ResolverAddress=$RESOLVER_ADDR"
