@@ -29,6 +29,11 @@ const TRANSACTIONS_KEY: &str = "transactions:";
 const COMMITTEE_KEY: &str = "committee:";
 // stake_changes:<subnet_id>:<configuration_number>
 const STAKE_CHANGES_KEY: &str = "stake_changes:";
+// kill_requests:<subnet_id>:<block_height>:<txid>
+const KILL_REQUESTS_KEY: &str = "kill_requests:";
+
+// Kill request validity duration in blocks
+const KILL_REQUEST_VALID_BLOCKS: u64 = 36;
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -66,6 +71,17 @@ fn stake_changes_prefix(subnet_id: SubnetId) -> String {
 
 fn stake_change_key(subnet_id: SubnetId, configuration_number: u64) -> String {
     format!("{STAKE_CHANGES_KEY}:{}:{}", subnet_id, configuration_number)
+}
+
+fn kill_requests_prefix(subnet_id: SubnetId) -> String {
+    format!("{KILL_REQUESTS_KEY}:{}", subnet_id)
+}
+
+fn kill_request_key(subnet_id: SubnetId, block_height: u64, txid: Txid) -> String {
+    format!(
+        "{KILL_REQUESTS_KEY}:{}:{}:{}",
+        subnet_id, block_height, txid
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -333,6 +349,19 @@ pub struct SubnetCheckpoint {
     pub next_configuration_number: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubnetKillState {
+    NotKilled,
+    ToBeKilled,
+    Killed {
+        /// The block height of the checkpoint on Bitcoin
+        checkpoint_block_height: u64,
+        /// The txid of the checkpoint on Bitcoin
+        checkpoint_txid: bitcoin::Txid,
+    },
+}
+
 /// The current state of a subnet
 /// Must only exist if the subnet is bootstrapped
 ///
@@ -356,6 +385,8 @@ pub struct SubnetState {
     pub waiting_committee: Option<SubnetCommittee>,
     /// The number of the last checkpoint
     pub last_checkpoint_number: Option<u64>,
+    /// The kill state of the subnet
+    pub killed: SubnetKillState,
 }
 
 impl SubnetState {
@@ -526,6 +557,7 @@ impl SubnetGenesisInfo {
                 .genesis_validators
                 .to_committee(&self.subnet_id, GENESIS_COMMITTEE_CONF_NUM),
             waiting_committee: None,
+            killed: SubnetKillState::NotKilled,
         }
     }
 
@@ -638,6 +670,14 @@ pub struct StakeChangeRequest {
     pub txid: Txid,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KillRequest {
+    pub validator_xpk: bitcoin::XOnlyPublicKey,
+    pub block_height: u64,
+    pub block_hash: bitcoin::BlockHash,
+    pub txid: Txid,
+}
+
 pub struct HeedDb {
     env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
@@ -650,6 +690,7 @@ pub struct HeedDb {
     transactions_db: HeedDatabase<Str, SerdeBincode<Vec<u8>>>,
     committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
     stake_changes_db: HeedDatabase<Str, SerdeBincode<StakeChangeRequest>>,
+    kill_requests_db: HeedDatabase<Str, SerdeBincode<KillRequest>>,
 }
 
 impl HeedDb {
@@ -688,7 +729,7 @@ impl HeedDb {
             EnvOpenOptions::new()
                 .flags(flags)
                 // TODO set max_dbs automatically
-                .max_dbs(10)
+                .max_dbs(11)
                 .open(database_path)?
         };
 
@@ -719,6 +760,9 @@ impl HeedDb {
             let stake_changes_db = env
                 .open_database(&rtxn, Some("stake_changes_db"))?
                 .ok_or(DbError::DbNotFound("stake_changes_db".to_string()))?;
+            let kill_requests_db = env
+                .open_database(&rtxn, Some("kill_requests_db"))?
+                .ok_or(DbError::DbNotFound("kill_requests_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -731,6 +775,7 @@ impl HeedDb {
                 transactions_db,
                 committee_db,
                 stake_changes_db,
+                kill_requests_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -743,6 +788,7 @@ impl HeedDb {
             let transactions_db = env.create_database(&mut txn, Some("transactions_db"))?;
             let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
             let stake_changes_db = env.create_database(&mut txn, Some("stake_changes_db"))?;
+            let kill_requests_db = env.create_database(&mut txn, Some("kill_requests_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -755,6 +801,7 @@ impl HeedDb {
                 transactions_db,
                 committee_db,
                 stake_changes_db,
+                kill_requests_db,
             })
         }
     }
@@ -905,6 +952,20 @@ pub trait Database {
         confirmed_block_height: u64,
         confirmed_block_hash: BlockHash,
     ) -> Result<(Option<StakeChangeRequest>, Vec<StakeChangeRequest>), DbError>;
+
+    // Kill Requests
+    fn add_kill_request(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        kill_request: KillRequest,
+    ) -> Result<(), DbError>;
+
+    fn get_valid_kill_requests(
+        &self,
+        subnet_id: SubnetId,
+        current_block_height: u64,
+    ) -> Result<Vec<KillRequest>, DbError>;
 }
 
 #[async_trait]
@@ -1398,6 +1459,43 @@ impl Database for HeedDb {
 
         Ok((last_confirmed, confirmed_changes))
     }
+
+    fn add_kill_request(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        kill_request: KillRequest,
+    ) -> Result<(), DbError> {
+        let key = kill_request_key(subnet_id, kill_request.block_height, kill_request.txid);
+        self.kill_requests_db
+            .put(txn, &key, &kill_request)
+            .map_err(|e| e.into())
+    }
+
+    fn get_valid_kill_requests(
+        &self,
+        subnet_id: SubnetId,
+        current_block_height: u64,
+    ) -> Result<Vec<KillRequest>, DbError> {
+        let rtxn = self.env.read_txn().map_err(DbError::HeedError)?;
+        let prefix = kill_requests_prefix(subnet_id);
+        let mut kill_requests = Vec::new();
+
+        // Calculate the minimum valid block height
+        let min_valid_height = current_block_height.saturating_sub(KILL_REQUEST_VALID_BLOCKS);
+
+        for item in self.kill_requests_db.prefix_iter(&rtxn, &prefix)? {
+            let (_key, kill_request) = item?;
+
+            // Only include kill requests that are still valid (not too old)
+            if kill_request.block_height >= min_valid_height {
+                kill_requests.push(kill_request);
+            }
+        }
+
+        rtxn.commit().map_err(DbError::HeedError)?;
+        Ok(kill_requests)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -1774,6 +1872,7 @@ pub mod tests {
             committee: current_committee.clone(),
             waiting_committee: Some(next_committee.clone()),
             last_checkpoint_number: None,
+            killed: SubnetKillState::NotKilled,
         };
 
         // Verify needs_rotation returns true when committees differ

@@ -53,7 +53,7 @@ pub const IPC_TRANSFER_TAG: &str = "IPCTFR";
 pub const IPC_DELETE_SUBNET_TAG: &str = "IPCDEL";
 pub const IPC_STAKE_TAG: &str = "IPCSTK";
 pub const IPC_UNSTAKE_TAG: &str = "IPCUST";
-pub const IPC_LEAVE_SUBNET_TAG: &str = "IPCLVE";
+pub const IPC_KILL_SUBNET_TAG: &str = "IPCKIL";
 
 // Static assertion to verify tag lengths at compile time
 const _: () = {
@@ -66,7 +66,7 @@ const _: () = {
     assert!(IPC_DELETE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_STAKE_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_UNSTAKE_TAG.len() == IPC_TAG_LENGTH);
-    assert!(IPC_LEAVE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
+    assert!(IPC_KILL_SUBNET_TAG.len() == IPC_TAG_LENGTH);
 };
 
 // Define the IPC tags enum
@@ -80,7 +80,7 @@ pub enum IpcTag {
     BatchTransfer,
     StakeCollateral,
     UnstakeCollateral,
-    LeaveSubnet,
+    KillSubnet,
 }
 
 impl IpcTag {
@@ -94,7 +94,7 @@ impl IpcTag {
             Self::BatchTransfer => IPC_TRANSFER_TAG,
             Self::StakeCollateral => IPC_STAKE_TAG,
             Self::UnstakeCollateral => IPC_UNSTAKE_TAG,
-            Self::LeaveSubnet => IPC_LEAVE_SUBNET_TAG,
+            Self::KillSubnet => IPC_KILL_SUBNET_TAG,
         }
     }
 }
@@ -110,6 +110,9 @@ impl std::str::FromStr for IpcTag {
             IPC_FUND_SUBNET_TAG => Ok(Self::FundSubnet),
             IPC_CHECKPOINT_TAG => Ok(Self::CheckpointSubnet),
             IPC_TRANSFER_TAG => Ok(Self::BatchTransfer),
+            IPC_STAKE_TAG => Ok(Self::StakeCollateral),
+            IPC_UNSTAKE_TAG => Ok(Self::UnstakeCollateral),
+            IPC_KILL_SUBNET_TAG => Ok(Self::KillSubnet),
             _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
@@ -2817,6 +2820,8 @@ pub struct IpcUnstakeCollateralMsg {
 }
 
 impl IpcUnstakeCollateralMsg {
+    const TAG: &str = IPC_UNSTAKE_TAG;
+
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE + Amount::SIZE;
 
@@ -2838,7 +2843,7 @@ impl IpcUnstakeCollateralMsg {
 
         let committee = subnet.latest_committee();
 
-        // Check if the validator with this public key is already registered
+        // Check if the validator with this public key is validator
         // NOTE: mandatory check here
         let pubkey = match self.pubkey {
             Some(pubkey) => {
@@ -2975,7 +2980,7 @@ impl IpcUnstakeCollateralMsg {
         // Create the first output: op_return with
         // ipc tag, schnorr signature, amount
         //
-        let tag: [u8; IPC_TAG_LENGTH] = IPC_UNSTAKE_TAG
+        let tag: [u8; IPC_TAG_LENGTH] = Self::TAG
             .as_bytes()
             .try_into()
             .expect("IPC_UNSTAKE_TAG has incorrect length");
@@ -3027,7 +3032,7 @@ impl IpcUnstakeCollateralMsg {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
-        let err = |msg: String| IpcLibError::MsgParseError(IPC_UNSTAKE_TAG, msg);
+        let err = |msg: String| IpcLibError::MsgParseError(Self::TAG, msg);
 
         // We expect at least two outputs:
         // 1. OP_RETURN with IPC tag, signature, and amount
@@ -3060,7 +3065,7 @@ impl IpcUnstakeCollateralMsg {
 
         // Check IPC tag
         let tag_bytes = &op_return_data[0..IPC_TAG_LENGTH];
-        let expected_tag = IPC_UNSTAKE_TAG.as_bytes();
+        let expected_tag = Self::TAG.as_bytes();
         if tag_bytes != expected_tag {
             return Err(err(format!(
                 "Invalid IPC tag: expected {:?}, got {:?}",
@@ -3204,7 +3209,7 @@ impl IpcUnstakeCollateralMsg {
         let tx = crate::wallet::sign_tx(rpc, tx)?;
         trace!("Unstake msg signed TX: {tx:?}");
 
-        // Submit the unstake transaction to the mempool
+        // Submit the transaction to the mempool
 
         let txid = tx.compute_txid();
         match submit_to_mempool(rpc, vec![tx]) {
@@ -3365,7 +3370,456 @@ impl IpcValidate for IpcUnstakeCollateralMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct IpcLeaveSubnetMsg {}
+pub struct IpcKillSubnetMsg {
+    /// The subnet id of the subnet to stake
+    /// This is derived from 2nd output
+    /// that is sent to the subnet multisig address
+    pub subnet_id: SubnetId,
+    /// The pubkey of the validator who submitted the kill request
+    #[serde(skip_deserializing)]
+    pub pubkey: Option<bitcoin::XOnlyPublicKey>,
+}
+
+impl IpcKillSubnetMsg {
+    const TAG: &str = IPC_KILL_SUBNET_TAG;
+
+    // The total length of the op_return data - helper
+    const DATA_LEN: usize = IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE;
+
+    pub fn validate_for_subnet(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
+        // should never happen
+        if subnet.id != self.subnet_id || genesis_info.subnet_id != self.subnet_id {
+            return Err(IpcValidateError::InvalidField(
+                "subnet_id",
+                format!(
+                    "Subnet ID mismatch: expected {}, got {}",
+                    subnet.id, self.subnet_id
+                ),
+            ));
+        }
+
+        let committee = subnet.latest_committee();
+
+        // Check if the validator with this public key is validator
+        // NOTE: mandatory check here
+        if let Some(pubkey) = self.pubkey {
+            if !committee.is_validator(&pubkey) {
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "Validator with public key '{}' must be a validator in subnet {}",
+                    pubkey, self.subnet_id,
+                )));
+            }
+        } else {
+            return Err(IpcValidateError::InvalidField(
+                "pubkey",
+                "Validator public key is required".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// See `make_signature` for information
+    fn make_signature_msg(
+        prev_txid: &Txid,
+        pubkey: &bitcoin::XOnlyPublicKey,
+        subnet_id: &SubnetId,
+    ) -> bitcoin::secp256k1::Message {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(prev_txid.as_byte_array().as_slice());
+        msg.extend_from_slice(&pubkey.serialize());
+        msg.extend_from_slice(subnet_id.txid20().as_ref());
+
+        let msg = bitcoin::hashes::sha256::Hash::hash(&msg);
+        bitcoin::secp256k1::Message::from_digest(msg.to_byte_array())
+    }
+
+    /// Returns a signature to be embedded in the OP_RETURN output
+    /// Confirming it's valid and signed by the validator making the request
+    ///
+    /// The signature is signing the following message:
+    /// prev_txid || xpubkey || subnet_id
+    ///
+    /// This is to prevent replay attacks, since the tx inputs
+    /// are not enforced or verified
+    pub(crate) fn make_signature(
+        &self,
+        prev_txid: &Txid,
+        secret_key: bitcoin::secp256k1::SecretKey,
+    ) -> bitcoin::secp256k1::schnorr::Signature {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (pubkey, _) = secret_key.x_only_public_key(&secp);
+        let msg = Self::make_signature_msg(prev_txid, &pubkey, &self.subnet_id);
+
+        // Sign the message with the secret key
+        // and return the signature
+        secp.sign_schnorr(&msg, &secret_key.keypair(&secp))
+    }
+
+    pub fn to_tx(
+        &self,
+        fee_rate: bitcoin::FeeRate,
+        multisig_address: &bitcoin::Address,
+        signature: bitcoin::secp256k1::schnorr::Signature,
+    ) -> Result<Transaction, IpcLibError> {
+        //
+        // Create the first output: op_return with
+        // ipc tag, schnorr signature, amount
+        //
+        let tag: [u8; IPC_TAG_LENGTH] = IPC_KILL_SUBNET_TAG
+            .as_bytes()
+            .try_into()
+            .expect("IPC_KILL_SUBNET_TAG has incorrect length");
+
+        let sig_bytes = signature.as_ref();
+
+        // Construct op_return data
+        let mut op_return_data = [0u8; Self::DATA_LEN];
+
+        op_return_data[0..IPC_TAG_LENGTH].copy_from_slice(&tag);
+        op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE]
+            .copy_from_slice(sig_bytes);
+
+        // Required to do since [u8; 78] for some reason doesn't implement pusbytes
+        let push_bytes: &bitcoin::script::PushBytes = (&op_return_data).into();
+
+        // Make op_return script and txout
+        let op_return_script = bitcoin_utils::make_op_return_script(push_bytes);
+        let data_value = op_return_script.minimal_non_dust_custom(fee_rate);
+        let data_tx_out = bitcoin::TxOut {
+            value: data_value,
+            script_pubkey: op_return_script,
+        };
+
+        //
+        // Create second output: amount sent to the subnet multisig address
+        //
+        let multisig_tx_out = bitcoin::TxOut {
+            // TODO check this dust calculation?
+            value: multisig_address
+                .script_pubkey()
+                .minimal_non_dust_custom(fee_rate),
+            script_pubkey: multisig_address.script_pubkey(),
+        };
+
+        // Construct transaction
+        let tx_outs = vec![data_tx_out, multisig_tx_out];
+        let tx = bitcoin_utils::create_tx_from_txouts(tx_outs);
+        debug!("Kill TX: {tx:?}");
+
+        Ok(tx)
+    }
+
+    /// Parses an IpcKillSubnetMsg from a Bitcoin transaction
+    pub fn from_tx<D: db::Database>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+        use bitcoin::blockdata::script::Instruction;
+
+        // Helper closure for error creation
+        let err = |msg: String| IpcLibError::MsgParseError(Self::TAG, msg);
+
+        // We expect at least two outputs:
+        // 1. OP_RETURN with IPC tag, signature, and amount
+        // 2. Output to the subnet multisig address
+        if tx.output.len() < 2 {
+            return Err(err(format!(
+                "Expected at least 2 outputs for unstake collateral message, found {}",
+                tx.output.len()
+            )));
+        }
+
+        // Get OP_RETURN data from first output
+        let op_return_data = tx.output[0]
+            .script_pubkey
+            .instructions_minimal()
+            .find_map(|ins| match ins {
+                Ok(Instruction::PushBytes(data)) => Some(data.as_bytes()),
+                _ => None,
+            })
+            .ok_or_else(|| err("First output must be OP_RETURN with pushdata".into()))?;
+
+        // Check data length
+        if op_return_data.len() != Self::DATA_LEN {
+            return Err(err(format!(
+                "Invalid OP_RETURN data length: expected {}, got {}",
+                Self::DATA_LEN,
+                op_return_data.len()
+            )));
+        }
+
+        // Check IPC tag
+        let tag_bytes = &op_return_data[0..IPC_TAG_LENGTH];
+        let expected_tag = Self::TAG.as_bytes();
+        if tag_bytes != expected_tag {
+            return Err(err(format!(
+                "Invalid IPC tag: expected {:?}, got {:?}",
+                expected_tag, tag_bytes
+            )));
+        }
+
+        // Extract signature
+        let sig_bytes = &op_return_data[IPC_TAG_LENGTH..IPC_TAG_LENGTH + SCHNORR_SIGNATURE_SIZE];
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes)
+            .map_err(|e| err(format!("Invalid schnorr signature: {}", e)))?;
+
+        let multisig_address = bitcoin::Address::from_script(&tx.output[1].script_pubkey, NETWORK)
+            .map_err(|_| err("Could not parse address from output 1".to_string()))?
+            .into_unchecked();
+
+        let subnet = match db.get_subnet_by_multisig_address(&multisig_address) {
+            Ok(Some(subnet)) => subnet,
+            Ok(None) => {
+                error!(
+                    "KillSubnetMsg: Could not find subnet with multisig address {:?}.",
+                    multisig_address
+                );
+                return Err(err(format!(
+                    "KillSubnetMsg: Could not find subnet with multisig address {:?}",
+                    multisig_address
+                )));
+            }
+            Err(e) => {
+                error!(
+                    "KillSubnetMsg: Error while looking up subnet with multisig address {:?}: {}",
+                    multisig_address, e
+                );
+                return Err(err(format!(
+                    "KillSubnetMsg: Error while looking up subnet with multisig address {:?}: {}",
+                    multisig_address, e
+                )));
+            }
+        };
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+
+        let prev_txid = tx
+            .input
+            .first()
+            .ok_or(err("No inputs in the transaction".to_string()))?
+            .previous_output
+            .txid;
+
+        let validator = subnet
+            .committee
+            .validators
+            .iter()
+            .find(|v| {
+                let msg = IpcKillSubnetMsg::make_signature_msg(&prev_txid, &v.pubkey, &subnet.id);
+
+                secp.verify_schnorr(&signature, &msg, &v.pubkey).is_ok()
+            })
+            .ok_or(IpcValidateError::InvalidMsg(format!(
+                "Signature doesn't match any of the validators in the committee for subnet {}",
+                subnet.id
+            )))?;
+
+        debug!(
+            "Kill request matches validator xpk {} from signature",
+            validator.pubkey
+        );
+
+        // Construct the message
+        Ok(Self {
+            subnet_id: subnet.id,
+            pubkey: Some(validator.pubkey),
+        })
+    }
+
+    /// Submits the kill subnet transaction to Bitcoin
+    /// It accepts the current subnet multisig address to send some non-dust amount
+    /// to identify the subnet
+    ///
+    /// First output of the transaction includes the signature of the validator
+    /// thus we accept the secret key of the validator
+    ///
+    /// The signature also includes the prev_txid (of the first input) to prevent
+    /// replay attacks. This function first funds the tx
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+        secret_key: bitcoin::secp256k1::SecretKey,
+    ) -> Result<Txid, IpcLibError> {
+        info!(
+            "Submitting kill subnet msg to bitcoin. Multisig address = {} Validator XPK = {:?}",
+            multisig_address, self.pubkey
+        );
+
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&[0; 64])
+            .expect("All-zero valid signature");
+
+        let fee_rate = get_fee_rate(rpc, None, None);
+        let tx = self.to_tx(fee_rate, multisig_address, signature)?;
+
+        // Construct, fund and sign the stake transaction
+        let mut tx = crate::wallet::fund_tx(rpc, tx, None)?;
+        trace!("Kill subnet msg funded TX (empty signature): {tx:?}");
+
+        let first_prev_txid = tx
+            .input
+            .first()
+            .ok_or(IpcLibError::MsgParseError(
+                Self::TAG,
+                "No inputs in the transaction".to_string(),
+            ))?
+            .previous_output
+            .txid;
+
+        // Update the signature with the correct one
+        let signature = self.make_signature(&first_prev_txid, secret_key);
+        let tx_with_signature = self.to_tx(fee_rate, multisig_address, signature)?;
+
+        // Update our funded tx's first output which has the updated signature
+        tx.output[0] = tx_with_signature.output[0].clone();
+
+        let tx = crate::wallet::sign_tx(rpc, tx)?;
+        trace!("Kill subnet msg signed TX: {tx:?}");
+
+        // Submit the transaction to the mempool
+
+        let txid = tx.compute_txid();
+        match submit_to_mempool(rpc, vec![tx]) {
+            Ok(_) => {
+                info!(
+                    "Submitted kill subnet msg for subnet_id={} txid={}",
+                    self.subnet_id, txid,
+                );
+                Ok(txid)
+            }
+            Err(e) => Err(IpcLibError::BitcoinUtilsError(e)),
+        }
+    }
+
+    pub fn save_to_db<D: db::Database>(
+        &self,
+        db: &D,
+        block_height: u64,
+        block_hash: bitcoin::BlockHash,
+        txid: Txid,
+    ) -> Result<(), IpcLibError> {
+        let genesis_info =
+            db.get_subnet_genesis_info(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} does not exist",
+                    self.subnet_id
+                )))?;
+
+        let subnet_state = db
+            .get_subnet_state(self.subnet_id)
+            .map_err(|e| {
+                error!("Error getting subnet info from Db: {}", e);
+                IpcValidateError::InvalidMsg(e.to_string())
+            })?
+            // should never happen
+            .ok_or_else(|| {
+                error!("Subnet {} not found, unexpected", self.subnet_id);
+                IpcValidateError::InvalidMsg(format!("Subnet {} not found.", self.subnet_id))
+            })?;
+
+        self.validate_for_subnet(&genesis_info, &subnet_state)?;
+
+        // checked before in validate_for_subnet
+        let pubkey = self.pubkey.expect("pubkey should be present");
+
+        let committee = subnet_state.latest_committee();
+
+        // we clone the validator to verify it exists
+        let _validator = committee
+            .validators
+            .iter()
+            .find(|v| v.pubkey == pubkey)
+            .ok_or(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key {} not part of committee",
+                pubkey
+            )))?
+            .clone();
+
+        // Get all valid kill requests including the one we just added
+        let mut valid_kill_requests = db.get_valid_kill_requests(self.subnet_id, block_height)?;
+
+        // Create the kill request
+        let kill_request = db::KillRequest {
+            validator_xpk: pubkey,
+            block_height,
+            block_hash,
+            txid,
+        };
+
+        if valid_kill_requests
+            .iter()
+            .any(|req| req.validator_xpk == kill_request.validator_xpk)
+        {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator {} has already submitted a kill request for subnet {}",
+                kill_request.validator_xpk.clone(),
+                self.subnet_id
+            ))
+            .into());
+        }
+
+        // Append the new kill request
+        valid_kill_requests.push(kill_request.clone());
+
+        let mut wtxn = db.write_txn()?;
+
+        // Add the kill request to the database
+        db.add_kill_request(&mut wtxn, self.subnet_id, kill_request)?;
+
+        // Calculate total power of validators who have submitted kill requests
+        let mut kill_request_power = 0u32;
+        for kill_req in &valid_kill_requests {
+            if let Some(validator) = committee
+                .validators
+                .iter()
+                .find(|v| v.pubkey == kill_req.validator_xpk)
+            {
+                kill_request_power += validator.power;
+            }
+        }
+
+        // Check if we have reached 2/3 majority
+        let total_power = committee.total_power();
+        let threshold = multisig::multisig_threshold(total_power);
+
+        if kill_request_power >= threshold {
+            info!(
+                "Kill request 2/3 majority reached for subnet {}: {}/{} power, marking subnet pending killed.",
+                self.subnet_id, kill_request_power, total_power
+            );
+
+            // Mark the subnet as to be killed
+            let mut updated_subnet_state = subnet_state;
+            updated_subnet_state.killed = db::SubnetKillState::ToBeKilled;
+            db.save_subnet_state(&mut wtxn, self.subnet_id, &updated_subnet_state)?;
+        } else {
+            info!(
+                "Kill request added for subnet {} but majority not reached: {}/{} power (threshold: {})",
+                self.subnet_id, kill_request_power, total_power, threshold
+            );
+        }
+
+        wtxn.commit()?;
+
+        Ok(())
+    }
+}
+
+impl IpcValidate for IpcKillSubnetMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        // Check subnet_id is not all zeros
+        if self.subnet_id == SubnetId::default() {
+            return Err(IpcValidateError::InvalidField(
+                "subnet_id",
+                "Subnet ID cannot be all zeros".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
 
 //
 // IPC Messages
@@ -3382,7 +3836,7 @@ pub enum IpcMessage {
     BatchTransfer(IpcBatchTransferMsg),
     StakeCollateral(IpcStakeCollateralMsg),
     UnstakeCollateral(IpcUnstakeCollateralMsg),
-    LeaveSubnet(IpcLeaveSubnetMsg),
+    KillSubnet(IpcKillSubnetMsg),
 }
 
 impl IpcMessage {
@@ -3430,7 +3884,7 @@ impl IpcMessage {
             IpcTag::UnstakeCollateral => {
                 Err(IpcSerializeError::DeserializationError("Skip".to_string()))
             }
-            IpcTag::LeaveSubnet => Err(IpcSerializeError::DeserializationError("Skip".to_string())),
+            IpcTag::KillSubnet => Err(IpcSerializeError::DeserializationError("Skip".to_string())),
         }
     }
 }
@@ -4839,6 +5293,7 @@ mod checkpoint_msg_tests {
             },
             waiting_committee: None,
             last_checkpoint_number: None,
+            killed: db::SubnetKillState::NotKilled,
         };
 
         {
