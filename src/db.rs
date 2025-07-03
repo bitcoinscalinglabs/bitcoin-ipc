@@ -33,6 +33,10 @@ const STAKE_CHANGES_KEY: &str = "stake_changes:";
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
 // Kill request validity duration in blocks
+#[cfg(feature = "dev")]
+const KILL_REQUEST_VALID_BLOCKS: u64 = 3;
+
+#[cfg(not(feature = "dev"))]
 const KILL_REQUEST_VALID_BLOCKS: u64 = 36;
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;

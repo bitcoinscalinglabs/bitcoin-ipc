@@ -16,7 +16,6 @@ use log::{debug, error, info, trace, warn};
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -935,6 +934,7 @@ pub struct DevMultisignPsbtResponse {
     )>,
 }
 
+#[cfg(feature = "dev")]
 pub async fn dev_multisign_psbt(
     _data: Data<Arc<ServerData>>,
     Params(params): Params<DevMultisignPsbtParams>,
@@ -1526,6 +1526,31 @@ pub async fn kill_subnet(
             RpcError::InvalidParams(e.to_string())
         })?;
 
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let current_valid_requests = data
+        .db
+        .get_valid_kill_requests(msg.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    // Check if the validator has already submitted a kill request
+    if current_valid_requests
+        .iter()
+        .any(|kr| kr.validator_xpk == validator_xpk)
+    {
+        return Err(RpcError::InvalidParams(format!(
+            "Validator {} has already submitted a kill request for subnet {}",
+            validator_xpk, msg.subnet_id
+        ))
+        .into());
+    }
+
     let multisig_address = subnet_state.multisig_address();
 
     let txid = msg
@@ -1541,10 +1566,13 @@ pub struct DevKillSubnetParams {
     secret_keys: Vec<String>,
 }
 
+#[cfg(feature = "dev")]
 pub async fn dev_kill_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<DevKillSubnetParams>,
 ) -> Result<Vec<KillSubnetResponse>, JsonRpcError> {
+    use std::str::FromStr;
+
     info!(
         "dev_killsubnet: {} with {} secret keys",
         params.subnet_id,
@@ -1575,6 +1603,19 @@ pub async fn dev_kill_subnet(
             params.subnet_id
         )))?;
 
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let valid_kill_requests = data
+        .db
+        .get_valid_kill_requests(params.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
     let multisig_address = subnet_state.multisig_address();
     let mut responses = Vec::new();
 
@@ -1588,6 +1629,13 @@ pub async fn dev_kill_subnet(
         // Get the public key from the secret key
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let (validator_xpk, _) = secret_key.x_only_public_key(&secp);
+
+        if valid_kill_requests
+            .iter()
+            .any(|kr| kr.validator_xpk == validator_xpk)
+        {
+            continue; // Skip if this validator has already submitted a kill request
+        }
 
         // Create the kill subnet message
         let msg = IpcKillSubnetMsg {
@@ -1623,7 +1671,7 @@ pub async fn dev_kill_subnet(
 }
 
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
-    jsonrpc_v2::Server::new()
+    let server = jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
         // btc info
         .with_method("getblockhash", get_block_hash)
@@ -1650,10 +1698,13 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // stake changes
         .with_method("stakecollateral", stake_collateral)
         .with_method("unstakecollateral", unstake_collateral)
-        .with_method("getstakechanges", get_stake_changes)
-        // dev methods
-        // TODO make dev only via feature flag
+        .with_method("getstakechanges", get_stake_changes);
+
+    #[cfg(feature = "dev")]
+    // dev methods
+    let server = server
         .with_method("dev_multisignpsbt", dev_multisign_psbt)
-        .with_method("dev_killsubnet", dev_kill_subnet)
-        .finish()
+        .with_method("dev_killsubnet", dev_kill_subnet);
+
+    server.finish()
 }

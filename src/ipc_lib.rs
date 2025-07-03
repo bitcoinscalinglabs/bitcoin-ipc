@@ -3526,7 +3526,7 @@ impl IpcKillSubnetMsg {
         // 2. Output to the subnet multisig address
         if tx.output.len() < 2 {
             return Err(err(format!(
-                "Expected at least 2 outputs for unstake collateral message, found {}",
+                "Expected at least 2 outputs for kill subnet message, found {}",
                 tx.output.len()
             )));
         }
@@ -3737,7 +3737,7 @@ impl IpcKillSubnetMsg {
             )))?
             .clone();
 
-        // Get all valid kill requests including the one we just added
+        // Get all valid kill requests not including the new one to be added
         let mut valid_kill_requests = db.get_valid_kill_requests(self.subnet_id, block_height)?;
 
         // Create the kill request
@@ -3785,15 +3785,32 @@ impl IpcKillSubnetMsg {
         let threshold = multisig::multisig_threshold(total_power);
 
         if kill_request_power >= threshold {
-            info!(
-                "Kill request 2/3 majority reached for subnet {}: {}/{} power, marking subnet pending killed.",
-                self.subnet_id, kill_request_power, total_power
-            );
+            use db::SubnetKillState::*;
 
-            // Mark the subnet as to be killed
-            let mut updated_subnet_state = subnet_state;
-            updated_subnet_state.killed = db::SubnetKillState::ToBeKilled;
-            db.save_subnet_state(&mut wtxn, self.subnet_id, &updated_subnet_state)?;
+            match subnet_state.killed {
+                NotKilled => {
+                    info!(
+						"Kill request majority reached for subnet {}: {}/{} power, marking subnet pending killed.",
+						self.subnet_id, kill_request_power, total_power
+					);
+                    // Mark the subnet as to be killed
+                    let mut updated_subnet_state = subnet_state;
+                    updated_subnet_state.killed = ToBeKilled;
+                    db.save_subnet_state(&mut wtxn, self.subnet_id, &updated_subnet_state)?;
+                }
+                ToBeKilled => {
+                    info!(
+						"Kill request majority reached for subnet {}: {}/{} power, but subnet is already pending killed.",
+						self.subnet_id, kill_request_power, total_power
+					);
+                }
+                Killed { .. } => {
+                    info!(
+						"Kill request majority reached for subnet {}: {}/{} power, but subnet is already killed.",
+						self.subnet_id, kill_request_power, total_power
+					);
+                }
+            }
         } else {
             info!(
                 "Kill request added for subnet {} but majority not reached: {}/{} power (threshold: {})",
