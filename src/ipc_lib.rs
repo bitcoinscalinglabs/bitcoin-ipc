@@ -3526,7 +3526,7 @@ impl IpcKillSubnetMsg {
         // 2. Output to the subnet multisig address
         if tx.output.len() < 2 {
             return Err(err(format!(
-                "Expected at least 2 outputs for unstake collateral message, found {}",
+                "Expected at least 2 outputs for kill subnet message, found {}",
                 tx.output.len()
             )));
         }
