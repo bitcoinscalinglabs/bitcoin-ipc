@@ -761,6 +761,20 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
+    if subnet.is_killed() {
+        error!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        );
+        return Err(RpcError::InvalidParams(format!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        ))
+        .into());
+    }
+
+    let should_kill_subnet = subnet.killed == db::SubnetKillState::ToBeKilled;
+
     // Fill in the subnet addresses, erroring out if any subnet is not found
     msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
         error!("Error updating subnets for transfer: {}", e);
@@ -778,6 +792,57 @@ pub async fn gen_checkpoint_psbt(
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
 
+    if should_kill_subnet {
+        // Calculation of total unspent and stake amounts, alongside with transfers and withdrawals to process
+
+        let total_unspent_amount = unspent.iter().map(|u| u.amount).sum::<bitcoin::Amount>();
+        let total_stake_amount = subnet
+            .committee
+            .validators
+            .iter()
+            .map(|v| v.collateral)
+            .sum::<bitcoin::Amount>();
+
+        let total_transfer_amount_to_process = msg
+            .transfers
+            .iter()
+            .map(|t| t.amount)
+            .sum::<bitcoin::Amount>();
+
+        let total_withdrawal_amount_to_process = msg
+            .withdrawals
+            .iter()
+            .map(|w| w.amount)
+            .sum::<bitcoin::Amount>();
+
+        let total_extra_amount = total_unspent_amount
+            - total_stake_amount
+            - total_withdrawal_amount_to_process
+            - total_transfer_amount_to_process;
+
+        info!(
+            "Killing subnet {}, total unspent amount: {}, total stake amount: {}, extra value after withdrawals and transfers: {}",
+            msg.subnet_id, total_unspent_amount, total_stake_amount, total_extra_amount
+        );
+
+        // Process all validators in the committee for unstaking
+        msg.unstakes = subnet
+            .committee
+            .validators
+            .iter()
+            .map(|v| ipc_lib::IpcUnstake {
+                amount: v.collateral,
+                address: v.backup_address.clone(),
+                pubkey: v.pubkey.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        info!(
+            "Killing subnet {}, processing {} unstakes.",
+            msg.subnet_id,
+            msg.unstakes.len()
+        );
+    } else
     // update next_committee and process unstakes if the configuration number changed
     if msg.next_committee_configuration_number > current_committee_configuration {
         next_committee = data

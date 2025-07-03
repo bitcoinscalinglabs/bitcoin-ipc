@@ -469,6 +469,10 @@ impl SubnetState {
             ))
         }
     }
+
+    pub fn is_killed(&self) -> bool {
+        matches!(self.killed, SubnetKillState::Killed { .. })
+    }
 }
 
 /// An entry in the subnet genesis balance

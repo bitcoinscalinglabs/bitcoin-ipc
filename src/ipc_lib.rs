@@ -1243,6 +1243,8 @@ pub struct IpcCheckpointSubnetMsg {
     /// Optional change address (multisig)
     #[serde(skip_deserializing)]
     pub change_address: Option<bitcoin::Address<NetworkUnchecked>>,
+    /// The flag marking the subnet killed, ie. the last checkpoint
+    pub kill_checkpoint: bool,
 }
 
 impl IpcValidate for IpcCheckpointSubnetMsg {
@@ -1344,6 +1346,13 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             }
         }
 
+        if self.kill_checkpoint && self.change_address.is_some() {
+            return Err(IpcValidateError::InvalidField(
+                "change_address",
+                "Change address must not be set for kill checkpoint".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -1355,13 +1364,16 @@ impl IpcCheckpointSubnetMsg {
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
     // u64 length
     const COMMITTEE_CONF_LEN: usize = std::mem::size_of::<u64>();
+    // bool length
+    const KILLED_LEN: usize = 1;
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
         + SubnetId::INNER_LEN
         + bitcoin::hashes::sha256::Hash::LEN
         + Self::MARKERS_LEN
         + Self::HEIGHT_LEN
-        + Self::COMMITTEE_CONF_LEN;
+        + Self::COMMITTEE_CONF_LEN
+        + Self::KILLED_LEN;
 
     const TAG_OFFSET: usize = 0;
     const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
@@ -1369,6 +1381,7 @@ impl IpcCheckpointSubnetMsg {
     const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
     const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
     const COMMITTEE_CONF_OFFSET: usize = Self::MARKERS_OFFSET + Self::MARKERS_LEN;
+    const KILLED_OFFSET: usize = Self::COMMITTEE_CONF_OFFSET + Self::COMMITTEE_CONF_LEN;
 
     fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
@@ -1395,10 +1408,13 @@ impl IpcCheckpointSubnetMsg {
         op_return_data[Self::MARKERS_OFFSET + 2] = self.unstakes.len().min(255) as u8; // Unstake count
 
         // Add committee configuration number
-        op_return_data[Self::COMMITTEE_CONF_OFFSET..]
+        op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::KILLED_OFFSET]
             .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
-        // Required to do since [u8; 77] for some reason doesn't implement pusbytes
+        // Add killed flag
+        op_return_data[Self::KILLED_OFFSET] = if self.kill_checkpoint { 1 } else { 0 };
+
+        // Required to do since [u8; 78] for some reason doesn't implement pusbytes
         let push_bytes: &bitcoin::script::PushBytes =
             (&op_return_data[..]).try_into().expect("the size is okay");
 
@@ -1415,7 +1431,7 @@ impl IpcCheckpointSubnetMsg {
 
     pub fn extract_markers_from_metadata_tx_out(
         tx_out: &bitcoin::TxOut,
-    ) -> Result<(u8, u8, u8), IpcLibError> {
+    ) -> Result<(u8, u8, u8, bool), IpcLibError> {
         let err = |msg: String| IpcLibError::MsgParseError(IPC_CHECKPOINT_TAG, msg);
 
         // Get OP_RETURN data from first output
@@ -1447,7 +1463,10 @@ impl IpcCheckpointSubnetMsg {
         let transfer_count = op_return_data[Self::MARKERS_OFFSET + 1];
         let unstake_count = op_return_data[Self::MARKERS_OFFSET + 2];
 
-        Ok((withdrawal_count, transfer_count, unstake_count))
+        // Extract the killed flag
+        let killed = op_return_data[Self::KILLED_OFFSET] != 0;
+
+        Ok((withdrawal_count, transfer_count, unstake_count, killed))
     }
 
     fn make_batched_transfer_data(&self) -> Result<Vec<u8>, IpcLibError> {
@@ -1775,6 +1794,17 @@ impl IpcCheckpointSubnetMsg {
             &fee_rate,
         )?;
 
+        let change_amount = checkpoint_tx
+            .output
+            .iter()
+            .find(|out| out.script_pubkey == committee_change_address.script_pubkey())
+            .map_or(Amount::ZERO, |out| out.value);
+
+        debug!(
+            "Checkpoint has {} of change going to {}",
+            change_amount, committee_change_address
+        );
+
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let checkpoint_psbt = multisig::construct_spend_psbt(
             &secp,
@@ -1804,7 +1834,7 @@ impl IpcCheckpointSubnetMsg {
     ///
     /// The checkpoint transaction has:
     /// 1. An OP_RETURN output with metadata in the format:
-    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 1-byte withdrawal count | 1-byte transfer count | 8-byte committee configuration number]
+    ///    [checkpoint tag | 32-byte subnet ID txid | 32-byte checkpoint hash | 8-byte checkpoint height | 1-byte withdrawal count | 1-byte transfer count | 1-byte unstake count | 8-byte committee configuration number | 1-byte killed flag]
     /// 2. Withdrawal outputs for each withdrawal
     /// 3. Optional batch transfer commit output if transfers exist
     /// 4. Transfer outputs for each transfer
@@ -1876,11 +1906,15 @@ impl IpcCheckpointSubnetMsg {
         let unstakes_count = op_return_data[Self::MARKERS_OFFSET + 2] as usize;
 
         // Extract committee configuration number
-        let committee_conf_bytes = &op_return_data[Self::COMMITTEE_CONF_OFFSET..];
+        let committee_conf_bytes =
+            &op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::KILLED_OFFSET];
         let next_committee_configuration_number =
             u64::from_le_bytes(committee_conf_bytes.try_into().map_err(|_| {
                 err("Failed to convert committee configuration number bytes to u64".to_string())
             })?);
+
+        // Extract killed flag
+        let kill_checkpoint = op_return_data[Self::KILLED_OFFSET] != 0;
 
         // Check if we have enough outputs for all the withdrawals, unstakes and transfers
         let expected_outputs = 1 + // metadata
@@ -2024,6 +2058,7 @@ impl IpcCheckpointSubnetMsg {
             withdrawals,
             transfers,
             change_address,
+            kill_checkpoint,
         })
     }
 
@@ -2129,6 +2164,14 @@ impl IpcCheckpointSubnetMsg {
         // Update subnet state with the new committee
         if let Some(next_committee) = &next_committee {
             subnet_state.rotate_to_committee(next_committee.clone());
+        }
+
+        // Update subnet state if killed
+        if self.kill_checkpoint {
+            subnet_state.killed = db::SubnetKillState::Killed {
+                checkpoint_block_height: block_height,
+                checkpoint_txid: txid,
+            };
         }
 
         // Begin a database transaction
@@ -2353,7 +2396,7 @@ impl IpcBatchTransferMsg {
             )))?;
 
         // Extract withdrawal and transfer counts from checkpoint metadata
-        let (_, transfer_count, _) =
+        let (_, transfer_count, _, _) =
             match IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(metadata_tx_out) {
                 Ok(counts) => counts,
                 Err(e) => {
@@ -2492,6 +2535,13 @@ impl IpcStakeCollateralMsg {
                     subnet.id, self.subnet_id
                 ),
             ));
+        }
+
+        if subnet.killed != db::SubnetKillState::NotKilled {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is killed or marked for killing, cannot change stake.",
+                self.subnet_id
+            )));
         }
 
         // Check if the validator with this public key is already registered
@@ -2839,6 +2889,13 @@ impl IpcUnstakeCollateralMsg {
                     subnet.id, self.subnet_id
                 ),
             ));
+        }
+
+        if subnet.killed != db::SubnetKillState::NotKilled {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is killed or marked for killing, cannot change stake.",
+                self.subnet_id
+            )));
         }
 
         let committee = subnet.latest_committee();
@@ -4747,13 +4804,14 @@ mod checkpoint_msg_tests {
         }
 
         // Verify metadata and markers
-        let (withdrawal_count, transfer_count, unstake_count) =
+        let (withdrawal_count, transfer_count, unstake_count, killed) =
             IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&checkpoint_tx.output[0])
                 .expect("Should extract markers");
 
         assert_eq!(withdrawal_count as usize, checkpoint_msg.withdrawals.len());
         assert_eq!(transfer_count as usize, checkpoint_msg.transfers.len());
         assert_eq!(unstake_count as usize, original_unstakes.len());
+        assert_eq!(killed, checkpoint_msg.kill_checkpoint);
     }
 
     fn create_test_checkpoint_msg() -> IpcCheckpointSubnetMsg {
@@ -4806,6 +4864,7 @@ mod checkpoint_msg_tests {
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
+            kill_checkpoint: false,
         }
     }
 
@@ -4957,6 +5016,7 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
+            kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -5037,6 +5097,7 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
+            kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -5184,11 +5245,12 @@ mod checkpoint_msg_tests {
             subnet_id: source_subnet.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
             withdrawals: vec![],
             unstakes: vec![],
-            transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
+            kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
