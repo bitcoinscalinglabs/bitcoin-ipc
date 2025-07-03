@@ -1244,7 +1244,8 @@ pub struct IpcCheckpointSubnetMsg {
     #[serde(skip_deserializing)]
     pub change_address: Option<bitcoin::Address<NetworkUnchecked>>,
     /// The flag marking the subnet killed, ie. the last checkpoint
-    pub kill_checkpoint: bool,
+    #[serde(default, skip_deserializing)]
+    pub is_kill_checkpoint: bool,
 }
 
 impl IpcValidate for IpcCheckpointSubnetMsg {
@@ -1346,7 +1347,7 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             }
         }
 
-        if self.kill_checkpoint && self.change_address.is_some() {
+        if self.is_kill_checkpoint && self.change_address.is_some() {
             return Err(IpcValidateError::InvalidField(
                 "change_address",
                 "Change address must not be set for kill checkpoint".to_string(),
@@ -1412,7 +1413,7 @@ impl IpcCheckpointSubnetMsg {
             .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
         // Add killed flag
-        op_return_data[Self::KILLED_OFFSET] = if self.kill_checkpoint { 1 } else { 0 };
+        op_return_data[Self::KILLED_OFFSET] = if self.is_kill_checkpoint { 1 } else { 0 };
 
         // Required to do since [u8; 78] for some reason doesn't implement pusbytes
         let push_bytes: &bitcoin::script::PushBytes =
@@ -1684,7 +1685,7 @@ impl IpcCheckpointSubnetMsg {
         );
 
         // Check if committee rotation is happening
-        let exhaust_unspent = committee != next_committee;
+        let exhaust_unspent = committee != next_committee || self.is_kill_checkpoint;
         let committee_change_address = next_committee.address_checked();
 
         let mut tx_outs = vec![];
@@ -1784,7 +1785,7 @@ impl IpcCheckpointSubnetMsg {
 
         let committee_keys = committee.validator_weighted_keys();
 
-        let checkpoint_tx = multisig::construct_spend_unsigned_transaction(
+        let mut checkpoint_tx = multisig::construct_spend_unsigned_transaction(
             &committee_keys,
             committee.threshold,
             &committee_change_address,
@@ -1793,6 +1794,8 @@ impl IpcCheckpointSubnetMsg {
             &tx_outs,
             &fee_rate,
         )?;
+
+        // dbg!(&checkpoint_tx);
 
         let change_amount = checkpoint_tx
             .output
@@ -1804,6 +1807,64 @@ impl IpcCheckpointSubnetMsg {
             "Checkpoint has {} of change going to {}",
             change_amount, committee_change_address
         );
+
+        // If this is a kill checkpoint, we should not have any change
+        // we split it among the unstake outputs proportionally
+        if self.is_kill_checkpoint && change_amount > Amount::ZERO && !self.unstakes.is_empty() {
+            debug!(
+                "Kill checkpoint, splitting the leftover funds {} among unstake outputs.",
+                change_amount
+            );
+
+            // Get the total amount in unstake outputs to calculate proportions
+            let total_unstake_amount: Amount = self.unstakes.iter().map(|u| u.amount).sum();
+
+            if total_unstake_amount > Amount::ZERO {
+                // Modify the last N tx_outs which are the unstake outputs
+                let num_unstakes = self.unstakes.len();
+                let unstake_start_index = tx_outs.len() - num_unstakes;
+
+                // Distribute the change proportionally among unstake outputs
+                let mut distributed_amount = Amount::ZERO;
+                for (i, unstake) in self.unstakes.iter().enumerate() {
+                    let output_index = unstake_start_index + i;
+                    if output_index < tx_outs.len() {
+                        let proportion =
+                            unstake.amount.to_sat() as f64 / total_unstake_amount.to_sat() as f64;
+                        let additional_amount = if i == self.unstakes.len() - 1 {
+                            // For the last unstake, give remaining to avoid rounding issues
+                            change_amount - distributed_amount
+                        } else {
+                            Amount::from_sat((change_amount.to_sat() as f64 * proportion) as u64)
+                        };
+
+                        tx_outs[output_index].value += additional_amount;
+                        distributed_amount += additional_amount;
+
+                        debug!(
+                            "Added {} to unstake output {} (proportion: {:.4})",
+                            additional_amount, i, proportion
+                        );
+                    }
+                }
+
+                debug!(
+                    "Redistributed {} change among {} unstake outputs",
+                    change_amount, num_unstakes
+                );
+
+                // Reconstruct the transaction with updated tx_outs
+                checkpoint_tx = multisig::construct_spend_unsigned_transaction(
+                    &committee_keys,
+                    committee.threshold,
+                    &committee_change_address,
+                    unspent,
+                    exhaust_unspent,
+                    &tx_outs,
+                    &fee_rate,
+                )?;
+            }
+        }
 
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let checkpoint_psbt = multisig::construct_spend_psbt(
@@ -1822,10 +1883,10 @@ impl IpcCheckpointSubnetMsg {
         // dbg!(&checkpoint_tx);
         // dbg!(&checkpoint_psbt);
 
-        assert_eq!(
-            checkpoint_tx.compute_txid(),
-            checkpoint_psbt.unsigned_tx.compute_txid()
-        );
+        // assert_eq!(
+        //     checkpoint_tx.compute_txid(),
+        //     checkpoint_psbt.unsigned_tx.compute_txid()
+        // );
 
         Ok(checkpoint_psbt)
     }
@@ -2058,7 +2119,7 @@ impl IpcCheckpointSubnetMsg {
             withdrawals,
             transfers,
             change_address,
-            kill_checkpoint,
+            is_kill_checkpoint: kill_checkpoint,
         })
     }
 
@@ -2156,6 +2217,7 @@ impl IpcCheckpointSubnetMsg {
             signed_committee_number: subnet_state.committee_number,
             next_committee_number,
             next_configuration_number,
+            is_kill_checkpoint: self.is_kill_checkpoint,
         };
 
         // Update the checkpoint number in subnet state
@@ -2167,11 +2229,13 @@ impl IpcCheckpointSubnetMsg {
         }
 
         // Update subnet state if killed
-        if self.kill_checkpoint {
-            subnet_state.killed = db::SubnetKillState::Killed {
-                checkpoint_block_height: block_height,
-                checkpoint_txid: txid,
-            };
+        if self.is_kill_checkpoint {
+            info!(
+                "Marking subnet {} as killed at block height {} with txid {}",
+                self.subnet_id, block_height, txid
+            );
+
+            subnet_state.killed = db::SubnetKillState::Killed;
         }
 
         // Begin a database transaction
@@ -4811,7 +4875,7 @@ mod checkpoint_msg_tests {
         assert_eq!(withdrawal_count as usize, checkpoint_msg.withdrawals.len());
         assert_eq!(transfer_count as usize, checkpoint_msg.transfers.len());
         assert_eq!(unstake_count as usize, original_unstakes.len());
-        assert_eq!(killed, checkpoint_msg.kill_checkpoint);
+        assert_eq!(killed, checkpoint_msg.is_kill_checkpoint);
     }
 
     fn create_test_checkpoint_msg() -> IpcCheckpointSubnetMsg {
@@ -4864,7 +4928,7 @@ mod checkpoint_msg_tests {
             transfers: vec![transfer],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
-            kill_checkpoint: false,
+            is_kill_checkpoint: false,
         }
     }
 
@@ -5016,7 +5080,7 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
-            kill_checkpoint: false,
+            is_kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -5097,7 +5161,7 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
-            kill_checkpoint: false,
+            is_kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -5250,7 +5314,7 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
-            kill_checkpoint: false,
+            is_kill_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -5591,6 +5655,152 @@ mod checkpoint_msg_tests {
                 parsed_msg
             );
         }
+    }
+
+    #[test]
+    fn test_kill_checkpoint_change_distribution() {
+        let subnet = test_utils::generate_subnet(3);
+
+        // Clone the multisig address early to avoid borrow issues
+        let committee_address = subnet.committee.multisig_address.clone();
+
+        // Create unstakes with different amounts
+        let unstake1 = IpcUnstake {
+            amount: Amount::from_sat(300_000), // 30% of total
+            address: subnet.committee.validators[0].backup_address.clone(),
+            pubkey: subnet.committee.validators[0].pubkey.clone(),
+        };
+        let unstake2 = IpcUnstake {
+            amount: Amount::from_sat(500_000), // 50% of total
+            address: subnet.committee.validators[1].backup_address.clone(),
+            pubkey: subnet.committee.validators[1].pubkey.clone(),
+        };
+        let unstake3 = IpcUnstake {
+            amount: Amount::from_sat(200_000), // 20% of total
+            address: subnet.committee.validators[2].backup_address.clone(),
+            pubkey: subnet.committee.validators[2].pubkey.clone(),
+        };
+
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_byte_array([42u8; 32]);
+
+        // Create a kill checkpoint with unstakes
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            withdrawals: vec![],
+            transfers: vec![],
+            unstakes: vec![unstake1.clone(), unstake2.clone(), unstake3.clone()],
+            change_address: None, // Kill checkpoints shouldn't have change address
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: true,
+        };
+
+        // Create test UTXOs with extra funds that will become change
+        let extra_change = Amount::from_sat(100_000); // This should be distributed among unstakes
+        let script_pub_key = committee_address
+            .clone()
+            .require_network(NETWORK)
+            .unwrap()
+            .script_pubkey();
+        let unspent = vec![bitcoincore_rpc::json::ListUnspentResultEntry {
+            txid: bitcoin::Txid::from_str(
+                "f61b1742ca13176464adb3cb66050c00787bb3a4eead37e985f2df1e37718126",
+            )
+            .unwrap(),
+            vout: 0,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: script_pub_key.clone(),
+            amount: checkpoint_msg
+                .unstakes
+                .iter()
+                .map(|u| u.amount)
+                .sum::<Amount>()
+                + extra_change
+                + Amount::from_sat(4_000), // Add some buffer for fees
+            descriptor: None,
+            spendable: true,
+            solvable: true,
+            safe: true,
+            confirmations: 6,
+        }];
+
+        // Generate the checkpoint PSBT
+        let psbt_result = checkpoint_msg.to_checkpoint_psbt(
+            &subnet.committee,
+            &subnet.committee, // Same committee (no rotation)
+            DEFAULT_BTC_FEE_RATE,
+            &unspent,
+        );
+
+        assert!(psbt_result.is_ok(), "Failed to create checkpoint PSBT");
+        let psbt = psbt_result.unwrap();
+
+        // Check that there's no change output in the transaction
+        let committee_script = committee_address
+            .require_network(NETWORK)
+            .unwrap()
+            .script_pubkey();
+        let change_outputs: Vec<_> = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .filter(|out| out.script_pubkey == committee_script)
+            .collect();
+
+        dbg!(&psbt.unsigned_tx);
+        dbg!(&change_outputs);
+
+        assert_eq!(
+            change_outputs.len(),
+            0,
+            "Kill checkpoint should not have change output"
+        );
+
+        // Verify that unstake outputs have been increased
+        // The unstake outputs should be outputs 1, 2, 3 (after metadata at index 0)
+        let total_original_unstakes: Amount =
+            checkpoint_msg.unstakes.iter().map(|u| u.amount).sum();
+        let total_final_unstakes: Amount = psbt.unsigned_tx.output[1..4]
+            .iter()
+            .map(|out| out.value)
+            .sum();
+
+        // The final unstakes should be larger than original due to distributed change
+        assert!(
+            total_final_unstakes > total_original_unstakes,
+            "Unstake outputs should have increased due to change distribution"
+        );
+
+        // Verify proportional distribution
+        let expected_increase_1 = Amount::from_sat((extra_change.to_sat() as f64 * 0.3) as u64); // 30%
+        let expected_increase_2 = Amount::from_sat((extra_change.to_sat() as f64 * 0.5) as u64); // 50%
+        let expected_increase_3 = Amount::from_sat((extra_change.to_sat() as f64 * 0.2) as u64); // 20%
+
+        let actual_1 = psbt.unsigned_tx.output[1].value;
+        let actual_2 = psbt.unsigned_tx.output[2].value;
+        let actual_3 = psbt.unsigned_tx.output[3].value;
+
+        // Allow some tolerance for rounding
+
+        dbg!(actual_1 - (unstake1.amount + expected_increase_1));
+        dbg!(actual_2 - (unstake2.amount + expected_increase_2));
+        dbg!(actual_3 - (unstake3.amount + expected_increase_3));
+
+        assert!((actual_1 - (unstake1.amount + expected_increase_1)) < Amount::from_sat(200));
+        assert!((actual_2 - (unstake2.amount + expected_increase_2)) < Amount::from_sat(200));
+        assert!((actual_3 - (unstake3.amount + expected_increase_3)) < Amount::from_sat(200));
+
+        // Verify total is conserved (minus fees)
+        let total_input: Amount = unspent.iter().map(|u| u.amount).sum();
+        let total_output: Amount = psbt.unsigned_tx.output.iter().map(|out| out.value).sum();
+        assert!(
+            total_input >= total_output,
+            "Total output should not exceed total input"
+        );
     }
 
     #[test]

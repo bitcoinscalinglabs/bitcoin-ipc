@@ -793,6 +793,9 @@ pub async fn gen_checkpoint_psbt(
     let current_committee_configuration = subnet.committee.configuration_number;
 
     if should_kill_subnet {
+        // Mark the checkpoint as a kill checkpoint
+        msg.is_kill_checkpoint = true;
+
         // Calculation of total unspent and stake amounts, alongside with transfers and withdrawals to process
 
         let total_unspent_amount = unspent.iter().map(|u| u.amount).sum::<bitcoin::Amount>();

@@ -351,6 +351,8 @@ pub struct SubnetCheckpoint {
     pub next_committee_number: u64,
     /// The next committee configuration number
     pub next_configuration_number: u64,
+    /// If this is the kill checkpoint
+    pub is_kill_checkpoint: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -358,12 +360,7 @@ pub struct SubnetCheckpoint {
 pub enum SubnetKillState {
     NotKilled,
     ToBeKilled,
-    Killed {
-        /// The block height of the checkpoint on Bitcoin
-        checkpoint_block_height: u64,
-        /// The txid of the checkpoint on Bitcoin
-        checkpoint_txid: bitcoin::Txid,
-    },
+    Killed,
 }
 
 /// The current state of a subnet
