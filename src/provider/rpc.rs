@@ -1628,7 +1628,49 @@ pub async fn kill_subnet(
     Ok(KillSubnetResponse { txid })
 }
 
+// Stake changes
+
 #[derive(Serialize, Deserialize)]
+pub struct GetKillRequestsParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_kill_requests(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetKillRequestsParams>,
+) -> Result<Vec<db::KillRequest>, JsonRpcError> {
+    info!("getkillrequests: {}", params.subnet_id);
+
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let valid_kill_requests = data
+        .db
+        .get_valid_kill_requests(params.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    Ok(valid_kill_requests)
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg(feature = "dev")]
 pub struct DevKillSubnetParams {
     subnet_id: SubnetId,
     secret_keys: Vec<String>,
@@ -1766,7 +1808,9 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // stake changes
         .with_method("stakecollateral", stake_collateral)
         .with_method("unstakecollateral", unstake_collateral)
-        .with_method("getstakechanges", get_stake_changes);
+        .with_method("getstakechanges", get_stake_changes)
+        // kill requests
+        .with_method("getkillrequests", get_kill_requests);
 
     #[cfg(feature = "dev")]
     // dev methods

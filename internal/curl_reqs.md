@@ -243,7 +243,21 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "killsubnet",
     "params": {
-			"subnet_id": "/b4/t410fn7eqf4xnhatdjzwo4xhmidxrm4ty2xwbhhciuwy"
+			"subnet_id": /b4/t410flanywnfx3ynyhmt5fvdwqqlfzslgyr7bwyc5zba"
+    },
+    "id": 1
+}' | jq
+
+# get kill requests
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getkillrequests",
+    "params": {
+      "subnet_id": "/b4/t410flanywnfx3ynyhmt5fvdwqqlfzslgyr7bwyc5zba"
     },
     "id": 1
 }' | jq
