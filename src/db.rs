@@ -470,6 +470,10 @@ impl SubnetState {
     pub fn is_killed(&self) -> bool {
         matches!(self.killed, SubnetKillState::Killed { .. })
     }
+
+    pub fn is_killed_or_pending(&self) -> bool {
+        self.killed != SubnetKillState::NotKilled
+    }
 }
 
 /// An entry in the subnet genesis balance

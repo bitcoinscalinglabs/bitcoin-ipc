@@ -394,6 +394,13 @@ impl IpcJoinSubnetMsg {
         genesis_info: &db::SubnetGenesisInfo,
         subnet: &db::SubnetState,
     ) -> Result<(), IpcValidateError> {
+        if subnet.is_killed_or_pending() {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is killed or marked for killing, cannot join.",
+                self.subnet_id
+            )));
+        }
+
         // Check if the collateral is at least the minimum validator stake
         if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
             return Err(IpcValidateError::InvalidField(
@@ -963,11 +970,13 @@ impl IpcFundSubnetMsg {
     const DATA_LEN: usize = Self::FUND_TAG_LEN + SubnetId::INNER_LEN + ETH_ADDR_LEN;
 
     /// Validates the fund msg for the given subnet
-    pub fn validate_for_subnet(
-        &self,
-        _subnet_state: &db::SubnetState,
-    ) -> Result<(), IpcValidateError> {
-        // For now no need to validate anything, the subnet must exist
+    pub fn validate_for_subnet(&self, subnet: &db::SubnetState) -> Result<(), IpcValidateError> {
+        if subnet.is_killed_or_pending() {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is killed or marked for killing, cannot fund.",
+                self.subnet_id
+            )));
+        }
 
         Ok(())
     }
@@ -2601,7 +2610,7 @@ impl IpcStakeCollateralMsg {
             ));
         }
 
-        if subnet.killed != db::SubnetKillState::NotKilled {
+        if subnet.is_killed_or_pending() {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Subnet {} is killed or marked for killing, cannot change stake.",
                 self.subnet_id
@@ -2955,7 +2964,7 @@ impl IpcUnstakeCollateralMsg {
             ));
         }
 
-        if subnet.killed != db::SubnetKillState::NotKilled {
+        if subnet.is_killed_or_pending() {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Subnet {} is killed or marked for killing, cannot change stake.",
                 self.subnet_id
