@@ -1375,7 +1375,7 @@ impl IpcCheckpointSubnetMsg {
     // u64 length
     const COMMITTEE_CONF_LEN: usize = std::mem::size_of::<u64>();
     // bool length
-    const KILLED_LEN: usize = 1;
+    const KILLED_LEN: usize = std::mem::size_of::<u8>();
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
         + SubnetId::INNER_LEN

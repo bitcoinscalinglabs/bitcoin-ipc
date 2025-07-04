@@ -836,7 +836,7 @@ pub async fn gen_checkpoint_psbt(
             .map(|v| ipc_lib::IpcUnstake {
                 amount: v.collateral,
                 address: v.backup_address.clone(),
-                pubkey: v.pubkey.clone(),
+                pubkey: v.pubkey,
             })
             .collect::<Vec<_>>();
 
