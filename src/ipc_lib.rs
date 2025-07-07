@@ -3934,7 +3934,7 @@ impl IpcKillSubnetMsg {
 						self.subnet_id, kill_request_power, total_power
 					);
                 }
-                Killed { .. } => {
+                Killed => {
                     info!(
 						"Kill request majority reached for subnet {}: {}/{} power, but subnet is already killed.",
 						self.subnet_id, kill_request_power, total_power
@@ -5677,17 +5677,17 @@ mod checkpoint_msg_tests {
         let unstake1 = IpcUnstake {
             amount: Amount::from_sat(300_000), // 30% of total
             address: subnet.committee.validators[0].backup_address.clone(),
-            pubkey: subnet.committee.validators[0].pubkey.clone(),
+            pubkey: subnet.committee.validators[0].pubkey,
         };
         let unstake2 = IpcUnstake {
             amount: Amount::from_sat(500_000), // 50% of total
             address: subnet.committee.validators[1].backup_address.clone(),
-            pubkey: subnet.committee.validators[1].pubkey.clone(),
+            pubkey: subnet.committee.validators[1].pubkey,
         };
         let unstake3 = IpcUnstake {
             amount: Amount::from_sat(200_000), // 20% of total
             address: subnet.committee.validators[2].backup_address.clone(),
-            pubkey: subnet.committee.validators[2].pubkey.clone(),
+            pubkey: subnet.committee.validators[2].pubkey,
         };
 
         let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_byte_array([42u8; 32]);
