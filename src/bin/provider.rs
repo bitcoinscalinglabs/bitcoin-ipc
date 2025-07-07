@@ -53,10 +53,7 @@ async fn main() -> std::io::Result<()> {
 
     let token = std::env::var("PROVIDER_AUTH_TOKEN").map_err(|e| {
         error!("Couldn't load PROVIDER_AUTH_TOKEN: {}", e);
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Couldn't load PROVIDER_AUTH_TOKEN",
-        )
+        std::io::Error::other("Couldn't load PROVIDER_AUTH_TOKEN")
     })?;
 
     // Init the bitcoincore_rpc client
@@ -105,10 +102,7 @@ fn load_validator(
             sk_path.display(),
             e
         );
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Couldn't read validator secret key: {}", e),
-        )
+        std::io::Error::other(format!("Couldn't read validator secret key: {}", e))
     })?;
 
     // Trim whitespace and remove any '0x' prefix if present
@@ -126,10 +120,7 @@ fn load_validator(
 
     let validator_sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes).map_err(|e| {
         error!("Invalid validator secret key: {}", e);
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Invalid validator secret key: {}", e),
-        )
+        std::io::Error::other(format!("Invalid validator secret key: {}", e))
     })?;
 
     let secp = bitcoin::secp256k1::Secp256k1::new();

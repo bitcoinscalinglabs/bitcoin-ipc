@@ -468,7 +468,7 @@ impl SubnetState {
     }
 
     pub fn is_killed(&self) -> bool {
-        matches!(self.killed, SubnetKillState::Killed { .. })
+        matches!(self.killed, SubnetKillState::Killed)
     }
 
     pub fn is_killed_or_pending(&self) -> bool {
@@ -1762,9 +1762,7 @@ pub mod tests {
         };
 
         // Create initial committee with two validators
-        let mut initial_validators = Vec::new();
-        initial_validators.push(validator1);
-        initial_validators.push(validator2);
+        let initial_validators = vec![validator1, validator2];
 
         let mut committee = initial_validators.to_committee(&subnet_id, 0);
 
@@ -1863,15 +1861,11 @@ pub mod tests {
         };
 
         // Create current committee with validators 1 and 2
-        let mut current_validators = Vec::new();
-        current_validators.push(validator1.clone());
-        current_validators.push(validator2.clone());
+        let current_validators = vec![validator1.clone(), validator2.clone()];
         let current_committee = current_validators.to_committee(&subnet_id, 1);
 
         // Create next committee with validators 1 and 3
-        let mut next_validators = Vec::new();
-        next_validators.push(validator1.clone());
-        next_validators.push(validator3.clone());
+        let next_validators = vec![validator1.clone(), validator3.clone()];
         let next_committee = next_validators.to_committee(&subnet_id, 2);
 
         // Create subnet state
@@ -2175,8 +2169,7 @@ pub mod tests {
         };
 
         // Create initial committee with two validators
-        let mut initial_validators = Vec::new();
-        initial_validators.push(validator1.clone());
+        let initial_validators = vec![validator1.clone()];
 
         let mut committee = initial_validators.to_committee(&subnet_id, 0);
 

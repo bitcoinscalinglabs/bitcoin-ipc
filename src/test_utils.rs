@@ -182,7 +182,6 @@ mod tests {
             );
         }
 
-        assert!(true);
         // uncomment next line to fail the test and print the keypairs
         // assert!(false);
     }
