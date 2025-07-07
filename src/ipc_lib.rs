@@ -2151,16 +2151,84 @@ impl IpcCheckpointSubnetMsg {
         })?;
 
         let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
+
         let last_committee_configuration_number = subnet_state.committee.configuration_number;
 
-        let stake_change = if
+        let mut kill_unstake_requests = Vec::with_capacity(self.unstakes.len());
+
+        // Get the stake change for the next committee configuration
+        let stake_change =
+        // Option one, we get last stake change after the kill request,
+        // ie. all validators are unstaked
+        if self.is_kill_checkpoint {
+            // add unstake requests for all validators
+            // so it is reflected in the subnet
+            let mut next_config_number =
+                db.get_next_stake_change_configuration_number(self.subnet_id)?;
+
+            // we're not actually removing any of the validators from the next committee
+            // since we're killing the subnet we'll leave the last committee as is
+            let next_committee = subnet_state.committee.clone();
+
+            for unstake in self.unstakes.iter() {
+                let validator = subnet_state
+                    .committee
+                    .validators
+                    .iter()
+                    .find(|v| v.pubkey == unstake.pubkey);
+
+                let validator = match validator {
+                    Some(v) => v,
+                    None => {
+                        warn!(
+							"Subnet {} checkpoint: unstake present for a non-validator pubkey {}, skipping...",
+							self.subnet_id, unstake.pubkey
+						);
+                        continue;
+                    }
+                };
+
+                // Remove the validator from the next committee
+                // NOTE: this is required by the stake change request
+                // it is not actually the next committee, which will be empty
+                // next_committee.remove_validator(&self.subnet_id, &validator.pubkey)?;
+
+                let request = db::StakeChangeRequest {
+                    change: db::StakingChange::Withdraw {
+                        amount: unstake.amount,
+                    },
+                    validator_xpk: unstake.pubkey,
+                    validator_subnet_address: validator.subnet_address,
+                    configuration_number: next_config_number,
+                    committee_after_change: next_committee.clone(),
+                    block_height,
+                    block_hash,
+                    // normally stake change requests are confirmed by a checkpoint
+                    // (see confirm_stake_changes in db.rs)
+                    // however these are special requests since they are
+                    // produced by the kill checkpoint
+                    checkpoint_block_height: Some(block_height),
+                    checkpoint_block_hash: Some(block_hash),
+                    txid,
+                };
+                kill_unstake_requests.push(request);
+                next_config_number += 1;
+            }
+
+            kill_unstake_requests.last().cloned()
+        }
+        // Option two, no committee change
         // If next_committee_configuration_number is zero, it "could mean" no change
-        self.next_committee_configuration_number.is_zero()
+        else if self.next_committee_configuration_number.is_zero()
             || self.next_committee_configuration_number == last_committee_configuration_number
         {
             // No committee rotation, no stake change
             None
-        } else {
+
+        }
+        // Option three, next committee configuration number is set
+        // and we switch to it
+        else {
             if self.next_committee_configuration_number < last_committee_configuration_number {
                 return Err(IpcValidateError::InvalidField(
                     "next_committee_configuration_number",
@@ -2243,7 +2311,6 @@ impl IpcCheckpointSubnetMsg {
                 "Marking subnet {} as killed at block height {} with txid {}",
                 self.subnet_id, block_height, txid
             );
-
             subnet_state.killed = db::SubnetKillState::Killed;
         }
 
@@ -2253,6 +2320,12 @@ impl IpcCheckpointSubnetMsg {
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
         // Save the checkpoint record
         db.save_checkpoint(&mut wtxn, self.subnet_id, &checkpoint, checkpoint_number)?;
+
+        // Save the kill unstake requests if any
+        for unstake_request in kill_unstake_requests {
+            db.add_stake_change(&mut wtxn, self.subnet_id, unstake_request)?;
+        }
+
         // Save new committee if changed
         if let Some(next_committee) = &next_committee {
             db.save_committee(
@@ -3934,7 +4007,7 @@ impl IpcKillSubnetMsg {
 						self.subnet_id, kill_request_power, total_power
 					);
                 }
-                Killed { .. } => {
+                Killed => {
                     info!(
 						"Kill request majority reached for subnet {}: {}/{} power, but subnet is already killed.",
 						self.subnet_id, kill_request_power, total_power
@@ -5677,17 +5750,17 @@ mod checkpoint_msg_tests {
         let unstake1 = IpcUnstake {
             amount: Amount::from_sat(300_000), // 30% of total
             address: subnet.committee.validators[0].backup_address.clone(),
-            pubkey: subnet.committee.validators[0].pubkey.clone(),
+            pubkey: subnet.committee.validators[0].pubkey,
         };
         let unstake2 = IpcUnstake {
             amount: Amount::from_sat(500_000), // 50% of total
             address: subnet.committee.validators[1].backup_address.clone(),
-            pubkey: subnet.committee.validators[1].pubkey.clone(),
+            pubkey: subnet.committee.validators[1].pubkey,
         };
         let unstake3 = IpcUnstake {
             amount: Amount::from_sat(200_000), // 20% of total
             address: subnet.committee.validators[2].backup_address.clone(),
-            pubkey: subnet.committee.validators[2].pubkey.clone(),
+            pubkey: subnet.committee.validators[2].pubkey,
         };
 
         let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_byte_array([42u8; 32]);
