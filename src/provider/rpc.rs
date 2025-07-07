@@ -3,7 +3,8 @@ use crate::{
     db::{self, Database, StakingChange},
     ipc_lib::{
         self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
-        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
+        IpcKillSubnetMsg, IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg,
+        IpcValidate, SubnetId,
     },
     multisig, wallet, NETWORK,
 };
@@ -760,6 +761,20 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
+    if subnet.is_killed() {
+        error!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        );
+        return Err(RpcError::InvalidParams(format!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        ))
+        .into());
+    }
+
+    let should_kill_subnet = subnet.killed == db::SubnetKillState::ToBeKilled;
+
     // Fill in the subnet addresses, erroring out if any subnet is not found
     msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
         error!("Error updating subnets for transfer: {}", e);
@@ -777,6 +792,60 @@ pub async fn gen_checkpoint_psbt(
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
 
+    if should_kill_subnet {
+        // Mark the checkpoint as a kill checkpoint
+        msg.is_kill_checkpoint = true;
+
+        // Calculation of total unspent and stake amounts, alongside with transfers and withdrawals to process
+
+        let total_unspent_amount = unspent.iter().map(|u| u.amount).sum::<bitcoin::Amount>();
+        let total_stake_amount = subnet
+            .committee
+            .validators
+            .iter()
+            .map(|v| v.collateral)
+            .sum::<bitcoin::Amount>();
+
+        let total_transfer_amount_to_process = msg
+            .transfers
+            .iter()
+            .map(|t| t.amount)
+            .sum::<bitcoin::Amount>();
+
+        let total_withdrawal_amount_to_process = msg
+            .withdrawals
+            .iter()
+            .map(|w| w.amount)
+            .sum::<bitcoin::Amount>();
+
+        let total_extra_amount = total_unspent_amount
+            - total_stake_amount
+            - total_withdrawal_amount_to_process
+            - total_transfer_amount_to_process;
+
+        info!(
+            "Killing subnet {}, total unspent amount: {}, total stake amount: {}, extra value after withdrawals and transfers: {}",
+            msg.subnet_id, total_unspent_amount, total_stake_amount, total_extra_amount
+        );
+
+        // Process all validators in the committee for unstaking
+        msg.unstakes = subnet
+            .committee
+            .validators
+            .iter()
+            .map(|v| ipc_lib::IpcUnstake {
+                amount: v.collateral,
+                address: v.backup_address.clone(),
+                pubkey: v.pubkey,
+            })
+            .collect::<Vec<_>>();
+
+        info!(
+            "Killing subnet {}, processing {} unstakes.",
+            msg.subnet_id,
+            msg.unstakes.len()
+        );
+    } else
     // update next_committee and process unstakes if the configuration number changed
     if msg.next_committee_configuration_number > current_committee_configuration {
         next_committee = data
@@ -933,6 +1002,7 @@ pub struct DevMultisignPsbtResponse {
     )>,
 }
 
+#[cfg(feature = "dev")]
 pub async fn dev_multisign_psbt(
     _data: Data<Arc<ServerData>>,
     Params(params): Params<DevMultisignPsbtParams>,
@@ -1355,7 +1425,7 @@ pub async fn stake_collateral(
     Ok(StakeCollateralResponse { txid })
 }
 
-// Stake collateral
+// Unstake collateral
 
 #[derive(Serialize, Deserialize)]
 pub struct UnstakeCollateralResponse {
@@ -1464,8 +1534,254 @@ pub async fn get_stake_changes(
         })
 }
 
+// Kill subnet
+
+#[derive(Serialize, Deserialize)]
+pub struct KillSubnetResponse {
+    txid: bitcoin::Txid,
+}
+
+pub async fn kill_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(mut msg): Params<IpcKillSubnetMsg>,
+) -> Result<KillSubnetResponse, JsonRpcError> {
+    info!("killsubnet: {}", msg.subnet_id);
+
+    let (validator_xpk, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
+    msg.pubkey = Some(validator_xpk);
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid kill subnet message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    msg.validate_for_subnet(&genesis_info, &subnet_state)
+        .map_err(|e| {
+            error!("Error validating kill subnet msg for subnet info: {}", e);
+            RpcError::InvalidParams(e.to_string())
+        })?;
+
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let current_valid_requests = data
+        .db
+        .get_valid_kill_requests(msg.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    // Check if the validator has already submitted a kill request
+    if current_valid_requests
+        .iter()
+        .any(|kr| kr.validator_xpk == validator_xpk)
+    {
+        return Err(RpcError::InvalidParams(format!(
+            "Validator {} has already submitted a kill request for subnet {}",
+            validator_xpk, msg.subnet_id
+        ))
+        .into());
+    }
+
+    let multisig_address = subnet_state.multisig_address();
+
+    let txid = msg
+        .submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+
+    Ok(KillSubnetResponse { txid })
+}
+
+// Stake changes
+
+#[derive(Serialize, Deserialize)]
+pub struct GetKillRequestsParams {
+    subnet_id: SubnetId,
+}
+
+pub async fn get_kill_requests(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetKillRequestsParams>,
+) -> Result<Vec<db::KillRequest>, JsonRpcError> {
+    info!("getkillrequests: {}", params.subnet_id);
+
+    // Check subnet exists
+    data.db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let valid_kill_requests = data
+        .db
+        .get_valid_kill_requests(params.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    Ok(valid_kill_requests)
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg(feature = "dev")]
+pub struct DevKillSubnetParams {
+    subnet_id: SubnetId,
+    secret_keys: Vec<String>,
+}
+
+#[cfg(feature = "dev")]
+pub async fn dev_kill_subnet(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<DevKillSubnetParams>,
+) -> Result<Vec<KillSubnetResponse>, JsonRpcError> {
+    use std::str::FromStr;
+
+    info!(
+        "dev_killsubnet: {} with {} secret keys",
+        params.subnet_id,
+        params.secret_keys.len()
+    );
+
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+
+    let current_block_height = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last block height from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let valid_kill_requests = data
+        .db
+        .get_valid_kill_requests(params.subnet_id, current_block_height)
+        .map_err(|e| {
+            error!("Error getting valid kill requests from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    let multisig_address = subnet_state.multisig_address();
+    let mut responses = Vec::new();
+
+    for secret_key_str in params.secret_keys {
+        // Parse the secret key
+        let secret_key = bitcoin::secp256k1::SecretKey::from_str(&secret_key_str).map_err(|e| {
+            error!("Invalid secret key: {}", e);
+            RpcError::InvalidParams(format!("Invalid secret key: {}", e))
+        })?;
+
+        // Get the public key from the secret key
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (validator_xpk, _) = secret_key.x_only_public_key(&secp);
+
+        if valid_kill_requests
+            .iter()
+            .any(|kr| kr.validator_xpk == validator_xpk)
+        {
+            continue; // Skip if this validator has already submitted a kill request
+        }
+
+        // Create the kill subnet message
+        let msg = IpcKillSubnetMsg {
+            subnet_id: params.subnet_id,
+            pubkey: Some(validator_xpk),
+        };
+
+        // Validate the message
+        if let Err(err) = msg.validate() {
+            error!("Invalid kill subnet message={msg:?}: {err}");
+            return Err(RpcError::InvalidParams(err.to_string()).into());
+        }
+
+        // Validate for the specific subnet
+        if let Err(err) = msg.validate_for_subnet(&genesis_info, &subnet_state) {
+            error!("Error validating kill subnet msg for subnet info: {}", err);
+            return Err(RpcError::InvalidParams(err.to_string()).into());
+        }
+
+        // Submit to Bitcoin
+        let txid = msg
+            .submit_to_bitcoin(&data.btc_rpc, &multisig_address, secret_key)
+            .map_err(|e| {
+                error!("Error submitting kill subnet transaction: {}", e);
+                JsonRpcError::internal(e.to_string())
+            })?;
+
+        info!("Kill subnet transaction submitted with txid: {}", txid);
+        responses.push(KillSubnetResponse { txid });
+    }
+
+    Ok(responses)
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
-    jsonrpc_v2::Server::new()
+    let server = jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
         // btc info
         .with_method("getblockhash", get_block_hash)
@@ -1478,6 +1794,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
+        .with_method("killsubnet", kill_subnet)
         // rootnet messages
         .with_method("getrootnetmessages", get_rootnet_messages)
         // multisig
@@ -1486,12 +1803,20 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("finalizebootstraphandover", finalize_bootstrap_handover)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
-        .with_method("dev_multisignpsbt", dev_multisign_psbt) // TODO make dev only
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
         .with_method("getsubnetcheckpoint", get_subnet_checkpoint)
         // stake changes
         .with_method("stakecollateral", stake_collateral)
         .with_method("unstakecollateral", unstake_collateral)
         .with_method("getstakechanges", get_stake_changes)
-        .finish()
+        // kill requests
+        .with_method("getkillrequests", get_kill_requests);
+
+    #[cfg(feature = "dev")]
+    // dev methods
+    let server = server
+        .with_method("dev_multisignpsbt", dev_multisign_psbt)
+        .with_method("dev_killsubnet", dev_kill_subnet);
+
+    server.finish()
 }

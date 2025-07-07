@@ -67,22 +67,26 @@ CHECKPOINT_RESPONSE=$(curl -s -X POST "$API_URL" \
                 \"amount\": 25000,
                 \"address\": \"bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n\"
             }
-        ],
-        \"transfers\": [
-            {
-                \"amount\": 150000,
-                \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
-                \"subnet_user_address\": \"0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf\"
-            },
-            {
-                \"amount\": 100000,
-                \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
-                \"subnet_user_address\": \"0x4967bB72907683bb6a933d47348a49bC3832968b\"
-            }
         ]
     },
     \"id\": 1
 }")
+
+#
+# Add this to test transfers
+# \"transfers\": [
+#     {
+#         \"amount\": 150000,
+#         \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
+#         \"subnet_user_address\": \"0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf\"
+#     },
+#     {
+#         \"amount\": 100000,
+#         \"destination_subnet_id\": \"$DESTINATION_SUBNET_ID_1\",
+#         \"subnet_user_address\": \"0x4967bB72907683bb6a933d47348a49bC3832968b\"
+#     }
+# ]
+#
 
 # Extract the unsigned PSBT
 UNSIGNED_PSBT_BASE64=$(echo "$CHECKPOINT_RESPONSE" | jq -r '.result.unsigned_psbt_base64')

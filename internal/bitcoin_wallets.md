@@ -1,6 +1,6 @@
 
 ```sh
-bitcoin-cli -rpcwallet=default_subnets_watchonly listlabels
+bitcoin-cli -rpcwallet=validator1_subnets_watchonly listlabels
 
 [
 	"/b4/t410fbr36gwprxna7jegp27w26plfkojdg4tha337ccy-0",
@@ -12,7 +12,7 @@ bitcoin-cli -rpcwallet=default_subnets_watchonly listlabels
 ```
 
 ```sh
-bitcoin-cli -rpcwallet=default_subnets_watchonly getaddressesbylabel /b4/t410fmkhwlg65rgq2hs6yxpxe2r3yyi55cz6vpz7f7mi-1
+bitcoin-cli -rpcwallet=validator1_subnets_watchonly getaddressesbylabel /b4/t410fxyo353sn5oguanypndcnnvjbdy3uuqpidtunv7q-0
 
 {
   "bcrt1pw9rm2vz742azym7snjerxzj7rqdwehjarrvka7mg82zhsu7t26uq2wlf2t": {
@@ -22,7 +22,7 @@ bitcoin-cli -rpcwallet=default_subnets_watchonly getaddressesbylabel /b4/t410fmk
 ```
 
 ```sh
-bitcoin-cli -rpcwallet=default_subnets_watchonly listunspent 0 9999999 '["bcrt1pcmdctveccxe09nl3lhaenyjddjggss95fkhf77vahnkqkn4eu95s3len9c"]'
+bitcoin-cli -rpcwallet=validator1_subnets_watchonly listunspent 0 9999999 '["bcrt1pcmdctveccxe09nl3lhaenyjddjggss95fkhf77vahnkqkn4eu95s3len9c"]'
 
 [
   {

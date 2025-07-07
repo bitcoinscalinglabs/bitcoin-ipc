@@ -201,7 +201,7 @@ curl -X POST http://localhost:3040/api \
     "jsonrpc": "2.0",
     "method": "getsubnet",
     "params": {
-			"subnet_id": "/b4/t410f7kn2c5qglq6ymzbqczbff2scqm2y6vszeqc2lxy"
+			"subnet_id": "/b4/t410fn7eqf4xnhatdjzwo4xhmidxrm4ty2xwbhhciuwy"
     },
     "id": 1
 }' | jq
@@ -230,6 +230,52 @@ curl -X POST http://localhost:3030/api \
 			"subnet_id": "/b4/t410fuvtcymuzlxqj4ypvbf7ybk4rdlkq6u4mqtcrybi",
 			"amount": 40000000,
 			"address": "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf"
+    },
+    "id": 1
+}' | jq
+
+# unstake more collateral
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "killsubnet",
+    "params": {
+			"subnet_id": /b4/t410flanywnfx3ynyhmt5fvdwqqlfzslgyr7bwyc5zba"
+    },
+    "id": 1
+}' | jq
+
+# get kill requests
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getkillrequests",
+    "params": {
+      "subnet_id": "/b4/t410flanywnfx3ynyhmt5fvdwqqlfzslgyr7bwyc5zba"
+    },
+    "id": 1
+}' | jq
+
+curl -X POST http://localhost:3040/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "dev_killsubnet",
+    "params": {
+    		"subnet_id": "/b4/t410fn7eqf4xnhatdjzwo4xhmidxrm4ty2xwbhhciuwy",
+        "secret_keys": [
+            "21b16a87dd69bc6283045ab63738c9ab73c93c93f91e96cd0e54bd321bba80ad",
+            "67308c2f3915f4c36135f267ed709418c2880025d669e4ada7a206842d53c146",
+            "994220215e4601d21a245f8f5e0c407f2f5733ce7907e128c3190c64f4ef443c",
+            "ab3a1fafa925836386be55b12fdc92f208ebdad5ef96c0109e4bd06638dcb897"
+        ]
     },
     "id": 1
 }' | jq

@@ -110,7 +110,12 @@ pub fn get_unspent_for_address(
     let mut unspent = rpc.list_unspent(None, None, Some(&[addr]), None, None)?;
     // exact ordering doesn't matter, we care about having it deterministic
     // coin selection or similar should order it more specifically
-    unspent.sort_by(|a, b| b.amount.cmp(&a.amount));
+    unspent.sort_by(|a, b| {
+        b.amount
+            .cmp(&a.amount)
+            .then(a.txid.cmp(&b.txid))
+            .then(a.vout.cmp(&b.vout))
+    });
     debug!("get_unspent_for_address {addr}: {unspent:?}");
     Ok(unspent)
 }

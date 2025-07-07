@@ -312,6 +312,15 @@ pub fn construct_spend_unsigned_transaction(
             ));
         }
 
+        let mut unspent = unspent.to_vec();
+        // Sort UTXOs deterministically by amount, txid and vout
+        unspent.sort_by(|a, b| {
+            b.amount
+                .cmp(&a.amount)
+                .then(a.txid.cmp(&b.txid))
+                .then(a.vout.cmp(&b.vout))
+        });
+
         // Create inputs from all UTXOs
         let inputs = unspent
             .iter()

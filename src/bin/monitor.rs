@@ -473,6 +473,16 @@ where
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(e)?,
             }
+        } else if let Ok(msg) = ipc_lib::IpcKillSubnetMsg::from_tx(&self.db, tx) {
+            let ipc_message = IpcMessage::KillSubnet(msg);
+
+            match self
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
+            }
         }
 
         Ok(())
@@ -683,8 +693,14 @@ where
                 Ok(())
             }
 
-            IpcMessage::LeaveSubnet(msg) => {
+            IpcMessage::KillSubnet(msg) => {
                 debug!("Found IPC message: {:?}", msg);
+                msg.validate()?;
+                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
+                info!(
+                    "Processed KillSubnet for Subnet ID: {} Validator XPK: {:?}",
+                    msg.subnet_id, msg.pubkey,
+                );
                 Ok(())
             }
         }
