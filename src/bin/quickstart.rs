@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     // Check if default wallet already exists by trying to load it first
     let wallet_load = Command::new("bitcoin-cli")
-        .args(["loadwallet", "default"])
+        .args(["--regtest", "loadwallet", "default"])
         .output();
 
     let wallets_exist = match wallet_load {
@@ -87,7 +87,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         // Load all wallets
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(["loadwallet", wallet])
+                .args(["--regtest", "loadwallet", wallet])
                 .output()?;
 
             if output.status.success() {
@@ -106,7 +106,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         // Create wallets
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(["createwallet", wallet])
+                .args(["--regtest", "createwallet", wallet])
                 .output()?;
 
             if output.status.success() {
@@ -148,7 +148,11 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
 async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::error::Error>> {
     // Get new address for the wallet
     let address_output = Command::new("bitcoin-cli")
-        .args([&format!("--rpcwallet={}", wallet_name), "getnewaddress"])
+        .args([
+            "--regtest",
+            &format!("--rpcwallet={}", wallet_name),
+            "getnewaddress",
+        ])
         .output()?;
 
     if !address_output.status.success() {
@@ -164,7 +168,12 @@ async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::
 
     // Generate blocks to the address
     let generate_output = Command::new("bitcoin-cli")
-        .args(["generatetoaddress", &blocks.to_string(), &address])
+        .args([
+            "--regtest",
+            "generatetoaddress",
+            &blocks.to_string(),
+            &address,
+        ])
         .output()?;
 
     if generate_output.status.success() {
@@ -182,7 +191,11 @@ async fn fund_wallet(wallet_name: &str, blocks: u32) -> Result<(), Box<dyn std::
 
 async fn check_wallet_balance(wallet_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("bitcoin-cli")
-        .args([&format!("--rpcwallet={}", wallet_name), "getbalance"])
+        .args([
+            "--regtest",
+            &format!("--rpcwallet={}", wallet_name),
+            "getbalance",
+        ])
         .output()?;
 
     if output.status.success() {
