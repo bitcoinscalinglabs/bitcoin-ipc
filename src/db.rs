@@ -35,9 +35,14 @@ const KILL_REQUESTS_KEY: &str = "kill_requests:";
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
 const KILL_REQUEST_VALID_BLOCKS: u64 = 3;
-
 #[cfg(not(feature = "dev"))]
 const KILL_REQUEST_VALID_BLOCKS: u64 = 36;
+
+// Kill period delay in number of checkpoints
+#[cfg(feature = "dev")]
+pub const KILL_PERIOD_NUMBER_OF_CHECKPOINTS: u64 = 2;
+#[cfg(not(feature = "dev"))]
+pub const KILL_PERIOD_NUMBER_OF_CHECKPOINTS: u64 = 5;
 
 pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
@@ -388,6 +393,15 @@ pub struct SubnetState {
     pub last_checkpoint_number: Option<u64>,
     /// The kill state of the subnet
     pub killed: SubnetKillState,
+    /// The checkpoint number that was last when
+    /// the subnet was marked for kill. That checkpoint
+    /// has nothing to do with the kill request, it's
+    /// just for reference since we wait N checkpoints
+    /// as the kill delay period.
+    ///
+    /// If killed = ToBeKilled, but marked_for_kill_checkpoint_number is None,
+    /// that means the subnet had no checkpoints when it was marked for killing.
+    pub marked_for_kill_checkpoint_number: Option<u64>,
 }
 
 impl SubnetState {
@@ -473,6 +487,20 @@ impl SubnetState {
 
     pub fn is_killed_or_pending(&self) -> bool {
         self.killed != SubnetKillState::NotKilled
+    }
+
+    pub fn should_kill(&self) -> bool {
+        self.killed == SubnetKillState::ToBeKilled
+            && self
+                .last_checkpoint_number
+                .is_some_and(|last_checkpoint_number| {
+                    if let Some(marked_checkpoint_number) = self.marked_for_kill_checkpoint_number {
+                        last_checkpoint_number - marked_checkpoint_number
+                            >= KILL_PERIOD_NUMBER_OF_CHECKPOINTS
+                    } else {
+                        (last_checkpoint_number + 1) >= KILL_PERIOD_NUMBER_OF_CHECKPOINTS
+                    }
+                })
     }
 }
 
@@ -567,6 +595,7 @@ impl SubnetGenesisInfo {
                 .to_committee(&self.subnet_id, GENESIS_COMMITTEE_CONF_NUM),
             waiting_committee: None,
             killed: SubnetKillState::NotKilled,
+            marked_for_kill_checkpoint_number: None,
         }
     }
 
@@ -1876,6 +1905,7 @@ pub mod tests {
             waiting_committee: Some(next_committee.clone()),
             last_checkpoint_number: None,
             killed: SubnetKillState::NotKilled,
+            marked_for_kill_checkpoint_number: None,
         };
 
         // Verify needs_rotation returns true when committees differ
@@ -1911,6 +1941,32 @@ pub mod tests {
         assert!(subnet_state.committee.is_validator(&pubkey1));
         assert!(!subnet_state.committee.is_validator(&pubkey2));
         assert!(subnet_state.committee.is_validator(&pubkey3));
+    }
+
+    #[test]
+    fn test_should_kill_subnet() {
+        let mut subnet = generate_subnet(3);
+        assert!(!subnet.should_kill());
+        subnet.killed = SubnetKillState::ToBeKilled;
+        assert!(!subnet.should_kill());
+        subnet.last_checkpoint_number = Some(1);
+        assert!(!subnet.should_kill());
+        subnet.last_checkpoint_number = Some(5);
+        assert!(subnet.should_kill());
+        subnet.marked_for_kill_checkpoint_number = Some(4);
+        assert!(!subnet.should_kill());
+        subnet.marked_for_kill_checkpoint_number = Some(4);
+        subnet.last_checkpoint_number = Some(10);
+        assert!(subnet.should_kill());
+        subnet.marked_for_kill_checkpoint_number = Some(4);
+        subnet.last_checkpoint_number = Some(4 + KILL_PERIOD_NUMBER_OF_CHECKPOINTS - 1);
+        assert!(!subnet.should_kill());
+        subnet.marked_for_kill_checkpoint_number = Some(4);
+        subnet.last_checkpoint_number = Some(4 + KILL_PERIOD_NUMBER_OF_CHECKPOINTS);
+        assert!(subnet.should_kill());
+        subnet.marked_for_kill_checkpoint_number = None;
+        subnet.last_checkpoint_number = Some(KILL_PERIOD_NUMBER_OF_CHECKPOINTS - 1);
+        assert!(subnet.should_kill());
     }
 
     #[test]

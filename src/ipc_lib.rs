@@ -3926,6 +3926,11 @@ impl IpcKillSubnetMsg {
                     // Mark the subnet as to be killed
                     let mut updated_subnet_state = subnet_state;
                     updated_subnet_state.killed = ToBeKilled;
+                    // if there was a checkpoint, set the marked for kill checkpoint number
+                    if let Some(last_checkpoint) = updated_subnet_state.last_checkpoint_number {
+                        updated_subnet_state.marked_for_kill_checkpoint_number =
+                            Some(last_checkpoint);
+                    }
                     db.save_subnet_state(&mut wtxn, self.subnet_id, &updated_subnet_state)?;
                 }
                 ToBeKilled => {
@@ -5446,6 +5451,7 @@ mod checkpoint_msg_tests {
             waiting_committee: None,
             last_checkpoint_number: None,
             killed: db::SubnetKillState::NotKilled,
+            marked_for_kill_checkpoint_number: None,
         };
 
         {

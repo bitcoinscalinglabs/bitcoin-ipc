@@ -135,6 +135,7 @@ pub fn generate_subnet(n_val: usize) -> db::SubnetState {
         waiting_committee: None,
         last_checkpoint_number: None,
         killed: db::SubnetKillState::NotKilled,
+        marked_for_kill_checkpoint_number: None,
     }
 }
 

@@ -773,7 +773,7 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
-    let should_kill_subnet = subnet.killed == db::SubnetKillState::ToBeKilled;
+    let should_kill_subnet = subnet.should_kill();
 
     // Fill in the subnet addresses, erroring out if any subnet is not found
     msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
