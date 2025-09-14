@@ -128,6 +128,8 @@ pub enum IpcSerializeError {
     ParseFieldError(String, String),
     #[error("Unknown IPC tag: {0}")]
     UnknownTag(String),
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 }
@@ -156,8 +158,7 @@ pub trait IpcValidate {
 
 // IPC Messages
 
-#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
-#[tag(IPC_CREATE_SUBNET_TAG)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IpcCreateSubnetMsg {
     /// The minimum number of collateral required for validators in Satoshis
     #[serde(with = "bitcoin::amount::serde::as_sat")]
@@ -218,6 +219,23 @@ impl IpcValidate for IpcCreateSubnetMsg {
 }
 
 impl IpcCreateSubnetMsg {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, IpcSerializeError> {
+        let serialized = postcard::to_stdvec(self)
+            .map_err(|e| IpcSerializeError::SerializationError(e.to_string()))?;
+        Ok([IPC_CREATE_SUBNET_TAG.as_bytes(), &serialized].concat())
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, IpcSerializeError> {
+        if &data[..IPC_TAG_LENGTH] != IPC_CREATE_SUBNET_TAG.as_bytes() {
+            return Err(IpcSerializeError::DeserializationError(
+                "Invalid message tag".to_string(),
+            ));
+        }
+
+        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
+            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+    }
+
     /// Submits the create subnet message to the Bitcoin network
     /// Using commit-reveal scheme
     /// Returns the subnet id — derived from the commit txid
@@ -225,12 +243,11 @@ impl IpcCreateSubnetMsg {
         &self,
         rpc: &bitcoincore_rpc::Client,
     ) -> Result<SubnetId, IpcLibError> {
-        let subnet_data = self.ipc_serialize();
+        let subnet_data = self
+            .to_bytes()
+            .expect("Failed to serialize create subnet msg using postcard");
 
-        info!(
-            "Submitting create subnet msg to bitcoin. Data={}",
-            subnet_data
-        );
+        info!("Submitting create subnet msg to bitcoin. Data={:?}", self);
 
         // The address to return any non-dust values
         let return_address = wallet::get_new_address(rpc)?;
@@ -240,7 +257,7 @@ impl IpcCreateSubnetMsg {
             rpc,
             &secp,
             &return_address,
-            subnet_data.as_bytes(),
+            &subnet_data,
             None,
         )?;
 
@@ -320,13 +337,12 @@ impl IpcCreateSubnetMsg {
     }
 }
 
-#[derive(Serialize, Deserialize, IpcSerialize, Debug, Clone)]
-#[tag(IPC_JOIN_SUBNET_TAG)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IpcJoinSubnetMsg {
     /// The subnet id of the subnet to join
     pub subnet_id: SubnetId,
-    /// The amount to collateral to lock in the subnet
-    #[ipc_serde(skip)]
+    /// The amount of collateral to lock in the subnet
+    #[serde(skip)]
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub collateral: bitcoin::Amount,
     /// The IP address of the validator, as
@@ -341,6 +357,23 @@ pub struct IpcJoinSubnetMsg {
 }
 
 impl IpcJoinSubnetMsg {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, IpcSerializeError> {
+        let serialized = postcard::to_stdvec(self)
+            .map_err(|e| IpcSerializeError::SerializationError(e.to_string()))?;
+        Ok([IPC_JOIN_SUBNET_TAG.as_bytes(), &serialized].concat())
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, IpcSerializeError> {
+        if &data[..IPC_TAG_LENGTH] != IPC_JOIN_SUBNET_TAG.as_bytes() {
+            return Err(IpcSerializeError::DeserializationError(
+                "Invalid message tag".to_string(),
+            ));
+        }
+
+        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
+            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+    }
+
     /// Validates the join subnet message, for the given genesis info
     pub fn validate_pre_bootstrap(
         &self,
@@ -469,11 +502,13 @@ impl IpcJoinSubnetMsg {
         rpc: &bitcoincore_rpc::Client,
         multisig_address: &bitcoin::Address,
     ) -> Result<Txid, IpcLibError> {
-        let subnet_data = self.ipc_serialize();
+        let subnet_data = self
+            .to_bytes()
+            .expect("Failed to serialize join subnet msg using postcard");
 
         info!(
-            "Submitting join subnet msg to bitcoin. Multisig address = {}. Data={}",
-            multisig_address, subnet_data
+            "Submitting join subnet msg to bitcoin. Multisig address = {}. Data={:?}",
+            multisig_address, self
         );
 
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -481,7 +516,7 @@ impl IpcJoinSubnetMsg {
             rpc,
             &secp,
             multisig_address,
-            subnet_data.as_bytes(),
+            &subnet_data,
             Some(self.collateral),
         )?;
 
@@ -4004,19 +4039,12 @@ impl IpcMessage {
             IpcSerializeError::DeserializationError(format!("Could not deserialize tag: {}", e))
         })?;
 
-        // we keep this a result since not all messages need it
-        let wstr = std::str::from_utf8(&w).map_err(|_| {
-            IpcSerializeError::DeserializationError("Could not deserialize witness".to_string())
-        });
-
         match IpcTag::from_str(tag)? {
-            IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(
-                IpcCreateSubnetMsg::ipc_deserialize(wstr?)?,
-            )),
-
-            IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::ipc_deserialize(
-                wstr?,
+            IpcTag::CreateSubnet => Ok(IpcMessage::CreateSubnet(IpcCreateSubnetMsg::from_bytes(
+                &w,
             )?)),
+
+            IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::from_bytes(&w)?)),
             //
             // The bellow messages will be processed from output
             //
@@ -4270,7 +4298,6 @@ mod tests {
     use crate::eth_utils::{
         delegated_fvm_to_eth_address, evm_address_to_delegated_fvm, set_fvm_network,
     };
-    use crate::L1_NAME;
     use bitcoin::hex::DisplayHex;
     use bitcoin::{Amount, XOnlyPublicKey};
     use fvm_shared::address::{set_current_network, Network as FvmNetwork};
@@ -4318,19 +4345,17 @@ mod tests {
             whitelist: vec![validator1, validator2],
         };
 
-        let serialized = params.ipc_serialize();
-        println!("{}", serialized);
+        let serialized = params.to_bytes().expect("Serialization failed");
 
-        assert!(serialized.starts_with(IPC_CREATE_SUBNET_TAG));
-        assert!(serialized.contains(&format!("{}min_validator_stake=1000", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!("{}min_validators=2", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!("{}bottomup_check_period=10", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!("{}active_validators_limit=20", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!("{}min_cross_msg_fee=50", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!(
-            "{}whitelist={},{}",
-            IPC_TAG_DELIMITER, validator1, validator2
-        )));
+        println!("{:?}", serialized);
+
+        let params = IpcCreateSubnetMsg::from_bytes(&serialized).unwrap();
+        assert_eq!(params.min_validator_stake, Amount::from_sat(1000));
+        assert_eq!(params.min_validators, 2);
+        assert_eq!(params.bottomup_check_period, 10);
+        assert_eq!(params.active_validators_limit, 20);
+        assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
+        assert_eq!(params.whitelist, vec![validator1, validator2]);
     }
 
     #[test]
@@ -4346,28 +4371,65 @@ mod tests {
         )
         .unwrap();
 
-        let serialized = format!(
-            "{}{}min_validator_stake=1000{}min_validators=2{}bottomup_check_period=10{}active_validators_limit=20{}min_cross_msg_fee=50{}whitelist={},{}",
-            IPC_CREATE_SUBNET_TAG,
-            IPC_TAG_DELIMITER,
-            IPC_TAG_DELIMITER,
-            IPC_TAG_DELIMITER,
-            IPC_TAG_DELIMITER,
-            IPC_TAG_DELIMITER,
-            IPC_TAG_DELIMITER,
-            validator1,
-            validator2,
-        );
+        // Postcard binary format from the above serialization test
+        // Works like a snapshot for deserialization
+        let serialized = vec![
+            73, 80, 67, 67, 82, 84, 232, 7, 2, 10, 20, 50, 2, 24, 132, 87, 129, 246, 49, 196, 143,
+            28, 151, 9, 226, 48, 146, 6, 125, 6, 131, 127, 48, 170, 12, 208, 84, 74, 200, 135, 254,
+            145, 221, 209, 102, 106, 101, 56, 249, 58, 26, 230, 106, 43, 104, 170, 216, 55, 219,
+            243, 206, 151, 1, 14, 202, 251, 237, 68, 11, 121, 171, 121, 140, 242, 137, 132, 223,
+        ];
 
-        println!("{}", serialized);
-
-        let params = IpcCreateSubnetMsg::ipc_deserialize(&serialized).unwrap();
+        let params = IpcCreateSubnetMsg::from_bytes(&serialized).unwrap();
         assert_eq!(params.min_validator_stake, Amount::from_sat(1000));
         assert_eq!(params.min_validators, 2);
         assert_eq!(params.bottomup_check_period, 10);
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
         assert_eq!(params.whitelist, vec![validator1, validator2]);
+    }
+
+    #[test]
+    fn print_create_msg_savings_with_postcard_serialization() {
+        let validator1 = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+        let validator2 = XOnlyPublicKey::from_str(
+            "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df",
+        )
+        .unwrap();
+
+        let old_serialized = format!(
+        "{}{}min_validator_stake=1000{}min_validators=2{}bottomup_check_period=10{}active_validators_limit=20{}min_cross_msg_fee=50{}whitelist={},{}",
+        IPC_CREATE_SUBNET_TAG,
+        IPC_TAG_DELIMITER,
+        IPC_TAG_DELIMITER,
+        IPC_TAG_DELIMITER,
+        IPC_TAG_DELIMITER,
+        IPC_TAG_DELIMITER,
+        IPC_TAG_DELIMITER,
+        validator1,
+        validator2,
+    );
+
+        // Postcard binary format from the above serialization test
+        // Works like a snapshot for deserialization
+        let serialized = vec![
+            73, 80, 67, 67, 82, 84, 232, 7, 2, 10, 20, 50, 2, 24, 132, 87, 129, 246, 49, 196, 143,
+            28, 151, 9, 226, 48, 146, 6, 125, 6, 131, 127, 48, 170, 12, 208, 84, 74, 200, 135, 254,
+            145, 221, 209, 102, 106, 101, 56, 249, 58, 26, 230, 106, 43, 104, 170, 216, 55, 219,
+            243, 206, 151, 1, 14, 202, 251, 237, 68, 11, 121, 171, 121, 140, 242, 137, 132, 223,
+        ];
+
+        // Print savings from old serialization
+        println!(
+        "Old string-based serialization size: {}\nNew postcard serialization size: {}\nSavings: {} bytes ({}% savings)",
+        old_serialized.len(),
+        serialized.len(),
+        old_serialized.len() as isize - serialized.len() as isize,
+        100 - (serialized.len() * 100 / old_serialized.len()),
+    );
     }
 
     //
@@ -4449,42 +4511,51 @@ mod tests {
             pubkey,
         };
 
-        let serialized = msg.ipc_serialize();
+        let serialized = msg.to_bytes().expect("Serialization failed");
 
-        println!("{}", serialized);
-
-        // Check serialization
-        assert!(serialized.starts_with(IPC_JOIN_SUBNET_TAG));
-        // collateral should not be in serialized, it's included in the output
-        assert!(!serialized.contains("collateral"));
-
-        assert!(serialized.contains(&format!("{}ip=127.0.0.1:8080", IPC_TAG_DELIMITER)));
-        assert!(serialized.contains(&format!(
-            "{}backup_address=bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-            IPC_TAG_DELIMITER
-        )));
-        assert!(serialized.contains(&format!(
-            "{}pubkey=18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
-            IPC_TAG_DELIMITER
-        )));
-        assert!(serialized.contains(&format!(
-            "{}subnet_id={}/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei",
-            IPC_TAG_DELIMITER, L1_NAME
-        )));
+        println!("{:?}", serialized);
 
         // Test deserialization
-        let deserialized = IpcJoinSubnetMsg::ipc_deserialize(&serialized).unwrap();
+        let deserialized = IpcJoinSubnetMsg::from_bytes(&serialized).unwrap();
 
         // Skipped fields should be default values
-        assert_eq!(deserialized.subnet_id, SubnetId::from_txid(create_txid));
         assert_eq!(deserialized.collateral, Amount::from_sat(0));
         // Other fields should match
+        assert_eq!(deserialized.subnet_id, SubnetId::from_txid(create_txid));
         assert_eq!(deserialized.ip, msg.ip);
         assert_eq!(deserialized.backup_address, msg.backup_address);
         assert_eq!(deserialized.pubkey, msg.pubkey);
 
         // It should be invalid because it's missing collateral and subnet_id
         assert!(deserialized.validate().is_err());
+    }
+
+    #[test]
+    fn print_join_msg_savings_with_postcard_serialization() {
+        let old_serialized = "IPCJOI#backup_address=bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n#ip=127.0.0.1:8080#pubkey=18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166#subnet_id=/b4/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei
+        test ipc_lib::tests::test_ipc_join_subnet_msg_serialize_deserialize";
+
+        // Postcard binary format from the above serialization test
+        // Works like a snapshot for deserialization
+        let serialized = vec![
+            73, 80, 67, 74, 79, 73, 48, 47, 98, 52, 47, 116, 52, 49, 48, 102, 104, 111, 114, 54,
+            51, 55, 108, 50, 112, 109, 106, 108, 101, 54, 119, 104, 102, 113, 55, 103, 111, 53,
+            117, 112, 109, 102, 55, 52, 113, 103, 54, 100, 98, 114, 52, 117, 122, 101, 105, 0, 127,
+            0, 0, 1, 144, 63, 44, 98, 99, 114, 116, 49, 113, 51, 102, 122, 110, 115, 112, 114, 51,
+            101, 48, 50, 97, 114, 116, 109, 57, 100, 102, 55, 116, 107, 56, 50, 55, 97, 50, 120,
+            104, 110, 121, 50, 109, 52, 122, 122, 114, 54, 110, 24, 132, 87, 129, 246, 49, 196,
+            143, 28, 151, 9, 226, 48, 146, 6, 125, 6, 131, 127, 48, 170, 12, 208, 84, 74, 200, 135,
+            254, 145, 221, 209, 102,
+        ];
+
+        // Print savings from old serialization
+        println!(
+        "Old string-based serialization size: {}\nNew postcard serialization size: {}\nSavings: {} bytes ({}% savings)",
+        old_serialized.len(),
+        serialized.len(),
+        old_serialized.len() as isize - serialized.len() as isize,
+        100 - (serialized.len() * 100 / old_serialized.len()),
+    );
     }
 
     //
