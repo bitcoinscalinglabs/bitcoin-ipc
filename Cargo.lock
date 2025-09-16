@@ -675,7 +675,6 @@ dependencies = [
  "heed",
  "hex",
  "include_dir",
- "ipc_serde",
  "jsonrpc-v2",
  "log",
  "num-bigint",
@@ -1949,14 +1948,6 @@ dependencies = [
  "equivalent",
  "hashbrown",
  "serde",
-]
-
-[[package]]
-name = "ipc_serde"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 2.0.100",
 ]
 
 [[package]]

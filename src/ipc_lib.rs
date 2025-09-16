@@ -6,7 +6,6 @@ use bitcoin::Amount;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
-use ipc_serde::IpcSerialize;
 use log::error;
 use log::trace;
 use log::warn;
@@ -30,9 +29,9 @@ use crate::NETWORK;
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
     pub use super::{
-        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcMessage, IpcSerialize, IpcTag, SubnetId,
-        IPC_CHECKPOINT_TAG, IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_FUND_SUBNET_TAG,
-        IPC_JOIN_SUBNET_TAG, IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER,
+        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcMessage, IpcTag, SubnetId, IPC_CHECKPOINT_TAG,
+        IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_FUND_SUBNET_TAG, IPC_JOIN_SUBNET_TAG,
+        IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER,
     };
 }
 
