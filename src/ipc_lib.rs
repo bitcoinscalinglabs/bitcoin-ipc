@@ -1526,14 +1526,12 @@ impl IpcCheckpointSubnetMsg {
             entry.push((transfer.subnet_user_address, transfer.amount));
         }
 
-        let transfers_binary =
-            bincode::serde::encode_to_vec(&transfers_by_subnet, bincode::config::standard())
-                .map_err(|e| {
-                    IpcLibError::from(IpcValidateError::InvalidMsg(format!(
-                        "Failed to serialize transfers: {}",
-                        e
-                    )))
-                })?;
+        let transfers_binary = postcard::to_stdvec(&transfers_by_subnet).map_err(|e| {
+            IpcLibError::from(IpcValidateError::InvalidMsg(format!(
+                "Failed to serialize transfers: {}",
+                e
+            )))
+        })?;
 
         // Combine UTF-8 tag and binary data
         let mut complete_data = Vec::with_capacity(IPC_TRANSFER_TAG.len() + transfers_binary.len());
@@ -2372,6 +2370,32 @@ impl IpcValidate for IpcBatchTransferMsg {
 }
 
 impl IpcBatchTransferMsg {
+    /// Makes a map of transfers by subnet txid20 from the witness data.
+    /// Witness data must be already processed to extract the pushdata.
+    pub fn witness_to_transfers_map(
+        witness_data: &[u8],
+    ) -> Result<HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>>, IpcLibError> {
+        if witness_data.len() < IPC_TAG_LENGTH
+            || &witness_data[..IPC_TAG_LENGTH] != IPC_TRANSFER_TAG.as_bytes()
+        {
+            return Err(IpcLibError::MsgParseError(
+                IPC_TRANSFER_TAG,
+                format!("Invalid tag: expected '{}' prefix", IPC_TRANSFER_TAG),
+            ));
+        }
+
+        // Deserialize the transfers
+        let transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
+            postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..]).map_err(|e| {
+                IpcLibError::MsgParseError(
+                    IPC_TRANSFER_TAG,
+                    format!("Failed to deserialize transfers: {}", e),
+                )
+            })?;
+
+        Ok(transfers_by_subnet)
+    }
+
     /// Reconstructs an IpcBatchTransferMsg from a Bitcoin transaction.
     ///
     /// Given that:
@@ -2415,14 +2439,9 @@ impl IpcBatchTransferMsg {
         }
 
         // Deserialize the transfers
-        let (transfers_by_subnet, _): (
-            HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>>,
-            usize,
-        ) = bincode::serde::decode_from_slice(
-            &witness_data[IPC_TRANSFER_TAG.len()..],
-            bincode::config::standard(),
-        )
-        .map_err(|e| err(format!("Failed to deserialize transfers: {}", e)))?;
+        let transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
+            postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..])
+                .map_err(|e| err(format!("Failed to deserialize transfers: {}", e)))?;
 
         // Collect all cross-subnet transfers with proper subnet info
         let transfers = transfers_by_subnet
@@ -4390,7 +4409,7 @@ mod tests {
     }
 
     #[test]
-    fn print_create_msg_savings_with_postcard_serialization() {
+    fn print_postcard_savings_create_msg() {
         let validator1 = XOnlyPublicKey::from_str(
             "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
         )
@@ -4531,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn print_join_msg_savings_with_postcard_serialization() {
+    fn print_postcard_savings_join_msg() {
         let old_serialized = "IPCJOI#backup_address=bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n#ip=127.0.0.1:8080#pubkey=18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166#subnet_id=/b4/t410fhor637l2pmjle6whfq7go5upmf74qg6dbr4uzei
         test ipc_lib::tests::test_ipc_join_subnet_msg_serialize_deserialize";
 
@@ -5017,6 +5036,46 @@ mod checkpoint_msg_tests {
         }
     }
 
+    fn create_test_checkpoint_msg_multiple_transfers(n_transfers: usize) -> IpcCheckpointSubnetMsg {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        let mut transfers = Vec::with_capacity(n_transfers);
+
+        for i in 0..n_transfers {
+            let transfer = IpcCrossSubnetTransfer {
+                amount: Amount::from_sat(10000 + (i as u64 * 1000)), // Varying amounts
+                destination_subnet_id: destination_subnet.id,
+                subnet_multisig_address: Some(
+                    destination_subnet.committee.multisig_address.clone(),
+                ),
+                subnet_user_address: alloy_primitives::Address::from_str(
+                    // Varying addresses
+                    &format!("742d35Cc6634C0532925a3b844Bc454e4438f4{:02x}", i),
+                )
+                .unwrap(),
+            };
+            transfers.push(transfer);
+        }
+
+        IpcCheckpointSubnetMsg {
+            subnet_id: subnet_state.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            unstakes: vec![],
+            withdrawals: vec![],
+            transfers: transfers,
+            change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 30, // arbitrary test number
+            is_kill_checkpoint: false,
+        }
+    }
+
     fn create_test_utxos(
         script_pub_key: bitcoin::ScriptBuf,
     ) -> Vec<bitcoincore_rpc::json::ListUnspentResultEntry> {
@@ -5318,6 +5377,8 @@ mod checkpoint_msg_tests {
         // Get the batched transfer data
         let transfer_data = checkpoint_msg.make_batched_transfer_data().unwrap();
 
+        println!("{:?}", transfer_data);
+
         // Check that the transfer data starts with the correct tag
         let tag_bytes = IPC_TRANSFER_TAG.as_bytes();
         let prefix = &transfer_data[0..tag_bytes.len()];
@@ -5338,6 +5399,116 @@ mod checkpoint_msg_tests {
             transfer_data.len() > tag_bytes.len(),
             "Transfer data should contain more than just the tag"
         );
+    }
+
+    #[test]
+    fn print_postcard_savings_batch_transfer_msg() {
+        let checkpoint_1_transfers = create_test_checkpoint_msg_multiple_transfers(1)
+            .make_batched_transfer_data()
+            .unwrap();
+        // println!("{:?}", checkpoint_1_transfers);
+        let old_checkpoint_1_transfer = [
+            73, 80, 67, 84, 70, 82, 1, 19, 194, 87, 48, 180, 147, 217, 61, 218, 58, 159, 102, 135,
+            19, 235, 46, 174, 111, 27, 185, 1, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163,
+            184, 68, 188, 69, 78, 68, 56, 244, 0, 144, 78,
+        ];
+
+        println!(
+            "Bincode size 1 transfer: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
+            old_checkpoint_1_transfer.len(),
+            checkpoint_1_transfers.len(),
+            old_checkpoint_1_transfer.len() as isize - checkpoint_1_transfers.len() as isize,
+            100 - (checkpoint_1_transfers.len() * 100 / old_checkpoint_1_transfer.len()),
+        );
+
+        let checkpoint_5_transfers = create_test_checkpoint_msg_multiple_transfers(5)
+            .make_batched_transfer_data()
+            .unwrap();
+        // println!("{:?}", checkpoint_5_transfers);
+
+        let old_checkpoint_5_batch_transfers = vec![
+            73, 80, 67, 84, 70, 82, 1, 122, 221, 179, 48, 179, 107, 209, 110, 158, 205, 125, 18,
+            233, 196, 43, 196, 26, 42, 107, 251, 5, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37,
+            163, 184, 68, 188, 69, 78, 68, 56, 244, 0, 251, 16, 39, 20, 116, 45, 53, 204, 102, 52,
+            192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 1, 251, 248, 42, 20, 116, 45,
+            53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 2, 251, 224,
+            46, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56,
+            244, 3, 251, 200, 50, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68,
+            188, 69, 78, 68, 56, 244, 4, 251, 176, 54,
+        ];
+
+        println!(
+            "Bincode size 5 transfers: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
+            old_checkpoint_5_batch_transfers.len(),
+            checkpoint_5_transfers.len(),
+            old_checkpoint_5_batch_transfers.len() as isize - checkpoint_5_transfers.len() as isize,
+            100 - (checkpoint_5_transfers.len() * 100 / old_checkpoint_5_batch_transfers.len()),
+        );
+
+        let checkpoint_15_transfers = create_test_checkpoint_msg_multiple_transfers(15)
+            .make_batched_transfer_data()
+            .unwrap();
+        // println!("{:?}", checkpoint_15_transfers);
+
+        let old_checkpoint_15_batch_transfers = vec![
+            73, 80, 67, 84, 70, 82, 1, 14, 163, 184, 103, 216, 174, 124, 241, 177, 96, 47, 229, 47,
+            93, 137, 70, 188, 206, 89, 55, 15, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163,
+            184, 68, 188, 69, 78, 68, 56, 244, 0, 251, 16, 39, 20, 116, 45, 53, 204, 102, 52, 192,
+            83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 1, 251, 248, 42, 20, 116, 45, 53,
+            204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 2, 251, 224, 46,
+            20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244,
+            3, 251, 200, 50, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69,
+            78, 68, 56, 244, 4, 251, 176, 54, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163,
+            184, 68, 188, 69, 78, 68, 56, 244, 5, 251, 152, 58, 20, 116, 45, 53, 204, 102, 52, 192,
+            83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 6, 251, 128, 62, 20, 116, 45, 53,
+            204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 7, 251, 104, 66,
+            20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244,
+            8, 251, 80, 70, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69,
+            78, 68, 56, 244, 9, 251, 56, 74, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163,
+            184, 68, 188, 69, 78, 68, 56, 244, 10, 251, 32, 78, 20, 116, 45, 53, 204, 102, 52, 192,
+            83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 11, 251, 8, 82, 20, 116, 45, 53,
+            204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56, 244, 12, 251, 240,
+            85, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68, 188, 69, 78, 68, 56,
+            244, 13, 251, 216, 89, 20, 116, 45, 53, 204, 102, 52, 192, 83, 41, 37, 163, 184, 68,
+            188, 69, 78, 68, 56, 244, 14, 251, 192, 93,
+        ];
+
+        println!(
+            "Bincode size 15 transfers: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
+            old_checkpoint_15_batch_transfers.len(),
+            checkpoint_15_transfers.len(),
+            old_checkpoint_15_batch_transfers.len() as isize
+                - checkpoint_15_transfers.len() as isize,
+            100 - (checkpoint_15_transfers.len() * 100 / old_checkpoint_15_batch_transfers.len()),
+        );
+    }
+
+    #[test]
+    fn test_batch_transfer_serialization_roundtrip() {
+        // Create a checkpoint message with 5 transfers using existing helper
+        let checkpoint_msg = create_test_checkpoint_msg_multiple_transfers(5);
+
+        // 1. Serialize the transfer data using make_batched_transfer_data
+        let serialized = checkpoint_msg.make_batched_transfer_data().unwrap();
+
+        let transfers_map = IpcBatchTransferMsg::witness_to_transfers_map(&serialized).unwrap();
+
+        // One subnet
+        assert_eq!(1, transfers_map.len());
+
+        let transfers = transfers_map
+            .get(
+                // All transfers go to the same subnet in this test
+                &checkpoint_msg
+                    .transfers
+                    .first()
+                    .unwrap()
+                    .destination_subnet_id
+                    .txid20(),
+            )
+            .unwrap();
+
+        assert_eq!(checkpoint_msg.transfers.len(), transfers.len());
     }
 
     #[test]
