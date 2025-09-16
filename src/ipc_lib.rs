@@ -242,9 +242,10 @@ impl IpcCreateSubnetMsg {
         &self,
         rpc: &bitcoincore_rpc::Client,
     ) -> Result<SubnetId, IpcLibError> {
-        let subnet_data = self
-            .to_bytes()
-            .expect("Failed to serialize create subnet msg using postcard");
+        let subnet_data = self.to_bytes().map_err(|e| {
+            error!("Could not serialize create subnet msg: {}", e);
+            IpcValidateError::InvalidMsg("Could not serialize message".to_string())
+        })?;
 
         info!("Submitting create subnet msg to bitcoin. Data={:?}", self);
 
@@ -501,9 +502,10 @@ impl IpcJoinSubnetMsg {
         rpc: &bitcoincore_rpc::Client,
         multisig_address: &bitcoin::Address,
     ) -> Result<Txid, IpcLibError> {
-        let subnet_data = self
-            .to_bytes()
-            .expect("Failed to serialize join subnet msg using postcard");
+        let subnet_data = self.to_bytes().map_err(|e| {
+            error!("Could not serialize join subnet msg: {}", e);
+            IpcValidateError::InvalidMsg("Could not serialize message".to_string())
+        })?;
 
         info!(
             "Submitting join subnet msg to bitcoin. Multisig address = {}. Data={:?}",
@@ -5068,7 +5070,7 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             unstakes: vec![],
             withdrawals: vec![],
-            transfers: transfers,
+            transfers,
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
