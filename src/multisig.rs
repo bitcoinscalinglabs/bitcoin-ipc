@@ -249,8 +249,6 @@ pub fn select_coins(
                 total_fee,
                 change
             );
-            #[cfg(test)]
-            dbg!(change, non_dust_change_tx_out.value);
 
             // if change is non-dust, return it
             if change > non_dust_change_tx_out.value {
