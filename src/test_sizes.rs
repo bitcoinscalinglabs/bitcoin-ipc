@@ -4,6 +4,7 @@ use bitcoin::{
     secp256k1::{self, schnorr},
     Amount, Weight,
 };
+use num_traits::ToPrimitive;
 
 use crate::ipc_lib::{
     IpcCheckpointSubnetMsg, IpcCrossSubnetTransfer, IpcUnstake, IpcValidate, IpcWithdrawal,
@@ -186,6 +187,7 @@ fn calc_checkpoint_size(
         &signature_refs,
     )
     .unwrap();
+    // dbg!(&checkpoint_tx);
 
     assert_eq!(
         checkpoint_tx.input.len(),
@@ -193,7 +195,10 @@ fn calc_checkpoint_size(
         "Input number doesn't match"
     );
 
-    // dbg!(&checkpoint_tx);
+    assert!(
+        checkpoint_tx.weight() < Weight::MAX_BLOCK,
+        "Checkpoint transaction is too large to fit in a block"
+    );
 
     // Get the size of checkpoint transaction
 
@@ -205,7 +210,6 @@ fn calc_checkpoint_size(
                 &subnet.committee.address_checked(),
             )
             .unwrap();
-
         // dbg!(&batch_tx);
 
         assert!(
@@ -214,6 +218,21 @@ fn calc_checkpoint_size(
         );
 
         let batch_tx = batch_tx.unwrap();
+
+        assert!(
+            batch_tx.weight() < Weight::MAX_BLOCK,
+            "Batch transfer transaction is too large to fit in a block"
+        );
+
+        let percentage = batch_tx.weight().to_wu().to_f64().unwrap()
+            / Weight::MAX_BLOCK.to_wu().to_f64().unwrap();
+
+        if percentage > 0.8 {
+            println!(
+                "WARNING: Batch transfer transaction is {:.2}% of a block!",
+                percentage * 100.0
+            );
+        }
 
         (checkpoint_tx.weight(), batch_tx.weight())
     } else {
