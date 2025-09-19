@@ -69,6 +69,9 @@ fn calc_checkpoint_size(
     // (transfers will be evenly distributed among the subnets)
     n_destination_subnets: usize,
 ) -> (Weight, Weight) {
+    // Print params in a single line
+    println!("validators: {}, inputs: {}, withdrawals: {}, unstakes: {}, transfers: {}, destination_subnets: {}", n_validators, n_inputs, n_withdrawals, n_unstakes, n_transfers, n_destination_subnets);
+
     //
     // Generate the source subnet
     //
@@ -110,12 +113,18 @@ fn calc_checkpoint_size(
 
     // Evenly divide total output amount among the deposit UTXOs
 
-    let per_unspent = total_out
+    let mut per_unspent = total_out
         .checked_div(n_inputs as u64)
         .expect("total_out should be divisible by n_deposits");
 
-    println!("Total checkpoint output amount: {}", total_out);
-    println!("Each input UTXO amount: {}", per_unspent);
+    // If there's only one input, we can make it big enough
+    // since we don't care about coin selection
+    if n_inputs == 1 {
+        per_unspent *= 100;
+    }
+
+    // println!("Total checkpoint output amount: {}", total_out);
+    // println!("Each input UTXO amount: {}", per_unspent);
 
     // Create UTXOs, with 25% more to cover for fees
     // This is picked arbitrarily for testing purposes
