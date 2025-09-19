@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use bitcoin::{
     secp256k1::{self, schnorr},
-    Amount, Weight,
+    Amount, Transaction, Weight,
 };
 use num_traits::ToPrimitive;
 
@@ -196,8 +196,8 @@ fn calc_checkpoint_size(
     );
 
     assert!(
-        checkpoint_tx.weight() < Weight::MAX_BLOCK,
-        "Checkpoint transaction is too large to fit in a block"
+        checkpoint_tx.weight() < Transaction::MAX_STANDARD_WEIGHT,
+        "Batch transfer transaction is too large to be standard"
     );
 
     // Get the size of checkpoint transaction
@@ -220,16 +220,16 @@ fn calc_checkpoint_size(
         let batch_tx = batch_tx.unwrap();
 
         assert!(
-            batch_tx.weight() < Weight::MAX_BLOCK,
-            "Batch transfer transaction is too large to fit in a block"
+            batch_tx.weight() < Transaction::MAX_STANDARD_WEIGHT,
+            "Batch transfer transaction is too large to be standard"
         );
 
         let percentage = batch_tx.weight().to_wu().to_f64().unwrap()
-            / Weight::MAX_BLOCK.to_wu().to_f64().unwrap();
+            / Transaction::MAX_STANDARD_WEIGHT.to_wu().to_f64().unwrap();
 
         if percentage > 0.8 {
             println!(
-                "WARNING: Batch transfer transaction is {:.2}% of a block!",
+                "WARNING: Batch transfer transaction is {:.2}% of a standard tx!",
                 percentage * 100.0
             );
         }
