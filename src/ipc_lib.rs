@@ -1361,14 +1361,6 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             }
         }
 
-        if self.transfers.len() > u8::MAX as usize {
-            return Err(IpcValidateError::InvalidMsg(format!(
-                "Number of transfers ({}) exceeds maximum allowed ({})",
-                self.transfers.len(),
-                u8::MAX
-            )));
-        }
-
         // Check if the transfers are valid
         for transfer in &self.transfers {
             if transfer.amount == Amount::ZERO {
@@ -1377,6 +1369,21 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
                     "Transfer amount must be greater than zero".to_string(),
                 ));
             }
+        }
+
+        let distinct_destination_subnets: std::collections::BTreeSet<_> = self
+            .transfers
+            .iter()
+            .map(|t| t.destination_subnet_id)
+            .collect();
+
+        // Each destination subnet requires a separate batch transfer output
+        if distinct_destination_subnets.len() > u8::MAX as usize {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Number of batch transfers ({}) exceeds maximum allowed ({})",
+                self.transfers.len(),
+                u8::MAX
+            )));
         }
 
         // Check if the change address is valid
@@ -2006,7 +2013,7 @@ impl IpcCheckpointSubnetMsg {
 
         // Extract marker values
         let withdrawals_count = op_return_data[Self::MARKERS_OFFSET] as usize;
-        let transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
+        let batch_transfers_count = op_return_data[Self::MARKERS_OFFSET + 1] as usize;
         let unstakes_count = op_return_data[Self::MARKERS_OFFSET + 2] as usize;
 
         // Extract committee configuration number
@@ -2024,8 +2031,8 @@ impl IpcCheckpointSubnetMsg {
         let expected_outputs = 1 + // metadata
                withdrawals_count + // withdrawals
                unstakes_count + // unstakes
-               (if transfers_count > 0 { 1 } else { 0 }) + // batch transfer commit (if needed)
-               transfers_count; // transfers
+               (if batch_transfers_count > 0 { 1 } else { 0 }) + // batch transfer commit (if needed)
+               batch_transfers_count; // transfers
 
         if tx.output.len() < expected_outputs {
             return Err(err(format!(
@@ -2091,17 +2098,13 @@ impl IpcCheckpointSubnetMsg {
             });
         }
 
-        // Parse transfers
-        let mut transfers = Vec::with_capacity(transfers_count);
-
-        // If there are transfers, there should be a batch transfer commit output
-        if transfers_count > 0 {
+        // If there are batch transfers, there should be a batch transfer commit output
+        if batch_transfers_count > 0 {
             // Start after metadata + withdrawals + unstakes + batch commit
             let transfer_start_index = 1 + withdrawals_count + unstakes_count + 1;
 
-            for i in 0..transfers_count {
+            for i in 0..batch_transfers_count {
                 let txout = &tx.output[transfer_start_index + i];
-                let amount = txout.value;
 
                 // For transfers, we can only extract the multisig address from the output
                 // The subnet_id and user_address would need to be provided by the batch reveal transaction
@@ -2114,13 +2117,16 @@ impl IpcCheckpointSubnetMsg {
                     })?;
                 let subnet_multisig_address = subnet_multisig_address.into_unchecked();
 
-                let destination_subnet_id = match db
-                    .get_subnet_by_multisig_address(&subnet_multisig_address)
-                {
-                    Ok(Some(subnet)) => subnet.id,
+                match db.get_subnet_by_multisig_address(&subnet_multisig_address) {
+                    Ok(Some(subnet)) => {
+                        trace!(
+                            "Found subnet {} for multisig address {:?}",
+                            subnet.id,
+                            subnet_multisig_address
+                        );
+                    }
                     Ok(None) => {
                         error!("CheckpointSubnetMsg: Could not find subnet with multisig address {:?} for transfer.", subnet_multisig_address);
-                        SubnetId::default()
                     }
                     Err(e) => {
                         return Err(err(format!(
@@ -2129,16 +2135,6 @@ impl IpcCheckpointSubnetMsg {
                         )));
                     }
                 };
-
-                // Note: We're creating placeholder values for subnet ID and user address
-                // These will need to be filled in by parsing the batch reveal transaction
-                transfers.push(IpcCrossSubnetTransfer {
-                    amount,
-                    destination_subnet_id,
-                    subnet_multisig_address: Some(subnet_multisig_address),
-                    // Placeholder, will be filled in batch transfer tx
-                    subnet_user_address: alloy_primitives::Address::ZERO,
-                });
             }
         }
 
@@ -2160,7 +2156,7 @@ impl IpcCheckpointSubnetMsg {
             next_committee_configuration_number,
             unstakes,
             withdrawals,
-            transfers,
+            transfers: vec![],
             change_address,
             is_kill_checkpoint: kill_checkpoint,
         })
@@ -4097,7 +4093,7 @@ pub const L1_DELEGATED_NAMESPACE: u64 = 10;
 
 /// Create Subnet IPC message is sent as a commit-reveal transaction pair.
 /// Subnet ID is derived from the transaction ID of the reveal transaction.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubnetId(FvmAddress);
 
 #[derive(Debug, Error)]
