@@ -244,21 +244,94 @@ fn calc_checkpoint_size(
 #[ignore]
 // cargo test test_checkpoint_size -- --nocapture --ignored
 fn test_checkpoint_size() {
-    let n_validators = 4;
+    // let n_validators = 4;
     let n_inputs = 1;
-    let n_withdrawals = 20;
+    let n_withdrawals = 0;
     let n_unstakes = 0;
-    let n_transfers = 250;
-    let n_destination_subnets = 3;
+    // let n_transfers = 10;
+    // let n_destination_subnets = 1;
+    for n_validators in [4, 7, 10, 16, 25, 36] {
+        for n_destination_subnets in [1, 2, 5, 10] {
+            for n_transfers in [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250] {
+                let (checkpoint_size, transfer_size) = calc_checkpoint_size(
+                    n_validators,
+                    n_inputs,
+                    n_withdrawals,
+                    n_unstakes,
+                    n_transfers,
+                    n_destination_subnets,
+                );
 
-    let (checkpoint_size, transfer_size) = calc_checkpoint_size(
-        n_validators,
-        n_inputs,
-        n_withdrawals,
-        n_unstakes,
-        n_transfers,
-        n_destination_subnets,
+                write_to_csv(
+                    n_validators as u64,
+                    n_destination_subnets as u64,
+                    n_transfers as u64,
+                    checkpoint_size.to_vbytes_ceil(),
+                    transfer_size.to_vbytes_ceil(),
+                );
+
+                // println!("{n_validators} validators, {n_inputs} inputs, {n_withdrawals} withdrawals, {n_unstakes} unstakes, {n_transfers} transfers, {n_destination_subnets} destination subnets\nCheckpoint size: {} vbytes\tnBatch transfer: {} vbytes", checkpoint_size.to_vbytes_ceil(), transfer_size.to_vbytes_ceil());
+            }
+        }
+    }
+}
+
+fn write_to_csv(
+    number_of_validators: u64,
+    number_of_subnets: u64,
+    total_transfers: u64,
+    checkpoint_tx_size: u64,
+    transfer_tx_size: u64,
+) {
+    let file_name = "bench-transfer-sizes.csv";
+
+    let output = format!(
+        "{},{},{},{},{}",
+        number_of_validators,
+        number_of_subnets,
+        total_transfers,
+        checkpoint_tx_size,
+        transfer_tx_size,
     );
 
-    println!("{n_validators} validators, {n_inputs} inputs, {n_withdrawals} withdrawals, {n_unstakes} unstakes, {n_transfers} transfers, {n_destination_subnets} destination subnets\nCheckpoint size: {} vbytes\nBatch transfer: {} vbytes", checkpoint_size.to_vbytes_ceil(), transfer_size.to_vbytes_ceil());
+    let file = match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(file_name)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            panic!("Error opening file: {}", e);
+        }
+    };
+
+    let mut wtr = csv::Writer::from_writer(file);
+
+    // write header if file is empty
+    let metadata = match std::fs::metadata(file_name) {
+        Ok(m) => m,
+        Err(e) => {
+            panic!("Error getting metadata: {}", e);
+        }
+    };
+    if metadata.len() == 0 {
+        if let Err(e) = wtr.write_record([
+            "Number of validators",
+            "Number of subnets",
+            "Total transfers",
+            "Commit Tx vsize",
+            "Reveal Tx vsize",
+        ]) {
+            panic!("Error writing record: {}", e);
+        };
+    }
+
+    // write data
+    if let Err(e) = wtr.write_record(output.split(',')) {
+        panic!("Error writing record: {}", e);
+    };
+
+    if let Err(e) = wtr.flush() {
+        panic!("Error flushing writer: {}", e);
+    }
 }
