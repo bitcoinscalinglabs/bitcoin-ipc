@@ -15,3 +15,6 @@ outputs/*
 
 # example .env files
 !internal/**/.env
+
+# benchmark files
+bench-transfer-sizes.csv
