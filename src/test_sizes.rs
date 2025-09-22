@@ -259,7 +259,7 @@ fn test_checkpoint_size() {
     let n_unstakes = 0;
     // let n_transfers = 10;
     // let n_destination_subnets = 1;
-    for n_validators in [4, 7, 10, 16, 25, 36] {
+    for n_validators in [1, 4, 7, 10, 16, 25, 36] {
         for n_destination_subnets in [1, 2, 5, 10] {
             for n_transfers in [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250] {
                 let (checkpoint_size, transfer_size) = calc_checkpoint_size(
@@ -275,7 +275,7 @@ fn test_checkpoint_size() {
                     n_validators as u64,
                     n_destination_subnets as u64,
                     n_transfers as u64,
-                    checkpoint_size.to_vbytes_ceil(),
+                    checkpoint_size.to_vbytes_ceil() - 78, // don't count the checkpoint data
                     transfer_size.to_vbytes_ceil(),
                 );
 
@@ -325,11 +325,11 @@ fn write_to_csv(
     };
     if metadata.len() == 0 {
         if let Err(e) = wtr.write_record([
-            "Number of validators",
-            "Number of subnets",
-            "Total transfers",
-            "Commit Tx vsize",
-            "Reveal Tx vsize",
+            "n_validators",
+            "n_destination_subnets",
+            "n_transfers",
+            "checkpoint_tx_size",
+            "transfer_tx_size",
         ]) {
             panic!("Error writing record: {}", e);
         };
