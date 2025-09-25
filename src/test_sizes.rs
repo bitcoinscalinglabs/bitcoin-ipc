@@ -16,6 +16,8 @@ use crate::test_utils::{
 };
 use crate::DEFAULT_BTC_FEE_RATE;
 
+const RESULTS_FILE: &str = "bench-transfer-sizes.csv";
+
 /// Create a dummy schnorr signature for testing purposes only
 pub fn create_dummy_schnorr_signature() -> schnorr::Signature {
     let sig_bytes = [
@@ -261,7 +263,9 @@ fn test_checkpoint_size() {
     // let n_destination_subnets = 1;
     for n_validators in [1, 4, 7, 10, 16, 25, 36] {
         for n_destination_subnets in [1, 2, 5, 10] {
-            for n_transfers in [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250] {
+            for n_transfers in [
+                1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250, 500, 1000, 2000, 5000, 10000, 15000,
+            ] {
                 let (checkpoint_size, transfer_size) = calc_checkpoint_size(
                     n_validators,
                     n_inputs,
@@ -292,7 +296,7 @@ fn write_to_csv(
     checkpoint_tx_size: u64,
     transfer_tx_size: u64,
 ) {
-    let file_name = "bench-transfer-sizes.csv";
+    let file_name = RESULTS_FILE;
 
     let output = format!(
         "{},{},{},{},{}",
