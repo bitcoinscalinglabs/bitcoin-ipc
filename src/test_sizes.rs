@@ -16,7 +16,14 @@ use crate::test_utils::{
 };
 use crate::DEFAULT_BTC_FEE_RATE;
 
-const RESULTS_FILE: &str = "bench-transfer-sizes.csv";
+const N_VALIDATORS: [usize; 9] = [1, 4, 7, 10, 25, 37, 52, 76, 100];
+const N_DESTINATION_SUBNETS: [usize; 4] = [1, 2, 5, 10];
+const N_TRANSFERS: [usize; 18] = [
+    1, 2, 3, 4, 5, 10, 20, 30, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 15000, 16500,
+];
+const N_WITHDRAWALS: [usize; 12] = [1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 255];
+const RESULTS_FILE_TRANSFER: &str = "bench-plots/bench-transfer-sizes.csv";
+const RESULTS_FILE_WITHDRAW: &str = "bench-plots/bench-withdraw-sizes.csv";
 
 /// Create a dummy schnorr signature for testing purposes only
 pub fn create_dummy_schnorr_signature() -> schnorr::Signature {
@@ -254,18 +261,14 @@ fn calc_checkpoint_size(
 #[test]
 #[ignore]
 // cargo test test_checkpoint_size -- --nocapture --ignored
-fn test_checkpoint_size() {
-    // let n_validators = 4;
+fn test_transfer_size() {
     let n_inputs = 1;
     let n_withdrawals = 0;
     let n_unstakes = 0;
-    // let n_transfers = 10;
-    // let n_destination_subnets = 1;
-    for n_validators in [1, 4, 7, 10, 16, 25, 36] {
-        for n_destination_subnets in [1, 2, 5, 10] {
-            for n_transfers in [
-                1, 2, 3, 4, 5, 10, 20, 50, 100, 150, 200, 250, 500, 1000, 2000, 5000, 10000, 15000,
-            ] {
+
+    for n_validators in N_VALIDATORS {
+        for n_destination_subnets in N_DESTINATION_SUBNETS {
+            for n_transfers in N_TRANSFERS {
                 let (checkpoint_size, transfer_size) = calc_checkpoint_size(
                     n_validators,
                     n_inputs,
@@ -276,36 +279,94 @@ fn test_checkpoint_size() {
                 );
 
                 write_to_csv(
+                    BenchType::Transfer,
                     n_validators as u64,
                     n_destination_subnets as u64,
                     n_transfers as u64,
+                    n_withdrawals as u64,
                     checkpoint_size.to_vbytes_ceil() - 78, // don't count the checkpoint data
                     transfer_size.to_vbytes_ceil(),
                 );
-
-                // println!("{n_validators} validators, {n_inputs} inputs, {n_withdrawals} withdrawals, {n_unstakes} unstakes, {n_transfers} transfers, {n_destination_subnets} destination subnets\nCheckpoint size: {} vbytes\tnBatch transfer: {} vbytes", checkpoint_size.to_vbytes_ceil(), transfer_size.to_vbytes_ceil());
             }
         }
     }
 }
 
+#[test]
+#[ignore]
+// cargo test test_checkpoint_size -- --nocapture --ignored
+fn test_withdraw_size() {
+    let n_inputs = 1;
+    let n_unstakes = 0;
+    let n_validators = 4;
+    let n_destination_subnets = 1;
+    let n_transfers = 0;
+
+    for n_withdrawals in N_WITHDRAWALS {
+        let (checkpoint_size, transfer_size) = calc_checkpoint_size(
+            n_validators,
+            n_inputs,
+            n_withdrawals,
+            n_unstakes,
+            n_transfers,
+            n_destination_subnets,
+        );
+
+        write_to_csv(
+            BenchType::Withdraw,
+            n_validators as u64,
+            n_destination_subnets as u64,
+            n_transfers as u64,
+            n_withdrawals as u64,
+            checkpoint_size.to_vbytes_ceil() - 78, // don't count the checkpoint data
+            transfer_size.to_vbytes_ceil(),
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn test_checkpoint_size() {
+    let n_inputs = 1;
+    let n_withdrawals = 0;
+    let n_unstakes = 0;
+    let n_validators = 4;
+    let n_destination_subnets = 0;
+    let n_transfers = 0;
+
+    let (checkpoint_size, transfer_size) = calc_checkpoint_size(
+        n_validators,
+        n_inputs,
+        n_withdrawals,
+        n_unstakes,
+        n_transfers,
+        n_destination_subnets,
+    );
+    println!(
+        "checkpoint_size: {}, transfer_size: {}",
+        checkpoint_size.to_vbytes_ceil(),
+        transfer_size.to_vbytes_ceil()
+    );
+}
+
+enum BenchType {
+    Transfer,
+    Withdraw,
+}
+
 fn write_to_csv(
-    number_of_validators: u64,
-    number_of_subnets: u64,
-    total_transfers: u64,
+    bench_type: BenchType,
+    n_validators: u64,
+    n_subnets: u64,
+    n_transfers: u64,
+    n_withdrawals: u64,
     checkpoint_tx_size: u64,
     transfer_tx_size: u64,
 ) {
-    let file_name = RESULTS_FILE;
-
-    let output = format!(
-        "{},{},{},{},{}",
-        number_of_validators,
-        number_of_subnets,
-        total_transfers,
-        checkpoint_tx_size,
-        transfer_tx_size,
-    );
+    let file_name = match bench_type {
+        BenchType::Transfer => RESULTS_FILE_TRANSFER,
+        BenchType::Withdraw => RESULTS_FILE_WITHDRAW,
+    };
 
     let file = match std::fs::OpenOptions::new()
         .append(true)
@@ -328,18 +389,30 @@ fn write_to_csv(
         }
     };
     if metadata.len() == 0 {
-        if let Err(e) = wtr.write_record([
-            "n_validators",
-            "n_destination_subnets",
-            "n_transfers",
-            "checkpoint_tx_size",
-            "transfer_tx_size",
-        ]) {
-            panic!("Error writing record: {}", e);
+        let header = match bench_type {
+            BenchType::Transfer => vec![
+                "n_validators",
+                "n_destination_subnets",
+                "n_transfers",
+                "checkpoint_tx_size",
+                "transfer_tx_size",
+            ],
+            BenchType::Withdraw => vec!["n_withdrawals", "checkpoint_tx_size"],
+        };
+        if let Err(e) = wtr.write_record(&header) {
+            panic!("Error writing header: {}", e);
         };
     }
 
     // write data
+    let output = match bench_type {
+        BenchType::Transfer => format!(
+            "{},{},{},{},{}",
+            n_validators, n_subnets, n_transfers, checkpoint_tx_size, transfer_tx_size,
+        ),
+        BenchType::Withdraw => format!("{},{}", n_withdrawals, checkpoint_tx_size,),
+    };
+
     if let Err(e) = wtr.write_record(output.split(',')) {
         panic!("Error writing record: {}", e);
     };
