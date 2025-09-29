@@ -116,9 +116,15 @@ fn calc_checkpoint_size(
     // Calculate total output amount and create dummy UTXOs for inputs
     //
 
-    let total_out: Amount = unstakes.iter().map(|u| u.amount).sum::<Amount>()
+    let mut total_out: Amount = unstakes.iter().map(|u| u.amount).sum::<Amount>()
         + withdrawals.iter().map(|w| w.amount).sum::<Amount>()
         + transfers.iter().map(|t| t.amount).sum::<Amount>();
+
+    // Make sure there's at least some output amount
+    // needed for the coin selection setup below
+    if total_out == Amount::ZERO {
+        total_out = Amount::from_sat(10000);
+    }
 
     // Evenly divide total output amount among the deposit UTXOs
 
@@ -247,7 +253,7 @@ fn calc_checkpoint_size(
 
         if percentage > 0.8 {
             println!(
-                "WARNING: Batch transfer transaction is {:.2}% of a standard tx!",
+                "    WARNING: Batch transfer transaction is {:.2}% of a standard tx!",
                 percentage * 100.0
             );
         }
