@@ -84,6 +84,59 @@ def plot3(filename, title, title_fee, n_transfers_list, x_ticks):
     plt.tight_layout()
     plt.savefig(filename.replace('.png', '_fee.png'))
 
+# Seventh plot: throughput vs total number of batched transfers
+def plot7(n_transfers_list, x_ticks):
+    n_target_subnets_list = [1, 2, 5, 10]
+    transfers_dict = {n: [] for n in n_target_subnets_list}
+    throughput_dict = {n: [] for n in n_target_subnets_list}
+
+    with open(csv_file_transfer, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if int(row['n_validators']) == 4:
+                n_subnets = int(row['n_destination_subnets'])
+                n_transfers = int(row['n_transfers'])
+                if n_subnets in n_target_subnets_list and n_transfers in n_transfers_list and n_transfers >= n_subnets:
+                    commit_vsize = int(row['checkpoint_tx_size'])
+                    reveal_vsize = int(row['transfer_tx_size'])
+                    total_size = commit_vsize + reveal_vsize
+                    amortized_vsize = total_size / float(n_transfers)
+                    throughput = 7 * (141 / amortized_vsize)
+                    transfers_dict[n_subnets].append(n_transfers)
+                    throughput_dict[n_subnets].append(throughput)
+
+    plt.figure(figsize=(8, 5))
+    for i, n_subnets in enumerate(n_target_subnets_list):
+        # Sort by n_transfers for each line for better plot
+        pairs = sorted(zip(transfers_dict[n_subnets], throughput_dict[n_subnets]))
+        if pairs:
+            x, y = zip(*pairs)
+            plt.plot(x, y, marker=markers_subnets[i % len(markers_subnets)], label=f'{n_subnets} target subnets')
+
+    # Add Native bitcoin line (throughput = 7 * (141 / 141) = 7)
+    defined_x_points = set()
+    for n_subnets in n_target_subnets_list:
+        defined_x_points.update(transfers_dict[n_subnets])
+    native_bitcoin_x = sorted(defined_x_points)
+    native_bitcoin_y = [7 for _ in native_bitcoin_x]
+    plt.plot(native_bitcoin_x, native_bitcoin_y, linestyle='--', color='black', label='Native bitcoin')
+
+    plt.xlabel('Total number of batched transfers (to all destination subnets)')
+    plt.ylabel('Throughput (tps)')
+    plt.title('Attainable throughput (tps) vs. Total number of batched transfers (4 validators)')
+    plt.grid(True)
+    plt.legend()
+    plt.xscale('log')
+    plt.xticks(x_ticks)
+    current_yticks = list(plt.yticks()[0])
+    if 7 not in current_yticks:
+        current_yticks.append(7)
+        current_yticks = sorted(current_yticks)
+        plt.yticks(current_yticks)
+    plt.ylim(bottom=-3)
+    plt.tight_layout()
+    plt.savefig('bench-plots/7-throughput_vs_n_transfers.png')
+
 
 # First plot: total size of transfers vs number of validators, for varying number of transfers
 validators_dict = {n: [] for n in n_transfers_list_default}
@@ -283,3 +336,5 @@ plt.xticks([1, 2, 4, 8, 12, 16, 20, 24])
 plt.tight_layout()
 plt.savefig('bench-plots/6-daily_overhead_vs_checkpoint_period_fee.png')
 
+# Seventh plot: throughput vs total number of batched transfers
+plot7([1,2,3,5, 10,20,50, 100, 200, 500, 1000, 10000, 16500], [1, 10, 100, 1000, 10000, 16500])
