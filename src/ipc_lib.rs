@@ -1534,6 +1534,10 @@ impl IpcCheckpointSubnetMsg {
             entry.push((transfer.subnet_user_address, transfer.amount));
         }
 
+        for (subnet_id, transfers) in &transfers_by_subnet {
+            println!("{}", SubnetId::from_txid20(subnet_id).to_string());
+            println!("{:?}", transfers);
+        }
         let transfers_binary = postcard::to_stdvec(&transfers_by_subnet).map_err(|e| {
             IpcLibError::from(IpcValidateError::InvalidMsg(format!(
                 "Failed to serialize transfers: {}",
@@ -1559,6 +1563,8 @@ impl IpcCheckpointSubnetMsg {
 
         // Construct the script that will contain the data
         let commit_script = bitcoin_utils::make_push_data_script(batched_transfer_data.as_slice());
+
+        dbg!(&commit_script);
 
         let unspendable_pubkey = bitcoin_utils::unspenable_internal_key();
         let builder = bitcoin::taproot::TaprootBuilder::new()

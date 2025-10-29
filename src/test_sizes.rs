@@ -272,9 +272,9 @@ fn test_transfer_size() {
     let n_withdrawals = 0;
     let n_unstakes = 0;
 
-    for n_validators in N_VALIDATORS {
-        for n_destination_subnets in N_DESTINATION_SUBNETS {
-            for n_transfers in N_TRANSFERS {
+    for n_validators in [4] {
+        for n_destination_subnets in [2] {
+            for n_transfers in [20] {
                 let (checkpoint_size, transfer_size) = calc_checkpoint_size(
                     n_validators,
                     n_inputs,
@@ -284,15 +284,15 @@ fn test_transfer_size() {
                     n_destination_subnets,
                 );
 
-                write_to_csv(
-                    BenchType::Transfer,
-                    n_validators as u64,
-                    n_destination_subnets as u64,
-                    n_transfers as u64,
-                    n_withdrawals as u64,
-                    checkpoint_size.to_vbytes_ceil() - 78, // don't count the checkpoint data
-                    transfer_size.to_vbytes_ceil(),
-                );
+                // write_to_csv(
+                //     BenchType::Transfer,
+                //     n_validators as u64,
+                //     n_destination_subnets as u64,
+                //     n_transfers as u64,
+                //     n_withdrawals as u64,
+                //     checkpoint_size.to_vbytes_ceil() - 78, // don't count the checkpoint data
+                //     transfer_size.to_vbytes_ceil(),
+                // );
             }
         }
     }
