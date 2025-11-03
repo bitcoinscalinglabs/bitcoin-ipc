@@ -1380,8 +1380,8 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
         // Each destination subnet requires a separate batch transfer output
         if distinct_destination_subnets.len() > u8::MAX as usize {
             return Err(IpcValidateError::InvalidMsg(format!(
-                "Number of batch transfers ({}) exceeds maximum allowed ({})",
-                self.transfers.len(),
+                "Number of batch transfer destination subnets ({}) exceeds maximum allowed ({})",
+                distinct_destination_subnets.len(),
                 u8::MAX
             )));
         }
