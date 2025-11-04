@@ -14,7 +14,7 @@ markers_validators = ['*', 'H', 'X', '2', '+', 'p']
 markers_transfers = ['*', 'H', 'X', '2', '+', 'p']
 
 # Third plot: amortized size per transfer vs total number of transfers, for n_validators=4, one line per n_destination_subnets
-def plot3(filename, title, title_fee, n_transfers_list, x_ticks):
+def plot3(filename, title, title_fee, n_transfers_list, x_ticks, log_scale=False):
     n_target_subnets_list = [1, 2, 5, 10]
     transfers_dict = {n: [] for n in n_target_subnets_list}
     avg_sizes_dict = {n: [] for n in n_target_subnets_list}
@@ -52,11 +52,15 @@ def plot3(filename, title, title_fee, n_transfers_list, x_ticks):
     plt.plot(native_bitcoin_x, native_bitcoin_y, linestyle='--', color='black', label='Native bitcoin')
 
     plt.xlabel('Total number of batched transfers (to all destination subnets)')
+    if log_scale:
+        plt.xlabel('Total number of batched transfers (to all destination subnets), log scale')
     plt.ylabel('Amortized size per transfer (vbytes)')
     plt.title(title)
     plt.grid(True)
     plt.legend()
     plt.xticks(x_ticks)
+    if log_scale:
+        plt.xscale('log')
     plt.tight_layout()
     plt.savefig(filename)
 
@@ -73,12 +77,15 @@ def plot3(filename, title, title_fee, n_transfers_list, x_ticks):
     # Add Native bitcoin line (also multiplied by fee)
     native_bitcoin_y_fee = [141 * fee_per_vb for _ in native_bitcoin_x]
     plt.plot(native_bitcoin_x, native_bitcoin_y_fee, linestyle='--', color='black', label='Native bitcoin')
-
     plt.xlabel('Total number of batched transfers (to all destination subnets)')
+    if log_scale:
+        plt.xlabel('Total number of batched transfers (to all destination subnets), log scale')
     plt.ylabel(f'Amortized fee per transfer (in sats)')
     # plt.title(f'{title} , using fee rate {fee_per_vb} sat / vB)- Cost Analysis')
     plt.title(title_fee)
     plt.grid(True)
+    if log_scale:
+        plt.xscale('log')
     plt.legend()
     plt.xticks(x_ticks)
     plt.tight_layout()
@@ -232,6 +239,9 @@ plot3('bench-plots/3B-amortized_vsize_vs_n_transfers_vary_n_subnets.png', 'Amort
 
 # Third plot, zoom in
 plot3('bench-plots/3C-amortized_vsize_vs_n_transfers_vary_n_subnets.png', 'Amortized size per transfer vs. total number of transfers (4 validators, zoom-in)', f'Fee per transfer vs. total number of transfers (4 validators, fee rate = {fee_per_vb} sat / vB)', [1,2,3,5, 10], [1,2,3,5, 10])
+
+# Third plot, log scale
+plot3('bench-plots/3D-amortized_vsize_vs_n_transfers_vary_n_subnets_log.png', 'Amortized size per transfer vs. total number of transfers (4 validators)', f'Fee per transfer vs. total number of transfers (4 validators, fee rate = {fee_per_vb} sat / vB)', [1,2,3,5, 10,20,50, 100, 200, 500, 1000, 10000, 16500], [1, 10, 100, 1000, 10000, 16500], log_scale=True)
 
 
 # Fourth plot: amortized size per transfer vs total number of transfers, for varying n_validators and n_destination_subnets=1
