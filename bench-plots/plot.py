@@ -7,7 +7,8 @@ csv_file_transfer = 'bench-plots/bench-transfer-sizes.csv'
 csv_file_withdraw = 'bench-plots/bench-withdraw-sizes.csv'
 n_transfers_list_default = [1, 2, 3, 4, 5, 10, 20, 30, 50]
 
-fee_per_vb = 3.0  # Fee per vbyte for cost analysis
+fee_per_vb = 200  # Fee per vbyte for cost analysis, in sats,
+# https://mempool.space/block/0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5
 
 markers_subnets = ['o', 's', 'D', 'v']
 markers_validators = ['*', 'H', 'X', '2', '+', 'p']
