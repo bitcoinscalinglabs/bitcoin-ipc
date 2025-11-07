@@ -1584,7 +1584,7 @@ pub mod tests {
         let msg = IpcFundSubnetMsg {
             subnet_id,
             amount: Amount::from_sat(1_000_000),
-            address: create_rand_addr(),
+            address: create_rand_eth_addr(),
         };
 
         RootnetMessage::FundSubnet {
@@ -1770,7 +1770,7 @@ pub mod tests {
 
         let validator1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10,
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1781,7 +1781,7 @@ pub mod tests {
 
         let validator2 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15,
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1807,7 +1807,7 @@ pub mod tests {
 
         let validator3 = SubnetValidator {
             pubkey: pubkey3,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 20,
             collateral: Amount::from_sat(3_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1854,7 +1854,7 @@ pub mod tests {
 
         let validator1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10,
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1865,7 +1865,7 @@ pub mod tests {
 
         let validator2 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15,
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1880,7 +1880,7 @@ pub mod tests {
 
         let validator3 = SubnetValidator {
             pubkey: pubkey3,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 20,
             collateral: Amount::from_sat(3_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1984,7 +1984,7 @@ pub mod tests {
         // Create first set of validators with certain powers
         let validator1_set1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10, // Power of 10 for first set
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -1995,7 +1995,7 @@ pub mod tests {
 
         let validator2_set1 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15, // Power of 15 for first set
             collateral: Amount::from_sat(1_500_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2007,7 +2007,7 @@ pub mod tests {
         // Create second set of validators with the same pubkeys but different powers
         let validator1_set2 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 20, // Power of 20 for second set
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2018,7 +2018,7 @@ pub mod tests {
 
         let validator2_set2 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 25, // Power of 25 for second set
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2065,7 +2065,7 @@ pub mod tests {
         // Create the first validator
         let validator1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10,
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2077,7 +2077,7 @@ pub mod tests {
         // Create the second validator
         let validator2 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15,
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2142,7 +2142,7 @@ pub mod tests {
 
         let validator1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10,
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2165,7 +2165,7 @@ pub mod tests {
 
         let new_validator = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15,
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2204,7 +2204,7 @@ pub mod tests {
 
         let validator1 = SubnetValidator {
             pubkey: pubkey1,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 10, // Power of 10 for first set
             collateral: Amount::from_sat(1_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")
@@ -2215,7 +2215,7 @@ pub mod tests {
 
         let validator2 = SubnetValidator {
             pubkey: pubkey2,
-            subnet_address: create_rand_addr(),
+            subnet_address: create_rand_eth_addr(),
             power: 15,
             collateral: Amount::from_sat(2_000_000),
             backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd")

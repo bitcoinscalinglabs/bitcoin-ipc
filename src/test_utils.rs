@@ -2,12 +2,19 @@ use bitcoin::{
     hashes::Hash,
     key::{Keypair, Secp256k1},
     secp256k1::{PublicKey, SecretKey},
-    BlockHash, Txid, XOnlyPublicKey,
+    Amount, BlockHash, ScriptBuf, Txid, XOnlyPublicKey,
 };
 use rand::Rng;
 
-use crate::multisig::{collateral_to_power, Power, WeightedKey};
-use crate::{db, SubnetId};
+use crate::{
+    db,
+    ipc_lib::{IpcCrossSubnetTransfer, IpcUnstake, IpcWithdrawal},
+    SubnetId,
+};
+use crate::{
+    multisig::{collateral_to_power, Power, WeightedKey},
+    NETWORK,
+};
 
 pub fn generate_xonly_pubkeys(n: usize) -> Vec<XOnlyPublicKey> {
     let secp = Secp256k1::new();
@@ -27,6 +34,7 @@ pub fn generate_equal_weighted_keys(n: usize) -> Vec<WeightedKey> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn generate_random_weighted_keys(n: usize) -> Vec<WeightedKey> {
     let power: Power = rand::thread_rng().gen_range(0..=5000);
 
@@ -151,11 +159,75 @@ pub fn create_test_db() -> crate::db::HeedDb {
 pub fn create_rand_txid() -> Txid {
     Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap()
 }
+
 pub fn create_rand_blockhash() -> BlockHash {
     BlockHash::from_slice(&rand::random::<[u8; 32]>()).unwrap()
 }
-pub fn create_rand_addr() -> alloy_primitives::Address {
+
+pub fn create_rand_addr() -> bitcoin::Address {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = SecretKey::new(&mut rand::thread_rng());
+    let pk = PublicKey::from_secret_key(&secp, &sk);
+    let xpk = XOnlyPublicKey::from(pk);
+    bitcoin::Address::p2tr(&secp, xpk, None, NETWORK)
+}
+
+pub fn create_rand_eth_addr() -> alloy_primitives::Address {
     alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
+}
+
+pub fn create_rand_ipc_unstake(amount_sats: Option<u64>) -> IpcUnstake {
+    let amount = Amount::from_sat(amount_sats.unwrap_or(40000));
+    let pubkey = generate_xonly_pubkeys(1)[0];
+    let address = create_rand_addr().into_unchecked();
+
+    IpcUnstake {
+        amount,
+        address,
+        pubkey,
+    }
+}
+
+pub fn create_rand_ipc_withdrawal(amount_sats: Option<u64>) -> IpcWithdrawal {
+    let amount = Amount::from_sat(amount_sats.unwrap_or(50000));
+    let address = create_rand_addr().into_unchecked();
+
+    IpcWithdrawal { amount, address }
+}
+
+pub fn create_rand_ipc_cross_subnet_transfer(
+    destination_subnet: &db::SubnetState,
+    amount_sats: Option<u64>,
+) -> IpcCrossSubnetTransfer {
+    let amount = Amount::from_sat(amount_sats.unwrap_or(30000));
+    let subnet_user_address = create_rand_eth_addr();
+
+    IpcCrossSubnetTransfer {
+        amount,
+        destination_subnet_id: destination_subnet.id,
+        subnet_multisig_address: None,
+        subnet_user_address,
+    }
+}
+
+pub fn create_rand_utxo_entry(
+    amount: Option<Amount>,
+) -> bitcoincore_rpc::json::ListUnspentResultEntry {
+    bitcoincore_rpc::json::ListUnspentResultEntry {
+        txid: create_rand_txid(),
+        vout: 0,
+        address: None,
+        label: None,
+        redeem_script: None,
+        witness_script: None,
+        script_pub_key: ScriptBuf::new(),
+        amount: amount.unwrap_or(Amount::from_btc(500.0).unwrap()),
+        confirmations: 1,
+        spendable: true,
+        solvable: true,
+        descriptor: None,
+        safe: true,
+    }
 }
 
 #[cfg(test)]

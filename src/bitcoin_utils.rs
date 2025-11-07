@@ -254,6 +254,7 @@ pub fn create_commit_reveal_txs(
         commit_spend_info.merkle_root(),
     );
 
+    // TODO: should there be a min_non_dust for the reveal tx?
     let commit_output_value = std::cmp::max(
         // Provide at least the minimal value for the output
         commit_script_pubkey.minimal_non_dust_custom(fee_rate),
