@@ -15,3 +15,5 @@ outputs/*
 
 # example .env files
 !internal/**/.env
+
+_container_inspect/*

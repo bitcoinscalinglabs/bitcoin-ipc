@@ -1,0 +1,158 @@
+#!/bin/bash
+set -euo pipefail
+
+# Run this INSIDE the bitcoin-ipc container.
+#
+# Starts fendermint child-validator containers on the HOST (via /var/run/docker.sock),
+# pointed at the provider APIs exposed by the bitcoin-ipc container (via host port mappings).
+#
+# Usage:
+#   /workspace/bitcoin-ipc/scripts/spin_up_subnet_a_from_container.sh <subnet_id>
+
+cleanup() {
+    echo -e "\nCleaning up..."
+    # Kill all background processes in the same process group
+    pkill -P $$ || true
+    exit 1
+}
+
+trap cleanup SIGINT SIGTERM
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <subnet_id>" >&2
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: docker CLI not found in PATH" >&2
+    exit 1
+fi
+
+if [ ! -S /var/run/docker.sock ]; then
+    echo "Error: /var/run/docker.sock is not mounted; cannot start host containers." >&2
+    exit 1
+fi
+
+if ! command -v cargo-make >/dev/null 2>&1; then
+    echo "Error: cargo-make not found in PATH" >&2
+    exit 1
+fi
+
+SUBNET_ID=$1
+
+# IMPORTANT (local docker + docker.sock):
+# The fendermint Makefile uses `docker run --volume ${BASE_DIR}:/data` and commands.
+# Because we talk to the host's Docker daemon (via /var/run/docker.sock bind-mount), those paths must
+# exist on the host. We therefore set `HOME` for cargo-make to a host-relative path under this repo,
+# so BASE_DIR becomes: ${HOST_HOME_DIR}/.ipc/...
+if [ -z "${HOST_HOME_DIR:-}" ]; then
+    echo "Error: HOST_HOME_DIR is not set (expected from docker-compose environment)." >&2
+    exit 1
+fi
+
+# IPC repo lives here in the container image.
+IPC_DIR="/workspace/ipc"
+FENDERMINT_MAKEFILE_PATH="infra/fendermint/Makefile.toml"
+
+if [ ! -d "$IPC_DIR" ]; then
+    echo "Error: IPC repo not found at $IPC_DIR" >&2
+    exit 1
+fi
+
+cd "$IPC_DIR"
+
+# Define hardcoded ports and auth tokens for each validator
+PORT_1="3030"
+PORT_2="3031"
+PORT_3="3032"
+PORT_4="3033"
+
+BEARER_TOKEN_1="validator1_auth_token"
+BEARER_TOKEN_2="validator2_auth_token"
+BEARER_TOKEN_3="validator3_auth_token"
+BEARER_TOKEN_4="validator4_auth_token"
+
+API_URL_1="http://host.docker.internal:${PORT_1}/api"
+API_URL_2="http://host.docker.internal:${PORT_2}/api"
+API_URL_3="http://host.docker.internal:${PORT_3}/api"
+API_URL_4="http://host.docker.internal:${PORT_4}/api"
+
+echo "Starting validator 1..."
+
+VALIDATOR1_OUTPUT=""
+if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
+    --env NODE_NAME="validator-1" \
+    --env SUBNET_ID="$SUBNET_ID" \
+    --env HOME="$HOST_HOME_DIR" \
+    --env PRIVATE_KEY_PATH="/root/.ipc/validator1/validator.sk" \
+    --env CMT_P2P_HOST_PORT=26656 \
+    --env CMT_RPC_HOST_PORT=26657 \
+    --env ETHAPI_HOST_PORT=8545 \
+    --env RESOLVER_HOST_PORT=26655 \
+    --env PARENT_ENDPOINT="$API_URL_1" \
+    --env PARENT_AUTH_TOKEN="$BEARER_TOKEN_1" \
+    --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
+    --env TOPDOWN_PROPOSAL_DELAY=0 \
+    --env FM_PULL_SKIP=1 \
+    child-validator 2>&1); then
+    echo "Error: failed to start validator 1" >&2
+    echo "$VALIDATOR1_OUTPUT" >&2
+    exit 1
+fi
+
+# Extract bootstrap information
+COMETBFT_ID=$(echo "$VALIDATOR1_OUTPUT" | grep "CometBFT node ID:" -A 1 | tail -n 1 | tr -d ' ' | xargs)
+RESOLVER_ADDR=$(echo "$VALIDATOR1_OUTPUT" | grep -o '/ip4/0.0.0.0/tcp/[0-9]*/p2p/[a-zA-Z0-9]*' | cut -d'/' -f7 | xargs)
+
+echo "Bootstrap information:"
+echo "CometBFT ID: $COMETBFT_ID"
+echo "Resolver Address: $RESOLVER_ADDR"
+
+# Function to run additional validators
+run_validator() {
+    local validator_num=$1
+    local p2p_port=$2
+    local rpc_port=$3
+    local eth_port=$4
+    local resolver_port=$5
+    local api_url=$6
+    local bearer_token=$7
+
+    echo "Starting validator $validator_num..."
+
+    cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
+        --env NODE_NAME="validator-${validator_num}" \
+        --env SUBNET_ID="$SUBNET_ID" \
+        --env HOME="$HOST_HOME_DIR" \
+        --env PRIVATE_KEY_PATH="/root/.ipc/validator${validator_num}/validator.sk" \
+        --env CMT_P2P_HOST_PORT="$p2p_port" \
+        --env CMT_RPC_HOST_PORT="$rpc_port" \
+        --env ETHAPI_HOST_PORT="$eth_port" \
+        --env RESOLVER_HOST_PORT="$resolver_port" \
+        --env BOOTSTRAPS="${COMETBFT_ID}@validator-1-cometbft:26656" \
+        --env RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${RESOLVER_ADDR}" \
+        --env PARENT_ENDPOINT="$api_url" \
+        --env PARENT_AUTH_TOKEN="$bearer_token" \
+        --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
+        --env TOPDOWN_PROPOSAL_DELAY=0 \
+        --env FM_PULL_SKIP=1 \
+        child-validator > /dev/null 2>&1
+    echo "Validator $validator_num started!"
+}
+
+# Start other validators in parallel
+pids=()
+run_validator 2 26756 26757 8645 26755 "$API_URL_2" "$BEARER_TOKEN_2" & pids+=("$!")
+run_validator 3 26856 26857 8745 26855 "$API_URL_3" "$BEARER_TOKEN_3" & pids+=("$!")
+run_validator 4 26956 26957 8845 26955 "$API_URL_4" "$BEARER_TOKEN_4" & pids+=("$!")
+
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
+
+echo "All validators have been started for subnet $SUBNET_ID!"
+echo ""
+echo "To save bootstrap information, run the following commands:"
+echo "export CometBftID=$COMETBFT_ID"
+echo "export ResolverAddress=$RESOLVER_ADDR"
+
