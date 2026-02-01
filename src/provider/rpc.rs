@@ -143,6 +143,31 @@ pub async fn create_subnet(
     Ok(CreateSubnetResponse { subnet_id })
 }
 
+/// Request struct for the join_subnet RPC endpoint.
+/// Separate from `IpcJoinSubnetMsg` because collateral is provided in the JSON request
+/// but skipped in postcard serialization (it's derived from the transaction output).
+#[derive(Debug, Deserialize)]
+pub struct JoinSubnetRequest {
+    pub subnet_id: SubnetId,
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub collateral: bitcoin::Amount,
+    pub ip: std::net::SocketAddr,
+    pub backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+    pub pubkey: bitcoin::XOnlyPublicKey,
+}
+
+impl From<JoinSubnetRequest> for IpcJoinSubnetMsg {
+    fn from(req: JoinSubnetRequest) -> Self {
+        Self {
+            subnet_id: req.subnet_id,
+            collateral: req.collateral,
+            ip: req.ip,
+            backup_address: req.backup_address,
+            pubkey: req.pubkey,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct JoinSubnetResponse {
     join_txid: bitcoin::Txid,
@@ -150,8 +175,9 @@ pub struct JoinSubnetResponse {
 
 pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
-    Params(msg): Params<IpcJoinSubnetMsg>,
+    Params(req): Params<JoinSubnetRequest>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
+    let msg: IpcJoinSubnetMsg = req.into();
     info!("joinsubnet: {:?}", msg);
 
     if let Err(err) = msg.validate() {
