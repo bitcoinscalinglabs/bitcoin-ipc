@@ -342,6 +342,7 @@ pub struct IpcJoinSubnetMsg {
     /// The subnet id of the subnet to join
     pub subnet_id: SubnetId,
     /// The amount of collateral to lock in the subnet
+    #[serde(skip)]
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub collateral: bitcoin::Amount,
     /// The IP address of the validator, as
