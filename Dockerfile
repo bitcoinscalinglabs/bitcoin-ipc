@@ -26,7 +26,7 @@ COPY . /workspace/bitcoin-ipc
 # Build bitcoin-ipc repo
 RUN cargo build --release
 
-# IPC artifacts come from a prebuilt image (build once, reuse):
+# Stage 2: IPC artifacts come from a prebuilt image (build once, reuse):
 #   docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 FROM ipc-builder:latest AS ipc-builder
 
@@ -35,6 +35,8 @@ FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
+    python3-pip \
+    build-essential \
     ca-certificates \
     libssl3 \
     curl \
@@ -104,9 +106,20 @@ RUN BITCOIN_VERSION=28.1 && \
 
 WORKDIR /workspace
 
+# Install solc-select for versioned solc management.
+# Debian enforces PEP 668 ("externally managed environment") for system Python.
+# `pipx` is a convenient way to install Python *applications* in an isolated venv.
+RUN apt-get update && apt-get install -y \
+    python3-full \
+    pipx \
+    && rm -rf /var/lib/apt/lists/* && \
+    pipx install solc-select && \
+    ln -sf /root/.local/bin/solc-select /usr/local/bin/solc-select && \
+    solc-select --help >/dev/null
+
 # Copy built binaries from bitcoin-ipc builder
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/bitcoin-ipc /usr/local/bin/
-COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/monitor /usr/local/bin/
+COPY --from=bitcoin-     /workspace/bitcoin-ipc/target/release/monitor /usr/local/bin/
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/provider /usr/local/bin/
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/quickstart /usr/local/bin/
 

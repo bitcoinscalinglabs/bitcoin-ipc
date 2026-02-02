@@ -42,9 +42,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 
 # Install Foundry
 RUN curl -L https://foundry.paradigm.xyz | bash
-
 ENV PATH="/root/.foundry/bin:${PATH}"
-
 RUN /root/.foundry/bin/foundryup && \
     forge --version && \
     cast --version
