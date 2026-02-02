@@ -32,14 +32,6 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 - **3040–3041** – Provider (user1–2)
 
 
-## Quick Start
-
-```bash
-docker-compose up --build
-docker-compose logs -f # Ctrl+C stops following logs; container keeps running
-
-```
-
 ## IPC build caching (separate image)
 
 The IPC repo is built into a separate image to avoid rebuilding it when you make local changes in this repo.
@@ -56,15 +48,12 @@ Then build/run the main container normally:
 docker-compose up --build
 ```
 
-## Full Rebuild
-
 To rebuild the image from scratch (ignore cache):
 
 ```bash
 docker-compose build --no-cache
 docker-compose up
 ```
-
 Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the image is rebuilt.
 
 ## Monitor and provider logs
@@ -79,12 +68,6 @@ Log files live inside the container at `/root/logs/` (same volume as `/root`, so
 ```bash
 # Stream one log
 docker exec bitcoin-ipc tail -f /root/logs/monitor-validator1.log
-
-# Last 50 lines
-docker exec bitcoin-ipc tail -50 /root/logs/provider-validator2.log
-
-# List log files
-docker exec bitcoin-ipc ls -la /root/logs/
 ```
 
 ## Running monitor and provider manually
@@ -106,15 +89,40 @@ pgrep -a monitor || true
 pgrep -a provider || true
 ```
 
-Or with `docker exec`:
+## Available commands (IPC-CLI, cast)
+All ipc-cli commands can be run from within the subnet. For example:
 
-```bash
-docker exec bitcoin-ipc monitor --env ~/.ipc/validator1/.env
-docker exec bitcoin-ipc provider --env ~/.ipc/validator1/.env
-# …
+- Send native (wBTC) tokens between accounts in the subnet:
+```
+export RPC_URL="http://host.docker.internal:8545"
+
+# Read hex private key from validator1 sk file.
+# Supports either raw hex with 0x prefix.
+# base64-encoded bytes (some key files): will be converted to hex
+SENDER_PRIVATE_KEY="$(tr -d '\r\n[:space:]' < /root/.ipc/validator1/validator.sk)"
+
+RECIPIENT_ADDRESS=0xb8c4486622484150084a8E1Ee6687e17fEBE6229
+
+# In the subnet 1 ether = 1 wBTC. To send 50K sats:
+VALUE="0.0005ether"
+
+# send 0.01 native units to an address
+cast send \
+  --rpc-url "$RPC_URL" \
+  --private-key "$SENDER_PRIVATE_KEY" \
+  --value $VALUE \
+  $RECIPIENT_ADDRESS
 ```
 
-## IPC-CLI
+- List balances in a subnet:
+```
+ipc-cli wallet balances --wallet-type btc --subnet $SubnetID
+```
+and
+```
+# With --ether to show the balance in wBTC unit (in the subnet 1 ether = 1 wBTC)
+cast balance --ether 0x27b60d9f71d6806cca7d5a92b391093fe100f8e8 --rpc-url $RPC_URL
+```
 
 Subnet creation (set `WHITELIST` first, e.g. from quickstart output):
 
@@ -127,15 +135,6 @@ docker exec -e WHITELIST=$WHITELIST bitcoin-ipc ipc-cli \
 ```
 
 Other commands (balance, etc.): use the same `ipc-cli --config-path ~/.ipc/validatorN/config.toml` (or `userN`) inside the container.
-
-## Fendermint Validators from the Host
-
-```bash
-./docker-deploy-local/run-fendermint-validator.sh <SUBNET_ID> [validator_number]
-# e.g. ./docker-deploy-local/run-fendermint-validator.sh /b4/t410f... 1
-```
-
-The script runs `cargo make` inside the `bitcoin-ipc` container. Override container with `CONTAINER_NAME` if needed.
 
 
 ## Troubleshooting
