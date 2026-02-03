@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Documentation builds
+docs/_build/
+
+# Benchmarks and plots
+bench-plots/
+

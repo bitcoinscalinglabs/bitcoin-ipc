@@ -15,3 +15,11 @@ outputs/*
 
 # example .env files
 !internal/**/.env
+
+# Foundry files for test contracts
+scripts/stablecoin-example/usdt-bsc-token/lib
+scripts/stablecoin-example/usdt-bsc-token/out
+scripts/stablecoin-example/usdt-bsc-token/cache
+
+_container_inspect/*
+.ipc/

@@ -27,8 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_dir = PathBuf::from(&home_dir).join(".ipc");
 
     // Check if $HOME/.ipc already exists
-    if ipc_dir.exists() {
-        println!("Directory {} already exists. Skipping.", ipc_dir.display());
+    if ipc_dir.exists()
+        && ipc_dir
+            .read_dir()?
+            .filter_map(Result::ok)
+            .any(|e| e.path().is_dir())
+    {
+        println!(
+            "Directory {} already contains subdirectories. Skipping.",
+            ipc_dir.display()
+        );
     } else {
         // Extract the embedded demo.ipc directory to $HOME/.ipc
         extract_embedded_dir(&DEMO_IPC, &ipc_dir)?;
@@ -123,7 +131,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         println!("Funding wallets...");
 
         // Fund validator wallets
-        for i in 1..=6 {
+        for i in 1..=5 {
             let wallet_name = format!("validator{}", i);
             fund_wallet(&wallet_name, 2).await?;
         }
