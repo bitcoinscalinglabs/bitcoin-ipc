@@ -1,19 +1,19 @@
 #!/bin/bash
 
-# Check if validator number is provided (optional, defaults to 1)
-VALIDATOR_NUM=${1:-1}
+# Check if RPC port is provided
+if [ -z "${1:-}" ]; then
+    echo "Error: RPC port of CometBFT node is required"
+    echo "Usage: $0 <rpc-port>"
+    echo "Example: $0 26657"
+    echo "Example: $0 26757"
+    echo "Example: $0 27657"
+    echo "Example: $0 27757"
+    exit 1
+fi
 
-# Map validator number to RPC port
-case $VALIDATOR_NUM in
-    1) RPC_PORT=26657 ;;
-    2) RPC_PORT=26757 ;;
-    3) RPC_PORT=26857 ;;
-    4) RPC_PORT=26957 ;;
-    5) RPC_PORT=27057 ;;
-    *) echo "Error: Invalid validator number. Valid range: 1-5"; exit 1 ;;
-esac
+RPC_PORT="$1"
 
-echo "Monitoring validators on validator $VALIDATOR_NUM (port $RPC_PORT)..."
+echo "Monitoring validators on port $RPC_PORT..."
 echo "Press Ctrl+C to exit"
 
 clear;

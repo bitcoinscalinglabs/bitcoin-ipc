@@ -295,7 +295,7 @@ for f in "${CONFIG_FILES[@]}"; do
   fi
   cat >> "$f" <<EOF
 
-# Subnet : ${SUBNET_ID}, created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
+# Created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
 [[subnets]]
 id = "${SUBNET_ID}"
 

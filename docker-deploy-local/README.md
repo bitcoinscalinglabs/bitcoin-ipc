@@ -1,19 +1,39 @@
 # Docker Deployment Guide (Local)
 
-Guide for running Bitcoin IPC in Docker for **local deployment**: all validator containers on a single host. The Compose project name is `bitcoin-ipc-local`; the main container name is `bitcoin-ipc`, specified in `Dockerfile1`; this uses container `ipc-builder`, specified in `Dockerfile.ipc`.
+Guide for running Bitcoin IPC in Docker for **local deployment**.
+
+## Building the repo and starting the `bitcoin-ipc` container
+
+The IPC repo is built into a separate image to avoid rebuilding when we make local changes to this repo.
+
+Build it once (from repo root):
+
+```bash
+docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
+```
+
+Then build/run the main container normally:
+
+```bash
+docker-compose up --build
+```
+
+Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the image is rebuilt.
+
 
 ## What does the `bitcoin-ipc` container run?
 
 The `bitcoin-ipc` container contains/runs:
 
-- **Bitcoin Core** in `regtest` mode for private blockchain testing.
-- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 5 validators and 2 users, using the `quickstart` script.
-- The `monitor` and `provider` binaries for each validator (`validator1`–`validator5`) and user (`user1`, `user2`).
-  - Captures logs for each monitor/provider instance, outputting them to `/root/logs/` inside the container.
-- The `ipc-cli` tool and `Fendermint` image.
-- Sets the environment variables
-- A script to quickly create, join, and fund subnet can be found on `/workspace/bitcoin-ipc/internal/bootstrap_subnet_in_container.sh` (not run automatically).
-- The script `/workspace/bitcoin-ipc/scripts/miner.sh` is started automatically by the entrypoint script.
+- Bitcoin Core in `regtest` mode.
+- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 5 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
+- The `monitor` and `provider` binaries for each validator (`validator1`–`validator5`) and user (`user1`, `user2`), automatically started upon container creation.
+- The captured logs for each monitor and provider instance in the `/root/logs/` directory inside the container.
+- The `ipc-cli` tool.
+- Sets the required environment variables
+- The script `/workspace/bitcoin-ipc/scripts/miner.sh` that mines regtest blocks every 10 seconds is started automatically upon container creation.
+- A script to quickly create, join, and fund subnet can be found on `/workspace/bitcoin-ipc/internal/bootstrap_subnet_in_container.sh` in the container (not run automatically).
+
 
 ## Layout Inside the Container
 
@@ -32,29 +52,7 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 - **3040–3041** – Provider (user1–2)
 
 
-## IPC build caching (separate image)
 
-The IPC repo is built into a separate image to avoid rebuilding it when you make local changes in this repo.
-
-Build it once (from repo root):
-
-```bash
-docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
-```
-
-Then build/run the main container normally:
-
-```bash
-docker-compose up --build
-```
-
-To rebuild the image from scratch (ignore cache):
-
-```bash
-docker-compose build --no-cache
-docker-compose up
-```
-Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the image is rebuilt.
 
 ## Monitor and provider logs
 

@@ -12,12 +12,14 @@ services:
       - root-data:/root
       # Bind-mount entrypoint script for fast iteration (no rebuild needed)
       - ./docker-deploy-local/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
-      # Bind-mount spin_up_subnet_a_from_container.sh for quick subnet spin-up
-      - ./scripts/spin_up_subnet_a_from_container.sh:/usr/local/bin/spin_up_subnet_a_from_container.sh:ro
-      # Bind-mount bootstrap_subnet_from_container.sh for quick subnet bootstrap
+      # Bind-mount script for quick subnet bootstrap
       - ./scripts/bootstrap_subnet_from_container.sh:/usr/local/bin/bootstrap_subnet_from_container.sh:ro
+      # Bind-mount scripts for quick validator spin-up
+      - ./scripts/spin_up_subnet_a_from_container.sh:/usr/local/bin/spin_up_subnet_a_from_container.sh:ro
+      - ./scripts/spin_up_subnet_b_from_container.sh:/usr/local/bin/spin_up_subnet_b_from_container.sh:ro
       # The next two mounts are: from container's /root/.ipc to host's $HOME/.ipc,
-      # from that to container's $HOME/.ipc.
+      # from that to container's $HOME/.ipc ($HOME is evaluated to the host's $HOME).
+      # This is for some ipc-cli commands to work properly from inside the container.
       - $HOME/.ipc:/root/.ipc
       - $HOME/.ipc:/$HOME/.ipc
       # Mount Docker socket so calls to docker from the container are handled by the host's Docker daemon
