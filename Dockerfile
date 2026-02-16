@@ -26,8 +26,8 @@ COPY . /workspace/bitcoin-ipc
 # Build bitcoin-ipc repo
 RUN cargo build --release
 
-# Stage 2: IPC artifacts come from a prebuilt image (build once, reuse):
-#   docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
+# Stage 2: IPC artifacts come from a prebuilt image (build once and reuse):
+# docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 FROM ipc-builder:latest AS ipc-builder
 
 # Stage 3: Final runtime environment
@@ -66,8 +66,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 #   build and run host-managed containers (e.g. fendermint) from inside this container.
 # - Debian's `docker.io` package can be too old for Docker Desktop / newer daemons, which
 #   causes `docker info`/`docker run` to fail.
-#
-# Why the keyring + repo:
 # - `docker-ce-cli` is distributed via Docker's official APT repository.
 # - APT verifies package signatures using Docker's public signing key.
 # - We store it in a repo-specific keyring (preferred over deprecated `apt-key`).
@@ -119,7 +117,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy built binaries from bitcoin-ipc builder
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/bitcoin-ipc /usr/local/bin/
-COPY --from=bitcoin-     /workspace/bitcoin-ipc/target/release/monitor /usr/local/bin/
+COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/monitor /usr/local/bin/
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/provider /usr/local/bin/
 COPY --from=bitcoin-ipc-builder /workspace/bitcoin-ipc/target/release/quickstart /usr/local/bin/
 
