@@ -1,6 +1,6 @@
 use crate::{
     bitcoin_utils,
-    db::{self, Database, StakingChange},
+    db::{self, BitcoinIpcDatabase, StakingChange},
     ipc_lib::{
         self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
         IpcKillSubnetMsg, IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg,
@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use thiserror::Error;
+
+#[cfg(feature = "emission_chain")]
+use crate::rewards::{RewardConfig, RewardDatabase};
 
 pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
 
@@ -1806,6 +1809,68 @@ pub async fn dev_kill_subnet(
     Ok(responses)
 }
 
+#[cfg(feature = "emission_chain")]
+pub async fn get_validator_rewards(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<crate::rewards::GetValidatorRewardParams>,
+) -> Result<crate::rewards::GetValidatorRewardResponse, JsonRpcError> {
+    let reward_config = {
+        let reward_config_path = std::env::var("REWARD_CONFIG_PATH")
+            .unwrap_or_else(|_| "reward_config.toml".to_string());
+        Arc::new(
+            RewardConfig::new_from_file(&reward_config_path).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to load REWARD_CONFIG_PATH='{}': {}",
+                    reward_config_path, e
+                )
+            }),
+        )
+    };
+
+    let Some((snapshot_number, start_height, end_height)) =
+        reward_config
+        .snapshot_boundaries_from_height(params.bitcoin_height)
+        .map_err(|e| RpcError::InternalError(format!("Error getting snapshot boundaries from height {}. Is the server configured correctly?: {}", params.bitcoin_height, e.to_string())))?
+    else {
+        trace!("Validator rewards not yet activated at bitcoin height {}.", params.bitcoin_height);
+        return Ok(crate::rewards::GetValidatorRewardResponse {
+            rewards_list: Vec::new(),
+            total_rewarded_collateral: bitcoin::Amount::from_sat(0),
+        });
+    };
+
+    info!(
+        "get_validator_rewards bitcoin_height={} snapshot={} start_height={} end_height={}",
+        params.bitcoin_height, snapshot_number, start_height, end_height
+    );
+
+    // Ensure snapshot is finalized
+    let last_processed_block = data.db.get_last_processed_block().map_err(|e| {
+        error!("Error getting last processed block from Db: {}", e);
+        RpcError::DbError(e)
+    })?;
+
+    let result = data
+        .db
+        .get_reward_result(snapshot_number)
+        .map_err(|e| {
+            error!("Error getting reward result from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or_else(|| {
+            info!("No cached rewards found for snapshot {}. Last processed block: {last_processed_block}", snapshot_number);
+            RpcError::InvalidParams(format!(
+                "No cached rewards found for snapshot {}",
+                snapshot_number
+            ))
+        })?;
+
+    Ok(crate::rewards::GetValidatorRewardResponse {
+        rewards_list: result.rewards_list,
+        total_rewarded_collateral: result.total_rewarded_collateral,
+    })
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     let server = jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -1837,6 +1902,9 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getstakechanges", get_stake_changes)
         // kill requests
         .with_method("getkillrequests", get_kill_requests);
+
+    #[cfg(feature = "emission_chain")]
+    let server = server.with_method("getvalidatorrewards", get_validator_rewards);
 
     #[cfg(feature = "dev")]
     // dev methods

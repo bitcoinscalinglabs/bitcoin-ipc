@@ -4,8 +4,13 @@ pub mod bitcoin_utils;
 pub mod db;
 pub mod eth_utils;
 pub mod ipc_lib;
+pub mod easy_tester;
 pub mod multisig;
 pub mod provider;
+
+#[cfg(feature = "emission_chain")]
+pub mod rewards;
+
 pub mod wallet;
 
 #[cfg(test)]

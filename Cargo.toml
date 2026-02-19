@@ -6,6 +6,7 @@ default-run = "bitcoin-ipc"
 
 [features]
 dev = []
+emission_chain = ["dep:toml"]
 
 [dependencies]
 bitcoin = { version = "0.32.5", features = ["serde"] }
@@ -33,10 +34,11 @@ base64 = "0.22.1"
 bincode = { version = "2.0.0", features = ["alloc", "std", "serde"] }
 include_dir = "0.7"
 postcard = { version = "1.1.3", features = ["use-std"] }
+toml = { version = "0.8.20", optional = true }
+rand = "0.8.5"
+tempfile = "3.17.1"
 
 [dev-dependencies]
 bitcoinconsensus = "0.106.0"
-tempfile = "3.17.1"
 test_retry = "0.1.0"
-rand = "0.8.5"
 csv = "1.3.1"

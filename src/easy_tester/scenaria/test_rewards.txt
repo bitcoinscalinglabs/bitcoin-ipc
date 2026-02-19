@@ -1,0 +1,16 @@
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+block 1
+create subnet1
+join subnet1 validator1 200_000_000

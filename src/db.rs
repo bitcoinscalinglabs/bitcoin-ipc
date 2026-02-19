@@ -32,6 +32,12 @@ const STAKE_CHANGES_KEY: &str = "stake_changes:";
 // kill_requests:<subnet_id>:<block_height>:<txid>
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
+// Number of LMDB databases (`heed::Database`) we open/create in this environment.
+#[cfg(feature = "emission_chain")]
+const MAX_DBS: u32 = 13;
+#[cfg(not(feature = "emission_chain"))]
+const MAX_DBS: u32 = 11;
+
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
 const KILL_REQUEST_VALID_BLOCKS: u64 = 3;
@@ -48,6 +54,10 @@ pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
 fn subnet_state_key(subnet_id: SubnetId) -> String {
     format!("{SUBNET_STATE_KEY}:{}", subnet_id)
+}
+
+fn all_subnets_prefix() -> String {
+    format!("{SUBNET_STATE_KEY}")
 }
 
 fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
@@ -365,7 +375,7 @@ pub struct SubnetCheckpoint {
 pub enum SubnetKillState {
     NotKilled,
     ToBeKilled,
-    Killed,
+    Killed { parent_height: u64 },
 }
 
 /// The current state of a subnet
@@ -482,7 +492,7 @@ impl SubnetState {
     }
 
     pub fn is_killed(&self) -> bool {
-        matches!(self.killed, SubnetKillState::Killed)
+        matches!(self.killed, SubnetKillState::Killed { .. })
     }
 
     pub fn is_killed_or_pending(&self) -> bool {
@@ -717,7 +727,7 @@ pub struct KillRequest {
 }
 
 pub struct HeedDb {
-    env: Env,
+    pub(crate) env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
@@ -729,6 +739,11 @@ pub struct HeedDb {
     committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
     stake_changes_db: HeedDatabase<Str, SerdeBincode<StakeChangeRequest>>,
     kill_requests_db: HeedDatabase<Str, SerdeBincode<KillRequest>>,
+    #[cfg(feature = "emission_chain")]
+    pub(crate) reward_candidates_db:
+        HeedDatabase<Str, SerdeBincode<crate::rewards::SubnetRewardInfo>>,
+    #[cfg(feature = "emission_chain")]
+    pub(crate) reward_results_db: HeedDatabase<Str, SerdeBincode<crate::rewards::SnapshotResult>>,
 }
 
 impl HeedDb {
@@ -767,7 +782,7 @@ impl HeedDb {
             EnvOpenOptions::new()
                 .flags(flags)
                 // TODO set max_dbs automatically
-                .max_dbs(11)
+                .max_dbs(MAX_DBS)
                 .open(database_path)?
         };
 
@@ -801,6 +816,14 @@ impl HeedDb {
             let kill_requests_db = env
                 .open_database(&rtxn, Some("kill_requests_db"))?
                 .ok_or(DbError::DbNotFound("kill_requests_db".to_string()))?;
+            #[cfg(feature = "emission_chain")]
+            let reward_candidates_db = env
+                .open_database(&rtxn, Some("reward_candidates_db"))?
+                .ok_or(DbError::DbNotFound("reward_candidates_db".to_string()))?;
+            #[cfg(feature = "emission_chain")]
+            let reward_results_db = env
+                .open_database(&rtxn, Some("reward_results_db"))?
+                .ok_or(DbError::DbNotFound("reward_results_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -814,6 +837,10 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
+                #[cfg(feature = "emission_chain")]
+                reward_candidates_db,
+                #[cfg(feature = "emission_chain")]
+                reward_results_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -827,6 +854,11 @@ impl HeedDb {
             let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
             let stake_changes_db = env.create_database(&mut txn, Some("stake_changes_db"))?;
             let kill_requests_db = env.create_database(&mut txn, Some("kill_requests_db"))?;
+            #[cfg(feature = "emission_chain")]
+            let reward_candidates_db =
+                env.create_database(&mut txn, Some("reward_candidates_db"))?;
+            #[cfg(feature = "emission_chain")]
+            let reward_results_db = env.create_database(&mut txn, Some("reward_results_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -840,12 +872,16 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
+                #[cfg(feature = "emission_chain")]
+                reward_candidates_db,
+                #[cfg(feature = "emission_chain")]
+                reward_results_db,
             })
         }
     }
 }
 
-pub trait Database {
+pub trait BitcoinIpcDatabase {
     fn write_txn(&self) -> Result<RwTxn, DbError>;
 
     // Monitor Info
@@ -872,6 +908,10 @@ pub trait Database {
         subnet_id: SubnetId,
         subnet_state: &SubnetState,
     ) -> Result<(), DbError>;
+
+    /// Returns all subnet states stored in the database.
+    fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError>;
+
     /// Gets a subnet by its multisig address
     fn get_subnet_by_multisig_address(
         &self,
@@ -880,27 +920,32 @@ pub trait Database {
 
     // Rootnet Messages
     fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError>;
+
     fn get_rootnet_msgs_by_height(
         &self,
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
+
     fn get_last_rootnet_msg_nonce_txn(
         &self,
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<Option<u64>, DbError>;
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+
     fn get_next_rootnet_msg_nonce_txn(
         &self,
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError>;
+
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
         nonce: u64,
     ) -> Result<Option<RootnetMessage>, DbError>;
+
     fn add_rootnet_msg(
         &self,
         txn: &mut RwTxn,
@@ -1007,7 +1052,7 @@ pub trait Database {
 }
 
 #[async_trait]
-impl Database for HeedDb {
+impl BitcoinIpcDatabase for HeedDb {
     fn write_txn(&self) -> Result<RwTxn, DbError> {
         self.env.write_txn().map_err(|e| e.into())
     }
@@ -1083,6 +1128,16 @@ impl Database for HeedDb {
         let key = subnet_state_key(subnet_id);
         self.subnet_db.put(txn, &key, subnet_state)?;
         Ok(())
+    }
+
+    fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError> {
+        let txn = self.env.read_txn()?;
+        let prefix = all_subnets_prefix();
+        let iter = self.subnet_db.prefix_iter(&txn, &prefix)?;
+        let subnets = iter
+            .map(|res| res.map(|(_, subnet_state)| subnet_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(subnets)
     }
 
     fn get_subnet_by_multisig_address(
@@ -1569,6 +1624,7 @@ pub enum DbError {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::ipc_lib::IpcCreateSubnetMsg;
     use crate::test_utils::*;
     use bitcoin::{hashes::Hash, key::Parity, Amount, BlockHash, Txid, XOnlyPublicKey};
     use std::str::FromStr;
