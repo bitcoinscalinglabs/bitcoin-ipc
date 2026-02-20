@@ -1,3 +1,4 @@
+use log::{info, trace};
 use std::{fs, path::Path};
 use thiserror::Error;
 
@@ -229,12 +230,16 @@ pub struct RewardConfig {
 }
 
 impl RewardConfig {
-    pub fn new_from_file(path: impl AsRef<Path>) -> Result<Self, RewardConfigError> {
-        let path = path.as_ref();
+    pub fn new_from_env() -> Result<Self, RewardConfigError> {
+        let path = std::env::var("REWARD_CONFIG_PATH")
+            .unwrap_or_else(|_| "reward_config.toml".to_string());
+        let path = Path::new(&path);
         let path_str = path.display().to_string();
-        let content = fs::read_to_string(path).map_err(|source| RewardConfigError::ReadFailed {
-            path: path_str.clone(),
-            source,
+        let content = fs::read_to_string(path).map_err(|source| {
+            RewardConfigError::InternalError(format!(
+                "Failed to read reward config from {}: {}",
+                path_str, source
+            ))
         })?;
         let cfg = toml::from_str::<RewardConfig>(&content).map_err(|source| {
             RewardConfigError::ParseFailed {
@@ -243,24 +248,43 @@ impl RewardConfig {
             }
         })?;
 
-        if cfg.snapshots_per_epoch == 0 {
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn new(
+        activation_height: u64,
+        epoch_length: u64,
+        snapshots_per_epoch: u64,
+    ) -> Result<Self, RewardConfigError> {
+        let cfg = RewardConfig {
+            activation_height,
+            epoch_length,
+            snapshots_per_epoch,
+        };
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), RewardConfigError> {
+        if self.snapshots_per_epoch == 0 {
             return Err(RewardConfigError::InvalidConfig(
                 "snapshots_per_epoch must be > 0".to_string(),
             ));
         }
-        if cfg.epoch_length == 0 {
+        if self.epoch_length == 0 {
             return Err(RewardConfigError::InvalidConfig(
                 "epoch_length must be > 0".to_string(),
             ));
         }
-        if cfg.epoch_length % cfg.snapshots_per_epoch != 0 {
+        if self.epoch_length % self.snapshots_per_epoch != 0 {
             return Err(RewardConfigError::InvalidConfig(format!(
                 "epoch_length ({}) must be divisible by snapshots_per_epoch ({})",
-                cfg.epoch_length, cfg.snapshots_per_epoch
+                self.epoch_length, self.snapshots_per_epoch
             )));
         }
-
-        Ok(cfg)
+        Ok(())
     }
 
     pub fn snapshot_length(&self) -> Result<u64, RewardConfigError> {
@@ -338,6 +362,237 @@ pub struct GetValidatorRewardParams {
 pub struct GetValidatorRewardResponse {
     pub rewards_list: Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)>,
     pub total_rewarded_collateral: bitcoin::Amount,
+}
+
+//
+// Reward tracker logic (shared by monitor + testers)
+//
+
+#[derive(Error, Debug)]
+pub enum RewardTrackerError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+
+    #[error("invalid configuration: {0}")]
+    Config(String),
+
+    #[error("IPC message error: {0}")]
+    IpcTxInvalid(String),
+}
+
+/// Reward logic, meant to be run on the emission chain.
+/// Function `update_after_block()` must be called after the caller finishes processing a Bitcoin block.
+/// Function `update_after_checkpoint()` must be called after the caller finishes processing a subnet checkpoint.
+/// For blocks with a checkpoint, `update_after_checkpoint()` must be called first and then `update_after_block()`.
+pub struct RewardTracker {
+    config: RewardConfig,
+}
+
+impl RewardTracker {
+    pub fn new() -> Self {
+        let config = RewardConfig::new_from_env()
+            .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
+        Self { config }
+    }
+
+    pub fn new_with_config(config: RewardConfig) -> Self {
+        Self { config }
+    }
+
+    // After processing a block, we need to do the following:
+    // 1. If we are at the start of a snapshot, store all subnets that are candidates for rewards in this snapshot.
+    // 2. If we are at the end of a snapshot, calculate the rewards for all subnets that are candidates for rewards in this snapshot.
+    pub fn update_after_block(
+        &mut self,
+        db: &dyn RewardDatabase,
+        block_height: u64,
+    ) -> Result<(), RewardTrackerError> {
+        let Some((snapshot, start_height, end_height)) = self
+            .config
+            .snapshot_boundaries_from_height(block_height)
+            .map_err(|e| RewardTrackerError::Config(e.to_string()))?
+        else {
+            trace!("Validator rewards not yet activated at block height {block_height}.");
+            return Ok(());
+        };
+
+        // 1. Start of snapshot: store candidate subnets.
+        if block_height == start_height {
+            info!("Start of snapshot {snapshot} at block height {start_height}.");
+            let active_subnets = db.get_all_active_subnets(start_height, end_height)?;
+
+            let mut wtxn = db.write_txn()?;
+            for subnet in active_subnets {
+                db.put_reward_info(
+                    &mut wtxn,
+                    snapshot,
+                    subnet.id,
+                    &SubnetRewardInfo {
+                        most_recent_committee_number: subnet.committee_number,
+                        rewarded_amounts: None,
+                    },
+                )?;
+            }
+            wtxn.commit().map_err(DbError::from)?;
+        }
+
+        // 2. End of snapshot: finalize rewards.
+        if block_height == end_height {
+            info!("End of snapshot {snapshot} at block height {end_height}.");
+            let candidates = db.iter_reward_info(snapshot)?;
+
+            let mut rewards_total: std::collections::HashMap<
+                bitcoin::XOnlyPublicKey,
+                bitcoin::Amount,
+            > = std::collections::HashMap::new();
+
+            for (subnet_id, info) in candidates {
+                let rewards_in_subnet =
+                    self.get_or_init_reward_amounts(db, subnet_id, &info, block_height)?;
+
+                for (pk, amt) in rewards_in_subnet {
+                    rewards_total
+                        .entry(pk)
+                        .and_modify(|a| *a += amt)
+                        .or_insert(amt);
+                }
+            }
+
+            let rewards_list = rewards_total.into_iter().collect::<Vec<_>>();
+            let total_rewarded_collateral = rewards_list.iter().map(|(_, a)| *a).sum();
+
+            let mut wtxn = db.write_txn()?;
+            db.put_reward_result(
+                &mut wtxn,
+                snapshot,
+                &SnapshotResult {
+                    rewards_list,
+                    total_rewarded_collateral,
+                },
+            )?;
+            wtxn.commit().map_err(DbError::from)?;
+        }
+
+        Ok(())
+    }
+
+    /// React to a checkpoint during a snapshot:
+    /// 1. Kill checkpoint: delete the candidate (subnet is not eligible for rewards).
+    /// 2. Rotation checkpoint: lazily materialize and update a min-collateral accumulator.
+    pub fn update_after_checkpoint(
+        &mut self,
+        db: &dyn RewardDatabase,
+        block_height: u64,
+        subnet_id: SubnetId,
+        checkpoint: &crate::db::SubnetCheckpoint,
+    ) -> Result<(), RewardTrackerError> {
+        let Some((current_snapshot, start_height, _end_height)) = self
+            .config
+            .snapshot_boundaries_from_height(block_height)
+            .map_err(|e| RewardTrackerError::Config(e.to_string()))?
+        else {
+            trace!("Validator rewards not yet activated at block height {block_height}.");
+            return Ok(());
+        };
+
+        // Changes made on the first block of a snapshot are already accounted for in update_after_block().
+        if block_height == start_height {
+            return Ok(());
+        }
+
+        // 1. Kill checkpoint: remove subnet from candidates.
+        if checkpoint.is_kill_checkpoint {
+            let mut wtxn = db.write_txn()?;
+            db.delete_reward_info(&mut wtxn, current_snapshot, subnet_id)?;
+            wtxn.commit().map_err(DbError::from)?;
+            return Ok(());
+        }
+
+        // Nothing else to do if no committee rotation happened.
+        if checkpoint.signed_committee_number == checkpoint.next_committee_number {
+            return Ok(());
+        }
+
+        // Only update if subnet is still a candidate for this snapshot.
+        let Some(mut cand_info) = db.get_reward_info(current_snapshot, subnet_id)? else {
+            return Ok(());
+        };
+
+        // The following should never happen
+        if checkpoint.next_committee_number == cand_info.most_recent_committee_number {
+            trace!("Received checkpoint with next_committee_number equal to the most_recent_committee_number in reward candidate database for subnet {subnet_id}");
+            return Ok(());
+        }
+
+        // 2. Rotation checkpoint: update the min-collateral accumulator.
+        let mut rewards_in_subnet =
+            self.get_or_init_reward_amounts(db, subnet_id, &cand_info, block_height)?;
+
+        let new_committee = db
+            .get_committee(subnet_id, checkpoint.next_committee_number)?
+            .ok_or_else(|| {
+                RewardTrackerError::IpcTxInvalid(format!(
+                    "could not get committee {} for subnet {} at block height {}",
+                    checkpoint.next_committee_number, subnet_id, block_height
+                ))
+            })?;
+
+        let new_committee_collaterals: std::collections::HashMap<
+            bitcoin::XOnlyPublicKey,
+            bitcoin::Amount,
+        > = new_committee
+            .validators
+            .into_iter()
+            .filter(|v| v.collateral > bitcoin::Amount::ZERO)
+            .map(|v| (v.pubkey, v.collateral))
+            .collect();
+
+        rewards_in_subnet = rewards_in_subnet
+            .into_iter()
+            .filter_map(|(pk, rewarded_collateral)| {
+                let new_collateral = new_committee_collaterals.get(&pk)?;
+                Some((pk, rewarded_collateral.min(*new_collateral)))
+            })
+            .collect();
+
+        cand_info.most_recent_committee_number = checkpoint.next_committee_number;
+        cand_info.rewarded_amounts = Some(rewards_in_subnet);
+
+        let mut wtxn = db.write_txn()?;
+        db.put_reward_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
+        wtxn.commit().map_err(DbError::from)?;
+
+        Ok(())
+    }
+
+    fn get_or_init_reward_amounts(
+        &mut self,
+        db: &dyn RewardDatabase,
+        subnet_id: SubnetId,
+        info: &SubnetRewardInfo,
+        block_height: u64,
+    ) -> Result<Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)>, RewardTrackerError> {
+        let reward_amounts: Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)> =
+            if let Some(v) = &info.rewarded_amounts {
+                v.clone()
+            } else {
+                let committee = db
+                    .get_committee(subnet_id, info.most_recent_committee_number)?
+                    .ok_or_else(|| {
+                        RewardTrackerError::IpcTxInvalid(format!(
+                            "could not get committee {} for subnet {} at block height {}",
+                            info.most_recent_committee_number, subnet_id, block_height
+                        ))
+                    })?;
+                committee
+                    .validators
+                    .into_iter()
+                    .filter(|v| v.collateral > bitcoin::Amount::ZERO)
+                    .map(|v| (v.pubkey, v.collateral))
+                    .collect()
+            };
+        Ok(reward_amounts)
+    }
 }
 
 #[cfg(test)]

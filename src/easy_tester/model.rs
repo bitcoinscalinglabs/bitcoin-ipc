@@ -43,6 +43,31 @@ impl SetupSpec {
 }
 
 #[derive(Debug, Clone)]
+pub enum TesterConfig {
+    RewardTester {
+        activation_height: u64,
+        epoch_length: u64,
+        snapshots_per_epoch: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    pub tester: TesterConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDb {
+    Subnet,
+    SubnetGenesis,
+    StakeChanges,
+    KillRequests,
+    Committee,
+    RewardCandidates,
+    RewardResults,
+}
+
+#[derive(Debug, Clone)]
 pub enum ScenarioCommand {
     Block { height: u64 },
     Create { subnet_name: String },
@@ -51,10 +76,23 @@ pub enum ScenarioCommand {
         validator_name: String,
         collateral_sats: u64,
     },
+    Checkpoint { subnet_name: String },
+    OutputRead { db: OutputDb, args: Vec<String> },
+    OutputExpect {
+        target: OutputExpectTarget,
+        expected_sats: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedTestFile {
+pub enum OutputExpectTarget {
+    RewardResultsRewardsList { key: String },
+    RewardResultsTotalRewardedCollateral,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedTest {
+    pub config: TestConfig,
     pub setup: SetupSpec,
     pub scenario: Vec<ScenarioCommand>,
 }

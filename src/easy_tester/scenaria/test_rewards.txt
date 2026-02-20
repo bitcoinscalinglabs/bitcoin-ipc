@@ -1,3 +1,8 @@
+config
+tester RewardTester activation_height = 1 epoch_length = 10 snapshots_per_epoch = 1
+# each snapshot is 10 blocks long
+# snapshot 0: blocks 1-10, snapshot 1: blocks 11-20, etc
+
 setup
 
 validator1
@@ -5,12 +10,45 @@ validator2
 validator3
 validator4
 validator5
+validator6
 
 subnet1
 whitelist validator1 validator2 validator3 validator4
 min 4
 
 scenario
-block 1
+
+block 5
 create subnet1
-join subnet1 validator1 200_000_000
+join subnet1 validator1 100_000_000
+join subnet1 validator2 200_000_000
+join subnet1 validator3 300_000_000
+join subnet1 validator4 400_000_000
+
+block 11 # snapshot 0: blocks 1-10
+output read reward_results 0
+output expect result.total_rewarded_collateral = 0 # subnet not active for whole snapshot
+
+block 15
+join subnet1 validator1 500_000_000
+
+block 16
+checkpoint subnet1 # validator1 effectively joins at block 16
+
+block 21 # snapshot 1: blocks 11-20
+output read reward_results 1
+output expect result.rewards_list.validator1 = 100_000_000 # validators 1-4 in subnet for whole snapshot
+output expect result.rewards_list.validator5 = 0 # validator 5 not in subnet for whole snapshot
+
+block 31 # snapshot 2: blocks 21-30
+output read reward_results 2
+output expect result.rewards_list.total_rewarded_collateral = 1_500_000_000 # validators 1-5 in subnet for whole snapshot
+output expect result.rewards_list.validator5 = 500_000_000
+
+join subnet1 validator6 600_000_000
+checkpoint subnet1 # validator6 effectively joins at block 31
+
+block41 # snapshot 3: blocks 31-40
+output read reward_results 2
+output expect result.rewards_list.total_rewarded_collateral = 2_100_000_000 # validators 1-6 in subnet for whole snapshot
+output expect result.rewards_list.validator6 = 600_000_000 # validator6 joined on the first block of the snapshot

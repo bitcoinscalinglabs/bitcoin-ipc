@@ -1,10 +1,15 @@
 pub mod error;
 pub mod model;
 pub mod parser;
-pub mod runner;
+#[cfg(feature = "emission_chain")]
+pub mod reward_tester;
+pub mod tester;
 
 pub use error::EasyTesterError;
-pub use model::ParsedTestFile;
+pub use model::ParsedTest;
+pub use model::ScenarioCommand;
+pub use model::OutputDb;
 pub use parser::parse_test_file;
-pub use runner::DbTester;
-
+#[cfg(feature = "emission_chain")]
+pub use reward_tester::RewardTester;
+pub use tester::Tester;

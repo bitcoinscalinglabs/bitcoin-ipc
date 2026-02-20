@@ -15,7 +15,7 @@ use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
 #[cfg(feature = "emission_chain")]
-use bitcoin_ipc::rewards::{RewardConfig, RewardDatabase, SubnetRewardInfo};
+use bitcoin_ipc::rewards::{RewardDatabase, RewardTracker};
 
 #[cfg(feature = "emission_chain")]
 trait MonitorDatabase: BitcoinIpcDatabase + RewardDatabase {}
@@ -132,11 +132,6 @@ enum SideEffect {
     },
 }
 
-#[cfg(feature = "emission_chain")]
-struct RewardTracker {
-    config: RewardConfig,
-}
-
 // TODO use generics for rpc + add a trait for the monitor
 struct Monitor<D: MonitorDatabase> {
     db: D,
@@ -147,7 +142,7 @@ struct Monitor<D: MonitorDatabase> {
     cancel_token: CancellationToken,
     side_effects: Vec<SideEffect>,
     #[cfg(feature = "emission_chain")]
-    reward_calculator: RewardTracker,
+    reward_tracker: RewardTracker,
 }
 
 impl<D> Monitor<D>
@@ -170,7 +165,7 @@ where
             current_height: 0,
             side_effects: Vec::new(),
             #[cfg(feature = "emission_chain")]
-            reward_calculator: RewardTracker::new(),
+            reward_tracker: RewardTracker::new(),
         }
     }
 
@@ -230,7 +225,7 @@ where
                 // Reward bookkeeping hooks (must run after processing all tx in each block).
                 #[cfg(feature = "emission_chain")]
                 match self
-                    .reward_calculator
+                    .reward_tracker
                     .update_after_block(&self.db, next_height)
                 {
                     Ok(_) => info!("Updated reward bookkeeping after block {}", next_height),
@@ -663,7 +658,7 @@ where
 
                 // Reward bookkeeping on checkpoint.
                 #[cfg(feature = "emission_chain")]
-                match self.reward_calculator.update_after_checkpoint(
+                match self.reward_tracker.update_after_checkpoint(
                     &self.db,
                     block_height,
                     msg.subnet_id,
@@ -778,254 +773,6 @@ where
                 Err(e)
             }
         }
-    }
-}
-
-/// Reward logic, meant to be run on the emission chain.
-/// Function update_after_block() must be called after the monitor finishes processing a Bitcoin block.
-/// Function update_after_checkpoint() must be called after the monitor finishes processing a subnet checkpoint.
-/// For blocks with a checkpoint, update_after_checkpoint() must be called first and then update_after_block().
-#[cfg(feature = "emission_chain")]
-impl RewardTracker {
-    fn new() -> Self {
-        let config = {
-            let reward_config_path = std::env::var("REWARD_CONFIG_PATH")
-                .unwrap_or_else(|_| "reward_config.toml".to_string());
-            RewardConfig::new_from_file(&reward_config_path).unwrap_or_else(|e| {
-                panic!(
-                    "Failed to load REWARD_CONFIG_PATH='{}': {}",
-                    reward_config_path, e
-                )
-            })
-        };
-        Self { config }
-    }
-
-    // After processing a block, we need to do the following:
-    // 1. If we are at the start of a snapshot, store all subnets that are candidates for rewards in this snapshot.
-    // 2. If we are at the end of a snapshot, calculate the rewards for all subnets that are candidates for rewards in this snapshot.
-    fn update_after_block(
-        &mut self,
-        db: &dyn MonitorDatabase,
-        block_height: u64,
-    ) -> Result<(), MonitorError> {
-        let Some((snapshot, start_height, end_height)) = self
-            .config
-            .snapshot_boundaries_from_height(block_height)
-            .map_err(|e| MonitorError::ConfigError(e.to_string()))?
-        else {
-            trace!("Validator rewards not yet activated at block height {block_height}.");
-            return Ok(());
-        };
-
-        // 1.
-        // On the first block of a snapshot, store all subnets that are candidates for rewards in this snapshot.
-        // The candidate subnets are those returned by get_all_active_subnets().
-        // Their validators will get rewarded at the end of the snapshot if they are still in the subnet's committee.
-        if block_height == start_height {
-            info!("Start of snapshot {snapshot} at block height {start_height}.");
-            let active_subnets = db.get_all_active_subnets(start_height, end_height)?;
-
-            let mut wtxn = db.write_txn()?;
-            for subnet in active_subnets {
-                db.put_reward_info(
-                    &mut wtxn,
-                    snapshot,
-                    subnet.id,
-                    &SubnetRewardInfo {
-                        most_recent_committee_number: subnet.committee_number,
-                        rewarded_amounts: None,
-                    },
-                )?;
-            }
-            wtxn.commit().map_err(db::DbError::from)?;
-        }
-
-        // 2.
-        // At the end of a snapshot, calculate the rewards for all subnets that are still in the candidates database.
-        //
-        // The per-subnet rewards are computed in two places:
-        // A) If the subnet had a committee rotation during the snapshot, the rewards have already been computed
-        // and are already stored in the SubnetRewardInfo.rewarded_amounts entry of that subnet (see update_after_checkpoint()).
-        // B) If the subnet did not have a committee rotation during the snapshot, then SubnetRewardInfo.rewarded_amounts is None.
-        // We compute the rewards now by getting the committee snapshot at the most recent committee number and then iterating
-        // over the validators in the committee.
-        //
-        // The total rewards are computed by summing the per-subnet rewards for each validator.
-        if block_height == end_height {
-            use bitcoin_ipc::rewards::SnapshotResult;
-
-            info!("End of snapshot {snapshot} at block height {end_height}.");
-            let candidates = db.iter_reward_info(snapshot)?;
-
-            let mut rewards_total: std::collections::HashMap<
-                bitcoin::XOnlyPublicKey,
-                bitcoin::Amount,
-            > = std::collections::HashMap::new();
-
-            for (subnet_id, info) in candidates {
-                let rewards_in_subnet =
-                    self.get_or_init_reward_amounts(db, subnet_id, &info, block_height)?;
-
-                for (pk, amt) in rewards_in_subnet {
-                    rewards_total
-                        .entry(pk)
-                        .and_modify(|a| *a += amt)
-                        .or_insert(amt);
-                }
-            }
-
-            let rewards_list = rewards_total.into_iter().collect::<Vec<_>>();
-            let total_rewarded_collateral = rewards_list.iter().map(|(_, a)| *a).sum();
-
-            let mut wtxn = db.write_txn()?;
-            db.put_reward_result(
-                &mut wtxn,
-                snapshot,
-                &SnapshotResult {
-                    rewards_list,
-                    total_rewarded_collateral,
-                },
-            )?;
-            wtxn.commit().map_err(db::DbError::from)?;
-        }
-
-        Ok(())
-    }
-
-    /// At the beginning of a snapshot (see update_after_block()), we created a candidate for each active subnet.
-    /// Now, during the snapshot, we react to checkpoint events:
-    /// 1. Kill checkpoint: delete the candidate (subnet is not eligible for rewards).
-    /// 2. Rotation checkpoint: lazily materialize and update a min-collateral accumulator.
-    ///
-    /// The SubnetRewardInfo.rewarded_amounts entry for each subnet acts as an accumulator,
-    /// keeping track of validators and their minimum collateral seen across all rotations during the snapshot.
-    ///
-    /// If a subnet has no rotations during the snapshot, we avoid storing the accumulator and later derive
-    /// rewards directly from the start committee snapshot at finalization time (see update_after_block()).
-    fn update_after_checkpoint(
-        &mut self,
-        db: &dyn MonitorDatabase,
-        block_height: u64,
-        subnet_id: bitcoin_ipc::SubnetId,
-        checkpoint: &db::SubnetCheckpoint,
-    ) -> Result<(), MonitorError> {
-        let Some((current_snapshot, start_height, _end_height)) = self
-            .config
-            .snapshot_boundaries_from_height(block_height)
-            .map_err(|e| MonitorError::ConfigError(e.to_string()))?
-        else {
-            trace!("Validator rewards not yet activated at block height {block_height}.");
-            return Ok(());
-        };
-
-        // Changes made on the first block of a snapshot are already accounted for in update_after_block().
-        if block_height == start_height {
-            return Ok(());
-        }
-
-        // 1. Kill checkpoint: remove subnet from candidates (and do nothing else).
-        if checkpoint.is_kill_checkpoint {
-            let mut wtxn = db.write_txn()?;
-            db.delete_reward_info(&mut wtxn, current_snapshot, subnet_id)
-                .map_err(MonitorError::DbError)?;
-            wtxn.commit().map_err(db::DbError::from)?;
-            return Ok(());
-        }
-
-        // Nothing else to do if no committee rotation happened.
-        if checkpoint.signed_committee_number == checkpoint.next_committee_number {
-            return Ok(());
-        }
-
-        // Only update if subnet is still a candidate for this snapshot.
-        let Some(mut cand_info) = db
-            .get_reward_info(current_snapshot, subnet_id)
-            .map_err(MonitorError::DbError)?
-        else {
-            return Ok(());
-        };
-
-        // The following should never happen
-        if checkpoint.next_committee_number == cand_info.most_recent_committee_number {
-            trace!("Received checkpoint with next_committee_number equal to the most_recent_committee_number in reward candidate database for subnet {subnet_id}");
-            return Ok(());
-        }
-
-        // 2. Rotation checkpoint: read SubnetRewardInfo.rewarded_amounts, get the new committee,
-        // update SubnetRewardInfo.rewarded_amounts based on the new committee.
-        let mut rewards_in_subnet =
-            self.get_or_init_reward_amounts(db, subnet_id, &cand_info, block_height)?;
-
-        let new_committee = db
-            .get_committee(subnet_id, checkpoint.next_committee_number)?
-            .ok_or_else(|| {
-                MonitorError::IpcTxInvalid(format!(
-                    "could not get committee {} for subnet {} at block height {}",
-                    checkpoint.next_committee_number, subnet_id, block_height
-                ))
-            })?;
-
-        let new_committee_collaterals: std::collections::HashMap<
-            bitcoin::XOnlyPublicKey,
-            bitcoin::Amount,
-        > = new_committee
-            .validators
-            .into_iter()
-            .filter(|v| v.collateral > bitcoin::Amount::ZERO)
-            .map(|v| (v.pubkey, v.collateral))
-            .collect();
-
-        // Go through the original committee and their rewards, and keep only those validators that are still in the new committee.
-        // Keep the minimum collateral across the old and the new committee.
-        rewards_in_subnet = rewards_in_subnet
-            .into_iter()
-            .filter_map(|(pk, rewarded_collateral)| {
-                let new_collateral = new_committee_collaterals.get(&pk)?;
-                Some((pk, rewarded_collateral.min(*new_collateral)))
-            })
-            .collect();
-
-        cand_info.most_recent_committee_number = checkpoint.next_committee_number;
-        cand_info.rewarded_amounts = Some(rewards_in_subnet);
-
-        let mut wtxn = db.write_txn()?;
-        db.put_reward_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)
-            .map_err(MonitorError::DbError)?;
-        wtxn.commit().map_err(db::DbError::from)?;
-
-        Ok(())
-    }
-
-    /// If we have already cached some SubnetRewardInfo.rewarded_amounts for a subnet then return it,
-    /// otherwise read the rewarded amounts from the committee snapshot at SubnetRewardInfo
-    fn get_or_init_reward_amounts(
-        &mut self,
-        db: &dyn MonitorDatabase,
-        subnet_id: bitcoin_ipc::SubnetId,
-        info: &SubnetRewardInfo,
-        block_height: u64,
-    ) -> Result<Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)>, MonitorError> {
-        let reward_amounts: Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)> =
-            if let Some(v) = &info.rewarded_amounts {
-                v.clone()
-            } else {
-                let committee = db
-                    .get_committee(subnet_id, info.most_recent_committee_number)?
-                    .ok_or_else(|| {
-                        MonitorError::IpcTxInvalid(format!(
-                            "could not get committee {} for subnet {} at block height {}",
-                            info.most_recent_committee_number, subnet_id, block_height
-                        ))
-                    })?;
-                committee
-                    .validators
-                    .into_iter()
-                    .filter(|v| v.collateral > bitcoin::Amount::ZERO)
-                    .map(|v| (v.pubkey, v.collateral))
-                    .collect()
-            };
-        Ok(reward_amounts)
     }
 }
 

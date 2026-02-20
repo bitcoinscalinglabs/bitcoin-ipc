@@ -1814,18 +1814,8 @@ pub async fn get_validator_rewards(
     data: Data<Arc<ServerData>>,
     Params(params): Params<crate::rewards::GetValidatorRewardParams>,
 ) -> Result<crate::rewards::GetValidatorRewardResponse, JsonRpcError> {
-    let reward_config = {
-        let reward_config_path = std::env::var("REWARD_CONFIG_PATH")
-            .unwrap_or_else(|_| "reward_config.toml".to_string());
-        Arc::new(
-            RewardConfig::new_from_file(&reward_config_path).unwrap_or_else(|e| {
-                panic!(
-                    "Failed to load REWARD_CONFIG_PATH='{}': {}",
-                    reward_config_path, e
-                )
-            }),
-        )
-    };
+    let reward_config = RewardConfig::new_from_env()
+        .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
 
     let Some((snapshot_number, start_height, end_height)) =
         reward_config
