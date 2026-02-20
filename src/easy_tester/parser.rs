@@ -3,8 +3,8 @@ use std::{collections::HashSet, fs, path::PathBuf};
 use crate::easy_tester::{
     error::EasyTesterError,
     model::{
-        generate_validator, parse_u16_allow_underscores, parse_u64_allow_underscores, ParsedTest,
-        OutputDb, OutputExpectTarget, ScenarioCommand, SetupSpec, SubnetSpec, TestConfig,
+        generate_validator, parse_u16_allow_underscores, parse_u64_allow_underscores, OutputDb,
+        OutputExpectTarget, ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TestConfig,
         TesterConfig,
     },
 };
@@ -261,14 +261,15 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         let kv = parse_kv_pairs(&tokens[2..]).map_err(|e| {
                             EasyTesterError::parse(path.clone(), line_no, e, original_line)
                         })?;
-                        let activation_height = require_kv_u64(&kv, "activation_height").map_err(
-                            |e| EasyTesterError::parse(path.clone(), line_no, e, original_line),
-                        )?;
+                        let activation_height =
+                            require_kv_u64(&kv, "activation_height").map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?;
                         let epoch_length = require_kv_u64(&kv, "epoch_length").map_err(|e| {
                             EasyTesterError::parse(path.clone(), line_no, e, original_line)
                         })?;
-                        let snapshots_per_epoch =
-                            require_kv_u64(&kv, "snapshots_per_epoch").map_err(|e| {
+                        let snapshots_per_epoch = require_kv_u64(&kv, "snapshots_per_epoch")
+                            .map_err(|e| {
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
                             })?;
 
@@ -456,6 +457,50 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         },
                     });
                 }
+                "stake" => {
+                    if tokens.len() != 4 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "stake syntax: stake <subnetName> <validatorName> <amountToAddSats>",
+                            original_line,
+                        ));
+                    }
+                    let amount_sats = parse_u64_allow_underscores(tokens[3]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::Stake {
+                            subnet_name: tokens[1].to_string(),
+                            validator_name: tokens[2].to_string(),
+                            amount_sats,
+                        },
+                    });
+                }
+                "unstake" => {
+                    if tokens.len() != 4 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "unstake syntax: unstake <subnetName> <validatorName> <amountToRemoveSats>",
+                            original_line,
+                        ));
+                    }
+                    let amount_sats = parse_u64_allow_underscores(tokens[3]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::Unstake {
+                            subnet_name: tokens[1].to_string(),
+                            validator_name: tokens[2].to_string(),
+                            amount_sats,
+                        },
+                    });
+                }
                 "checkpoint" => {
                     if tokens.len() != 2 {
                         return Err(EasyTesterError::parse(
@@ -473,61 +518,41 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         },
                     });
                 }
-                "output" => {
+                "read" => {
                     if tokens.len() < 3 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "output syntax: output <read|expect> ...",
+                            "read syntax: read <db> <args...>",
                             original_line,
                         ));
                     }
-                    if tokens[1] == "read" {
-                        if tokens.len() < 4 {
-                            return Err(EasyTesterError::parse(
-                                path.clone(),
-                                line_no,
-                                "output syntax: output read <db> <args...>",
-                                original_line,
-                            ));
-                        }
-                        let db = parse_output_db(tokens[2]).map_err(|e| {
-                            EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                        })?;
-                        let args =
-                            tokens[3..].iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-                        validate_output_args(&path, line_no, original_line, db, &args)?;
+                    let db = parse_output_db(tokens[1]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    let args = tokens[2..]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<Vec<_>>();
+                    validate_output_args(&path, line_no, original_line, db, &args)?;
 
-                        scenario_entries.push(ScenarioEntry {
-                            line_no,
-                            text: original_line.to_string(),
-                            cmd: ScenarioCommand::OutputRead { db, args },
-                        });
-                        continue;
-                    }
-
-                    if tokens[1] == "expect" {
-                        let (target, expected_sats) =
-                            parse_output_expect(&path, line_no, original_line, &tokens[2..])?;
-                        scenario_entries.push(ScenarioEntry {
-                            line_no,
-                            text: original_line.to_string(),
-                            cmd: ScenarioCommand::OutputExpect {
-                                target,
-                                expected_sats,
-                            },
-                        });
-                        continue;
-                    }
-
-                    {
-                        return Err(EasyTesterError::parse(
-                            path.clone(),
-                            line_no,
-                            "only 'output read' and 'output expect' are supported",
-                            original_line,
-                        ));
-                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::OutputRead { db, args },
+                    });
+                }
+                "expect" => {
+                    let (target, expected_sats) =
+                        parse_output_expect(&path, line_no, original_line, &tokens[1..])?;
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::OutputExpect {
+                            target,
+                            expected_sats,
+                        },
+                    });
                 }
                 "setup" | "scenario" => {
                     return Err(EasyTesterError::parse(
@@ -693,6 +718,98 @@ fn validate_scenario(
                     ));
                 }
             }
+            ScenarioCommand::Stake {
+                subnet_name,
+                validator_name,
+                amount_sats,
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !setup.validators.contains_key(validator_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("validator '{validator_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before stake"),
+                        &entry.text,
+                    ));
+                }
+                if *amount_sats == 0 {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "amount must be greater than 0",
+                        &entry.text,
+                    ));
+                }
+            }
+            ScenarioCommand::Unstake {
+                subnet_name,
+                validator_name,
+                amount_sats,
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !setup.validators.contains_key(validator_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("validator '{validator_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before unstake"),
+                        &entry.text,
+                    ));
+                }
+                if *amount_sats == 0 {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "amount must be greater than 0",
+                        &entry.text,
+                    ));
+                }
+            }
             ScenarioCommand::Checkpoint { subnet_name } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
@@ -736,7 +853,11 @@ fn validate_scenario(
                     | OutputDb::KillRequests
                     | OutputDb::Committee
                     | OutputDb::RewardCandidates => {
-                        let subnet_arg_index = if *db == OutputDb::RewardCandidates { 1 } else { 0 };
+                        let subnet_arg_index = if *db == OutputDb::RewardCandidates {
+                            1
+                        } else {
+                            0
+                        };
                         let subnet_name = args.get(subnet_arg_index).ok_or_else(|| {
                             EasyTesterError::parse(
                                 path.clone(),
@@ -759,9 +880,7 @@ fn validate_scenario(
                             return Err(EasyTesterError::parse(
                                 path.clone(),
                                 entry.line_no,
-                                format!(
-                                    "subnet '{subnet_name}' must be created before output read"
-                                ),
+                                format!("subnet '{subnet_name}' must be created before read"),
                                 &entry.text,
                             ));
                         }
@@ -785,7 +904,7 @@ fn validate_scenario(
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         entry.line_no,
-                        "output expect is only supported after 'output read reward_results ...'",
+                        "expect is only supported after 'read reward_results ...'",
                         &entry.text,
                     ));
                 }
@@ -796,7 +915,7 @@ fn validate_scenario(
                             path.clone(),
                             entry.line_no,
                             format!(
-                                "output expect rewards_list key '{}' is not a known validator name",
+                                "expect rewards_list key '{}' is not a known validator name",
                                 key
                             ),
                             &entry.text,
@@ -817,14 +936,12 @@ fn parse_output_expect(
     tokens: &[&str],
 ) -> Result<(OutputExpectTarget, u64), EasyTesterError> {
     // Examples:
-    // output expect result.rewards_list.validator1 = 100_000 sats
-    // output expect result.total_rewarded_collateral = 1_000 sats
+    // expect result.rewards_list.validator1 = 100_000 sats
+    // expect result.total_rewarded_collateral = 1_000 sats
     let err = |msg: String| EasyTesterError::parse(path.clone(), line_no, msg, original_line);
 
     if tokens.len() < 3 {
-        return Err(err(
-            "expected: output expect <lhs> = <sats> [sats]".to_string(),
-        ));
+        return Err(err("expected: expect <lhs> = <sats> [sats]".to_string()));
     }
 
     // Support both `lhs = rhs` and `lhs=rhs` forms.
@@ -847,14 +964,13 @@ fn parse_output_expect(
         }
     }
 
-    let eq_pos = flat.iter().position(|t| t == "=").ok_or_else(|| {
-        err("expected '=' in output expect (e.g. ... = 100_000 sats)".to_string())
-    })?;
+    let eq_pos = flat
+        .iter()
+        .position(|t| t == "=")
+        .ok_or_else(|| err("expected '=' in expect (e.g. ... = 100_000 sats)".to_string()))?;
 
     if eq_pos == 0 || eq_pos + 1 >= flat.len() {
-        return Err(err(
-            "expected: output expect <lhs> = <sats> [sats]".to_string(),
-        ));
+        return Err(err("expected: expect <lhs> = <sats> [sats]".to_string()));
     }
 
     let lhs = flat[0..eq_pos].join(" ");
@@ -882,7 +998,7 @@ fn parse_output_expect(
     }
     if rhs_tokens.len() > 2 {
         return Err(err(
-            "too many tokens after rhs; expected: <sats> [sats]".to_string(),
+            "too many tokens after rhs; expected: <sats> [sats]".to_string()
         ));
     }
 
@@ -902,12 +1018,7 @@ fn parse_output_expect(
         ["result", "total_rewarded_collateral"] => {
             OutputExpectTarget::RewardResultsTotalRewardedCollateral
         }
-        _ => {
-            return Err(err(format!(
-                "unsupported output expect path '{}'",
-                lhs
-            )))
-        }
+        _ => return Err(err(format!("unsupported expect path '{}'", lhs))),
     };
 
     Ok((target, expected_sats))
@@ -938,54 +1049,51 @@ fn validate_output_args(
     match db {
         OutputDb::Subnet | OutputDb::SubnetGenesis => {
             if args.len() != 1 {
-                return Err(err("expected: output read <db> <subnetName>"));
+                return Err(err("expected: read <db> <subnetName>"));
             }
         }
         OutputDb::Committee => {
             if args.len() != 2 {
-                return Err(err("expected: output read committee <subnetName> <committee_number>"));
+                return Err(err(
+                    "expected: read committee <subnetName> <committee_number>",
+                ));
             }
-            parse_u64_allow_underscores(&args[1]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-            })?;
+            parse_u64_allow_underscores(&args[1])
+                .map_err(|e| EasyTesterError::parse(path.clone(), line_no, e, original_line))?;
         }
         OutputDb::StakeChanges => {
             if args.len() != 2 {
                 return Err(err(
-                    "expected: output read stake_changes <subnetName> <configuration_number>",
+                    "expected: read stake_changes <subnetName> <configuration_number>",
                 ));
             }
-            parse_u64_allow_underscores(&args[1]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-            })?;
+            parse_u64_allow_underscores(&args[1])
+                .map_err(|e| EasyTesterError::parse(path.clone(), line_no, e, original_line))?;
         }
         OutputDb::KillRequests => {
             if args.len() != 2 {
                 return Err(err(
-                    "expected: output read kill_requests <subnetName> <current_block_height>",
+                    "expected: read kill_requests <subnetName> <current_block_height>",
                 ));
             }
-            parse_u64_allow_underscores(&args[1]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-            })?;
+            parse_u64_allow_underscores(&args[1])
+                .map_err(|e| EasyTesterError::parse(path.clone(), line_no, e, original_line))?;
         }
         OutputDb::RewardCandidates => {
             if args.len() != 2 {
                 return Err(err(
-                    "expected: output read reward_candidates <snapshot> <subnetName>",
+                    "expected: read reward_candidates <snapshot> <subnetName>",
                 ));
             }
-            parse_u64_allow_underscores(&args[0]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-            })?;
+            parse_u64_allow_underscores(&args[0])
+                .map_err(|e| EasyTesterError::parse(path.clone(), line_no, e, original_line))?;
         }
         OutputDb::RewardResults => {
             if args.len() != 1 {
-                return Err(err("expected: output read reward_results <snapshot>"));
+                return Err(err("expected: read reward_results <snapshot>"));
             }
-            parse_u64_allow_underscores(&args[0]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-            })?;
+            parse_u64_allow_underscores(&args[0])
+                .map_err(|e| EasyTesterError::parse(path.clone(), line_no, e, original_line))?;
         }
     }
 

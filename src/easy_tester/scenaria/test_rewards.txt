@@ -11,6 +11,7 @@ validator3
 validator4
 validator5
 validator6
+validator7
 
 subnet1
 whitelist validator1 validator2 validator3 validator4
@@ -25,30 +26,72 @@ join subnet1 validator2 200_000_000
 join subnet1 validator3 300_000_000
 join subnet1 validator4 400_000_000
 
-block 11 # snapshot 0: blocks 1-10
-output read reward_results 0
-output expect result.total_rewarded_collateral = 0 # subnet not active for whole snapshot
+block 11
+read reward_results 0 # snapshot 0: blocks 1-10
+expect result.total_rewarded_collateral = 0 # subnet not active for whole snapshot
 
 block 15
-join subnet1 validator1 500_000_000
+join subnet1 validator5 500_000_000
 
 block 16
 checkpoint subnet1 # validator1 effectively joins at block 16
 
-block 21 # snapshot 1: blocks 11-20
-output read reward_results 1
-output expect result.rewards_list.validator1 = 100_000_000 # validators 1-4 in subnet for whole snapshot
-output expect result.rewards_list.validator5 = 0 # validator 5 not in subnet for whole snapshot
+block 21
+read reward_results 1 # snapshot 1: blocks 11-20
+expect result.rewards_list.validator1 = 100_000_000 # validators 1-4 in subnet for whole snapshot
+expect result.rewards_list.validator5 = 0 # validator 5 not in subnet for whole snapshot
 
-block 31 # snapshot 2: blocks 21-30
-output read reward_results 2
-output expect result.rewards_list.total_rewarded_collateral = 1_500_000_000 # validators 1-5 in subnet for whole snapshot
-output expect result.rewards_list.validator5 = 500_000_000
+block 31
+read reward_results 2 # snapshot 2: blocks 21-30
+expect result.total_rewarded_collateral = 1_500_000_000 # validators 1-5 in subnet for whole snapshot
+expect result.rewards_list.validator5 = 500_000_000
 
 join subnet1 validator6 600_000_000
 checkpoint subnet1 # validator6 effectively joins at block 31
 
-block41 # snapshot 3: blocks 31-40
-output read reward_results 2
-output expect result.rewards_list.total_rewarded_collateral = 2_100_000_000 # validators 1-6 in subnet for whole snapshot
-output expect result.rewards_list.validator6 = 600_000_000 # validator6 joined on the first block of the snapshot
+block 40 # last block of snapshot 3
+join subnet1 validator7 700_000_000
+unstake subnet1 validator2 100_000_000
+checkpoint subnet1
+
+block 41
+read reward_results 3 # snapshot 3: blocks 31-40
+expect result.total_rewarded_collateral = 2_000_000_000
+expect result.rewards_list.validator2 = 100_000_000 # validator2's minimum collateral across snapshot was 100_000_000
+expect result.rewards_list.validator6 = 600_000_000 # validator6 joined on the first block of the snapshot
+expect result.rewards_list.validator7 = 0 # validator7 joined on the first block of the snapshot
+
+block 51
+read reward_results 4 # snapshot 4: blocks 41-50
+expect result.rewards_list.validator2 = 100_000_000 # validator2's collateral is still 100_000_000
+expect result.rewards_list.validator7 = 700_000_000 # validator7 joined on the first block of the snapshot
+
+block 52
+stake subnet1 validator4 400_000_000
+checkpoint subnet1
+
+block 61
+read reward_results 5 # snapshot 5: blocks 51-60
+expect result.rewards_list.validator4 = 400_000_000 # validator4's min collateral across snapshot was 400_000_000
+
+block 66
+unstake subnet1 validator1 100_000_000 # remaining stake 0, equiv to leaving subnet
+
+block 69
+checkpoint subnet1
+
+block 71
+read reward_results 6 # snapshot 6: blocks 61-70
+expect result.rewards_list.validator1 = 0
+expect result.rewards_list.validator4 = 800_000_000
+
+unstake subnet1 validator2 100_000_000 # remaining stake 0, equiv to leaving subnet
+
+block 81
+checkpoint subnet1
+read reward_results 7 # last block of snapshot was 80
+expect result.rewards_list.validator2 = 100_000_000 # still had collateral at block 80
+
+block 91
+read reward_results 8
+expect result.rewards_list.validator2 = 0

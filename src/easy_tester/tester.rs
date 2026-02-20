@@ -13,6 +13,22 @@ pub trait Tester {
         collateral_sats: u64,
     ) -> Result<(), EasyTesterError>;
 
+    fn exec_stake_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError>;
+
+    fn exec_unstake_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError>;
+
     fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError>;
 
     fn exec_output_read(

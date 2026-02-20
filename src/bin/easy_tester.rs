@@ -4,7 +4,14 @@ use bitcoin_ipc::easy_tester::{parse_test_file, ScenarioCommand, Tester};
 use bitcoin_ipc::easy_tester::model::TesterConfig;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = try_main().await {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let mut args = std::env::args().skip(1);
@@ -83,6 +90,22 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
             } => {
                 let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_join_subnet(height, &subnet_name, &validator_name, collateral_sats)?;
+            }
+            ScenarioCommand::Stake {
+                subnet_name,
+                validator_name,
+                amount_sats,
+            } => {
+                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_stake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
+            }
+            ScenarioCommand::Unstake {
+                subnet_name,
+                validator_name,
+                amount_sats,
+            } => {
+                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_unstake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
             }
             ScenarioCommand::Checkpoint { subnet_name } => {
                 let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;

@@ -1,8 +1,5 @@
 use bitcoin::{
-    hashes::Hash,
-    key::Secp256k1,
-    secp256k1::SecretKey,
-    Amount, BlockHash, Txid, XOnlyPublicKey,
+    hashes::Hash, key::Secp256k1, secp256k1::SecretKey, Amount, BlockHash, Txid, XOnlyPublicKey,
 };
 use rand::RngCore;
 use std::collections::HashMap;
@@ -69,15 +66,34 @@ pub enum OutputDb {
 
 #[derive(Debug, Clone)]
 pub enum ScenarioCommand {
-    Block { height: u64 },
-    Create { subnet_name: String },
+    Block {
+        height: u64,
+    },
+    Create {
+        subnet_name: String,
+    },
     Join {
         subnet_name: String,
         validator_name: String,
         collateral_sats: u64,
     },
-    Checkpoint { subnet_name: String },
-    OutputRead { db: OutputDb, args: Vec<String> },
+    Stake {
+        subnet_name: String,
+        validator_name: String,
+        amount_sats: u64,
+    },
+    Unstake {
+        subnet_name: String,
+        validator_name: String,
+        amount_sats: u64,
+    },
+    Checkpoint {
+        subnet_name: String,
+    },
+    OutputRead {
+        db: OutputDb,
+        args: Vec<String>,
+    },
     OutputExpect {
         target: OutputExpectTarget,
         expected_sats: u64,
@@ -138,7 +154,10 @@ pub fn generate_validator(name: &str, ordinal: usize) -> ValidatorSpec {
     let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &sk);
     let (xonly_pubkey, _) = keypair.x_only_public_key();
 
-    let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, (ordinal as u8).max(1))), 8080);
+    let ip = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, (ordinal as u8).max(1))),
+        8080,
+    );
     let backup = create_rand_backup_address(xonly_pubkey);
 
     ValidatorSpec {
@@ -167,4 +186,3 @@ pub fn build_create_subnet_msg(subnet: &SubnetSpec) -> IpcCreateSubnetMsg {
 pub fn subnet_id_from_txid(txid: &Txid) -> SubnetId {
     SubnetId::from_txid(txid)
 }
-

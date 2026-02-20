@@ -3,9 +3,12 @@ use std::path::PathBuf;
 #[derive(thiserror::Error, Debug)]
 pub enum EasyTesterError {
     #[error("I/O error reading {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
-    #[error("parse error at {path}:{line}: {message}\n  {text}")]
+    #[error("parse error at {path}:{line}: {message}")]
     Parse {
         path: PathBuf,
         line: usize,
@@ -18,7 +21,12 @@ pub enum EasyTesterError {
 }
 
 impl EasyTesterError {
-    pub fn parse(path: impl Into<PathBuf>, line: usize, message: impl Into<String>, text: &str) -> Self {
+    pub fn parse(
+        path: impl Into<PathBuf>,
+        line: usize,
+        message: impl Into<String>,
+        text: &str,
+    ) -> Self {
         Self::Parse {
             path: path.into(),
             line,
@@ -31,4 +39,3 @@ impl EasyTesterError {
         Self::Runtime(message.into())
     }
 }
-

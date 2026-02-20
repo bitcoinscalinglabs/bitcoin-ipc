@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use bitcoin::{Amount, BlockHash, Txid};
+use bitcoin::{hashes::sha256, Amount, BlockHash, Txid};
 use log::{error, info};
+use rand::RngCore;
 use tempfile::TempDir;
 
 use crate::{
@@ -15,7 +16,10 @@ use crate::{
         tester::Tester,
     },
     eth_utils,
-    ipc_lib::{IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcValidate},
+    ipc_lib::{
+        IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcStakeCollateralMsg,
+        IpcUnstakeCollateralMsg, IpcValidate,
+    },
     rewards::{RewardConfig, RewardDatabase, RewardTracker},
     SubnetId,
 };
@@ -36,6 +40,13 @@ fn validator_ordinal(name: &str) -> Option<u64> {
     name.strip_prefix("validator")?.parse::<u64>().ok()
 }
 
+fn create_rand_checkpoint_hash() -> sha256::Hash {
+    use bitcoin::hashes::Hash;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    sha256::Hash::from_slice(&bytes).expect("random bytes should make a sha256 hash")
+}
+
 pub struct RewardTester {
     _temp_dir: TempDir,
     db: HeedDb,
@@ -43,6 +54,7 @@ pub struct RewardTester {
     reward_tracker: RewardTracker,
     block_hashes: HashMap<u64, BlockHash>,
     created_subnets: HashMap<String, SubnetId>,
+    checkpoint_heights: HashMap<String, u64>,
     last_reward_results: Option<LastRewardResults>,
 }
 
@@ -84,6 +96,7 @@ impl RewardTester {
             reward_tracker,
             block_hashes: HashMap::new(),
             created_subnets: HashMap::new(),
+            checkpoint_heights: HashMap::new(),
             last_reward_results: None,
         })
     }
@@ -230,15 +243,191 @@ impl Tester for RewardTester {
         Ok(())
     }
 
-    fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError> {
-        let _subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
+    fn exec_stake_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError> {
+        let block_hash = self.block_hash(height);
+        let subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
             EasyTesterError::runtime(format!(
                 "internal error: subnet '{subnet_name}' not found in created subnets"
             ))
         })?;
 
-        let _ = height;
-        unimplemented!("checkpoint command not implemented yet")
+        let validator = self
+            .setup
+            .validators
+            .get(validator_name)
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "internal error: validator '{validator_name}' missing from parsed setup"
+                ))
+            })?
+            .clone();
+
+        let amount = Amount::from_sat(amount_sats);
+        let msg = IpcStakeCollateralMsg {
+            subnet_id,
+            amount,
+            pubkey: validator.pubkey,
+        };
+
+        msg.validate()
+            .map_err(|e| EasyTesterError::runtime(format!("stake msg invalid: {e}")))?;
+
+        let subnet_state = self
+            .db
+            .get_subnet_state(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "scenario error: subnet state missing for {subnet_id} (did you run create/bootstrap?)"
+                ))
+            })?;
+
+        msg.validate_for_subnet(&subnet_state)
+            .map_err(|e| EasyTesterError::runtime(format!("stake rejected: {e}")))?;
+
+        let txid = create_rand_txid();
+        msg.save_to_db(&self.db, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("stake failed: {e}")))?;
+
+        info!(
+            "Stake: validator '{}' staked {} sats to subnet '{}'",
+            validator_name, amount_sats, subnet_name
+        );
+        Ok(())
+    }
+
+    fn exec_unstake_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError> {
+        let block_hash = self.block_hash(height);
+        let subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!(
+                "internal error: subnet '{subnet_name}' not found in created subnets"
+            ))
+        })?;
+
+        let validator = self
+            .setup
+            .validators
+            .get(validator_name)
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "internal error: validator '{validator_name}' missing from parsed setup"
+                ))
+            })?
+            .clone();
+
+        let amount = Amount::from_sat(amount_sats);
+        let msg = IpcUnstakeCollateralMsg {
+            subnet_id,
+            amount,
+            pubkey: Some(validator.pubkey),
+        };
+
+        msg.validate()
+            .map_err(|e| EasyTesterError::runtime(format!("unstake msg invalid: {e}")))?;
+
+        let genesis_info = self
+            .db
+            .get_subnet_genesis_info(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "scenario error: subnet genesis info missing for {subnet_id} (did you run create?)"
+                ))
+            })?;
+
+        let subnet_state = self
+            .db
+            .get_subnet_state(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "scenario error: subnet state missing for {subnet_id} (did you run create/bootstrap?)"
+                ))
+            })?;
+
+        msg.validate_for_subnet(&genesis_info, &subnet_state)
+            .map_err(|e| EasyTesterError::runtime(format!("unstake rejected: {e}")))?;
+
+        let txid = create_rand_txid();
+        msg.save_to_db(&self.db, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("unstake failed: {e}")))?;
+
+        info!(
+            "Unstake: validator '{}' unstaked {} sats from subnet '{}'",
+            validator_name, amount_sats, subnet_name
+        );
+        Ok(())
+    }
+
+    fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError> {
+        let subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!(
+                "internal error: subnet '{subnet_name}' not found in created subnets"
+            ))
+        })?;
+
+        let block_hash = self.block_hash(height);
+
+        let subnet_state = self
+            .db
+            .get_subnet_state(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .ok_or_else(|| EasyTesterError::runtime(format!("subnet state missing for {subnet_id}")))?;
+
+        let current_cfg = subnet_state.committee.configuration_number;
+        let latest_cfg = self
+            .db
+            .get_last_stake_change_configuration_number(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
+        let next_cfg = if latest_cfg > current_cfg { latest_cfg } else { 0 };
+
+        let checkpoint_height = self
+            .checkpoint_heights
+            .entry(subnet_name.to_string())
+            .and_modify(|h| *h += 1)
+            .or_insert(1);
+
+        let msg = IpcCheckpointSubnetMsg {
+            subnet_id,
+            checkpoint_hash: create_rand_checkpoint_hash(),
+            checkpoint_height: *checkpoint_height,
+            next_committee_configuration_number: next_cfg,
+            withdrawals: vec![],
+            transfers: vec![],
+            unstakes: vec![],
+            change_address: None,
+            is_kill_checkpoint: false,
+        };
+
+        msg.validate()
+            .map_err(|e| EasyTesterError::runtime(format!("checkpoint msg invalid: {e}")))?;
+
+        let txid = create_rand_txid();
+        let checkpoint = msg
+            .save_to_db(&self.db, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
+
+        self.reward_tracker
+            .update_after_checkpoint(&self.db, height, subnet_id, &checkpoint)
+            .map_err(|e| EasyTesterError::runtime(format!("reward bookkeeping after checkpoint failed: {e}")))?;
+
+        info!(
+            "Checkpoint: subnet '{}' committed at height {} (next_cfg={})",
+            subnet_name, height, next_cfg
+        );
+        Ok(())
     }
 
     fn exec_output_read(
@@ -329,7 +518,7 @@ impl Tester for RewardTester {
             return Ok(());
         }
 
-        // For now, `output expect` only applies to reward_results, so reset any stored value when
+        // For now, `expect` only applies to reward_results, so reset any stored value when
         // reading other DBs.
         self.last_reward_results = None;
 
@@ -443,7 +632,7 @@ impl Tester for RewardTester {
     ) -> Result<(), EasyTesterError> {
         let Some(last) = self.last_reward_results.as_ref() else {
             return Err(EasyTesterError::runtime(
-                "output expect used but there is no previous 'output read reward_results' result",
+                "expect used but there is no previous 'read reward_results' result",
             ));
         };
 

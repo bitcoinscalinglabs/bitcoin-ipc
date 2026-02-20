@@ -20,8 +20,8 @@ join subnet1 validator3 300_000_000
 join subnet1 validator4 400_000_000
 
 block 21
-output read reward_results 0
-output expect result.rewards_list.validator1 = 100_000_000 sats
-output expect result.reward_list.validator2 = 200_000_000 sats
-output expect result.total_rewarded_collateral = 1_000_000_000 sats
+read reward_results 0
+expect result.rewards_list.validator1 = 100_000_000 sats
+expect result.reward_list.validator2 = 200_000_000 sats
+expect result.total_rewarded_collateral = 1_000_000_000 sats
 

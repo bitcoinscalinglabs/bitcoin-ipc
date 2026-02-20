@@ -13,7 +13,7 @@ This `RewardTester` does **not** talk to Bitcoin RPC/watchonly RPC; it only oper
 
 ## Scenario
 - A block <N> line sets the current block height for subsequent commands.
-- Commands (create, join, output read, output expect, …) execute at the current block height.
+- Commands (create, join, read, expect, …) execute at the current block height.
 - The runner “mines” blocks when it needs to advance height (and it mines the final open block at EOF).
 
 ## Output
