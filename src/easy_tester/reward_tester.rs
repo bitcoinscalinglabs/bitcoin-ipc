@@ -134,7 +134,11 @@ impl Tester for RewardTester {
         Ok(())
     }
 
-    fn exec_create_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError> {
+    fn exec_create_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+    ) -> Result<(), EasyTesterError> {
         let spec = self
             .setup
             .subnets
@@ -371,7 +375,11 @@ impl Tester for RewardTester {
         Ok(())
     }
 
-    fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError> {
+    fn exec_checkpoint_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+    ) -> Result<(), EasyTesterError> {
         let subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
             EasyTesterError::runtime(format!(
                 "internal error: subnet '{subnet_name}' not found in created subnets"
@@ -384,14 +392,20 @@ impl Tester for RewardTester {
             .db
             .get_subnet_state(subnet_id)
             .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
-            .ok_or_else(|| EasyTesterError::runtime(format!("subnet state missing for {subnet_id}")))?;
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!("subnet state missing for {subnet_id}"))
+            })?;
 
         let current_cfg = subnet_state.committee.configuration_number;
         let latest_cfg = self
             .db
             .get_last_stake_change_configuration_number(subnet_id)
             .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
-        let next_cfg = if latest_cfg > current_cfg { latest_cfg } else { 0 };
+        let next_cfg = if latest_cfg > current_cfg {
+            latest_cfg
+        } else {
+            0
+        };
 
         let checkpoint_height = self
             .checkpoint_heights
@@ -421,7 +435,9 @@ impl Tester for RewardTester {
 
         self.reward_tracker
             .update_after_checkpoint(&self.db, height, subnet_id, &checkpoint)
-            .map_err(|e| EasyTesterError::runtime(format!("reward bookkeeping after checkpoint failed: {e}")))?;
+            .map_err(|e| {
+                EasyTesterError::runtime(format!("reward bookkeeping after checkpoint failed: {e}"))
+            })?;
 
         info!(
             "Checkpoint: subnet '{}' committed at height {} (next_cfg={})",
@@ -495,11 +511,7 @@ impl Tester for RewardTester {
                     });
 
                     for (_known, _ord, label, sats) in rows {
-                        println!(
-                            "  {} -> {} SAT",
-                            label,
-                            fmt_sats_with_underscores(sats)
-                        );
+                        println!("  {} -> {} SAT", label, fmt_sats_with_underscores(sats));
                     }
 
                     println!(
@@ -530,10 +542,14 @@ impl Tester for RewardTester {
                         "internal error: subnet '{subnet_name}' not found in created subnets"
                     ))
                 })?;
-                format!("{:?}", self.db.get_subnet_state(subnet_id).map_err(|e| {
-                    EasyTesterError::runtime(format!("db read failed: {e}"))
-                })?)
+                format!(
+                    "{:?}",
+                    self.db.get_subnet_state(subnet_id).map_err(|e| {
+                        EasyTesterError::runtime(format!("db read failed: {e}"))
+                    })?
+                )
             }
+
             OutputDb::SubnetGenesis => {
                 let subnet_name = &args[0];
                 let subnet_id = *self.created_subnets.get(subnet_name).ok_or_else(|| {
@@ -610,9 +626,9 @@ impl Tester for RewardTester {
                 })?;
                 format!(
                     "{:?}",
-                    RewardDatabase::get_reward_info(&self.db, snapshot, subnet_id).map_err(|e| {
-                        EasyTesterError::runtime(format!("db read failed: {e}"))
-                    })?
+                    RewardDatabase::get_reward_info(&self.db, snapshot, subnet_id).map_err(
+                        |e| { EasyTesterError::runtime(format!("db read failed: {e}")) }
+                    )?
                 )
             }
             OutputDb::RewardResults => {
@@ -639,11 +655,7 @@ impl Tester for RewardTester {
         match target {
             OutputExpectTarget::RewardResultsRewardsList { key } => {
                 // `key` is expected to be a validator name (parse-time enforced).
-                let got = last
-                    .rewards_by_validator
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0);
+                let got = last.rewards_by_validator.get(&key).copied().unwrap_or(0);
                 if got != expected_sats {
                     return Err(EasyTesterError::runtime(format!(
                         "EXPECT failed (snapshot {}): result.rewards_list.{} expected {} sats, got {} sats",
@@ -674,4 +686,3 @@ impl Tester for RewardTester {
         Ok(())
     }
 }
-
