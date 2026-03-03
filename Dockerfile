@@ -7,6 +7,8 @@
 # Stage 1: Build environment for Bitcoin-IPC
 FROM rust:1.87.0-slim AS bitcoin-ipc-builder
 
+ARG EMISSION_CHAIN_FEATURES=false
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     git \
@@ -24,7 +26,11 @@ WORKDIR /workspace/bitcoin-ipc
 COPY . /workspace/bitcoin-ipc
 
 # Build bitcoin-ipc repo
-RUN cargo build --release
+RUN if [ "$EMISSION_CHAIN_FEATURES" = "true" ]; then \
+        cargo build --release --features emission_chain; \
+    else \
+        cargo build --release; \
+    fi
 
 # Stage 2: IPC artifacts come from a prebuilt image (build once and reuse):
 # docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .

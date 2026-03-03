@@ -32,16 +32,14 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     match parsed.config.tester {
         TesterConfig::RewardTester {
             activation_height,
-            epoch_length,
-            snapshots_per_epoch,
+            snapshot_length,
         } => {
             #[cfg(feature = "emission_chain")]
             {
                 let mut tester = bitcoin_ipc::easy_tester::RewardTester::new(
                     parsed.setup,
                     activation_height,
-                    epoch_length,
-                    snapshots_per_epoch,
+                    snapshot_length,
                 )
                 .await?;
                 run_scenario(&mut tester, scenario)?;

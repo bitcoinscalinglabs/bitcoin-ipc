@@ -224,11 +224,12 @@ where
 
                 // Reward bookkeeping hooks (must run after processing all tx in each block).
                 #[cfg(feature = "emission_chain")]
+                info!("Updating reward bookkeeping after block {}", next_height);
                 match self
                     .reward_tracker
                     .update_after_block(&self.db, next_height)
                 {
-                    Ok(_) => info!("Updated reward bookkeeping after block {}", next_height),
+                    Ok(_) => {}
                     Err(e) => error!(
                         "Error updating reward bookkeeping after block {}: {:?}",
                         next_height, e
@@ -285,6 +286,20 @@ where
                                 // Retry logic can be added here if needed
                                 return Err(e);
                             }
+                        }
+
+                        // Reward bookkeeping hooks (must run after processing all tx in each block).
+                        #[cfg(feature = "emission_chain")]
+                        info!("Updating reward bookkeeping after block {}", next_height);
+                        match self
+                            .reward_tracker
+                            .update_after_block(&self.db, next_height)
+                        {
+                            Ok(_) => {}
+                            Err(e) => error!(
+                                "Error updating reward bookkeeping after block {}: {:?}",
+                                next_height, e
+                            ),
                         }
                     }
                 }
@@ -656,7 +671,7 @@ where
                     msg.subnet_id, msg.checkpoint_height, checkpoint.checkpoint_number
                 );
 
-                // Reward bookkeeping on checkpoint.
+                // Reward bookkeeping hooks after a checkpoint.
                 #[cfg(feature = "emission_chain")]
                 match self.reward_tracker.update_after_checkpoint(
                     &self.db,

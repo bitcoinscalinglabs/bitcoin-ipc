@@ -43,8 +43,7 @@ impl SetupSpec {
 pub enum TesterConfig {
     RewardTester {
         activation_height: u64,
-        epoch_length: u64,
-        snapshots_per_epoch: u64,
+        snapshot_length: u64,
     },
 }
 

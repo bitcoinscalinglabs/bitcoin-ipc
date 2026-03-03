@@ -69,12 +69,11 @@ impl RewardTester {
     pub async fn new(
         setup: SetupSpec,
         activation_height: u64,
-        epoch_length: u64,
-        snapshots_per_epoch: u64,
+        snapshot_length: u64,
     ) -> Result<Self, EasyTesterError> {
         eth_utils::set_fvm_network();
 
-        let config = RewardConfig::new(activation_height, epoch_length, snapshots_per_epoch)
+        let config = RewardConfig::new(activation_height, snapshot_length)
             .map_err(|e| EasyTesterError::runtime(format!("invalid reward config: {e}")))?;
         let reward_tracker = RewardTracker::new_with_config(config);
 
@@ -456,7 +455,7 @@ impl Tester for RewardTester {
             let snapshot = parse_u64_allow_underscores(&args[0])
                 .map_err(|e| EasyTesterError::runtime(format!("invalid snapshot: {e}")))?;
 
-            let res = RewardDatabase::get_reward_result(&self.db, snapshot)
+            let res = RewardDatabase::get_snapshot_result(&self.db, snapshot)
                 .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
 
             match res {
@@ -626,9 +625,10 @@ impl Tester for RewardTester {
                 })?;
                 format!(
                     "{:?}",
-                    RewardDatabase::get_reward_info(&self.db, snapshot, subnet_id).map_err(
-                        |e| { EasyTesterError::runtime(format!("db read failed: {e}")) }
-                    )?
+                    RewardDatabase::get_reward_candidate_info(&self.db, snapshot, subnet_id)
+                        .map_err(|e| {
+                            EasyTesterError::runtime(format!("db read failed: {e}"))
+                        })?
                 )
             }
             OutputDb::RewardResults => {

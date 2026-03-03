@@ -265,19 +265,14 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             require_kv_u64(&kv, "activation_height").map_err(|e| {
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
                             })?;
-                        let epoch_length = require_kv_u64(&kv, "epoch_length").map_err(|e| {
+                        let snapshot_length = require_kv_u64(&kv, "snapshot_length").map_err(|e| {
                             EasyTesterError::parse(path.clone(), line_no, e, original_line)
                         })?;
-                        let snapshots_per_epoch = require_kv_u64(&kv, "snapshots_per_epoch")
-                            .map_err(|e| {
-                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                            })?;
 
                         config = Some(TestConfig {
                             tester: TesterConfig::RewardTester {
                                 activation_height,
-                                epoch_length,
-                                snapshots_per_epoch,
+                                snapshot_length,
                             },
                         });
                     }

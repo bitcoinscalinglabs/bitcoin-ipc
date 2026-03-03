@@ -1810,53 +1810,54 @@ pub async fn dev_kill_subnet(
 }
 
 #[cfg(feature = "emission_chain")]
-pub async fn get_validator_rewards(
+pub async fn get_rewared_collaterals(
     data: Data<Arc<ServerData>>,
-    Params(params): Params<crate::rewards::GetValidatorRewardParams>,
-) -> Result<crate::rewards::GetValidatorRewardResponse, JsonRpcError> {
+    Params(params): Params<crate::rewards::GetRewardedCollateralsParams>,
+) -> Result<crate::rewards::GetRewardedCollateralsResponse, JsonRpcError> {
     let reward_config = RewardConfig::new_from_env()
         .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
 
-    let Some((snapshot_number, start_height, end_height)) =
-        reward_config
-        .snapshot_boundaries_from_height(params.bitcoin_height)
-        .map_err(|e| RpcError::InternalError(format!("Error getting snapshot boundaries from height {}. Is the server configured correctly?: {}", params.bitcoin_height, e.to_string())))?
-    else {
-        trace!("Validator rewards not yet activated at bitcoin height {}.", params.bitcoin_height);
-        return Ok(crate::rewards::GetValidatorRewardResponse {
-            rewards_list: Vec::new(),
-            total_rewarded_collateral: bitcoin::Amount::from_sat(0),
-        });
-    };
+    let (start_height, end_height) = reward_config
+        .snapshot_boundaries(params.snapshot_number)
+        .map_err(|e| {
+            RpcError::InternalError(format!(
+                "Error getting boundaries for snapshot {}. Is the server configured correctly?: {}",
+                params.snapshot_number,
+                e.to_string()
+            ))
+        })?;
 
-    info!(
-        "get_validator_rewards bitcoin_height={} snapshot={} start_height={} end_height={}",
-        params.bitcoin_height, snapshot_number, start_height, end_height
-    );
-
-    // Ensure snapshot is finalized
     let last_processed_block = data.db.get_last_processed_block().map_err(|e| {
         error!("Error getting last processed block from Db: {}", e);
         RpcError::DbError(e)
     })?;
 
+    info!(
+        "get_validator_rewards snapshot={} start_height={} end_height={}. Last proccessed Bitcoin block={}",
+        params.snapshot_number, start_height, end_height, last_processed_block
+    );
+
     let result = data
         .db
-        .get_reward_result(snapshot_number)
+        .get_snapshot_result(params.snapshot_number)
         .map_err(|e| {
             error!("Error getting reward result from Db: {}", e);
             RpcError::DbError(e)
         })?
         .ok_or_else(|| {
-            info!("No cached rewards found for snapshot {}. Last processed block: {last_processed_block}", snapshot_number);
+            info!("No cached rewards found for snapshot {}. Last processed block: {last_processed_block}", params.snapshot_number);
             RpcError::InvalidParams(format!(
                 "No cached rewards found for snapshot {}",
-                snapshot_number
+                params.snapshot_number
             ))
         })?;
 
-    Ok(crate::rewards::GetValidatorRewardResponse {
-        rewards_list: result.rewards_list,
+    Ok(crate::rewards::GetRewardedCollateralsResponse {
+        collaterals: result
+            .rewards_list
+            .into_iter()
+            .map(|(pk, amt)| (crate::eth_utils::eth_addr_from_x_only_pubkey(pk), amt))
+            .collect(),
         total_rewarded_collateral: result.total_rewarded_collateral,
     })
 }
@@ -1894,7 +1895,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getkillrequests", get_kill_requests);
 
     #[cfg(feature = "emission_chain")]
-    let server = server.with_method("getvalidatorrewards", get_validator_rewards);
+    let server = server.with_method("getrewaredcollaterals", get_rewared_collaterals);
 
     #[cfg(feature = "dev")]
     // dev methods

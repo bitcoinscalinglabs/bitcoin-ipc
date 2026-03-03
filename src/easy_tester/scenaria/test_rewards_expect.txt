@@ -1,5 +1,5 @@
 config
-tester RewardTester activation_height = 1 epoch_length = 10 snapshots_per_epoch = 1
+tester RewardTester activation_height = 1 snapshot_length = 10
 
 setup
 validator1

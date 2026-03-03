@@ -1,5 +1,4 @@
 use log::{info, trace};
-use std::{fs, path::Path};
 use thiserror::Error;
 
 use crate::{
@@ -65,15 +64,15 @@ pub trait RewardDatabase: BitcoinIpcDatabase {
         height_to: u64,
     ) -> Result<Vec<SubnetState>, DbError>;
 
-    /// Returns the reward-related information for a subnet that, if it is a candidate
+    /// Returns the reward-related information for a subnet, if it is a candidate
     /// for rewards in snapshot `snapshot`, and None otherwise.
-    fn get_reward_info(
+    fn get_reward_candidate_info(
         &self,
         snapshot: u64,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetRewardInfo>, DbError>;
 
-    fn put_reward_info(
+    fn put_reward_candidate_info(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
@@ -81,19 +80,23 @@ pub trait RewardDatabase: BitcoinIpcDatabase {
         reward_info: &SubnetRewardInfo,
     ) -> Result<(), DbError>;
 
-    fn delete_reward_info(
+    fn delete_reward_candidate_info(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
         subnet_id: SubnetId,
     ) -> Result<(), DbError>;
 
-    fn iter_reward_info(&self, snapshot: u64)
-        -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
+    fn iter_reward_candidate_info(
+        &self,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
 
-    fn get_reward_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError>;
+    /// Returns the result of snapshot.
+    /// If the snapshot has not yet been finalized it returns an error.
+    fn get_snapshot_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError>;
 
-    fn put_reward_result(
+    fn put_snapshot_result(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
@@ -142,7 +145,7 @@ impl RewardDatabase for HeedDb {
         Ok(active)
     }
 
-    fn get_reward_info(
+    fn get_reward_candidate_info(
         &self,
         snapshot: u64,
         subnet_id: SubnetId,
@@ -152,7 +155,7 @@ impl RewardDatabase for HeedDb {
         Ok(self.reward_candidates_db.get(&txn, &key)?)
     }
 
-    fn put_reward_info(
+    fn put_reward_candidate_info(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
@@ -164,7 +167,7 @@ impl RewardDatabase for HeedDb {
         Ok(())
     }
 
-    fn delete_reward_info(
+    fn delete_reward_candidate_info(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
@@ -175,7 +178,7 @@ impl RewardDatabase for HeedDb {
         Ok(())
     }
 
-    fn iter_reward_info(
+    fn iter_reward_candidate_info(
         &self,
         snapshot: u64,
     ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
@@ -200,13 +203,13 @@ impl RewardDatabase for HeedDb {
         Ok(out)
     }
 
-    fn get_reward_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError> {
+    fn get_snapshot_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError> {
         let key = reward_result_key(snapshot);
         let txn = self.env.read_txn()?;
         Ok(self.reward_results_db.get(&txn, &key)?)
     }
 
-    fn put_reward_result(
+    fn put_snapshot_result(
         &self,
         txn: &mut RwTxn,
         snapshot: u64,
@@ -225,42 +228,30 @@ impl RewardDatabase for HeedDb {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RewardConfig {
     pub activation_height: u64,
-    pub epoch_length: u64,
-    pub snapshots_per_epoch: u64,
+    pub snapshot_length: u64,
 }
 
 impl RewardConfig {
     pub fn new_from_env() -> Result<Self, RewardConfigError> {
-        let path = std::env::var("REWARD_CONFIG_PATH")
-            .unwrap_or_else(|_| "reward_config.toml".to_string());
-        let path = Path::new(&path);
-        let path_str = path.display().to_string();
-        let content = fs::read_to_string(path).map_err(|source| {
-            RewardConfigError::InternalError(format!(
-                "Failed to read reward config from {}: {}",
-                path_str, source
-            ))
-        })?;
-        let cfg = toml::from_str::<RewardConfig>(&content).map_err(|source| {
-            RewardConfigError::ParseFailed {
-                path: path_str,
-                source,
-            }
-        })?;
+        let activation_height = std::env::var("ACTIVATION_HEIGHT")
+            .expect("ACTIVATION_HEIGHT env var not defined but required when emission chain features are enabled")
+            .parse::<u64>()
+            .expect("ACTIVATION_HEIGHT must be a valid u64");
+        let snapshot_length = std::env::var("SNAPSHOT_LENGTH")
+            .expect("SNAPSHOT_LENGTH env var not defined but required when emission chain features are enabled")
+            .parse::<u64>()
+            .expect("SNAPSHOT_LENGTH must be a valid u64");
 
-        cfg.validate()?;
-        Ok(cfg)
+        Self::new(activation_height, snapshot_length)
     }
 
     pub fn new(
         activation_height: u64,
-        epoch_length: u64,
-        snapshots_per_epoch: u64,
+        snapshot_length: u64,
     ) -> Result<Self, RewardConfigError> {
         let cfg = RewardConfig {
             activation_height,
-            epoch_length,
-            snapshots_per_epoch,
+            snapshot_length,
         };
 
         cfg.validate()?;
@@ -268,43 +259,12 @@ impl RewardConfig {
     }
 
     fn validate(&self) -> Result<(), RewardConfigError> {
-        if self.snapshots_per_epoch == 0 {
+        if self.snapshot_length == 0 {
             return Err(RewardConfigError::InvalidConfig(
-                "snapshots_per_epoch must be > 0".to_string(),
+                "snapshot_length must be > 0".to_string(),
             ));
-        }
-        if self.epoch_length == 0 {
-            return Err(RewardConfigError::InvalidConfig(
-                "epoch_length must be > 0".to_string(),
-            ));
-        }
-        if self.epoch_length % self.snapshots_per_epoch != 0 {
-            return Err(RewardConfigError::InvalidConfig(format!(
-                "epoch_length ({}) must be divisible by snapshots_per_epoch ({})",
-                self.epoch_length, self.snapshots_per_epoch
-            )));
         }
         Ok(())
-    }
-
-    pub fn snapshot_length(&self) -> Result<u64, RewardConfigError> {
-        if self.snapshots_per_epoch == 0 {
-            return Err(RewardConfigError::InternalError(
-                "found config with snapshots_per_epoch == 0".to_string(),
-            ));
-        }
-        if self.epoch_length == 0 {
-            return Err(RewardConfigError::InternalError(
-                "found config with epoch_length == 0".to_string(),
-            ));
-        }
-        if self.epoch_length % self.snapshots_per_epoch != 0 {
-            return Err(RewardConfigError::InternalError(format!(
-                "found config with epoch_length ({}) not divisible by snapshots_per_epoch ({})",
-                self.epoch_length, self.snapshots_per_epoch
-            )));
-        }
-        Ok(self.epoch_length / self.snapshots_per_epoch)
     }
 
     /// Returns (snapshot_number, start_height, end_height) for a Bitcoin height `h`,
@@ -316,30 +276,24 @@ impl RewardConfig {
         if h < self.activation_height {
             return Ok(None);
         }
-        let len = self.snapshot_length()?;
+        let len = self.snapshot_length;
         let snapshot = (h - self.activation_height) / len;
         let start_height = self.activation_height + snapshot * len;
         let end_height = start_height + len - 1;
         Ok(Some((snapshot, start_height, end_height)))
     }
+
+    /// Returns (start_height, end_height) for the given snapshot number.
+    pub fn snapshot_boundaries(&self, snapshot: u64) -> Result<(u64, u64), RewardConfigError> {
+        let len = self.snapshot_length;
+        let start_height = self.activation_height + snapshot * len;
+        let end_height = start_height + len - 1;
+        Ok((start_height, end_height))
+    }
 }
 
 #[derive(Error, Debug)]
 pub enum RewardConfigError {
-    #[error("failed reading {path}: {source}")]
-    ReadFailed {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed parsing {path}: {source}")]
-    ParseFailed {
-        path: String,
-        #[source]
-        source: toml::de::Error,
-    },
-
     #[error("{0}")]
     InvalidConfig(String),
 
@@ -353,14 +307,14 @@ pub enum RewardConfigError {
 
 #[derive(Serialize, Deserialize)]
 #[cfg(feature = "emission_chain")]
-pub struct GetValidatorRewardParams {
-    pub bitcoin_height: u64,
+pub struct GetRewardedCollateralsParams {
+    pub snapshot_number: u64,
 }
 
 #[cfg(feature = "emission_chain")]
 #[derive(Serialize, Deserialize)]
-pub struct GetValidatorRewardResponse {
-    pub rewards_list: Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)>,
+pub struct GetRewardedCollateralsResponse {
+    pub collaterals: Vec<(alloy_primitives::Address, bitcoin::Amount)>,
     pub total_rewarded_collateral: bitcoin::Amount,
 }
 
@@ -391,7 +345,7 @@ pub struct RewardTracker {
 impl RewardTracker {
     pub fn new() -> Self {
         let config = RewardConfig::new_from_env()
-            .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
+            .unwrap_or_else(|e| panic!("Failed to create reward config: {}", e));
         Self { config }
     }
 
@@ -423,7 +377,7 @@ impl RewardTracker {
 
             let mut wtxn = db.write_txn()?;
             for subnet in active_subnets {
-                db.put_reward_info(
+                db.put_reward_candidate_info(
                     &mut wtxn,
                     snapshot,
                     subnet.id,
@@ -439,7 +393,7 @@ impl RewardTracker {
         // 2. End of snapshot: finalize rewards.
         if block_height == end_height {
             info!("End of snapshot {snapshot} at block height {end_height}.");
-            let candidates = db.iter_reward_info(snapshot)?;
+            let candidates = db.iter_reward_candidate_info(snapshot)?;
 
             let mut rewards_total: std::collections::HashMap<
                 bitcoin::XOnlyPublicKey,
@@ -462,7 +416,7 @@ impl RewardTracker {
             let total_rewarded_collateral = rewards_list.iter().map(|(_, a)| *a).sum();
 
             let mut wtxn = db.write_txn()?;
-            db.put_reward_result(
+            db.put_snapshot_result(
                 &mut wtxn,
                 snapshot,
                 &SnapshotResult {
@@ -503,7 +457,7 @@ impl RewardTracker {
         // 1. Kill checkpoint: remove subnet from candidates.
         if checkpoint.is_kill_checkpoint {
             let mut wtxn = db.write_txn()?;
-            db.delete_reward_info(&mut wtxn, current_snapshot, subnet_id)?;
+            db.delete_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id)?;
             wtxn.commit().map_err(DbError::from)?;
             return Ok(());
         }
@@ -514,7 +468,7 @@ impl RewardTracker {
         }
 
         // Only update if subnet is still a candidate for this snapshot.
-        let Some(mut cand_info) = db.get_reward_info(current_snapshot, subnet_id)? else {
+        let Some(mut cand_info) = db.get_reward_candidate_info(current_snapshot, subnet_id)? else {
             return Ok(());
         };
 
@@ -559,7 +513,7 @@ impl RewardTracker {
         cand_info.rewarded_amounts = Some(rewards_in_subnet);
 
         let mut wtxn = db.write_txn()?;
-        db.put_reward_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
+        db.put_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
         wtxn.commit().map_err(DbError::from)?;
 
         Ok(())
@@ -759,10 +713,8 @@ mod tests {
     fn test_snapshot_boundaries() {
         let cfg = RewardConfig {
             activation_height: 100,
-            epoch_length: 20,
-            snapshots_per_epoch: 4,
+            snapshot_length: 5,
         };
-        // snapshot_length = 5
         // snapshot 0: [100, 104]
         // snapshot 1: [105, 109]
         // snapshot 2: [110, 114]

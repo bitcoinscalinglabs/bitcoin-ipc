@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        EMISSION_CHAIN_FEATURES: "true"
     image: bitcoin-ipc:latest
     container_name: bitcoin-ipc
     volumes:
