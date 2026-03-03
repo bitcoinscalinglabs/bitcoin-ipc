@@ -1895,7 +1895,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getkillrequests", get_kill_requests);
 
     #[cfg(feature = "emission_chain")]
-    let server = server.with_method("getrewaredcollaterals", get_rewared_collaterals);
+    let server = server.with_method("getrewardedcollaterals", get_rewared_collaterals);
 
     #[cfg(feature = "dev")]
     // dev methods

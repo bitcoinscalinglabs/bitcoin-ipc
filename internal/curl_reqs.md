@@ -506,7 +506,7 @@ curl -X POST http://localhost:3030/api \
 -H "Authorization: Bearer validator1_auth_token" \
 -d '{
     "jsonrpc": "2.0",
-    "method": "getrewaredcollaterals",
+    "method": "getrewardedcollaterals",
     "params": {
         "snapshot_number": 43
     },
