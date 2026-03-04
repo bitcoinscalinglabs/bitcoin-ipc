@@ -508,7 +508,7 @@ curl -X POST http://localhost:3030/api \
     "jsonrpc": "2.0",
     "method": "getrewardedcollaterals",
     "params": {
-        "snapshot_number": 43
+        "snapshot": 43
     },
     "id": 1
 }' | jq

@@ -1810,7 +1810,7 @@ pub async fn dev_kill_subnet(
 }
 
 #[cfg(feature = "emission_chain")]
-pub async fn get_rewared_collaterals(
+pub async fn get_rewarded_collaterals(
     data: Data<Arc<ServerData>>,
     Params(params): Params<crate::rewards::GetRewardedCollateralsParams>,
 ) -> Result<crate::rewards::GetRewardedCollateralsResponse, JsonRpcError> {
@@ -1818,11 +1818,11 @@ pub async fn get_rewared_collaterals(
         .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
 
     let (start_height, end_height) = reward_config
-        .snapshot_boundaries(params.snapshot_number)
+        .snapshot_boundaries(params.snapshot)
         .map_err(|e| {
             RpcError::InternalError(format!(
                 "Error getting boundaries for snapshot {}. Is the server configured correctly?: {}",
-                params.snapshot_number,
+                params.snapshot,
                 e.to_string()
             ))
         })?;
@@ -1834,21 +1834,21 @@ pub async fn get_rewared_collaterals(
 
     info!(
         "get_validator_rewards snapshot={} start_height={} end_height={}. Last proccessed Bitcoin block={}",
-        params.snapshot_number, start_height, end_height, last_processed_block
+        params.snapshot, start_height, end_height, last_processed_block
     );
 
     let result = data
         .db
-        .get_snapshot_result(params.snapshot_number)
+        .get_snapshot_result(params.snapshot)
         .map_err(|e| {
             error!("Error getting reward result from Db: {}", e);
             RpcError::DbError(e)
         })?
         .ok_or_else(|| {
-            info!("No cached rewards found for snapshot {}. Last processed block: {last_processed_block}", params.snapshot_number);
+            info!("No cached rewards found for snapshot {}. Last processed block: {last_processed_block}", params.snapshot);
             RpcError::InvalidParams(format!(
                 "No cached rewards found for snapshot {}",
-                params.snapshot_number
+                params.snapshot
             ))
         })?;
 
@@ -1895,7 +1895,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getkillrequests", get_kill_requests);
 
     #[cfg(feature = "emission_chain")]
-    let server = server.with_method("getrewardedcollaterals", get_rewared_collaterals);
+    let server = server.with_method("getrewardedcollaterals", get_rewarded_collaterals);
 
     #[cfg(feature = "dev")]
     // dev methods

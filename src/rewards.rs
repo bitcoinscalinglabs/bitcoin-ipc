@@ -308,7 +308,7 @@ pub enum RewardConfigError {
 #[derive(Serialize, Deserialize)]
 #[cfg(feature = "emission_chain")]
 pub struct GetRewardedCollateralsParams {
-    pub snapshot_number: u64,
+    pub snapshot: u64,
 }
 
 #[cfg(feature = "emission_chain")]
