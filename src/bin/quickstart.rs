@@ -85,6 +85,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         "validator3",
         "validator4",
         "validator5",
+        "validator6",
         "user1",
         "user2",
     ];
@@ -131,7 +132,7 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
         println!("Funding wallets...");
 
         // Fund validator wallets
-        for i in 1..=5 {
+        for i in 1..=6 {
             let wallet_name = format!("validator{}", i);
             fund_wallet(&wallet_name, 2).await?;
         }
@@ -277,6 +278,7 @@ fn print_validator_user_keys(ipc_dir: &Path) -> Result<(), Box<dyn std::error::E
         "validator3",
         "validator4",
         "validator5",
+        "validator6",
         "user1",
         "user2",
     ];

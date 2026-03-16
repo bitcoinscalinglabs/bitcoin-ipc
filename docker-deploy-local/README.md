@@ -26,8 +26,8 @@ Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the im
 The `bitcoin-ipc` container contains/runs:
 
 - Bitcoin Core in `regtest` mode.
-- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 5 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
-- The `monitor` and `provider` binaries for each validator (`validator1`–`validator5`) and user (`user1`, `user2`), automatically started upon container creation.
+- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 6 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
+- The `monitor` and `provider` binaries for each validator (`validator1`–`validator6`) and user (`user1`, `user2`), automatically started upon container creation.
 - The captured logs for each monitor and provider instance in the `/root/logs/` directory inside the container.
 - The `ipc-cli` tool.
 - Sets the required environment variables
@@ -48,7 +48,7 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 
 ## Exposed Ports
 <!-- - **18443** – Bitcoin RPC -->
-- **3030–3034** – Provider (validator1–5)
+- **3030–3035** – Provider (validator1–6)
 - **3040–3041** – Provider (user1–2)
 
 
@@ -58,7 +58,7 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 
 Log files live inside the container at `/root/logs/` (same volume as `/root`, so they persist across restarts):
 
-- `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator5.log`, `provider-validator5.log`
+- `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator6.log`, `provider-validator6.log`
 - `monitor-user1.log`, `provider-user1.log`, `monitor-user2.log`, `provider-user2.log`
 
 **View logs from the host:**
