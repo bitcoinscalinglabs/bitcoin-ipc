@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Bootstrap a BTC subnet locally (run inside the container):
+# Bootstrap Subnet B locally (run inside the container):
 # - Creates a subnet (via validator1 provider), mines blocks, has validators 1-4 join, funds it, mines more, and prints subnet state.
 
 API_HOST="127.0.0.1"
@@ -272,6 +272,18 @@ JSON
 rpc_post_raw_or_die "getsubnet" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$GETSUBNET_PAYLOAD" | jq
 
 # Add subnet configuration entry to all IPC config files (end of script)
+# Subnet B: validator1=9545, validator2=9645, validator3=9745, validator4=9845, validator5=9945, users=9545
+get_subnet_b_port() {
+  case "$1" in
+    *validator1*) echo "9545" ;;
+    *validator2*) echo "9645" ;;
+    *validator3*) echo "9745" ;;
+    *validator4*) echo "9845" ;;
+    *validator5*) echo "9945" ;;
+    *) echo "9545" ;;  # config.toml, user1, user2
+  esac
+}
+
 CONFIG_FILES=(
   /root/.ipc/config.toml
   /root/.ipc/validator1/config.toml
@@ -285,7 +297,7 @@ CONFIG_FILES=(
 
 echo "Adding subnet configuration to:"
 for f in "${CONFIG_FILES[@]}"; do
-  echo "  - $f"
+  echo "  - $f (port $(get_subnet_b_port "$f"))"
 done
 
 for f in "${CONFIG_FILES[@]}"; do
@@ -293,15 +305,16 @@ for f in "${CONFIG_FILES[@]}"; do
     echo "Error: config file not found: $f" >&2
     exit 1
   fi
+  PORT=$(get_subnet_b_port "$f")
   cat >> "$f" <<EOF
 
-# Created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
+# Subnet B. Created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
 [[subnets]]
 id = "${SUBNET_ID}"
 
 [subnets.config]
 network_type = "fevm"
-provider_http = "http://host.docker.internal:8545/"
+provider_http = "http://host.docker.internal:${PORT}/"
 gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
 registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
 EOF

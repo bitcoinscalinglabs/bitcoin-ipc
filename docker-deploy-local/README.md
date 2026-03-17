@@ -32,7 +32,7 @@ The `bitcoin-ipc` container contains/runs:
 - The `ipc-cli` tool.
 - Sets the required environment variables
 - The script `/workspace/bitcoin-ipc/scripts/miner.sh` that mines regtest blocks every 10 seconds is started automatically upon container creation.
-- A script to quickly create, join, and fund subnet can be found on `/workspace/bitcoin-ipc/internal/bootstrap_subnet_in_container.sh` in the container (not run automatically).
+- Scripts to quickly create, join, and fund subnets: `bootstrap_subnet_a_from_container.sh` and `bootstrap_subnet_b_from_container.sh` (mounted from `scripts/`, not run automatically).
 
 
 ## Layout Inside the Container

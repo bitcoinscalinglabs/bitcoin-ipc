@@ -14,8 +14,9 @@ services:
       - root-data:/root
       # Bind-mount entrypoint script for fast iteration (no rebuild needed)
       - ./docker-deploy-local/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
-      # Bind-mount script for quick subnet bootstrap
-      - ./scripts/bootstrap_subnet_from_container.sh:/usr/local/bin/bootstrap_subnet_from_container.sh:ro
+      # Bind-mount scripts for quick subnet bootstrap
+      - ./scripts/bootstrap_subnet_a_from_container.sh:/usr/local/bin/bootstrap_subnet_a_from_container.sh:ro
+      - ./scripts/bootstrap_subnet_b_from_container.sh:/usr/local/bin/bootstrap_subnet_b_from_container.sh:ro
       # Bind-mount scripts for quick validator spin-up
       - ./scripts/spin_up_subnet_a_from_container.sh:/usr/local/bin/spin_up_subnet_a_from_container.sh:ro
       - ./scripts/spin_up_subnet_b_from_container.sh:/usr/local/bin/spin_up_subnet_b_from_container.sh:ro
