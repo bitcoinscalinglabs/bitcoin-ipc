@@ -35,7 +35,20 @@ if [ "$#" -gt 2 ]; then
     exit 1
 fi
 
+# Reject case: $0 validator5 (user forgot subnet_id; $SUBNET_ID was unset)
+if [ "$#" -eq 1 ] && { [ "$1" = "validator5" ] || [ "$1" = "validator6" ]; }; then
+    echo "Error: <subnet_id> is required as the first argument." >&2
+    echo "Example: $0 \$SUBNET_ID validator5" >&2
+    exit 1
+fi
+
 SUBNET_ID=$1
+if [ -z "$SUBNET_ID" ]; then
+    echo "Error: <subnet_id> must be non-empty." >&2
+    echo "Example: $0 \$SUBNET_ID" >&2
+    exit 1
+fi
+
 ADD_VALIDATOR=""
 if [ "$#" -eq 2 ]; then
     case "$2" in
