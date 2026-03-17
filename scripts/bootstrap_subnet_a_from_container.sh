@@ -297,7 +297,7 @@ CONFIG_FILES=(
 
 echo "Adding subnet configuration to:"
 for f in "${CONFIG_FILES[@]}"; do
-  echo "  - $f (port $(get_subnet_a_port "$f"))"
+  echo "  - $f"
 done
 
 for f in "${CONFIG_FILES[@]}"; do
