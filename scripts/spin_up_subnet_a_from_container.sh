@@ -7,7 +7,11 @@ set -euo pipefail
 # pointed at the provider APIs exposed by the bitcoin-ipc container (via host port mappings).
 #
 # Usage:
-#   /workspace/bitcoin-ipc/scripts/spin_up_subnet_a_from_container.sh <subnet_id>
+#   /workspace/bitcoin-ipc/scripts/spin_up_subnet_a_from_container.sh <subnet_id> [validator5|validator6]
+#
+# With <subnet_id> only: starts validators 1-4 for Subnet A.
+# With <subnet_id> validator5: adds validator 5 (requires CometBftID, ResolverAddress from prior run).
+# With <subnet_id> validator6: adds validator 6 (requires CometBftID, ResolverAddress from prior run). Not supported yet.
 
 cleanup() {
     echo -e "\nCleaning up..."
@@ -18,9 +22,43 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <subnet_id>" >&2
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <subnet_id> [validator5|validator6]" >&2
+    echo "  <subnet_id>: required; start validators 1-4 for Subnet A" >&2
+    echo "  validator5: optional; add validator 5 (requires CometBftID, ResolverAddress from prior run)" >&2
+    echo "  validator6: optional; adds validator 6 (requires CometBftID, ResolverAddress from prior run). Not supported yet." >&2
     exit 1
+fi
+
+if [ "$#" -gt 2 ]; then
+    echo "Usage: $0 <subnet_id> [validator5|validator6]" >&2
+    exit 1
+fi
+
+SUBNET_ID=$1
+ADD_VALIDATOR=""
+if [ "$#" -eq 2 ]; then
+    case "$2" in
+        validator5) ADD_VALIDATOR="validator5" ;;
+        validator6) ADD_VALIDATOR="validator6" ;;
+        *)
+            echo "Error: second argument must be validator5 or validator6, got: $2" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+if [ -n "$ADD_VALIDATOR" ]; then
+    if [ "$ADD_VALIDATOR" = "validator6" ]; then
+        echo "The demo does not support validator6 yet" >&2
+        exit 1
+    fi
+    if [ -z "${ResolverAddress:-}" ] || [ -z "${CometBftID:-}" ]; then
+        echo "Error: ResolverAddress and CometBftID must be set." >&2
+        echo "These are returned by the spin_up_subnet_a_from_container script when we started the containers for Subnet A." >&2
+        echo "You need to set these env variables for the following cargo-make command to work." >&2
+        exit 1
+    fi
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -37,8 +75,6 @@ if ! command -v cargo-make >/dev/null 2>&1; then
     echo "Error: cargo-make not found in PATH" >&2
     exit 1
 fi
-
-SUBNET_ID=$1
 
 # IMPORTANT (local docker + docker.sock):
 # The fendermint Makefile uses `docker run --volume ${BASE_DIR}:/data` and commands.
@@ -66,16 +102,48 @@ PORT_1="3030"
 PORT_2="3031"
 PORT_3="3032"
 PORT_4="3033"
+PORT_5="3034"
 
 BEARER_TOKEN_1="validator1_auth_token"
 BEARER_TOKEN_2="validator2_auth_token"
 BEARER_TOKEN_3="validator3_auth_token"
 BEARER_TOKEN_4="validator4_auth_token"
+BEARER_TOKEN_5="validator5_auth_token"
 
 API_URL_1="http://host.docker.internal:${PORT_1}/api"
 API_URL_2="http://host.docker.internal:${PORT_2}/api"
 API_URL_3="http://host.docker.internal:${PORT_3}/api"
 API_URL_4="http://host.docker.internal:${PORT_4}/api"
+API_URL_5="http://host.docker.internal:${PORT_5}/api"
+
+# Validator 5 fendermint ports (Subnet A: 27056, 27057, 8945, 27055)
+CMT_P2P_5="27056"
+CMT_RPC_5="27057"
+ETHAPI_5="8945"
+RESOLVER_5="27055"
+
+if [ "$ADD_VALIDATOR" = "validator5" ]; then
+    echo "Starting validator 5..."
+    cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
+        --env NODE_NAME="validator-5" \
+        --env SUBNET_ID="$SUBNET_ID" \
+        --env HOME="$HOST_HOME_DIR" \
+        --env PRIVATE_KEY_PATH="/root/.ipc/validator5/validator.sk" \
+        --env CMT_P2P_HOST_PORT="$CMT_P2P_5" \
+        --env CMT_RPC_HOST_PORT="$CMT_RPC_5" \
+        --env ETHAPI_HOST_PORT="$ETHAPI_5" \
+        --env RESOLVER_HOST_PORT="$RESOLVER_5" \
+        --env BOOTSTRAPS="${CometBftID}@validator-1-cometbft:26656" \
+        --env RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${ResolverAddress}" \
+        --env PARENT_ENDPOINT="$API_URL_5" \
+        --env PARENT_AUTH_TOKEN="$BEARER_TOKEN_5" \
+        --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
+        --env TOPDOWN_PROPOSAL_DELAY=0 \
+        --env FM_PULL_SKIP=1 \
+        child-validator
+    echo "Validator 5 started!"
+    exit 0
+fi
 
 echo "Starting validator 1..."
 
