@@ -41,7 +41,7 @@ The `bitcoin-ipc` container contains/runs:
 - `/workspace/ipc/` – IPC repo
 - `/root/.bitcoin/` – Bitcoin Core regtest data and config
 - `/root/.ipc/` – IPC configs (validators/users)
-- `/root/logs/` – monitor and provider log files (e.g. `monitor-validator1.log`, `provider-validator1.log`)
+- `/root/logs/` – monitor, provider, and relayer log files (e.g. `monitor-validator1.log`, `provider-validator1.log`, `relayer-subnet-a-validator1.log`)
 
 Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermint`, `bitcoind`, `bitcoin-cli`, Foundry tools.
 
@@ -54,18 +54,26 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 
 
 
-## Monitor and provider logs
+## Monitor, provider, and relayer logs
 
 Log files live inside the container at `/root/logs/` (same volume as `/root`, so they persist across restarts):
 
 - `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator6.log`, `provider-validator6.log`
 - `monitor-user1.log`, `provider-user1.log`, `monitor-user2.log`, `provider-user2.log`
+- `relayer-subnet-a-validator1.log` … `relayer-subnet-a-validator4.log` (started by `spin_up_subnet_a_from_container.sh`)
+- `relayer-subnet-b-validator1.log` … `relayer-subnet-b-validator4.log` (started by `spin_up_subnet_b_from_container.sh`)
 
 **View logs from the host:**
 
 ```bash
-# Stream one log
+# Stream monitor log
 docker exec bitcoin-ipc tail -f /root/logs/monitor-validator1.log
+
+# Stream provider log
+docker exec bitcoin-ipc tail -f /root/logs/provider-validator1.log
+
+# Stream relayer log (Subnet A)
+docker exec bitcoin-ipc tail -f /root/logs/relayer-subnet-a-validator1.log
 ```
 
 ## Running monitor and provider manually
@@ -80,11 +88,12 @@ monitor --env ~/.ipc/validator1/.env
 provider --env ~/.ipc/validator1/.env
 ```
 
-### List running monitor/provider processes
+### List running monitor/provider/relayer processes
 
 ```bash
 pgrep -a monitor || true
 pgrep -a provider || true
+pgrep -af "checkpoint relayer" || true
 ```
 
 ## Available commands (IPC-CLI, cast)
