@@ -33,10 +33,7 @@ const STAKE_CHANGES_KEY: &str = "stake_changes:";
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
 // Number of LMDB databases (`heed::Database`) we open/create in this environment.
-#[cfg(feature = "emission_chain")]
 const MAX_DBS: u32 = 13;
-#[cfg(not(feature = "emission_chain"))]
-const MAX_DBS: u32 = 11;
 
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
@@ -101,6 +98,24 @@ fn kill_request_key(subnet_id: SubnetId, block_height: u64, txid: Txid) -> Strin
         "{KILL_REQUESTS_KEY}:{}:{}:{}",
         subnet_id, block_height, txid
     )
+}
+
+// reward_candidates:<snapshot>:<subnet_id>
+const REWARD_CANDIDATES_KEY: &str = "reward_candidates:";
+
+// reward_results:<snapshot>
+const REWARD_RESULTS_KEY: &str = "reward_results:";
+
+pub(crate) fn reward_candidates_prefix(snapshot: u64) -> String {
+    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:")
+}
+
+pub(crate) fn reward_candidate_key(snapshot: u64, subnet_id: SubnetId) -> String {
+    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:{subnet_id}")
+}
+
+pub(crate) fn reward_result_key(snapshot: u64) -> String {
+    format!("{REWARD_RESULTS_KEY}:{snapshot}")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -726,6 +741,79 @@ pub struct KillRequest {
     pub txid: Txid,
 }
 
+/// Keeps track of reward-related information for a subnet during a snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SubnetRewardInfo {
+    /// The last committee number detected for the subnet, either in previous or in the current snapshot.
+    pub most_recent_committee_number: u64,
+    /// The collateral amounts rewarded to each validator in the subnet during the snapshot.
+    /// Acts as a lazy accumulator, see `RewardTracker`
+    pub rewarded_amounts: Option<Vec<(XOnlyPublicKey, bitcoin::Amount)>>,
+}
+
+/// The result of a snapshot reward calculation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SnapshotResult {
+    /// The list of rewards for all eligible validators
+    pub rewards_list: Vec<(XOnlyPublicKey, bitcoin::Amount)>,
+    /// The total collateral rewarded in the snapshot.
+    /// Stored for convenience, this should be derivable from `rewards_list`.
+    pub total_rewarded_collateral: bitcoin::Amount,
+}
+
+pub trait DatabaseRewardExtensions: DatabaseCore {
+    /// Returns all subnets that were active throughout the Bitcoin height interval
+    /// `[height_from, height_to]` (both sides inclusive).
+    /// A subnet is considered active if:
+    /// - It was created at or before `height_from`
+    /// - It was bootstrapped at or before `height_from`
+    /// - It was not killed at or before `height_to`
+    fn get_all_active_subnets(
+        &self,
+        height_from: u64,
+        height_to: u64,
+    ) -> Result<Vec<SubnetState>, DbError>;
+
+    /// Returns the reward-related information for a subnet, if it is a candidate
+    /// for rewards in snapshot `snapshot`, and None otherwise.
+    fn get_reward_candidate_info(
+        &self,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetRewardInfo>, DbError>;
+
+    fn put_reward_candidate_info(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+        reward_info: &SubnetRewardInfo,
+    ) -> Result<(), DbError>;
+
+    fn delete_reward_candidate_info(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<(), DbError>;
+
+    fn iter_reward_candidate_info(
+        &self,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
+
+    /// Returns the result of snapshot.
+    /// If the snapshot has not yet been finalized it returns an error.
+    fn get_snapshot_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError>;
+
+    fn put_snapshot_result(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        result: &SnapshotResult,
+    ) -> Result<(), DbError>;
+}
+
 pub struct HeedDb {
     pub(crate) env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
@@ -739,11 +827,8 @@ pub struct HeedDb {
     committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
     stake_changes_db: HeedDatabase<Str, SerdeBincode<StakeChangeRequest>>,
     kill_requests_db: HeedDatabase<Str, SerdeBincode<KillRequest>>,
-    #[cfg(feature = "emission_chain")]
-    pub(crate) reward_candidates_db:
-        HeedDatabase<Str, SerdeBincode<crate::rewards::SubnetRewardInfo>>,
-    #[cfg(feature = "emission_chain")]
-    pub(crate) reward_results_db: HeedDatabase<Str, SerdeBincode<crate::rewards::SnapshotResult>>,
+    pub(crate) reward_candidates_db: HeedDatabase<Str, SerdeBincode<SubnetRewardInfo>>,
+    pub(crate) reward_results_db: HeedDatabase<Str, SerdeBincode<SnapshotResult>>,
 }
 
 impl HeedDb {
@@ -816,11 +901,9 @@ impl HeedDb {
             let kill_requests_db = env
                 .open_database(&rtxn, Some("kill_requests_db"))?
                 .ok_or(DbError::DbNotFound("kill_requests_db".to_string()))?;
-            #[cfg(feature = "emission_chain")]
             let reward_candidates_db = env
                 .open_database(&rtxn, Some("reward_candidates_db"))?
                 .ok_or(DbError::DbNotFound("reward_candidates_db".to_string()))?;
-            #[cfg(feature = "emission_chain")]
             let reward_results_db = env
                 .open_database(&rtxn, Some("reward_results_db"))?
                 .ok_or(DbError::DbNotFound("reward_results_db".to_string()))?;
@@ -837,9 +920,7 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
-                #[cfg(feature = "emission_chain")]
                 reward_candidates_db,
-                #[cfg(feature = "emission_chain")]
                 reward_results_db,
             })
         } else {
@@ -854,10 +935,8 @@ impl HeedDb {
             let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
             let stake_changes_db = env.create_database(&mut txn, Some("stake_changes_db"))?;
             let kill_requests_db = env.create_database(&mut txn, Some("kill_requests_db"))?;
-            #[cfg(feature = "emission_chain")]
             let reward_candidates_db =
                 env.create_database(&mut txn, Some("reward_candidates_db"))?;
-            #[cfg(feature = "emission_chain")]
             let reward_results_db = env.create_database(&mut txn, Some("reward_results_db"))?;
             txn.commit()?;
 
@@ -872,16 +951,14 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
-                #[cfg(feature = "emission_chain")]
                 reward_candidates_db,
-                #[cfg(feature = "emission_chain")]
                 reward_results_db,
             })
         }
     }
 }
 
-pub trait BitcoinIpcDatabase {
+pub trait DatabaseCore {
     fn write_txn(&self) -> Result<RwTxn, DbError>;
 
     // Monitor Info
@@ -1052,7 +1129,7 @@ pub trait BitcoinIpcDatabase {
 }
 
 #[async_trait]
-impl BitcoinIpcDatabase for HeedDb {
+impl DatabaseCore for HeedDb {
     fn write_txn(&self) -> Result<RwTxn, DbError> {
         self.env.write_txn().map_err(|e| e.into())
     }
@@ -1624,7 +1701,6 @@ pub enum DbError {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::ipc_lib::IpcCreateSubnetMsg;
     use crate::test_utils::*;
     use bitcoin::{hashes::Hash, key::Parity, Amount, BlockHash, Txid, XOnlyPublicKey};
     use std::str::FromStr;
@@ -2005,11 +2081,14 @@ pub mod tests {
         assert!(!subnet.should_kill());
         subnet.killed = SubnetKillState::ToBeKilled;
         assert!(!subnet.should_kill());
-        subnet.last_checkpoint_number = Some(1);
+        // With marked_for_kill=None, should_kill when (last_checkpoint+1) >= KILL_PERIOD
+        subnet.last_checkpoint_number = Some(KILL_PERIOD_NUMBER_OF_CHECKPOINTS - 2);
         assert!(!subnet.should_kill());
-        subnet.last_checkpoint_number = Some(5);
+        subnet.last_checkpoint_number = Some(KILL_PERIOD_NUMBER_OF_CHECKPOINTS);
         assert!(subnet.should_kill());
-        subnet.marked_for_kill_checkpoint_number = Some(4);
+        let marked = 4u64;
+        subnet.marked_for_kill_checkpoint_number = Some(marked);
+        subnet.last_checkpoint_number = Some(marked); // last - marked = 0 < KILL_PERIOD
         assert!(!subnet.should_kill());
         subnet.marked_for_kill_checkpoint_number = Some(4);
         subnet.last_checkpoint_number = Some(10);

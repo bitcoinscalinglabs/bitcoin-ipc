@@ -22,5 +22,5 @@ The `RewardTester` accepts commands like the following, which query the specifie
 ## Usage
 
 ```
-cargo run --features emission_chain --bin easy_tester -- src/easy_tester/scenaria/test_rewards.txt
+cargo run --bin easy_tester -- src/easy_tester/scenaria/test_rewards.txt
 ```

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use bitcoin_ipc::easy_tester::{parse_test_file, ScenarioCommand, Tester};
 use bitcoin_ipc::easy_tester::model::TesterConfig;
+use bitcoin_ipc::easy_tester::{parse_test_file, ScenarioCommand, Tester};
 
 #[tokio::main]
 async fn main() {
@@ -34,26 +34,22 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
             activation_height,
             snapshot_length,
         } => {
-            #[cfg(feature = "emission_chain")]
-            {
-                let mut tester = bitcoin_ipc::easy_tester::RewardTester::new(
-                    parsed.setup,
-                    activation_height,
-                    snapshot_length,
-                )
-                .await?;
-                run_scenario(&mut tester, scenario)?;
-            }
-            #[cfg(not(feature = "emission_chain"))]
-            {
-                return Err("RewardTester requires feature 'emission_chain'".into());
-            }
+            let mut tester = bitcoin_ipc::easy_tester::RewardTester::new(
+                parsed.setup,
+                activation_height,
+                snapshot_length,
+            )
+            .await?;
+            run_scenario(&mut tester, scenario)?;
         }
     }
     Ok(())
 }
 
-fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_scenario<T: Tester>(
+    tester: &mut T,
+    scenario: Vec<ScenarioCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut mined_height: u64 = 0;
     let mut current_block: Option<u64> = None;
 
@@ -78,7 +74,8 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
                 current_block = Some(height);
             }
             ScenarioCommand::Create { subnet_name } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_create_subnet(height, &subnet_name)?;
             }
             ScenarioCommand::Join {
@@ -86,7 +83,8 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
                 validator_name,
                 collateral_sats,
             } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_join_subnet(height, &subnet_name, &validator_name, collateral_sats)?;
             }
             ScenarioCommand::Stake {
@@ -94,7 +92,8 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
                 validator_name,
                 amount_sats,
             } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_stake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
             }
             ScenarioCommand::Unstake {
@@ -102,19 +101,26 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
                 validator_name,
                 amount_sats,
             } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_unstake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
             }
             ScenarioCommand::Checkpoint { subnet_name } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_checkpoint_subnet(height, &subnet_name)?;
             }
             ScenarioCommand::OutputRead { db, args } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_output_read(height, db, &args)?;
             }
-            ScenarioCommand::OutputExpect { target, expected_sats } => {
-                let height = current_block.ok_or("scenario error: must set 'block <height>' before actions")?;
+            ScenarioCommand::OutputExpect {
+                target,
+                expected_sats,
+            } => {
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_output_expect(height, target, expected_sats)?;
             }
         }
@@ -129,4 +135,3 @@ fn run_scenario<T: Tester>(tester: &mut T, scenario: Vec<ScenarioCommand>) -> Re
 
     Ok(())
 }
-

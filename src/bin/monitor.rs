@@ -9,23 +9,16 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use bitcoin::BlockHash;
-use bitcoin_ipc::db::{self, BitcoinIpcDatabase, HeedDb};
+use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
-#[cfg(feature = "emission_chain")]
-use bitcoin_ipc::rewards::{RewardDatabase, RewardTracker};
+use bitcoin_ipc::db::DatabaseRewardExtensions;
+use bitcoin_ipc::rewards::RewardTracker;
 
-#[cfg(feature = "emission_chain")]
-trait MonitorDatabase: BitcoinIpcDatabase + RewardDatabase {}
-#[cfg(feature = "emission_chain")]
-impl<T: BitcoinIpcDatabase + RewardDatabase> MonitorDatabase for T {}
-
-#[cfg(not(feature = "emission_chain"))]
-trait MonitorDatabase: BitcoinIpcDatabase {}
-#[cfg(not(feature = "emission_chain"))]
-impl<T: BitcoinIpcDatabase> MonitorDatabase for T {}
+trait Database: DatabaseCore + DatabaseRewardExtensions {}
+impl<T: DatabaseCore + DatabaseRewardExtensions> Database for T {}
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -92,6 +85,9 @@ async fn main() {
         cancel_token.clone(),
     );
 
+    #[cfg(feature = "emission_chain")]
+    monitor.set_reward_tracker();
+
     // Spawn monitor task
 
     let monitor_handle = tokio::spawn(async move { monitor.sync_and_listen().await });
@@ -133,7 +129,7 @@ enum SideEffect {
 }
 
 // TODO use generics for rpc + add a trait for the monitor
-struct Monitor<D: MonitorDatabase> {
+struct Monitor<D: Database> {
     db: D,
     rpc: bitcoincore_rpc::Client,
     watchonly_rpc: bitcoincore_rpc::Client,
@@ -141,13 +137,12 @@ struct Monitor<D: MonitorDatabase> {
     current_height: u64,
     cancel_token: CancellationToken,
     side_effects: Vec<SideEffect>,
-    #[cfg(feature = "emission_chain")]
-    reward_tracker: RewardTracker,
+    reward_tracker: Option<RewardTracker>,
 }
 
 impl<D> Monitor<D>
 where
-    D: MonitorDatabase,
+    D: Database,
 {
     fn new(
         db: D,
@@ -161,12 +156,17 @@ where
             rpc,
             watchonly_rpc,
             check_interval,
-            cancel_token,
-            current_height: 0,
-            side_effects: Vec::new(),
-            #[cfg(feature = "emission_chain")]
-            reward_tracker: RewardTracker::new(),
-        }
+        cancel_token,
+        current_height: 0,
+        side_effects: Vec::new(),
+        reward_tracker: None,
+    }
+}
+
+    #[cfg(feature = "emission_chain")]
+    /// Sets the reward tracker. Must be called to enable reward bookkeeping.
+    pub fn set_reward_tracker(&mut self) {
+        self.reward_tracker = Some(RewardTracker::new());
     }
 
     /// Syncs with the Bitcoin network
@@ -223,17 +223,15 @@ where
                 }
 
                 // Reward bookkeeping hooks (must run after processing all tx in each block).
-                #[cfg(feature = "emission_chain")]
-                info!("Updating reward bookkeeping after block {}", next_height);
-                match self
-                    .reward_tracker
-                    .update_after_block(&self.db, next_height)
-                {
-                    Ok(_) => {}
-                    Err(e) => error!(
-                        "Error updating reward bookkeeping after block {}: {:?}",
-                        next_height, e
-                    ),
+
+                if let Some(ref mut reward_tracker) = self.reward_tracker {
+                    match reward_tracker.update_after_block(&self.db, next_height) {
+                        Ok(_) => {}
+                        Err(e) => error!(
+                            "Error updating reward bookkeeping after block {}: {:?}",
+                            next_height, e
+                        ),
+                    }
                 }
             }
 
@@ -289,17 +287,15 @@ where
                         }
 
                         // Reward bookkeeping hooks (must run after processing all tx in each block).
-                        #[cfg(feature = "emission_chain")]
-                        info!("Updating reward bookkeeping after block {}", next_height);
-                        match self
-                            .reward_tracker
-                            .update_after_block(&self.db, next_height)
-                        {
-                            Ok(_) => {}
-                            Err(e) => error!(
-                                "Error updating reward bookkeeping after block {}: {:?}",
-                                next_height, e
-                            ),
+
+                        if let Some(ref mut reward_tracker) = self.reward_tracker {
+                            match reward_tracker.update_after_block(&self.db, next_height) {
+                                Ok(_) => {}
+                                Err(e) => error!(
+                                    "Error updating reward bookkeeping after block {}: {:?}",
+                                    next_height, e
+                                ),
+                            }
                         }
                     }
                 }
@@ -672,18 +668,20 @@ where
                 );
 
                 // Reward bookkeeping hooks after a checkpoint.
-                #[cfg(feature = "emission_chain")]
-                match self.reward_tracker.update_after_checkpoint(
-                    &self.db,
-                    block_height,
-                    msg.subnet_id,
-                    &checkpoint,
-                ) {
-                    Ok(_) => info!("Updated reward bookkeeping after checkpoint"),
-                    Err(e) => error!(
-                        "Error updating reward bookkeeping after checkpoint: {:?}",
-                        e
-                    ),
+
+                if let Some(ref mut reward_tracker) = self.reward_tracker {
+                    match reward_tracker.update_after_checkpoint(
+                        &self.db,
+                        block_height,
+                        msg.subnet_id,
+                        &checkpoint,
+                    ) {
+                        Ok(_) => info!("Updated reward bookkeeping after checkpoint"),
+                        Err(e) => error!(
+                            "Error updating reward bookkeeping after checkpoint: {:?}",
+                            e
+                        ),
+                    }
                 }
 
                 Ok(())

@@ -1,6 +1,6 @@
 use crate::{
     bitcoin_utils,
-    db::{self, BitcoinIpcDatabase, StakingChange},
+    db::{self, DatabaseCore, StakingChange},
     ipc_lib::{
         self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
         IpcKillSubnetMsg, IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg,
@@ -20,7 +20,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(feature = "emission_chain")]
-use crate::rewards::{RewardConfig, RewardDatabase};
+use crate::db::DatabaseRewardExtensions;
+#[cfg(feature = "emission_chain")]
+use crate::rewards::RewardConfig;
 
 pub type RpcServer = Arc<jsonrpc_v2::Server<MapRouter>>;
 
@@ -1817,15 +1819,16 @@ pub async fn get_rewarded_collaterals(
     let reward_config = RewardConfig::new_from_env()
         .unwrap_or_else(|e| panic!("Failed to load reward config: {}", e));
 
-    let (start_height, end_height) = reward_config
-        .snapshot_boundaries(params.snapshot)
-        .map_err(|e| {
-            RpcError::InternalError(format!(
+    let (start_height, end_height) =
+        reward_config
+            .snapshot_boundaries(params.snapshot)
+            .map_err(|e| {
+                RpcError::InternalError(format!(
                 "Error getting boundaries for snapshot {}. Is the server configured correctly?: {}",
                 params.snapshot,
                 e.to_string()
             ))
-        })?;
+            })?;
 
     let last_processed_block = data.db.get_last_processed_block().map_err(|e| {
         error!("Error getting last processed block from Db: {}", e);

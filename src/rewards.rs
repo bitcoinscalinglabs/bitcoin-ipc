@@ -1,110 +1,17 @@
-use log::{info, trace};
-use thiserror::Error;
-
 use crate::{
-    db::{BitcoinIpcDatabase, DbError, HeedDb, SubnetState},
+    db::{
+        reward_candidate_key, reward_candidates_prefix, reward_result_key, DatabaseCore,
+        DatabaseRewardExtensions, DbError, HeedDb, SnapshotResult, SubnetRewardInfo, SubnetState,
+    },
     SubnetId,
 };
-use bitcoin::XOnlyPublicKey;
 use heed::RwTxn;
+use log::{info, trace};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use thiserror::Error;
 
-//
-// Database types and traits
-//
-
-// reward_candidates:<snapshot>:<subnet_id>
-const REWARD_CANDIDATES_KEY: &str = "reward_candidates:";
-
-// reward_results:<snapshot>
-const REWARD_RESULTS_KEY: &str = "reward_results:";
-
-fn reward_candidates_prefix(snapshot: u64) -> String {
-    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:")
-}
-
-fn reward_candidate_key(snapshot: u64, subnet_id: SubnetId) -> String {
-    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:{subnet_id}")
-}
-
-fn reward_result_key(snapshot: u64) -> String {
-    format!("{REWARD_RESULTS_KEY}:{snapshot}")
-}
-
-/// Keeps track of reward-related information for a subnet during a snapshot.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SubnetRewardInfo {
-    /// The last committee number detected for the subnet, either in previous or in the current snapshot.
-    pub most_recent_committee_number: u64,
-    /// The collateral amounts rewarded to each validator in the subnet during the snapshot.
-    /// Acts as a lazy accumulator, see `RewardTracker`
-    pub rewarded_amounts: Option<Vec<(XOnlyPublicKey, bitcoin::Amount)>>,
-}
-
-/// The result of a snapshot reward calculation.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SnapshotResult {
-    /// The list of rewards for all eligible validators
-    pub rewards_list: Vec<(XOnlyPublicKey, bitcoin::Amount)>,
-    /// The total collateral rewarded in the snapshot.
-    /// Stored for convenience, this should be derivable from `rewards_list`.
-    pub total_rewarded_collateral: bitcoin::Amount,
-}
-
-pub trait RewardDatabase: BitcoinIpcDatabase {
-    /// Returns all subnets that were active throughout the Bitcoin height interval
-    /// `[height_from, height_to]` (both sides inclusive).
-    /// A subnet is considered active if:
-    /// - It was created at or before `height_from`
-    /// - It was bootstrapped at or before `height_from`
-    /// - It was not killed at or before `height_to`
-    fn get_all_active_subnets(
-        &self,
-        height_from: u64,
-        height_to: u64,
-    ) -> Result<Vec<SubnetState>, DbError>;
-
-    /// Returns the reward-related information for a subnet, if it is a candidate
-    /// for rewards in snapshot `snapshot`, and None otherwise.
-    fn get_reward_candidate_info(
-        &self,
-        snapshot: u64,
-        subnet_id: SubnetId,
-    ) -> Result<Option<SubnetRewardInfo>, DbError>;
-
-    fn put_reward_candidate_info(
-        &self,
-        txn: &mut RwTxn,
-        snapshot: u64,
-        subnet_id: SubnetId,
-        reward_info: &SubnetRewardInfo,
-    ) -> Result<(), DbError>;
-
-    fn delete_reward_candidate_info(
-        &self,
-        txn: &mut RwTxn,
-        snapshot: u64,
-        subnet_id: SubnetId,
-    ) -> Result<(), DbError>;
-
-    fn iter_reward_candidate_info(
-        &self,
-        snapshot: u64,
-    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
-
-    /// Returns the result of snapshot.
-    /// If the snapshot has not yet been finalized it returns an error.
-    fn get_snapshot_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError>;
-
-    fn put_snapshot_result(
-        &self,
-        txn: &mut RwTxn,
-        snapshot: u64,
-        result: &SnapshotResult,
-    ) -> Result<(), DbError>;
-}
-
-impl RewardDatabase for HeedDb {
+impl DatabaseRewardExtensions for HeedDb {
     fn get_all_active_subnets(
         &self,
         height_from: u64,
@@ -182,7 +89,6 @@ impl RewardDatabase for HeedDb {
         &self,
         snapshot: u64,
     ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
-        use std::str::FromStr;
         let txn = self.env.read_txn()?;
         let prefix = reward_candidates_prefix(snapshot);
         let mut out = Vec::new();
@@ -245,10 +151,7 @@ impl RewardConfig {
         Self::new(activation_height, snapshot_length)
     }
 
-    pub fn new(
-        activation_height: u64,
-        snapshot_length: u64,
-    ) -> Result<Self, RewardConfigError> {
+    pub fn new(activation_height: u64, snapshot_length: u64) -> Result<Self, RewardConfigError> {
         let cfg = RewardConfig {
             activation_height,
             snapshot_length,
@@ -306,12 +209,10 @@ pub enum RewardConfigError {
 //
 
 #[derive(Serialize, Deserialize)]
-#[cfg(feature = "emission_chain")]
 pub struct GetRewardedCollateralsParams {
     pub snapshot: u64,
 }
 
-#[cfg(feature = "emission_chain")]
 #[derive(Serialize, Deserialize)]
 pub struct GetRewardedCollateralsResponse {
     pub collaterals: Vec<(alloy_primitives::Address, bitcoin::Amount)>,
@@ -325,7 +226,7 @@ pub struct GetRewardedCollateralsResponse {
 #[derive(Error, Debug)]
 pub enum RewardTrackerError {
     #[error(transparent)]
-    Db(#[from] DbError),
+    Db(#[from] crate::db::DbError),
 
     #[error("invalid configuration: {0}")]
     Config(String),
@@ -358,7 +259,7 @@ impl RewardTracker {
     // 2. If we are at the end of a snapshot, calculate the rewards for all subnets that are candidates for rewards in this snapshot.
     pub fn update_after_block(
         &mut self,
-        db: &dyn RewardDatabase,
+        db: &dyn crate::db::DatabaseRewardExtensions,
         block_height: u64,
     ) -> Result<(), RewardTrackerError> {
         let Some((snapshot, start_height, end_height)) = self
@@ -381,13 +282,13 @@ impl RewardTracker {
                     &mut wtxn,
                     snapshot,
                     subnet.id,
-                    &SubnetRewardInfo {
+                    &crate::db::SubnetRewardInfo {
                         most_recent_committee_number: subnet.committee_number,
                         rewarded_amounts: None,
                     },
                 )?;
             }
-            wtxn.commit().map_err(DbError::from)?;
+            wtxn.commit().map_err(crate::db::DbError::from)?;
         }
 
         // 2. End of snapshot: finalize rewards.
@@ -419,14 +320,14 @@ impl RewardTracker {
             db.put_snapshot_result(
                 &mut wtxn,
                 snapshot,
-                &SnapshotResult {
+                &crate::db::SnapshotResult {
                     rewards_list,
                     total_rewarded_collateral,
                 },
             )?;
-            wtxn.commit().map_err(DbError::from)?;
+            wtxn.commit().map_err(crate::db::DbError::from)?;
         }
-
+        info!("Updated reward bookkeeping after block {block_height}.");
         Ok(())
     }
 
@@ -435,7 +336,7 @@ impl RewardTracker {
     /// 2. Rotation checkpoint: lazily materialize and update a min-collateral accumulator.
     pub fn update_after_checkpoint(
         &mut self,
-        db: &dyn RewardDatabase,
+        db: &dyn crate::db::DatabaseRewardExtensions,
         block_height: u64,
         subnet_id: SubnetId,
         checkpoint: &crate::db::SubnetCheckpoint,
@@ -458,7 +359,7 @@ impl RewardTracker {
         if checkpoint.is_kill_checkpoint {
             let mut wtxn = db.write_txn()?;
             db.delete_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id)?;
-            wtxn.commit().map_err(DbError::from)?;
+            wtxn.commit().map_err(crate::db::DbError::from)?;
             return Ok(());
         }
 
@@ -514,16 +415,16 @@ impl RewardTracker {
 
         let mut wtxn = db.write_txn()?;
         db.put_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
-        wtxn.commit().map_err(DbError::from)?;
+        wtxn.commit().map_err(crate::db::DbError::from)?;
 
         Ok(())
     }
 
     fn get_or_init_reward_amounts(
         &mut self,
-        db: &dyn RewardDatabase,
+        db: &dyn crate::db::DatabaseRewardExtensions,
         subnet_id: SubnetId,
-        info: &SubnetRewardInfo,
+        info: &crate::db::SubnetRewardInfo,
         block_height: u64,
     ) -> Result<Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)>, RewardTrackerError> {
         let reward_amounts: Vec<(bitcoin::XOnlyPublicKey, bitcoin::Amount)> =
@@ -554,7 +455,10 @@ mod tests {
     use bitcoin::{Amount, XOnlyPublicKey};
 
     use crate::{
-        db::{BitcoinIpcDatabase, SubnetGenesisInfo, SubnetKillState, SubnetValidator},
+        db::{
+            DatabaseCore, DatabaseRewardExtensions, SubnetGenesisInfo, SubnetKillState,
+            SubnetValidator,
+        },
         rewards::RewardConfig,
         test_utils::create_test_db,
         IpcCreateSubnetMsg, SubnetId,
@@ -696,7 +600,7 @@ mod tests {
 
         // Query active subnets between 100 and 150. Expected: subnets 3, 4, 5.
         let mut active_ids: Vec<_> =
-            crate::rewards::RewardDatabase::get_all_active_subnets(&db, 100, 150)
+            DatabaseRewardExtensions::get_all_active_subnets(&db, 100, 150)
                 .unwrap()
                 .into_iter()
                 .map(|s| s.id)

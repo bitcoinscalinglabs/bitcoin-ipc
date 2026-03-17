@@ -8,7 +8,6 @@ pub mod easy_tester;
 pub mod multisig;
 pub mod provider;
 
-#[cfg(feature = "emission_chain")]
 pub mod rewards;
 
 pub mod wallet;

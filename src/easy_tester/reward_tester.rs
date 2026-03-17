@@ -6,7 +6,7 @@ use rand::RngCore;
 use tempfile::TempDir;
 
 use crate::{
-    db::{BitcoinIpcDatabase, HeedDb},
+    db::{DatabaseCore, DatabaseRewardExtensions, HeedDb},
     easy_tester::{
         error::EasyTesterError,
         model::{
@@ -20,7 +20,7 @@ use crate::{
         IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcStakeCollateralMsg,
         IpcUnstakeCollateralMsg, IpcValidate,
     },
-    rewards::{RewardConfig, RewardDatabase, RewardTracker},
+    rewards::{RewardConfig, RewardTracker},
     SubnetId,
 };
 
@@ -455,7 +455,7 @@ impl Tester for RewardTester {
             let snapshot = parse_u64_allow_underscores(&args[0])
                 .map_err(|e| EasyTesterError::runtime(format!("invalid snapshot: {e}")))?;
 
-            let res = RewardDatabase::get_snapshot_result(&self.db, snapshot)
+            let res = DatabaseRewardExtensions::get_snapshot_result(&self.db, snapshot)
                 .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
 
             match res {
@@ -625,10 +625,10 @@ impl Tester for RewardTester {
                 })?;
                 format!(
                     "{:?}",
-                    RewardDatabase::get_reward_candidate_info(&self.db, snapshot, subnet_id)
-                        .map_err(|e| {
-                            EasyTesterError::runtime(format!("db read failed: {e}"))
-                        })?
+                    DatabaseRewardExtensions::get_reward_candidate_info(
+                        &self.db, snapshot, subnet_id
+                    )
+                    .map_err(|e| { EasyTesterError::runtime(format!("db read failed: {e}")) })?
                 )
             }
             OutputDb::RewardResults => {

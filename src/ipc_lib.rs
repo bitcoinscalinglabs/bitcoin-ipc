@@ -282,7 +282,7 @@ impl IpcCreateSubnetMsg {
     /// by creating a new subnet genesis info
     ///
     /// Returns the subnet id and the multisig address
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -545,7 +545,7 @@ impl IpcJoinSubnetMsg {
     /// Returning SubnetState *only* if the subnet is bootstrapped
     ///
     /// It will return None if processed for an already bootstrapped subnet
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -947,7 +947,7 @@ impl IpcPrefundSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -1035,7 +1035,7 @@ impl IpcFundSubnetMsg {
     }
 
     /// Modifies the database to account for the join subnet message
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -1642,7 +1642,7 @@ impl IpcCheckpointSubnetMsg {
 
     /// For each transfer, given the subnet id, set the subnet
     /// multisig address.
-    pub fn update_subnets_for_transfer<D: db::BitcoinIpcDatabase>(
+    pub fn update_subnets_for_transfer<D: db::DatabaseCore>(
         &mut self,
         db: &D,
     ) -> Result<(), IpcLibError> {
@@ -1951,7 +1951,7 @@ impl IpcCheckpointSubnetMsg {
     /// 4. Transfer outputs for each transfer
     ///
     /// Returns an error if the transaction doesn't match the expected format.
-    pub fn from_checkpoint_tx<D: db::BitcoinIpcDatabase>(
+    pub fn from_checkpoint_tx<D: db::DatabaseCore>(
         db: &D,
         tx: &Transaction,
     ) -> Result<Self, IpcLibError> {
@@ -2168,7 +2168,7 @@ impl IpcCheckpointSubnetMsg {
     /// and stores it in the database. It also updates the last checkpoint number in the subnet state.
     ///
     /// Returns the created checkpoint record.
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -2403,7 +2403,7 @@ impl IpcBatchTransferMsg {
     /// - The witness contains our batch transfer data with IPC:TFR tag prefix
     ///
     /// Returns an error if the expected data is missing or malformed.
-    pub fn from_tx<D: db::BitcoinIpcDatabase>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         // Helper closure for error creation
         let err = |msg: String| IpcLibError::MsgParseError(IPC_TRANSFER_TAG, msg);
 
@@ -2547,7 +2547,7 @@ impl IpcBatchTransferMsg {
         Ok(())
     }
 
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -2744,7 +2744,7 @@ impl IpcStakeCollateralMsg {
     }
 
     /// Parses an IpcStakeCollateralMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::BitcoinIpcDatabase>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -2867,7 +2867,7 @@ impl IpcStakeCollateralMsg {
         }
     }
 
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -3211,7 +3211,7 @@ impl IpcUnstakeCollateralMsg {
     }
 
     /// Parses an IpcUnstakeCollateralMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::BitcoinIpcDatabase>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -3407,7 +3407,7 @@ impl IpcUnstakeCollateralMsg {
         }
     }
 
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -3698,7 +3698,7 @@ impl IpcKillSubnetMsg {
     }
 
     /// Parses an IpcKillSubnetMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::BitcoinIpcDatabase>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -3876,7 +3876,7 @@ impl IpcKillSubnetMsg {
         }
     }
 
-    pub fn save_to_db<D: db::BitcoinIpcDatabase>(
+    pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
         block_height: u64,
@@ -4902,7 +4902,7 @@ mod prefund_msg_tests {
 mod checkpoint_msg_tests {
     use super::*;
     use crate::{
-        db::BitcoinIpcDatabase,
+        db::DatabaseCore,
         test_utils::{self, create_test_db},
         DEFAULT_BTC_FEE_RATE,
     };
