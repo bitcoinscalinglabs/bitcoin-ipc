@@ -3,33 +3,36 @@
 
 COMPOSE_FILE := docker-compose.local.yml
 
-.PHONY: docker-ipc-build docker-build docker-up docker-down docker-restart docker-reset
+.PHONY: local-ipc-build local-build local-up local-down local-reset-fendermint local-reset-data
 
-# Build the IPC builder image (required before first docker-up).
+# Build the IPC builder image
 # Run once, or when the IPC repo / Dockerfile.ipc changes.
-docker-ipc-build:
+local-ipc-build:
 	docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 
-# Build the bitcoin-ipc image (no ipc-builder rebuild).
-docker-build:
+# Build the bitcoin-ipc image (not the ipc repo).
+local-build:
 	docker compose -f $(COMPOSE_FILE) build
 
-# Build and start the container. Builds ipc-builder if missing.
-docker-up:
-	@docker image inspect ipc-builder:latest >/dev/null 2>&1 || $(MAKE) docker-ipc-build
-	docker compose -f $(COMPOSE_FILE) up --build
+# Start the container. Builds ipc-builder if missing.
+local-up:
+	@if ! docker image inspect ipc-builder:latest >/dev/null 2>&1; then $(MAKE) local-ipc-build; fi
+	docker compose -f $(COMPOSE_FILE) up
 
 # Stop and remove the container.
-docker-down:
+local-down:
 	docker compose -f $(COMPOSE_FILE) down
 
-# Restart the container (e.g. after resetting .ipc or .bitcoin).
-docker-restart:
-	docker compose -f $(COMPOSE_FILE) restart
+# Delete the local fendermint Docker image and pull the latest IPC repo inside the
+# bitcoin-ipc container. The next subnet spin-up will rebuild fendermint from the new code.
+local-reset-fendermint:
+	docker exec bitcoin-ipc git -C /workspace/ipc pull
+	docker rmi fendermint:latest || true
+	@echo "Fendermint image removed and workspace/ipc updated."
 
-# Full reset: stop container, delete the root-data volume, and remove ~/.ipc on the host.
-# Run 'make docker-up' afterward to start fresh.
-docker-reset:
+# Reset the local data (Bitcoin chain, IPC config, etc.).
+# Run 'make docker-up' to start fresh.
+local-reset-data:
 	docker compose -f $(COMPOSE_FILE) down -v
 	rm -rf $(HOME)/.ipc
-	@echo "Reset complete. Run 'make docker-up' to start fresh. Run `make docker-ipc-build` if you also want to rebuild the IPC repo."
+	@echo "Data reset complete."
