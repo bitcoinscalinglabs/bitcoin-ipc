@@ -148,6 +148,9 @@ pub fn generate_subnet(n_val: usize) -> db::SubnetState {
 }
 
 pub fn create_test_db() -> crate::db::HeedDb {
+    // Ensure FVM address network is set for SubnetId serde roundtrips.
+    crate::eth_utils::set_fvm_network();
+
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().to_str().unwrap();
     tokio::runtime::Runtime::new()

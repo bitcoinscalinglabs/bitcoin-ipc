@@ -9,10 +9,16 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use bitcoin::BlockHash;
-use bitcoin_ipc::db::{self, Database, HeedDb};
+use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
+
+use bitcoin_ipc::db::DatabaseRewardExtensions;
+use bitcoin_ipc::rewards::RewardTracker;
+
+trait Database: DatabaseCore + DatabaseRewardExtensions {}
+impl<T: DatabaseCore + DatabaseRewardExtensions> Database for T {}
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -79,6 +85,9 @@ async fn main() {
         cancel_token.clone(),
     );
 
+    #[cfg(feature = "emission_chain")]
+    monitor.set_reward_tracker();
+
     // Spawn monitor task
 
     let monitor_handle = tokio::spawn(async move { monitor.sync_and_listen().await });
@@ -128,6 +137,7 @@ struct Monitor<D: Database> {
     current_height: u64,
     cancel_token: CancellationToken,
     side_effects: Vec<SideEffect>,
+    reward_tracker: Option<RewardTracker>,
 }
 
 impl<D> Monitor<D>
@@ -146,10 +156,17 @@ where
             rpc,
             watchonly_rpc,
             check_interval,
-            cancel_token,
-            current_height: 0,
-            side_effects: Vec::new(),
-        }
+        cancel_token,
+        current_height: 0,
+        side_effects: Vec::new(),
+        reward_tracker: None,
+    }
+}
+
+    #[cfg(feature = "emission_chain")]
+    /// Sets the reward tracker. Must be called to enable reward bookkeeping.
+    pub fn set_reward_tracker(&mut self) {
+        self.reward_tracker = Some(RewardTracker::new());
     }
 
     /// Syncs with the Bitcoin network
@@ -204,6 +221,18 @@ where
                         return Err(e);
                     }
                 }
+
+                // Reward bookkeeping hooks (must run after processing all tx in each block).
+
+                if let Some(ref mut reward_tracker) = self.reward_tracker {
+                    match reward_tracker.update_after_block(&self.db, next_height) {
+                        Ok(_) => {}
+                        Err(e) => error!(
+                            "Error updating reward bookkeeping after block {}: {:?}",
+                            next_height, e
+                        ),
+                    }
+                }
             }
 
             // Refetch the latest block height
@@ -254,6 +283,18 @@ where
                                 error!("Error processing block {}: {:?}.", block_count, e);
                                 // Retry logic can be added here if needed
                                 return Err(e);
+                            }
+                        }
+
+                        // Reward bookkeeping hooks (must run after processing all tx in each block).
+
+                        if let Some(ref mut reward_tracker) = self.reward_tracker {
+                            match reward_tracker.update_after_block(&self.db, next_height) {
+                                Ok(_) => {}
+                                Err(e) => error!(
+                                    "Error updating reward bookkeeping after block {}: {:?}",
+                                    next_height, e
+                                ),
                             }
                         }
                     }
@@ -626,6 +667,23 @@ where
                     msg.subnet_id, msg.checkpoint_height, checkpoint.checkpoint_number
                 );
 
+                // Reward bookkeeping hooks after a checkpoint.
+
+                if let Some(ref mut reward_tracker) = self.reward_tracker {
+                    match reward_tracker.update_after_checkpoint(
+                        &self.db,
+                        block_height,
+                        msg.subnet_id,
+                        &checkpoint,
+                    ) {
+                        Ok(_) => info!("Updated reward bookkeeping after checkpoint"),
+                        Err(e) => error!(
+                            "Error updating reward bookkeeping after checkpoint: {:?}",
+                            e
+                        ),
+                    }
+                }
+
                 Ok(())
             }
 
@@ -759,4 +817,7 @@ pub enum MonitorError {
 
     #[error(transparent)]
     BitcoinRpcError(#[from] bitcoincore_rpc::Error),
+
+    #[error("Invalid configuration: {0}")]
+    ConfigError(String),
 }

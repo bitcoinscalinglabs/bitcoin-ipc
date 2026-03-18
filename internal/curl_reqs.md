@@ -498,4 +498,19 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
+
+
+# get rewarded collaterals for all validators for a past snapshot
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer validator1_auth_token" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "getrewardedcollaterals",
+    "params": {
+        "snapshot": 43
+    },
+    "id": 1
+}' | jq
+
 ```

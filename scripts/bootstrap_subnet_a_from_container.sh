@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Bootstrap a BTC subnet locally (run inside the container):
+# Bootstrap Subnet A locally (run inside the container):
 # - Creates a subnet (via validator1 provider), mines blocks, has validators 1-4 join, funds it, mines more, and prints subnet state.
 
 API_HOST="127.0.0.1"
@@ -272,6 +272,18 @@ JSON
 rpc_post_raw_or_die "getsubnet" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$GETSUBNET_PAYLOAD" | jq
 
 # Add subnet configuration entry to all IPC config files (end of script)
+# Subnet A: validator1=8545, validator2=8645, validator3=8745, validator4=8845, validator5=8945, users=8545
+get_subnet_a_port() {
+  case "$1" in
+    *validator1*) echo "8545" ;;
+    *validator2*) echo "8645" ;;
+    *validator3*) echo "8745" ;;
+    *validator4*) echo "8845" ;;
+    *validator5*) echo "8945" ;;
+    *) echo "8545" ;;  # config.toml, user1, user2
+  esac
+}
+
 CONFIG_FILES=(
   /root/.ipc/config.toml
   /root/.ipc/validator1/config.toml
@@ -293,15 +305,16 @@ for f in "${CONFIG_FILES[@]}"; do
     echo "Error: config file not found: $f" >&2
     exit 1
   fi
+  PORT=$(get_subnet_a_port "$f")
   cat >> "$f" <<EOF
 
-# Created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
+# Subnet A. Created on ${SUBNET_CREATED_AT} at height ${SUBNET_CREATED_HEIGHT}
 [[subnets]]
 id = "${SUBNET_ID}"
 
 [subnets.config]
 network_type = "fevm"
-provider_http = "http://host.docker.internal:8545/"
+provider_http = "http://host.docker.internal:${PORT}/"
 gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
 registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
 EOF

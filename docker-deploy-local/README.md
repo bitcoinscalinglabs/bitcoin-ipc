@@ -6,17 +6,31 @@ Guide for running Bitcoin IPC in Docker for **local deployment**.
 
 The IPC repo is built into a separate image to avoid rebuilding when we make local changes to this repo.
 
-Build it once (from repo root):
+**Using Make (recommended):**
 
 ```bash
-docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
+make docker-up
 ```
 
-Then build/run the main container normally:
+This builds `ipc-builder` if needed, then builds and starts the bitcoin-ipc container.
+
+**Manual steps:**
+
+Build the IPC image once (from repo root):
 
 ```bash
-docker-compose up --build
+make docker-ipc-build
+# or: docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 ```
+
+Then build/run the main container:
+
+```bash
+make docker-up
+# or: docker compose -f docker-compose.local.yml up --build
+```
+
+**Other Make targets:** `make docker-down`, `make docker-restart`, `make docker-build`
 
 Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the image is rebuilt.
 
@@ -26,13 +40,13 @@ Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the im
 The `bitcoin-ipc` container contains/runs:
 
 - Bitcoin Core in `regtest` mode.
-- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 5 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
-- The `monitor` and `provider` binaries for each validator (`validator1`–`validator5`) and user (`user1`, `user2`), automatically started upon container creation.
+- Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 6 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
+- The `monitor` and `provider` binaries for each validator (`validator1`–`validator6`) and user (`user1`, `user2`), automatically started upon container creation.
 - The captured logs for each monitor and provider instance in the `/root/logs/` directory inside the container.
 - The `ipc-cli` tool.
 - Sets the required environment variables
 - The script `/workspace/bitcoin-ipc/scripts/miner.sh` that mines regtest blocks every 10 seconds is started automatically upon container creation.
-- A script to quickly create, join, and fund subnet can be found on `/workspace/bitcoin-ipc/internal/bootstrap_subnet_in_container.sh` in the container (not run automatically).
+- Scripts to quickly create, join, and fund subnets: `bootstrap_subnet_a_from_container.sh` and `bootstrap_subnet_b_from_container.sh` (mounted from `scripts/`, not run automatically).
 
 
 ## Layout Inside the Container
@@ -41,31 +55,39 @@ The `bitcoin-ipc` container contains/runs:
 - `/workspace/ipc/` – IPC repo
 - `/root/.bitcoin/` – Bitcoin Core regtest data and config
 - `/root/.ipc/` – IPC configs (validators/users)
-- `/root/logs/` – monitor and provider log files (e.g. `monitor-validator1.log`, `provider-validator1.log`)
+- `/root/logs/` – monitor, provider, and relayer log files (e.g. `monitor-validator1.log`, `provider-validator1.log`, `relayer-subnet-a-validator1.log`)
 
 Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermint`, `bitcoind`, `bitcoin-cli`, Foundry tools.
 
 
 ## Exposed Ports
 <!-- - **18443** – Bitcoin RPC -->
-- **3030–3034** – Provider (validator1–5)
+- **3030–3035** – Provider (validator1–6)
 - **3040–3041** – Provider (user1–2)
 
 
 
 
-## Monitor and provider logs
+## Monitor, provider, and relayer logs
 
 Log files live inside the container at `/root/logs/` (same volume as `/root`, so they persist across restarts):
 
-- `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator5.log`, `provider-validator5.log`
+- `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator6.log`, `provider-validator6.log`
 - `monitor-user1.log`, `provider-user1.log`, `monitor-user2.log`, `provider-user2.log`
+- `relayer-subnet-a-validator1.log` … `relayer-subnet-a-validator4.log` (started by `spin_up_subnet_a_from_container.sh`)
+- `relayer-subnet-b-validator1.log` … `relayer-subnet-b-validator4.log` (started by `spin_up_subnet_b_from_container.sh`)
 
 **View logs from the host:**
 
 ```bash
-# Stream one log
+# Stream monitor log
 docker exec bitcoin-ipc tail -f /root/logs/monitor-validator1.log
+
+# Stream provider log
+docker exec bitcoin-ipc tail -f /root/logs/provider-validator1.log
+
+# Stream relayer log (Subnet A)
+docker exec bitcoin-ipc tail -f /root/logs/relayer-subnet-a-validator1.log
 ```
 
 ## Running monitor and provider manually
@@ -80,11 +102,12 @@ monitor --env ~/.ipc/validator1/.env
 provider --env ~/.ipc/validator1/.env
 ```
 
-### List running monitor/provider processes
+### List running monitor/provider/relayer processes
 
 ```bash
 pgrep -a monitor || true
 pgrep -a provider || true
+pgrep -af "checkpoint relayer" || true
 ```
 
 ## Available commands (IPC-CLI, cast)
@@ -142,8 +165,8 @@ Other commands (balance, etc.): use the same `ipc-cli --config-path ~/.ipc/valid
 
 ```bash
 docker exec bitcoin-ipc rm -rf /root/.ipc
-docker-compose restart
-# or: docker-compose down && docker-compose up -d
+make docker-restart
+# or: docker compose -f docker-compose.local.yml restart
 ```
 
 Quickstart will recreate `~/.ipc/` on next start.
@@ -152,7 +175,7 @@ Quickstart will recreate `~/.ipc/` on next start.
 
 ```bash
 docker exec bitcoin-ipc rm -rf /root/.bitcoin
-docker-compose restart
+make docker-restart
 ```
 
 The entrypoint recreates `/root/.bitcoin` and `bitcoin.conf` only when `/root/.bitcoin` is missing, so existing chain data is preserved until you delete it.

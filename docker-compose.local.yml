@@ -4,7 +4,10 @@ services:
   bitcoin-ipc:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker-deploy-local/Dockerfile
+      args:
+        # Set EMISSION_CHAIN_FEATURES=true to enable; unset = false
+        EMISSION_CHAIN_FEATURES: "${EMISSION_CHAIN_FEATURES:-false}"
     image: bitcoin-ipc:latest
     container_name: bitcoin-ipc
     volumes:
@@ -12,8 +15,9 @@ services:
       - root-data:/root
       # Bind-mount entrypoint script for fast iteration (no rebuild needed)
       - ./docker-deploy-local/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
-      # Bind-mount script for quick subnet bootstrap
-      - ./scripts/bootstrap_subnet_from_container.sh:/usr/local/bin/bootstrap_subnet_from_container.sh:ro
+      # Bind-mount scripts for quick subnet bootstrap
+      - ./scripts/bootstrap_subnet_a_from_container.sh:/usr/local/bin/bootstrap_subnet_a_from_container.sh:ro
+      - ./scripts/bootstrap_subnet_b_from_container.sh:/usr/local/bin/bootstrap_subnet_b_from_container.sh:ro
       # Bind-mount scripts for quick validator spin-up
       - ./scripts/spin_up_subnet_a_from_container.sh:/usr/local/bin/spin_up_subnet_a_from_container.sh:ro
       - ./scripts/spin_up_subnet_b_from_container.sh:/usr/local/bin/spin_up_subnet_b_from_container.sh:ro
@@ -33,6 +37,7 @@ services:
       - IPC_ADDRESS_OF_VALIDATOR_3=${IPC_ADDRESS_OF_VALIDATOR_3:-0x646aed5404567ae15648e9b9b0004cbafb126949}
       - IPC_ADDRESS_OF_VALIDATOR_4=${IPC_ADDRESS_OF_VALIDATOR_4:-0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf}
       - IPC_ADDRESS_OF_VALIDATOR_5=${IPC_ADDRESS_OF_VALIDATOR_5:-0xb628237ff4875b039ec1c3dedcf5fad93430ee4a}
+      - IPC_ADDRESS_OF_VALIDATOR_6=${IPC_ADDRESS_OF_VALIDATOR_6:-0x2aff4f2c3654acf4247e13aca3b4a0a52f340e25}
       - IPC_ADDRESS_OF_USER_1=${IPC_ADDRESS_OF_USER_1:-0x005e05dd763dd125473f8889726f7c305e50fcae}
       - IPC_ADDRESS_OF_USER_2=${IPC_ADDRESS_OF_USER_2:-0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d}
       - WHITELIST=${WHITELIST:-5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268,851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4,b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0,b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529}
@@ -45,6 +50,7 @@ services:
       - "3032:3032"  # validator3
       - "3033:3033"  # validator4
       - "3034:3034"  # validator5
+      - "3035:3035"  # validator6
       # User provider ports
       - "3040:3040"  # user1
       - "3041:3041"  # user2
@@ -55,4 +61,3 @@ services:
 volumes:
   root-data:
     name: bitcoin-ipc-local_root-data
-

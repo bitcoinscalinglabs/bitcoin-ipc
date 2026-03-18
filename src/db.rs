@@ -32,6 +32,9 @@ const STAKE_CHANGES_KEY: &str = "stake_changes:";
 // kill_requests:<subnet_id>:<block_height>:<txid>
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
+// Number of LMDB databases (`heed::Database`) we open/create in this environment.
+const MAX_DBS: u32 = 13;
+
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
 const KILL_REQUEST_VALID_BLOCKS: u64 = 3;
@@ -48,6 +51,10 @@ pub type Wtxn<'a> = &'a mut heed::RwTxn<'a>;
 
 fn subnet_state_key(subnet_id: SubnetId) -> String {
     format!("{SUBNET_STATE_KEY}:{}", subnet_id)
+}
+
+fn all_subnets_prefix() -> String {
+    format!("{SUBNET_STATE_KEY}")
 }
 
 fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
@@ -91,6 +98,24 @@ fn kill_request_key(subnet_id: SubnetId, block_height: u64, txid: Txid) -> Strin
         "{KILL_REQUESTS_KEY}:{}:{}:{}",
         subnet_id, block_height, txid
     )
+}
+
+// reward_candidates:<snapshot>:<subnet_id>
+const REWARD_CANDIDATES_KEY: &str = "reward_candidates:";
+
+// reward_results:<snapshot>
+const REWARD_RESULTS_KEY: &str = "reward_results:";
+
+pub(crate) fn reward_candidates_prefix(snapshot: u64) -> String {
+    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:")
+}
+
+pub(crate) fn reward_candidate_key(snapshot: u64, subnet_id: SubnetId) -> String {
+    format!("{REWARD_CANDIDATES_KEY}:{snapshot}:{subnet_id}")
+}
+
+pub(crate) fn reward_result_key(snapshot: u64) -> String {
+    format!("{REWARD_RESULTS_KEY}:{snapshot}")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -365,7 +390,7 @@ pub struct SubnetCheckpoint {
 pub enum SubnetKillState {
     NotKilled,
     ToBeKilled,
-    Killed,
+    Killed { parent_height: u64 },
 }
 
 /// The current state of a subnet
@@ -482,7 +507,7 @@ impl SubnetState {
     }
 
     pub fn is_killed(&self) -> bool {
-        matches!(self.killed, SubnetKillState::Killed)
+        matches!(self.killed, SubnetKillState::Killed { .. })
     }
 
     pub fn is_killed_or_pending(&self) -> bool {
@@ -716,8 +741,81 @@ pub struct KillRequest {
     pub txid: Txid,
 }
 
+/// Keeps track of reward-related information for a subnet during a snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SubnetRewardInfo {
+    /// The last committee number detected for the subnet, either in previous or in the current snapshot.
+    pub most_recent_committee_number: u64,
+    /// The collateral amounts rewarded to each validator in the subnet during the snapshot.
+    /// Acts as a lazy accumulator, see `RewardTracker`
+    pub rewarded_amounts: Option<Vec<(XOnlyPublicKey, bitcoin::Amount)>>,
+}
+
+/// The result of a snapshot reward calculation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SnapshotResult {
+    /// The list of rewards for all eligible validators
+    pub rewards_list: Vec<(XOnlyPublicKey, bitcoin::Amount)>,
+    /// The total collateral rewarded in the snapshot.
+    /// Stored for convenience, this should be derivable from `rewards_list`.
+    pub total_rewarded_collateral: bitcoin::Amount,
+}
+
+pub trait DatabaseRewardExtensions: DatabaseCore {
+    /// Returns all subnets that were active throughout the Bitcoin height interval
+    /// `[height_from, height_to]` (both sides inclusive).
+    /// A subnet is considered active if:
+    /// - It was created at or before `height_from`
+    /// - It was bootstrapped at or before `height_from`
+    /// - It was not killed at or before `height_to`
+    fn get_all_active_subnets(
+        &self,
+        height_from: u64,
+        height_to: u64,
+    ) -> Result<Vec<SubnetState>, DbError>;
+
+    /// Returns the reward-related information for a subnet, if it is a candidate
+    /// for rewards in snapshot `snapshot`, and None otherwise.
+    fn get_reward_candidate_info(
+        &self,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetRewardInfo>, DbError>;
+
+    fn put_reward_candidate_info(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+        reward_info: &SubnetRewardInfo,
+    ) -> Result<(), DbError>;
+
+    fn delete_reward_candidate_info(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<(), DbError>;
+
+    fn iter_reward_candidate_info(
+        &self,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
+
+    /// Returns the result of snapshot.
+    /// If the snapshot has not yet been finalized it returns an error.
+    fn get_snapshot_result(&self, snapshot: u64) -> Result<Option<SnapshotResult>, DbError>;
+
+    fn put_snapshot_result(
+        &self,
+        txn: &mut RwTxn,
+        snapshot: u64,
+        result: &SnapshotResult,
+    ) -> Result<(), DbError>;
+}
+
 pub struct HeedDb {
-    env: Env,
+    pub(crate) env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
     subnet_db: HeedDatabase<Str, SerdeBincode<SubnetState>>,
     subnet_genesis_db: HeedDatabase<Str, SerdeBincode<SubnetGenesisInfo>>,
@@ -729,6 +827,8 @@ pub struct HeedDb {
     committee_db: HeedDatabase<Str, SerdeBincode<SubnetCommittee>>,
     stake_changes_db: HeedDatabase<Str, SerdeBincode<StakeChangeRequest>>,
     kill_requests_db: HeedDatabase<Str, SerdeBincode<KillRequest>>,
+    pub(crate) reward_candidates_db: HeedDatabase<Str, SerdeBincode<SubnetRewardInfo>>,
+    pub(crate) reward_results_db: HeedDatabase<Str, SerdeBincode<SnapshotResult>>,
 }
 
 impl HeedDb {
@@ -767,7 +867,7 @@ impl HeedDb {
             EnvOpenOptions::new()
                 .flags(flags)
                 // TODO set max_dbs automatically
-                .max_dbs(11)
+                .max_dbs(MAX_DBS)
                 .open(database_path)?
         };
 
@@ -801,6 +901,12 @@ impl HeedDb {
             let kill_requests_db = env
                 .open_database(&rtxn, Some("kill_requests_db"))?
                 .ok_or(DbError::DbNotFound("kill_requests_db".to_string()))?;
+            let reward_candidates_db = env
+                .open_database(&rtxn, Some("reward_candidates_db"))?
+                .ok_or(DbError::DbNotFound("reward_candidates_db".to_string()))?;
+            let reward_results_db = env
+                .open_database(&rtxn, Some("reward_results_db"))?
+                .ok_or(DbError::DbNotFound("reward_results_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -814,6 +920,8 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
+                reward_candidates_db,
+                reward_results_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -827,6 +935,9 @@ impl HeedDb {
             let committee_db = env.create_database(&mut txn, Some("committee_db"))?;
             let stake_changes_db = env.create_database(&mut txn, Some("stake_changes_db"))?;
             let kill_requests_db = env.create_database(&mut txn, Some("kill_requests_db"))?;
+            let reward_candidates_db =
+                env.create_database(&mut txn, Some("reward_candidates_db"))?;
+            let reward_results_db = env.create_database(&mut txn, Some("reward_results_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -840,12 +951,14 @@ impl HeedDb {
                 committee_db,
                 stake_changes_db,
                 kill_requests_db,
+                reward_candidates_db,
+                reward_results_db,
             })
         }
     }
 }
 
-pub trait Database {
+pub trait DatabaseCore {
     fn write_txn(&self) -> Result<RwTxn, DbError>;
 
     // Monitor Info
@@ -872,6 +985,10 @@ pub trait Database {
         subnet_id: SubnetId,
         subnet_state: &SubnetState,
     ) -> Result<(), DbError>;
+
+    /// Returns all subnet states stored in the database.
+    fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError>;
+
     /// Gets a subnet by its multisig address
     fn get_subnet_by_multisig_address(
         &self,
@@ -880,27 +997,32 @@ pub trait Database {
 
     // Rootnet Messages
     fn get_all_rootnet_msgs(&self, subnet_id: SubnetId) -> Result<Vec<RootnetMessage>, DbError>;
+
     fn get_rootnet_msgs_by_height(
         &self,
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError>;
+
     fn get_last_rootnet_msg_nonce_txn(
         &self,
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<Option<u64>, DbError>;
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError>;
+
     fn get_next_rootnet_msg_nonce_txn(
         &self,
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError>;
+
     fn get_rootnet_msg(
         &self,
         subnet_id: SubnetId,
         nonce: u64,
     ) -> Result<Option<RootnetMessage>, DbError>;
+
     fn add_rootnet_msg(
         &self,
         txn: &mut RwTxn,
@@ -1007,7 +1129,7 @@ pub trait Database {
 }
 
 #[async_trait]
-impl Database for HeedDb {
+impl DatabaseCore for HeedDb {
     fn write_txn(&self) -> Result<RwTxn, DbError> {
         self.env.write_txn().map_err(|e| e.into())
     }
@@ -1083,6 +1205,16 @@ impl Database for HeedDb {
         let key = subnet_state_key(subnet_id);
         self.subnet_db.put(txn, &key, subnet_state)?;
         Ok(())
+    }
+
+    fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError> {
+        let txn = self.env.read_txn()?;
+        let prefix = all_subnets_prefix();
+        let iter = self.subnet_db.prefix_iter(&txn, &prefix)?;
+        let subnets = iter
+            .map(|res| res.map(|(_, subnet_state)| subnet_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(subnets)
     }
 
     fn get_subnet_by_multisig_address(
@@ -1949,11 +2081,14 @@ pub mod tests {
         assert!(!subnet.should_kill());
         subnet.killed = SubnetKillState::ToBeKilled;
         assert!(!subnet.should_kill());
-        subnet.last_checkpoint_number = Some(1);
+        // With marked_for_kill=None, should_kill when (last_checkpoint+1) >= KILL_PERIOD
+        subnet.last_checkpoint_number = Some(KILL_PERIOD_NUMBER_OF_CHECKPOINTS - 2);
         assert!(!subnet.should_kill());
-        subnet.last_checkpoint_number = Some(5);
+        subnet.last_checkpoint_number = Some(KILL_PERIOD_NUMBER_OF_CHECKPOINTS);
         assert!(subnet.should_kill());
-        subnet.marked_for_kill_checkpoint_number = Some(4);
+        let marked = 4u64;
+        subnet.marked_for_kill_checkpoint_number = Some(marked);
+        subnet.last_checkpoint_number = Some(marked); // last - marked = 0 < KILL_PERIOD
         assert!(!subnet.should_kill());
         subnet.marked_for_kill_checkpoint_number = Some(4);
         subnet.last_checkpoint_number = Some(10);
