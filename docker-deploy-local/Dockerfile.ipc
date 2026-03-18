@@ -48,8 +48,7 @@ RUN /root/.foundry/bin/foundryup && \
     cast --version
 
 WORKDIR /workspace
-#TODO:Change the following to use `bitcoin` branch
-RUN git clone --depth 1 --branch tokenomics-impl https://github.com/bitcoinscalinglabs/ipc.git ipc
+RUN git clone --depth 1 --branch bitcoin https://github.com/bitcoinscalinglabs/ipc.git ipc
 
 WORKDIR /workspace/ipc
 RUN cd contracts && ln -sf contracts src
