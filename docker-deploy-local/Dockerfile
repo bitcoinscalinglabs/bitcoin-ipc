@@ -33,7 +33,8 @@ RUN if [ "$EMISSION_CHAIN_FEATURES" = "true" ]; then \
     fi
 
 # Stage 2: IPC artifacts come from a prebuilt image (build once and reuse):
-# docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
+# make docker-ipc-build
+# or: docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 FROM ipc-builder:latest AS ipc-builder
 
 # Stage 3: Final runtime environment
@@ -150,7 +151,8 @@ ENV RUST_LOG=debug
 ENV HOME=/root
 
 # Copy entrypoint script from repo so edits don't rebuild builders
-COPY /docker-deploy-local/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# Build context is repo root; path is relative to context
+COPY docker-deploy-local/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

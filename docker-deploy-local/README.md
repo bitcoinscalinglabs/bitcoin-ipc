@@ -6,17 +6,31 @@ Guide for running Bitcoin IPC in Docker for **local deployment**.
 
 The IPC repo is built into a separate image to avoid rebuilding when we make local changes to this repo.
 
-Build it once (from repo root):
+**Using Make (recommended):**
 
 ```bash
-docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
+make docker-up
 ```
 
-Then build/run the main container normally:
+This builds `ipc-builder` if needed, then builds and starts the bitcoin-ipc container.
+
+**Manual steps:**
+
+Build the IPC image once (from repo root):
 
 ```bash
-docker-compose up --build
+make docker-ipc-build
+# or: docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
 ```
+
+Then build/run the main container:
+
+```bash
+make docker-up
+# or: docker compose -f docker-compose.local.yml up --build
+```
+
+**Other Make targets:** `make docker-down`, `make docker-restart`, `make docker-build`
 
 Persistent data (Bitcoin chain, IPC config in volumes) is unchanged; only the image is rebuilt.
 
@@ -151,8 +165,8 @@ Other commands (balance, etc.): use the same `ipc-cli --config-path ~/.ipc/valid
 
 ```bash
 docker exec bitcoin-ipc rm -rf /root/.ipc
-docker-compose restart
-# or: docker-compose down && docker-compose up -d
+make docker-restart
+# or: docker compose -f docker-compose.local.yml restart
 ```
 
 Quickstart will recreate `~/.ipc/` on next start.
@@ -161,7 +175,7 @@ Quickstart will recreate `~/.ipc/` on next start.
 
 ```bash
 docker exec bitcoin-ipc rm -rf /root/.bitcoin
-docker-compose restart
+make docker-restart
 ```
 
 The entrypoint recreates `/root/.bitcoin` and `bitcoin.conf` only when `/root/.bitcoin` is missing, so existing chain data is preserved until you delete it.

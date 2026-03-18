@@ -326,8 +326,8 @@ impl RewardTracker {
                 },
             )?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
+            info!("Updated reward bookkeeping after block {block_height}.");
         }
-        info!("Updated reward bookkeeping after block {block_height}.");
         Ok(())
     }
 

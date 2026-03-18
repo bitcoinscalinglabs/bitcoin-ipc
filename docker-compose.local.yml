@@ -4,9 +4,10 @@ services:
   bitcoin-ipc:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker-deploy-local/Dockerfile
       args:
-        EMISSION_CHAIN_FEATURES: "true"
+        # Set EMISSION_CHAIN_FEATURES=true to enable; unset = false
+        EMISSION_CHAIN_FEATURES: "${EMISSION_CHAIN_FEATURES:-false}"
     image: bitcoin-ipc:latest
     container_name: bitcoin-ipc
     volumes:
@@ -60,4 +61,3 @@ services:
 volumes:
   root-data:
     name: bitcoin-ipc-local_root-data
-
