@@ -161,6 +161,8 @@ fn calc_checkpoint_size(
         unstakes,
         withdrawals,
         transfers,
+        token_registrations: vec![],
+        erc_transfers: vec![],
         change_address: Some(subnet.committee.multisig_address.clone()),
         // Static values below, not relevant for size testing
         checkpoint_hash: bitcoin::hashes::sha256::Hash::from_str(

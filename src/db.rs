@@ -1,5 +1,5 @@
 use crate::{
-    ipc_lib::{IpcCreateSubnetMsg, IpcFundSubnetMsg},
+    ipc_lib::{IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcTokenRegistration, IpcFundSubnetMsg},
     multisig::{create_subnet_multisig_address, multisig_threshold, Power, WeightedKey},
     wallet, SubnetId, NETWORK,
 };
@@ -673,12 +673,33 @@ pub enum RootnetMessage {
         nonce: u64,
         txid: Txid,
     },
+    /// ERC20 cross-subnet transfer
+    #[serde(rename = "erc_transfer")]
+    ErcTransfer {
+        msg: IpcCrossSubnetErcTransfer,
+        block_height: u64,
+        block_hash: BlockHash,
+        nonce: u64,
+        txid: Txid,
+    },
+    /// ERC20 token metadata registration (fanned out to all known subnets)
+    #[serde(rename = "erc_registration")]
+    ErcRegistration {
+        home_subnet_id: SubnetId,
+        registration: IpcErcTokenRegistration,
+        block_height: u64,
+        block_hash: BlockHash,
+        nonce: u64,
+        txid: Txid,
+    },
 }
 
 impl RootnetMessage {
     pub fn nonce(&self) -> u64 {
         match self {
             RootnetMessage::FundSubnet { nonce, .. } => *nonce,
+            RootnetMessage::ErcTransfer { nonce, .. } => *nonce,
+            RootnetMessage::ErcRegistration { nonce, .. } => *nonce,
         }
     }
 }
@@ -1299,6 +1320,8 @@ impl DatabaseCore for HeedDb {
                 Ok(msg) => {
                     let height = match &msg {
                         RootnetMessage::FundSubnet { block_height, .. } => *block_height,
+                        RootnetMessage::ErcTransfer { block_height, .. } => *block_height,
+                        RootnetMessage::ErcRegistration { block_height, .. } => *block_height,
                     };
                     // Only include messages within the specified height range
                     if height == block_height {
@@ -1803,6 +1826,7 @@ pub mod tests {
                 assert_eq!(*nonce, 0);
                 assert_eq!(*block_height, *block_height);
             }
+            _ => panic!("Expected FundSubnet variant"),
         }
 
         // Check get_all_rootnet_msgs returns both messages
@@ -2463,5 +2487,147 @@ pub mod tests {
             .get_next_stake_change_configuration_number(subnet_id)
             .unwrap();
         assert_eq!(next_conf_num, GENESIS_COMMITTEE_CONF_NUM + 4);
+    }
+
+    #[test]
+    #[test_retry::retry(3)]
+    fn test_unified_nonce_across_message_types() {
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+        let block_height = 100;
+        let block_hash = create_rand_blockhash();
+        let txid = create_rand_txid();
+
+        let home_subnet_id = generate_subnet_id();
+
+        // Add a FundSubnet message (nonce 0)
+        let fund_msg = RootnetMessage::FundSubnet {
+            msg: IpcFundSubnetMsg {
+                subnet_id,
+                amount: Amount::from_sat(1_000_000),
+                address: create_rand_eth_addr(),
+            },
+            block_height,
+            block_hash,
+            nonce: 0,
+            txid,
+        };
+        let mut txn = db.write_txn().unwrap();
+        db.add_rootnet_msg(&mut txn, subnet_id, fund_msg).unwrap();
+
+        // Add an ErcRegistration message (nonce 1)
+        let erc_reg = RootnetMessage::ErcRegistration {
+            home_subnet_id,
+            registration: create_rand_erc_token_registration(),
+            block_height,
+            block_hash,
+            nonce: 1,
+            txid,
+        };
+        db.add_rootnet_msg(&mut txn, subnet_id, erc_reg).unwrap();
+
+        // Add an ErcTransfer message (nonce 2)
+        let erc_transfer = RootnetMessage::ErcTransfer {
+            msg: create_rand_erc_transfer(home_subnet_id, subnet_id),
+            block_height,
+            block_hash,
+            nonce: 2,
+            txid,
+        };
+        db.add_rootnet_msg(&mut txn, subnet_id, erc_transfer).unwrap();
+        txn.commit().unwrap();
+
+        // Verify next nonce is 3
+        assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 3);
+
+        // Verify all messages are retrievable and nonces are correct
+        let all_msgs = db.get_all_rootnet_msgs(subnet_id).unwrap();
+        assert_eq!(all_msgs.len(), 3);
+        assert_eq!(all_msgs[0].nonce(), 0);
+        assert_eq!(all_msgs[1].nonce(), 1);
+        assert_eq!(all_msgs[2].nonce(), 2);
+
+        // Verify types
+        assert!(matches!(all_msgs[0], RootnetMessage::FundSubnet { .. }));
+        assert!(matches!(all_msgs[1], RootnetMessage::ErcRegistration { .. }));
+        assert!(matches!(all_msgs[2], RootnetMessage::ErcTransfer { .. }));
+    }
+
+    #[test]
+    #[test_retry::retry(3)]
+    fn test_get_rootnet_msgs_by_height_filters_all_variants() {
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+        let home_subnet_id = generate_subnet_id();
+        let block_hash = create_rand_blockhash();
+        let txid = create_rand_txid();
+
+        let height_100 = 100u64;
+        let height_200 = 200u64;
+
+        let mut txn = db.write_txn().unwrap();
+
+        // Block 100: FundSubnet + ErcRegistration
+        db.add_rootnet_msg(
+            &mut txn,
+            subnet_id,
+            RootnetMessage::FundSubnet {
+                msg: IpcFundSubnetMsg {
+                    subnet_id,
+                    amount: Amount::from_sat(500_000),
+                    address: create_rand_eth_addr(),
+                },
+                block_height: height_100,
+                block_hash,
+                nonce: 0,
+                txid,
+            },
+        )
+        .unwrap();
+
+        db.add_rootnet_msg(
+            &mut txn,
+            subnet_id,
+            RootnetMessage::ErcRegistration {
+                home_subnet_id,
+                registration: create_rand_erc_token_registration(),
+                block_height: height_100,
+                block_hash,
+                nonce: 1,
+                txid,
+            },
+        )
+        .unwrap();
+
+        // Block 200: ErcTransfer only
+        db.add_rootnet_msg(
+            &mut txn,
+            subnet_id,
+            RootnetMessage::ErcTransfer {
+                msg: create_rand_erc_transfer(home_subnet_id, subnet_id),
+                block_height: height_200,
+                block_hash,
+                nonce: 2,
+                txid,
+            },
+        )
+        .unwrap();
+
+        txn.commit().unwrap();
+
+        // Block 100 should have 2 messages (FundSubnet + ErcRegistration)
+        let msgs_100 = db.get_rootnet_msgs_by_height(subnet_id, height_100).unwrap();
+        assert_eq!(msgs_100.len(), 2);
+        assert!(matches!(msgs_100[0], RootnetMessage::FundSubnet { .. }));
+        assert!(matches!(msgs_100[1], RootnetMessage::ErcRegistration { .. }));
+
+        // Block 200 should have 1 message (ErcTransfer)
+        let msgs_200 = db.get_rootnet_msgs_by_height(subnet_id, height_200).unwrap();
+        assert_eq!(msgs_200.len(), 1);
+        assert!(matches!(msgs_200[0], RootnetMessage::ErcTransfer { .. }));
+
+        // Block 300 should have 0 messages
+        let msgs_300 = db.get_rootnet_msgs_by_height(subnet_id, 300).unwrap();
+        assert_eq!(msgs_300.len(), 0);
     }
 }

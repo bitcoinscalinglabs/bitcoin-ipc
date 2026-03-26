@@ -45,6 +45,7 @@ pub enum TesterConfig {
         activation_height: u64,
         snapshot_length: u64,
     },
+    ErcTransferTester,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub enum OutputDb {
     Committee,
     RewardCandidates,
     RewardResults,
+    RootnetMsgs,
 }
 
 #[derive(Debug, Clone)]
@@ -89,20 +91,45 @@ pub enum ScenarioCommand {
     Checkpoint {
         subnet_name: String,
     },
+    /// Register an ERC20 token on a subnet (queues ETR for next checkpoint)
+    RegisterToken {
+        subnet_name: String,
+        name: String,
+        symbol: String,
+        decimals: u8,
+    },
+    /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint)
+    ErcTransfer {
+        src_subnet: String,
+        dst_subnet: String,
+        /// Token name (must match a previously registered token)
+        token_name: String,
+        /// Amount as decimal string (e.g. "1000")
+        amount: String,
+    },
     OutputRead {
         db: OutputDb,
         args: Vec<String>,
     },
     OutputExpect {
         target: OutputExpectTarget,
-        expected_sats: u64,
+        /// The expected value as a raw string. Testers parse as u64 or compare as string.
+        expected_value: String,
     },
 }
 
+/// Generic expect target — always starts with `result.`.
+/// The tester interprets the path based on what was last read.
+/// Examples:
+///   result.count = 3
+///   result.0.kind = 2
+///   result.0.tokenDecimals = 18
+///   result.rewards_list.validator1 = 100_000_000
+///   result.total_rewarded_collateral = 1_000_000_000
 #[derive(Debug, Clone)]
-pub enum OutputExpectTarget {
-    RewardResultsRewardsList { key: String },
-    RewardResultsTotalRewardedCollateral,
+pub struct OutputExpectTarget {
+    /// The dotted path after "result." (e.g. "count", "0.kind", "rewards_list.validator1")
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]

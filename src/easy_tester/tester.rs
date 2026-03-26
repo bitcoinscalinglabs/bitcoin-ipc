@@ -31,6 +31,32 @@ pub trait Tester {
 
     fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError>;
 
+    fn exec_register_token(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _name: &str,
+        _symbol: &str,
+        _decimals: u8,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "register_token is not supported by this tester",
+        ))
+    }
+
+    fn exec_erc_transfer(
+        &mut self,
+        _height: u64,
+        _src_subnet: &str,
+        _dst_subnet: &str,
+        _token_name: &str,
+        _amount: &str,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "erc_transfer is not supported by this tester",
+        ))
+    }
+
     fn exec_output_read(
         &mut self,
         height: u64,
@@ -42,7 +68,6 @@ pub trait Tester {
         &mut self,
         height: u64,
         target: OutputExpectTarget,
-        expected_sats: u64,
+        expected_value: &str,
     ) -> Result<(), EasyTesterError>;
 }
-

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use bitcoin_ipc::easy_tester::model::TesterConfig;
-use bitcoin_ipc::easy_tester::{parse_test_file, ScenarioCommand, Tester};
+use bitcoin_ipc::easy_tester::{parse_test_file, ErcTransferTester, ScenarioCommand, Tester};
 
 #[tokio::main]
 async fn main() {
@@ -40,6 +40,10 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 snapshot_length,
             )
             .await?;
+            run_scenario(&mut tester, scenario)?;
+        }
+        TesterConfig::ErcTransferTester => {
+            let mut tester = ErcTransferTester::new(parsed.setup).await?;
             run_scenario(&mut tester, scenario)?;
         }
     }
@@ -110,6 +114,26 @@ fn run_scenario<T: Tester>(
                     .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_checkpoint_subnet(height, &subnet_name)?;
             }
+            ScenarioCommand::RegisterToken {
+                subnet_name,
+                name,
+                symbol,
+                decimals,
+            } => {
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_register_token(height, &subnet_name, &name, &symbol, decimals)?;
+            }
+            ScenarioCommand::ErcTransfer {
+                src_subnet,
+                dst_subnet,
+                token_name,
+                amount,
+            } => {
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_erc_transfer(height, &src_subnet, &dst_subnet, &token_name, &amount)?;
+            }
             ScenarioCommand::OutputRead { db, args } => {
                 let height = current_block
                     .ok_or("scenario error: must set 'block <height>' before actions")?;
@@ -117,11 +141,11 @@ fn run_scenario<T: Tester>(
             }
             ScenarioCommand::OutputExpect {
                 target,
-                expected_sats,
+                expected_value,
             } => {
                 let height = current_block
                     .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_output_expect(height, target, expected_sats)?;
+                tester.exec_output_expect(height, target, &expected_value)?;
             }
         }
     }

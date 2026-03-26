@@ -8,7 +8,10 @@ use rand::Rng;
 
 use crate::{
     db,
-    ipc_lib::{IpcCrossSubnetTransfer, IpcUnstake, IpcWithdrawal},
+    ipc_lib::{
+        IpcCrossSubnetErcTransfer, IpcCrossSubnetTransfer, IpcErcTokenRegistration, IpcUnstake,
+        IpcWithdrawal,
+    },
     SubnetId,
 };
 use crate::{
@@ -210,6 +213,33 @@ pub fn create_rand_ipc_cross_subnet_transfer(
         destination_subnet_id: destination_subnet.id,
         subnet_multisig_address: None,
         subnet_user_address,
+    }
+}
+
+pub fn create_rand_erc_token_registration() -> IpcErcTokenRegistration {
+    IpcErcTokenRegistration {
+        home_token_address: create_rand_eth_addr(),
+        name: "TestToken".to_string(),
+        symbol: "TT".to_string(),
+        decimals: 18,
+    }
+}
+
+pub fn create_rand_erc_transfer(
+    home_subnet_id: SubnetId,
+    destination_subnet_id: SubnetId,
+) -> IpcCrossSubnetErcTransfer {
+    let mut amount = [0u8; 32];
+    // Set a non-zero amount (1000 in big-endian U256)
+    amount[31] = 0xe8;
+    amount[30] = 0x03;
+
+    IpcCrossSubnetErcTransfer {
+        home_subnet_id,
+        home_token_address: create_rand_eth_addr(),
+        amount,
+        destination_subnet_id,
+        recipient: create_rand_eth_addr(),
     }
 }
 
