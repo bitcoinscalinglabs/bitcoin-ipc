@@ -548,6 +548,46 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         },
                     });
                 }
+                "mint_token" => {
+                    // mint_token <subnet> <token_name> <amount>
+                    if tokens.len() != 4 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "mint_token syntax: mint_token <subnet> <token_name> <amount>",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::MintToken {
+                            subnet_name: tokens[1].to_string(),
+                            token_name: tokens[2].to_string(),
+                            amount: tokens[3].to_string(),
+                        },
+                    });
+                }
+                "burn_token" => {
+                    // burn_token <subnet> <token_name> <amount>
+                    if tokens.len() != 4 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "burn_token syntax: burn_token <subnet> <token_name> <amount>",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::BurnToken {
+                            subnet_name: tokens[1].to_string(),
+                            token_name: tokens[2].to_string(),
+                            amount: tokens[3].to_string(),
+                        },
+                    });
+                }
                 "erc_transfer" => {
                     // erc_transfer <src_subnet> <dst_subnet> <token_name> <amount>
                     if tokens.len() != 5 {
@@ -905,6 +945,25 @@ fn validate_scenario(
                     ));
                 }
             }
+            ScenarioCommand::MintToken { subnet_name, .. }
+            | ScenarioCommand::BurnToken { subnet_name, .. } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before mint/burn"),
+                        &entry.text,
+                    ));
+                }
+            }
             ScenarioCommand::ErcTransfer {
                 src_subnet,
                 dst_subnet,
@@ -985,7 +1044,7 @@ fn validate_scenario(
                         }
                     }
                     OutputDb::RewardResults => {}
-                    OutputDb::RootnetMsgs => {
+                    OutputDb::RootnetMsgs | OutputDb::TokenBalance => {
                         let subnet_name = args.get(0).ok_or_else(|| {
                             EasyTesterError::parse(
                                 path.clone(),
@@ -1021,13 +1080,15 @@ fn validate_scenario(
 
                 let valid_precursor = matches!(
                     last_output_read_db,
-                    Some(OutputDb::RewardResults) | Some(OutputDb::RootnetMsgs)
+                    Some(OutputDb::RewardResults)
+                        | Some(OutputDb::RootnetMsgs)
+                        | Some(OutputDb::TokenBalance)
                 );
                 if !valid_precursor {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         entry.line_no,
-                        "expect is only supported after 'read reward_results ...' or 'read rootnet_msgs ...'",
+                        "expect is only supported after a 'read' command",
                         &entry.text,
                     ));
                 }
@@ -1136,6 +1197,7 @@ fn parse_output_db(s: &str) -> Result<OutputDb, String> {
         "reward_candidates" => Ok(OutputDb::RewardCandidates),
         "reward_results" => Ok(OutputDb::RewardResults),
         "rootnet_msgs" => Ok(OutputDb::RootnetMsgs),
+        "token_balance" => Ok(OutputDb::TokenBalance),
         _ => Err(format!("unknown output db '{s}'")),
     }
 }
@@ -1201,6 +1263,11 @@ fn validate_output_args(
         OutputDb::RootnetMsgs => {
             if args.len() != 1 {
                 return Err(err("expected: read rootnet_msgs <subnetName>"));
+            }
+        }
+        OutputDb::TokenBalance => {
+            if args.len() != 2 {
+                return Err(err("expected: read token_balance <subnetName> <tokenName>"));
             }
         }
     }

@@ -1,5 +1,7 @@
 use crate::{
-    ipc_lib::{IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcTokenRegistration, IpcFundSubnetMsg},
+    ipc_lib::{
+        IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcTokenRegistration, IpcFundSubnetMsg,
+    },
     multisig::{create_subnet_multisig_address, multisig_threshold, Power, WeightedKey},
     wallet, SubnetId, NETWORK,
 };
@@ -31,9 +33,11 @@ const COMMITTEE_KEY: &str = "committee:";
 const STAKE_CHANGES_KEY: &str = "stake_changes:";
 // kill_requests:<subnet_id>:<block_height>:<txid>
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
+// token_balance:<home_subnet_id>:<home_token_address>:<holder_subnet_id>
+const TOKEN_BALANCE_KEY: &str = "token_balance:";
 
 // Number of LMDB databases (`heed::Database`) we open/create in this environment.
-const MAX_DBS: u32 = 13;
+const MAX_DBS: u32 = 14;
 
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
@@ -850,6 +854,8 @@ pub struct HeedDb {
     kill_requests_db: HeedDatabase<Str, SerdeBincode<KillRequest>>,
     pub(crate) reward_candidates_db: HeedDatabase<Str, SerdeBincode<SubnetRewardInfo>>,
     pub(crate) reward_results_db: HeedDatabase<Str, SerdeBincode<SnapshotResult>>,
+    /// Per-token per-subnet balance ledger.
+    token_balances_db: HeedDatabase<Str, SerdeBincode<alloy_primitives::U256>>,
 }
 
 impl HeedDb {
@@ -928,6 +934,9 @@ impl HeedDb {
             let reward_results_db = env
                 .open_database(&rtxn, Some("reward_results_db"))?
                 .ok_or(DbError::DbNotFound("reward_results_db".to_string()))?;
+            let token_balances_db = env
+                .open_database(&rtxn, Some("token_balances_db"))?
+                .ok_or(DbError::DbNotFound("token_balances_db".to_string()))?;
             rtxn.commit()?;
 
             Ok(Self {
@@ -943,6 +952,7 @@ impl HeedDb {
                 kill_requests_db,
                 reward_candidates_db,
                 reward_results_db,
+                token_balances_db,
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -959,6 +969,7 @@ impl HeedDb {
             let reward_candidates_db =
                 env.create_database(&mut txn, Some("reward_candidates_db"))?;
             let reward_results_db = env.create_database(&mut txn, Some("reward_results_db"))?;
+            let token_balances_db = env.create_database(&mut txn, Some("token_balances_db"))?;
             txn.commit()?;
 
             Ok(Self {
@@ -974,6 +985,7 @@ impl HeedDb {
                 kill_requests_db,
                 reward_candidates_db,
                 reward_results_db,
+                token_balances_db,
             })
         }
     }
@@ -1147,6 +1159,47 @@ pub trait DatabaseCore {
         subnet_id: SubnetId,
         current_block_height: u64,
     ) -> Result<Vec<KillRequest>, DbError>;
+
+    // Token balances
+
+    /// Get the token balance for a custom ERC20 Token `(homeSubnet, homeToken)`
+    /// held by subnet `holder_subnet_id`.
+    fn get_token_balance(
+        &self,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+    ) -> Result<alloy_primitives::U256, DbError>;
+
+    /// Get the token balance within a write transaction (sees uncommitted writes).
+    fn get_token_balance_txn(
+        &self,
+        txn: &RoTxn,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+    ) -> Result<alloy_primitives::U256, DbError>;
+
+    /// Set the token balance for a specific (homeSubnet, homeToken, holderSubnet) triple.
+    fn set_token_balance(
+        &self,
+        txn: &mut RwTxn,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+        balance: alloy_primitives::U256,
+    ) -> Result<(), DbError>;
+}
+
+fn token_balance_key(
+    home_subnet_id: SubnetId,
+    home_token_address: alloy_primitives::Address,
+    holder_subnet_id: SubnetId,
+) -> String {
+    format!(
+        "{}{}:{}:{}",
+        TOKEN_BALANCE_KEY, home_subnet_id, home_token_address, holder_subnet_id
+    )
 }
 
 #[async_trait]
@@ -1688,6 +1741,43 @@ impl DatabaseCore for HeedDb {
 
         rtxn.commit().map_err(DbError::HeedError)?;
         Ok(kill_requests)
+    }
+
+    fn get_token_balance(
+        &self,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+    ) -> Result<alloy_primitives::U256, DbError> {
+        let txn = self.env.read_txn()?;
+        self.get_token_balance_txn(&txn, home_subnet_id, home_token_address, holder_subnet_id)
+    }
+
+    fn get_token_balance_txn(
+        &self,
+        txn: &RoTxn,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+    ) -> Result<alloy_primitives::U256, DbError> {
+        let key = token_balance_key(home_subnet_id, home_token_address, holder_subnet_id);
+        match self.token_balances_db.get(txn, &key)? {
+            Some(balance) => Ok(balance),
+            None => Ok(alloy_primitives::U256::ZERO),
+        }
+    }
+
+    fn set_token_balance(
+        &self,
+        txn: &mut RwTxn,
+        home_subnet_id: SubnetId,
+        home_token_address: alloy_primitives::Address,
+        holder_subnet_id: SubnetId,
+        balance: alloy_primitives::U256,
+    ) -> Result<(), DbError> {
+        let key = token_balance_key(home_subnet_id, home_token_address, holder_subnet_id);
+        self.token_balances_db.put(txn, &key, &balance)?;
+        Ok(())
     }
 }
 
@@ -2534,7 +2624,8 @@ pub mod tests {
             nonce: 2,
             txid,
         };
-        db.add_rootnet_msg(&mut txn, subnet_id, erc_transfer).unwrap();
+        db.add_rootnet_msg(&mut txn, subnet_id, erc_transfer)
+            .unwrap();
         txn.commit().unwrap();
 
         // Verify next nonce is 3
@@ -2549,7 +2640,10 @@ pub mod tests {
 
         // Verify types
         assert!(matches!(all_msgs[0], RootnetMessage::FundSubnet { .. }));
-        assert!(matches!(all_msgs[1], RootnetMessage::ErcRegistration { .. }));
+        assert!(matches!(
+            all_msgs[1],
+            RootnetMessage::ErcRegistration { .. }
+        ));
         assert!(matches!(all_msgs[2], RootnetMessage::ErcTransfer { .. }));
     }
 
@@ -2616,13 +2710,20 @@ pub mod tests {
         txn.commit().unwrap();
 
         // Block 100 should have 2 messages (FundSubnet + ErcRegistration)
-        let msgs_100 = db.get_rootnet_msgs_by_height(subnet_id, height_100).unwrap();
+        let msgs_100 = db
+            .get_rootnet_msgs_by_height(subnet_id, height_100)
+            .unwrap();
         assert_eq!(msgs_100.len(), 2);
         assert!(matches!(msgs_100[0], RootnetMessage::FundSubnet { .. }));
-        assert!(matches!(msgs_100[1], RootnetMessage::ErcRegistration { .. }));
+        assert!(matches!(
+            msgs_100[1],
+            RootnetMessage::ErcRegistration { .. }
+        ));
 
         // Block 200 should have 1 message (ErcTransfer)
-        let msgs_200 = db.get_rootnet_msgs_by_height(subnet_id, height_200).unwrap();
+        let msgs_200 = db
+            .get_rootnet_msgs_by_height(subnet_id, height_200)
+            .unwrap();
         assert_eq!(msgs_200.len(), 1);
         assert!(matches!(msgs_200[0], RootnetMessage::ErcTransfer { .. }));
 

@@ -135,7 +135,7 @@ impl Tester for RewardTester {
         let subnet_id = self.base.resolve_subnet_id(subnet_name)?;
         let checkpoint = self
             .base
-            .checkpoint_subnet(height, subnet_name, vec![], vec![])?;
+            .checkpoint_subnet(height, subnet_name, vec![], vec![], vec![])?;
 
         self.reward_tracker
             .update_after_checkpoint(&self.base.db, height, subnet_id, &checkpoint)
@@ -321,9 +321,9 @@ impl Tester for RewardTester {
             OutputDb::RewardResults => {
                 unreachable!("RewardResults is handled above for pretty printing")
             }
-            OutputDb::RootnetMsgs => {
+            OutputDb::RootnetMsgs | OutputDb::TokenBalance => {
                 return Err(EasyTesterError::runtime(
-                    "RewardTester does not support reading rootnet_msgs",
+                    "RewardTester does not support reading rootnet_msgs or token_balance",
                 ));
             }
         };

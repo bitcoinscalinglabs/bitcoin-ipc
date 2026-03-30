@@ -10,7 +10,7 @@ use crate::{
         model::{OutputDb, OutputExpectTarget, SetupSpec},
         tester::Tester,
     },
-    ipc_lib::{IpcCrossSubnetErcTransfer, IpcErcTokenRegistration},
+    ipc_lib::{IpcCrossSubnetErcTransfer, IpcErcSupplyAdjustment, IpcErcTokenRegistration},
 };
 
 pub struct ErcTransferTester {
@@ -20,10 +20,14 @@ pub struct ErcTransferTester {
     registered_tokens: HashMap<String, (String, IpcErcTokenRegistration)>,
     /// Pending token registrations queued by `register_token`, consumed by next checkpoint
     pending_registrations: HashMap<String, Vec<IpcErcTokenRegistration>>,
+    /// Pending supply adjustments queued by `mint_token`/`burn_token`, consumed by next checkpoint
+    pending_supply_adjustments: HashMap<String, Vec<IpcErcSupplyAdjustment>>,
     /// Pending ERC transfers queued by `erc_transfer`, consumed by next checkpoint
     pending_erc_transfers: HashMap<String, Vec<IpcCrossSubnetErcTransfer>>,
     /// Last read rootnet messages for expect
     last_rootnet_msgs: Option<LastRootnetMsgs>,
+    /// Last read token balance for expect
+    last_token_balance: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -39,8 +43,10 @@ impl ErcTransferTester {
             base,
             registered_tokens: HashMap::new(),
             pending_registrations: HashMap::new(),
+            pending_supply_adjustments: HashMap::new(),
             pending_erc_transfers: HashMap::new(),
             last_rootnet_msgs: None,
+            last_token_balance: None,
         })
     }
 
@@ -71,11 +77,14 @@ impl ErcTransferTester {
             alloy_primitives::Address::from_slice(&rand::random::<[u8; 20]>())
         };
 
+        let initial_supply = alloy_primitives::U256::from(1_000_000u64);
+
         let etr = IpcErcTokenRegistration {
             home_token_address,
             name: name.to_string(),
             symbol: symbol.to_string(),
             decimals,
+            initial_supply,
         };
 
         self.registered_tokens
@@ -101,7 +110,7 @@ impl ErcTransferTester {
         token_name: &str,
         amount_str: &str,
     ) -> Result<(), EasyTesterError> {
-        let home_subnet_id = self.base.resolve_subnet_id(src_subnet)?;
+        self.base.resolve_subnet_id(src_subnet)?; // verify src exists
         let destination_subnet_id = self.base.resolve_subnet_id(dst_subnet)?;
 
         let (reg_subnet, reg) = self.registered_tokens.get(token_name).ok_or_else(|| {
@@ -111,19 +120,14 @@ impl ErcTransferTester {
             ))
         })?;
 
-        if reg_subnet != src_subnet {
-            return Err(EasyTesterError::runtime(format!(
-                "token '{}' was registered on subnet '{}', not '{}'",
-                token_name, reg_subnet, src_subnet
-            )));
-        }
+        // home_subnet_id is always the subnet where the token was registered,
+        // regardless of which subnet is sending the transfer.
+        let home_subnet_id = self.base.resolve_subnet_id(reg_subnet)?;
 
-        // Parse amount as decimal → big-endian U256
-        let amount_u64: u64 = amount_str
-            .parse()
-            .map_err(|e| EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}")))?;
-        let mut amount = [0u8; 32];
-        amount[24..32].copy_from_slice(&amount_u64.to_be_bytes());
+        let amount = alloy_primitives::U256::from(
+            amount_str.parse::<u64>()
+                .map_err(|e| EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}")))?,
+        );
 
         let etx = IpcCrossSubnetErcTransfer {
             home_subnet_id,
@@ -142,6 +146,68 @@ impl ErcTransferTester {
             "Queued ERC transfer from subnet '{}' to subnet '{}', token='{}', amount={}",
             src_subnet, dst_subnet, token_name, amount_str
         );
+        Ok(())
+    }
+
+    fn mint_token_impl(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        token_name: &str,
+        amount_str: &str,
+    ) -> Result<(), EasyTesterError> {
+        self.base.resolve_subnet_id(subnet_name)?;
+        let (_reg_subnet, reg) = self.registered_tokens.get(token_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!("token '{}' not registered", token_name))
+        })?;
+
+        let amount_u64: u64 = amount_str.parse().map_err(|e| {
+            EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}"))
+        })?;
+        let delta = alloy_primitives::I256::try_from(amount_u64 as i64)
+            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+
+        let ems = IpcErcSupplyAdjustment {
+            home_token_address: reg.home_token_address,
+            delta,
+        };
+        self.pending_supply_adjustments
+            .entry(subnet_name.to_string())
+            .or_default()
+            .push(ems);
+
+        info!("Queued mint for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount_str);
+        Ok(())
+    }
+
+    fn burn_token_impl(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        token_name: &str,
+        amount_str: &str,
+    ) -> Result<(), EasyTesterError> {
+        self.base.resolve_subnet_id(subnet_name)?;
+        let (_reg_subnet, reg) = self.registered_tokens.get(token_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!("token '{}' not registered", token_name))
+        })?;
+
+        let amount_u64: u64 = amount_str.parse().map_err(|e| {
+            EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}"))
+        })?;
+        let delta = alloy_primitives::I256::try_from(-(amount_u64 as i64))
+            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+
+        let ems = IpcErcSupplyAdjustment {
+            home_token_address: reg.home_token_address,
+            delta,
+        };
+        self.pending_supply_adjustments
+            .entry(subnet_name.to_string())
+            .or_default()
+            .push(ems);
+
+        info!("Queued burn for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount_str);
         Ok(())
     }
 
@@ -188,9 +254,7 @@ impl ErcTransferTester {
             },
             "amount" => match msg {
                 crate::db::RootnetMessage::ErcTransfer { msg: etx, .. } => {
-                    // Parse big-endian U256 → decimal
-                    let val = u64::from_be_bytes(etx.amount[24..32].try_into().unwrap());
-                    Ok(val.to_string())
+                    Ok(etx.amount.to_string())
                 }
                 crate::db::RootnetMessage::FundSubnet { msg, .. } => {
                     Ok(msg.amount.to_sat().to_string())
@@ -259,13 +323,17 @@ impl Tester for ErcTransferTester {
             .pending_registrations
             .remove(subnet_name)
             .unwrap_or_default();
+        let supply_adjustments = self
+            .pending_supply_adjustments
+            .remove(subnet_name)
+            .unwrap_or_default();
         let erc_transfers = self
             .pending_erc_transfers
             .remove(subnet_name)
             .unwrap_or_default();
 
         self.base
-            .checkpoint_subnet(height, subnet_name, token_registrations, erc_transfers)?;
+            .checkpoint_subnet(height, subnet_name, token_registrations, supply_adjustments, erc_transfers)?;
         Ok(())
     }
 
@@ -278,6 +346,26 @@ impl Tester for ErcTransferTester {
         decimals: u8,
     ) -> Result<(), EasyTesterError> {
         self.register_token_impl(height, subnet_name, name, symbol, decimals)
+    }
+
+    fn exec_mint_token(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        token_name: &str,
+        amount: &str,
+    ) -> Result<(), EasyTesterError> {
+        self.mint_token_impl(height, subnet_name, token_name, amount)
+    }
+
+    fn exec_burn_token(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        token_name: &str,
+        amount: &str,
+    ) -> Result<(), EasyTesterError> {
+        self.burn_token_impl(height, subnet_name, token_name, amount)
     }
 
     fn exec_erc_transfer(
@@ -325,10 +413,37 @@ impl Tester for ErcTransferTester {
                     _subnet_name: subnet_name.to_string(),
                     msgs,
                 });
+                self.last_token_balance = None;
+            }
+            OutputDb::TokenBalance => {
+                let subnet_name = &args[0];
+                let token_name = &args[1];
+                let subnet_id = self.base.resolve_subnet_id(subnet_name)?;
+
+                let (_reg_subnet, reg) = self.registered_tokens.get(token_name.as_str()).ok_or_else(|| {
+                    EasyTesterError::runtime(format!("token '{}' not registered", token_name))
+                })?;
+                let home_subnet_id = self.base.resolve_subnet_id(_reg_subnet)?;
+
+                let balance = self.base.db.get_token_balance(
+                    home_subnet_id,
+                    reg.home_token_address,
+                    subnet_id,
+                ).map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
+
+                // For test scenarios, U256 values fit in u64
+                let val: u64 = balance.try_into().unwrap_or(u64::MAX);
+                println!(
+                    "OUTPUT read token_balance subnet='{}' token='{}': {}",
+                    subnet_name, token_name, val
+                );
+
+                self.last_token_balance = Some(val);
+                self.last_rootnet_msgs = None;
             }
             _ => {
                 return Err(EasyTesterError::runtime(format!(
-                    "ErcTransferTester only supports reading rootnet_msgs, got {:?}",
+                    "ErcTransferTester does not support reading {:?}",
                     db
                 )));
             }
@@ -342,16 +457,43 @@ impl Tester for ErcTransferTester {
         target: OutputExpectTarget,
         expected_value: &str,
     ) -> Result<(), EasyTesterError> {
+        // If last read was token_balance, handle simple value comparison
+        if let Some(balance) = self.last_token_balance {
+            let parts: Vec<&str> = target.path.split('.').collect();
+            match parts.as_slice() {
+                ["balance"] => {
+                    let expected: u64 = expected_value.parse().map_err(|e| {
+                        EasyTesterError::runtime(format!("balance must be numeric: {e}"))
+                    })?;
+                    if balance != expected {
+                        return Err(EasyTesterError::runtime(format!(
+                            "EXPECT failed: result.balance expected {}, got {}",
+                            expected, balance
+                        )));
+                    }
+                    println!("OUTPUT expect result.balance == {} (ok)", expected);
+                    return Ok(());
+                }
+                _ => {
+                    return Err(EasyTesterError::runtime(format!(
+                        "after 'read token_balance', only 'result.balance' is supported, got 'result.{}'",
+                        target.path
+                    )));
+                }
+            }
+        }
+
+        // Otherwise, last read was rootnet_msgs
         let last = self.last_rootnet_msgs.as_ref().ok_or_else(|| {
-            EasyTesterError::runtime("expect used but no previous 'read rootnet_msgs'")
+            EasyTesterError::runtime("expect used but no previous 'read' command")
         })?;
 
         let parts: Vec<&str> = target.path.split('.').collect();
         match parts.as_slice() {
             ["count"] => {
-                let expected: u64 = expected_value
-                    .parse()
-                    .map_err(|e| EasyTesterError::runtime(format!("count must be numeric: {e}")))?;
+                let expected: u64 = expected_value.parse().map_err(|e| {
+                    EasyTesterError::runtime(format!("count must be numeric: {e}"))
+                })?;
                 let got = last.msgs.len() as u64;
                 if got != expected {
                     return Err(EasyTesterError::runtime(format!(
@@ -375,7 +517,6 @@ impl Tester for ErcTransferTester {
                 let got =
                     Self::msg_field_value(msg, field).map_err(|e| EasyTesterError::runtime(e))?;
 
-                // Compare as string — works for both numeric and string fields
                 if got != expected_value {
                     return Err(EasyTesterError::runtime(format!(
                         "EXPECT failed: result.{}.{} expected '{}', got '{}'",

@@ -955,6 +955,42 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
+    // Validate ERC token transfer balances before generating checkpoint.
+    // Aggregate total amounts per (home_subnet, home_token) across all ETX,
+    // then check each total against the balance.
+    {
+        // Use string key since SubnetId doesn't impl Hash
+        let mut totals: std::collections::HashMap<String, alloy_primitives::U256> =
+            std::collections::HashMap::new();
+        for etx in &msg.token_transfers {
+            let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
+            let entry = totals.entry(key).or_insert(alloy_primitives::U256::ZERO);
+            *entry = entry.checked_add(etx.amount).ok_or_else(|| {
+                RpcError::InvalidParams("Token transfer amounts overflow".to_string())
+            })?;
+        }
+        for etx in &msg.token_transfers {
+            let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
+            if let Some(total) = totals.remove(&key) {
+                let src_balance = data
+                    .db
+                    .get_token_balance(etx.home_subnet_id, etx.home_token_address, msg.subnet_id)
+                    .map_err(|e| {
+                        error!("Error reading token balance: {}", e);
+                        RpcError::DbError(e)
+                    })?;
+                if src_balance < total {
+                    return Err(RpcError::InvalidParams(format!(
+                        "Insufficient token balance for {} on subnet {}: has {}, needs {}",
+                        etx.home_token_address, msg.subnet_id, src_balance, total
+                    ))
+                    .into());
+                }
+            }
+            // else: already checked (remove ensures each key is checked once)
+        }
+    }
+
     let unsigned_psbt = msg
         .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
         .map_err(|e| {

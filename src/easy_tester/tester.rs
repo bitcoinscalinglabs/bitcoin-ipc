@@ -44,6 +44,30 @@ pub trait Tester {
         ))
     }
 
+    fn exec_mint_token(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _token_name: &str,
+        _amount: &str,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "mint_token is not supported by this tester",
+        ))
+    }
+
+    fn exec_burn_token(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _token_name: &str,
+        _amount: &str,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "burn_token is not supported by this tester",
+        ))
+    }
+
     fn exec_erc_transfer(
         &mut self,
         _height: u64,

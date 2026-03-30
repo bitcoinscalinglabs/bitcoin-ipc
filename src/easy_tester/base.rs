@@ -16,9 +16,9 @@ use crate::{
     },
     eth_utils,
     ipc_lib::{
-        IpcBatchTransferMsg, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg,
-        IpcCrossSubnetErcTransfer, IpcErcTokenRegistration, IpcJoinSubnetMsg,
-        IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
+        IpcBatchTransferMsg, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer,
+        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcStakeCollateralMsg,
+        IpcUnstakeCollateralMsg, IpcValidate,
     },
     SubnetId,
 };
@@ -85,7 +85,10 @@ impl BaseTester {
             })
     }
 
-    pub fn resolve_validator(&self, validator_name: &str) -> Result<ValidatorSpec, EasyTesterError> {
+    pub fn resolve_validator(
+        &self,
+        validator_name: &str,
+    ) -> Result<ValidatorSpec, EasyTesterError> {
         self.setup
             .validators
             .get(validator_name)
@@ -106,11 +109,7 @@ impl BaseTester {
         Ok(())
     }
 
-    pub fn create_subnet(
-        &mut self,
-        height: u64,
-        subnet_name: &str,
-    ) -> Result<(), EasyTesterError> {
+    pub fn create_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError> {
         let spec = self
             .setup
             .subnets
@@ -313,6 +312,7 @@ impl BaseTester {
         height: u64,
         subnet_name: &str,
         token_registrations: Vec<IpcErcTokenRegistration>,
+        supply_adjustments: Vec<IpcErcSupplyAdjustment>,
         erc_transfers: Vec<IpcCrossSubnetErcTransfer>,
     ) -> Result<SubnetCheckpoint, EasyTesterError> {
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -351,7 +351,8 @@ impl BaseTester {
             withdrawals: vec![],
             transfers: vec![],
             token_registrations,
-            erc_transfers,
+            token_supply_adjustments: supply_adjustments,
+            token_transfers: erc_transfers,
             unstakes: vec![],
             change_address: None,
             is_kill_checkpoint: false,
@@ -360,10 +361,13 @@ impl BaseTester {
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint msg invalid: {e}")))?;
 
-        let has_batch_data = !msg.token_registrations.is_empty() || !msg.erc_transfers.is_empty();
+        let has_batch_data = !msg.token_registrations.is_empty()
+            || !msg.token_supply_adjustments.is_empty()
+            || !msg.token_transfers.is_empty();
 
         let token_registrations = msg.token_registrations.clone();
-        let erc_transfers = msg.erc_transfers.clone();
+        let supply_adjustments = msg.token_supply_adjustments.clone();
+        let erc_transfers = msg.token_transfers.clone();
 
         let txid = create_rand_txid();
         let checkpoint = msg
@@ -379,7 +383,8 @@ impl BaseTester {
                 checkpoint_vout: 0,
                 transfers: vec![],
                 token_registrations,
-                erc_transfers,
+                token_supply_adjustments: supply_adjustments,
+                token_transfers: erc_transfers,
             };
             let batch_txid = create_rand_txid();
             batch_msg
@@ -387,7 +392,10 @@ impl BaseTester {
                 .map_err(|e| {
                     EasyTesterError::runtime(format!("batch transfer save failed: {e}"))
                 })?;
-            info!("Batch transfer reveal simulated for subnet '{}'", subnet_name);
+            info!(
+                "Batch transfer reveal simulated for subnet '{}'",
+                subnet_name
+            );
         }
 
         info!(

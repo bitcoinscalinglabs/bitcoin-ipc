@@ -222,6 +222,7 @@ pub fn create_rand_erc_token_registration() -> IpcErcTokenRegistration {
         name: "TestToken".to_string(),
         symbol: "TT".to_string(),
         decimals: 18,
+        initial_supply: alloy_primitives::U256::from(1_000_000u64),
     }
 }
 
@@ -229,10 +230,7 @@ pub fn create_rand_erc_transfer(
     home_subnet_id: SubnetId,
     destination_subnet_id: SubnetId,
 ) -> IpcCrossSubnetErcTransfer {
-    let mut amount = [0u8; 32];
-    // Set a non-zero amount (1000 in big-endian U256)
-    amount[31] = 0xe8;
-    amount[30] = 0x03;
+    let amount = alloy_primitives::U256::from(1000u64);
 
     IpcCrossSubnetErcTransfer {
         home_subnet_id,

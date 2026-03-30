@@ -124,6 +124,24 @@ fn run_scenario<T: Tester>(
                     .ok_or("scenario error: must set 'block <height>' before actions")?;
                 tester.exec_register_token(height, &subnet_name, &name, &symbol, decimals)?;
             }
+            ScenarioCommand::MintToken {
+                subnet_name,
+                token_name,
+                amount,
+            } => {
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_mint_token(height, &subnet_name, &token_name, &amount)?;
+            }
+            ScenarioCommand::BurnToken {
+                subnet_name,
+                token_name,
+                amount,
+            } => {
+                let height = current_block
+                    .ok_or("scenario error: must set 'block <height>' before actions")?;
+                tester.exec_burn_token(height, &subnet_name, &token_name, &amount)?;
+            }
             ScenarioCommand::ErcTransfer {
                 src_subnet,
                 dst_subnet,

@@ -63,6 +63,8 @@ pub enum OutputDb {
     RewardCandidates,
     RewardResults,
     RootnetMsgs,
+    /// Read token balance: `read token_balance <subnet> <token_name>`
+    TokenBalance,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,18 @@ pub enum ScenarioCommand {
         name: String,
         symbol: String,
         decimals: u8,
+    },
+    /// Queue a mint supply adjustment (queues ETS for next checkpoint)
+    MintToken {
+        subnet_name: String,
+        token_name: String,
+        amount: String,
+    },
+    /// Queue a burn supply adjustment (queues ETS for next checkpoint)
+    BurnToken {
+        subnet_name: String,
+        token_name: String,
+        amount: String,
     },
     /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint)
     ErcTransfer {
