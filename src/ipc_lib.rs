@@ -2478,6 +2478,115 @@ impl IpcCheckpointSubnetMsg {
     }
 }
 
+/// Validate ERC batch data (registrations, supply adjustments, transfers) against the
+/// current DB state.  Called by both the provider (before generating the PSBT) and the
+/// monitor (before writing state).  Returns `Err` on the first violation; the caller
+/// must treat any error as a fully invalid batch and take no action.
+///
+/// Validation order: registrations -> mints -> burns -> transfers. A shared
+/// `final_balances` map is updated in-memory as each operation is applied, so a
+/// token that is registered, minted, burned, and transferred all in one checkpoint
+/// is accounted for correctly.
+pub fn validate_erc_batch_data<D: db::DatabaseCore>(
+    source_subnet_id: SubnetId,
+    token_registrations: &[IpcErcTokenRegistration],
+    token_supply_adjustments: &[IpcErcSupplyAdjustment],
+    token_transfers: &[IpcCrossSubnetErcTransfer],
+    db: &D,
+) -> Result<(), IpcValidateError> {
+    // key: "{home_subnet_id}:{home_token_address}"
+    let mut final_balances: std::collections::HashMap<String, U256> =
+        std::collections::HashMap::new();
+
+    // 1. Registrations — must be new tokens, no duplicates within the batch.
+    for etr in token_registrations {
+        let key = format!("{}:{}", source_subnet_id, etr.home_token_address);
+        if final_balances.contains_key(&key) {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Token ({},{}) registered more than once in the same checkpoint",
+                source_subnet_id, etr.home_token_address
+            )));
+        }
+        let existing = db
+            .get_token_balance(source_subnet_id, etr.home_token_address, source_subnet_id)
+            .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+        if existing > U256::ZERO {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Token ({},{}) is already registered (existing balance: {})",
+                source_subnet_id, etr.home_token_address, existing
+            )));
+        }
+        final_balances.insert(key, etr.initial_supply);
+    }
+
+    // 2. Mints (positive ETS delta) — increase the running balance.
+    for ets in token_supply_adjustments {
+        if ets.delta.is_negative() {
+            continue;
+        }
+        let (_, mint_amount) = ets.delta.into_sign_and_abs();
+        let key = format!("{}:{}", source_subnet_id, ets.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        *bal = bal.saturating_add(mint_amount);
+    }
+
+    // 3. Burns (negative ETS delta) — must not exceed running balance.
+    for ets in token_supply_adjustments {
+        if !ets.delta.is_negative() {
+            continue;
+        }
+        let (_, burn_amount) = ets.delta.into_sign_and_abs();
+        let key = format!("{}:{}", source_subnet_id, ets.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        if *bal < burn_amount {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Burn exceeds balance for token ({},{}): has {}, burn {}",
+                source_subnet_id, ets.home_token_address, bal, burn_amount
+            )));
+        }
+        *bal -= burn_amount;
+    }
+
+    // 4. Transfers (ETX) — must not exceed running balance on the source subnet.
+    for etx in token_transfers {
+        let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(etx.home_subnet_id, etx.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        if *bal < etx.amount {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Insufficient balance for token ({},{}): has {}, needs {}",
+                etx.home_subnet_id, etx.home_token_address, bal, etx.amount
+            )));
+        }
+        *bal -= etx.amount;
+    }
+
+    Ok(())
+}
+
 /// Batch transfer message
 /// It lacks important information so it must be
 /// fetch from the checkpoint transaction and validated
@@ -2802,6 +2911,16 @@ impl IpcBatchTransferMsg {
                 ))
             })?;
 
+        // Validate ERC batch data before touching the DB.
+        // Any violation means the entire BatchTransferMsg is malformed — ignore it.
+        validate_erc_batch_data(
+            source_subnet_id,
+            &self.token_registrations,
+            &self.token_supply_adjustments,
+            &self.token_transfers,
+            db,
+        )?;
+
         // Update the checkpoint with the batch transfer information
         checkpoint.batch_transfer_txid = Some(txid);
         checkpoint.batch_transfer_block_height = Some(block_height);
@@ -2858,26 +2977,19 @@ impl IpcBatchTransferMsg {
         if !self.token_registrations.is_empty() {
             let all_subnets = db.get_all_subnets()?;
             for etr in &self.token_registrations {
-                // Seed balance for S_home (only on first registration — idempotent)
-                let existing = db.get_token_balance_txn(
-                    &wtxn,
+                // Seed balance for S_home with initial_supply (validation already
+                // confirmed this is a new token).
+                db.set_token_balance(
+                    &mut wtxn,
                     source_subnet_id,
                     etr.home_token_address,
                     source_subnet_id,
+                    etr.initial_supply,
                 )?;
-                if existing == U256::ZERO && etr.initial_supply != U256::ZERO {
-                    db.set_token_balance(
-                        &mut wtxn,
-                        source_subnet_id,
-                        etr.home_token_address,
-                        source_subnet_id,
-                        etr.initial_supply,
-                    )?;
-                    debug!(
-                        "Seeded balance for token {} on home subnet {}",
-                        etr.home_token_address, source_subnet_id
-                    );
-                }
+                debug!(
+                    "Seeded balance for token {} on home subnet {}",
+                    etr.home_token_address, source_subnet_id
+                );
 
                 for subnet in &all_subnets {
                     if subnet.id == source_subnet_id {
@@ -2901,41 +3013,70 @@ impl IpcBatchTransferMsg {
             }
         }
 
-        // Process ERC supply adjustments (IPC:ETS) — only valid from the home subnet.
-        // The source_subnet_id (from checkpoint OP_RETURN) is the home subnet.
-        for ems in &self.token_supply_adjustments {
+        // Process ERC supply adjustments (IPC:ETS) — mints first, then burns.
+        // Order must match validate_erc_batch_data() so that a batch containing
+        // both a burn and a mint for the same token is applied consistently.
+        for ems in self
+            .token_supply_adjustments
+            .iter()
+            .filter(|e| !e.delta.is_negative())
+        {
             let current_balance = db.get_token_balance_txn(
                 &wtxn,
                 source_subnet_id,
                 ems.home_token_address,
                 source_subnet_id,
             )?;
+            let (_, mint_amount) = ems.delta.into_sign_and_abs();
+            let new_balance = current_balance.saturating_add(mint_amount);
+            db.set_token_balance(
+                &mut wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+                new_balance,
+            )?;
+            debug!(
+                "Applied mint for token {} on subnet {}",
+                ems.home_token_address, source_subnet_id
+            );
+        }
 
-            // Apply I256 delta to U256 balance
-            let balance_i = I256::try_from(current_balance).unwrap_or(I256::MAX);
-            let new_balance_i = balance_i.checked_add(ems.delta);
-            match new_balance_i {
-                Some(nb) if nb >= I256::ZERO => {
-                    let new_balance = nb.into_raw().into();
-                    db.set_token_balance(
-                        &mut wtxn,
-                        source_subnet_id,
-                        ems.home_token_address,
-                        source_subnet_id,
-                        new_balance,
-                    )?;
-                    debug!(
-                        "Applied supply adjustment for token {} on subnet {}",
-                        ems.home_token_address, source_subnet_id
-                    );
-                }
-                _ => {
-                    warn!(
-                        "Dropping ETS for token {} from subnet {}: resulting balance would be negative or overflow",
-                        ems.home_token_address, source_subnet_id
-                    );
-                }
-            }
+        for ems in self
+            .token_supply_adjustments
+            .iter()
+            .filter(|e| e.delta.is_negative())
+        {
+            let current_balance = db.get_token_balance_txn(
+                &wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+            )?;
+            let (_, burn_amount) = ems.delta.into_sign_and_abs();
+            let Some(new_balance) = current_balance.checked_sub(burn_amount) else {
+                error!(
+                    "ETS burn underflow for token {} on subnet {}: balance {}, burn {} \
+                     — should have been caught by validate_erc_batch_data()",
+                    ems.home_token_address, source_subnet_id, current_balance, burn_amount,
+                );
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "ETS burn underflow for token {}: balance {}, burn {}",
+                    ems.home_token_address, current_balance, burn_amount
+                ))
+                .into());
+            };
+            db.set_token_balance(
+                &mut wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+                new_balance,
+            )?;
+            debug!(
+                "Applied burn for token {} on subnet {}",
+                ems.home_token_address, source_subnet_id
+            );
         }
 
         // Save ERC transfers (IPC:ETX) — firewall: check source has sufficient balance
@@ -2947,16 +3088,23 @@ impl IpcBatchTransferMsg {
                 source_subnet_id,
             )?;
 
-            if src_balance < etx.amount {
-                warn!(
-                    "Dropping ETX for token {} from subnet {} to {}: insufficient balance",
-                    etx.home_token_address, source_subnet_id, etx.destination_subnet_id
-                );
-                continue;
-            }
-
             // Debit source
-            let new_src = src_balance - etx.amount; // safe: checked above
+            let Some(new_src) = src_balance.checked_sub(etx.amount) else {
+                error!(
+                    "ETX underflow for token {} from subnet {} to {}: balance {}, amount {} \
+                     — should have been caught by validate_erc_batch_data()",
+                    etx.home_token_address,
+                    source_subnet_id,
+                    etx.destination_subnet_id,
+                    src_balance,
+                    etx.amount,
+                );
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "ETX underflow for token {}: balance {}, amount {}",
+                    etx.home_token_address, src_balance, etx.amount
+                ))
+                .into());
+            };
             db.set_token_balance(
                 &mut wtxn,
                 etx.home_subnet_id,
@@ -2973,8 +3121,10 @@ impl IpcBatchTransferMsg {
                 etx.destination_subnet_id,
             )?;
             let new_dst = dst_balance.checked_add(etx.amount).unwrap_or_else(|| {
-                warn!("Balance overflow crediting subnet {} for token {} — clamping to MAX",
-                    etx.destination_subnet_id, etx.home_token_address);
+                error!(
+                    "Balance overflow crediting subnet {} for token {} — clamping to MAX",
+                    etx.destination_subnet_id, etx.home_token_address
+                );
                 U256::MAX
             });
             db.set_token_balance(
@@ -7211,6 +7361,266 @@ mod checkpoint_msg_tests {
         assert!(
             checkpoint_tx.output[0].script_pubkey.is_op_return(),
             "First output should be OP_RETURN"
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_erc_batch_tests {
+    use super::*;
+    use crate::db::DatabaseCore;
+    use crate::test_utils;
+
+    /// Seed a fresh DB with a single token balance entry.
+    fn db_with_balance(
+        home_subnet: SubnetId,
+        token: alloy_primitives::Address,
+        holder: SubnetId,
+        balance: U256,
+    ) -> crate::db::HeedDb {
+        let db = test_utils::create_test_db();
+        let mut wtxn = db.write_txn().unwrap();
+        db.set_token_balance(&mut wtxn, home_subnet, token, holder, balance)
+            .unwrap();
+        wtxn.commit().unwrap();
+        db
+    }
+
+    fn etr(token: alloy_primitives::Address, initial_supply: u64) -> IpcErcTokenRegistration {
+        IpcErcTokenRegistration {
+            home_token_address: token,
+            name: "Token".to_string(),
+            symbol: "TK".to_string(),
+            decimals: 18,
+            initial_supply: U256::from(initial_supply),
+        }
+    }
+
+    fn ets_mint(token: alloy_primitives::Address, amount: i64) -> IpcErcSupplyAdjustment {
+        IpcErcSupplyAdjustment {
+            home_token_address: token,
+            delta: I256::try_from(amount).unwrap(),
+        }
+    }
+
+    fn ets_burn(token: alloy_primitives::Address, amount: i64) -> IpcErcSupplyAdjustment {
+        IpcErcSupplyAdjustment {
+            home_token_address: token,
+            delta: I256::try_from(-amount).unwrap(),
+        }
+    }
+
+    fn etx(
+        home: SubnetId,
+        token: alloy_primitives::Address,
+        amount: u64,
+        dest: SubnetId,
+    ) -> IpcCrossSubnetErcTransfer {
+        IpcCrossSubnetErcTransfer {
+            home_subnet_id: home,
+            home_token_address: token,
+            amount: U256::from(amount),
+            destination_subnet_id: dest,
+            recipient: test_utils::create_rand_eth_addr(),
+        }
+    }
+
+    // ── happy paths ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_batch_ok() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        assert!(validate_erc_batch_data(source, &[], &[], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_new_registration_ok() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_mint_ok() {
+        // Minting always succeeds (increases balance); DB balance starts at 0.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(
+            validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_burn_within_balance_ok() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000u64));
+        assert!(
+            validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_transfer_within_balance_ok() {
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000u64));
+        assert!(
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 500, dest)], &db)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_register_then_transfer_in_same_batch_ok() {
+        // Token registered with initial_supply=1000 and transferred 500 in the same checkpoint.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(validate_erc_batch_data(
+            source,
+            &[etr(token, 1000)],
+            &[],
+            &[etx(source, token, 500, dest)],
+            &db,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_mint_before_burn_order_in_batch_ok() {
+        // Even when the burn appears before the mint in the slice, mints are processed first.
+        // DB balance = 100, batch has burn 250 then mint 300.
+        // Expected: mint first → 400, then burn → 150. Should pass.
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[ets_burn(token, 250), ets_mint(token, 300)],
+            &[],
+            &db,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_foreign_token_transfer_ok() {
+        // Token's home subnet differs from the checkpoint submitter.
+        let home = test_utils::generate_subnet_id();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        // source_subnet holds 1000 of the foreign token
+        let db = db_with_balance(home, token, source, U256::from(1000u64));
+        assert!(
+            validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db)
+                .is_ok()
+        );
+    }
+
+    // ── error paths ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_duplicate_registration_in_batch_err() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let result =
+            validate_erc_batch_data(source, &[etr(token, 1000), etr(token, 2000)], &[], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("registered more than once"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_re_registration_of_existing_token_err() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(500u64));
+        let result = validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("already registered"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_burn_exceeds_balance_err() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        let result = validate_erc_batch_data(source, &[], &[ets_burn(token, 200)], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Burn exceeds balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_transfer_exceeds_balance_err() {
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        let result =
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 200, dest)], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Insufficient balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_register_then_over_transfer_err() {
+        // Register with initial_supply=100, transfer 200 — should fail.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let result = validate_erc_batch_data(
+            source,
+            &[etr(token, 100)],
+            &[],
+            &[etx(source, token, 200, dest)],
+            &db,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_transfers_same_token_cumulative_check_err() {
+        // Balance = 300; two transfers of 200 each — second exceeds remaining balance.
+        let source = test_utils::generate_subnet_id();
+        let dest1 = test_utils::generate_subnet_id();
+        let dest2 = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(300u64));
+        let result = validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[
+                etx(source, token, 200, dest1),
+                etx(source, token, 200, dest2),
+            ],
+            &db,
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Insufficient balance"),
+            "wrong error message"
         );
     }
 }
