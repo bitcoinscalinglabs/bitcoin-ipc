@@ -170,10 +170,8 @@ pub fn submit_to_mempool(
     }
 
     for tx in txs {
-        debug!(
-            "Transaction sent to mempool: {}",
-            rpc.send_raw_transaction(tx.raw_hex())?
-        );
+        let txid = rpc.send_raw_transaction(tx.raw_hex())?;
+        debug!("Transaction sent to mempool: {}", txid);
     }
 
     Ok(())
