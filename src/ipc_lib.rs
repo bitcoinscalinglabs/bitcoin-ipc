@@ -2641,6 +2641,14 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
                 source_subnet_id, etr.home_token_address, existing
             )));
         }
+        if etr.initial_supply == U256::ZERO {
+            trace!(
+                "Zero initial_supply for token ({},{}) on subnet {}",
+                source_subnet_id,
+                etr.home_token_address,
+                source_subnet_id
+            );
+        }
         final_balances.insert(key, etr.initial_supply);
     }
 
@@ -2650,6 +2658,15 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
             continue;
         }
         let (_, mint_amount) = ets.delta.into_sign_and_abs();
+        if mint_amount == U256::ZERO {
+            trace!(
+                "Zero-delta mint for token ({},{}) on subnet {} — no-op",
+                source_subnet_id,
+                ets.home_token_address,
+                source_subnet_id
+            );
+            continue;
+        }
         let key = format!("{}:{}", source_subnet_id, ets.home_token_address);
         let bal = match final_balances.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -2690,6 +2707,15 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
 
     // 4. Transfers (ETX) — must not exceed running balance on the source subnet.
     for etx in token_transfers {
+        if etx.amount == U256::ZERO {
+            trace!(
+                "Zero-amount ETX for token ({},{}) on subnet {}",
+                etx.home_subnet_id,
+                etx.home_token_address,
+                source_subnet_id
+            );
+            continue;
+        }
         let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
         let bal = match final_balances.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -3162,8 +3188,8 @@ impl IpcBatchTransferMsg {
                 new_balance,
             )?;
             debug!(
-                "Applied mint for token {} on subnet {}",
-                ems.home_token_address, source_subnet_id
+                "Applied mint of amount {} for token {} on subnet {}",
+                mint_amount, ems.home_token_address, source_subnet_id
             );
         }
 
@@ -3199,13 +3225,20 @@ impl IpcBatchTransferMsg {
                 new_balance,
             )?;
             debug!(
-                "Applied burn for token {} on subnet {}",
-                ems.home_token_address, source_subnet_id
+                "Applied burn of amount {} for token {} on subnet {}",
+                burn_amount, ems.home_token_address, source_subnet_id
             );
         }
 
         // Save ERC transfers (IPC:ETX) — firewall: check source has sufficient balance
         for etx in &self.token_transfers {
+            if etx.amount == U256::ZERO {
+                debug!(
+                    "Skipping zero-amount ETX for token ({},{}) on subnet {}",
+                    etx.home_subnet_id, etx.home_token_address, source_subnet_id
+                );
+                continue;
+            }
             let src_balance = db.get_token_balance_txn(
                 &wtxn,
                 etx.home_subnet_id,

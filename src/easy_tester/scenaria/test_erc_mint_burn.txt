@@ -162,3 +162,24 @@ block 116
 
 read token_balance subnet1 TokenA
 expect result.balance = 1_100_000
+
+# ──────────────────────────────────────────────────
+# Test 6: Zero-amount mint and burn
+# The monitor skips zero-delta supply adjustments; balance is unchanged.
+# ──────────────────────────────────────────────────
+
+mint_token subnet1 TokenA 0
+checkpoint subnet1
+
+block 117
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+burn_token subnet1 TokenA 0
+checkpoint subnet1
+
+block 118
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000

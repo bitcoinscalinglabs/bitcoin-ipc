@@ -1087,7 +1087,12 @@ pub async fn dev_gen_checkpoint_psbt(
         }
     };
 
-    if let Err(err) = msg.validate() {
+    // Validate, but allow zero-amount ERC transfers (the monitor should accept but skip them).
+    let mut msg_for_validation = msg.clone();
+    msg_for_validation
+        .token_transfers
+        .retain(|etx| etx.amount != alloy_primitives::U256::ZERO);
+    if let Err(err) = msg_for_validation.validate() {
         error!("Invalid checkpoint message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }

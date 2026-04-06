@@ -212,3 +212,20 @@ read rootnet_msgs subnet3
 expect result.count = 5
 expect result.4.kind = erc_transfer
 expect result.4.amount = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+
+# ──────────────────────────────────────────────────
+# Test 7: Zero-amount transfer
+# The provider allows it (dev endpoint), but the monitor skips it entirely —
+# no balance change, no rootnet message delivered.
+# ──────────────────────────────────────────────────
+
+block 140
+
+erc_transfer subnet1 subnet2 MyToken 0
+checkpoint subnet1
+
+block 141
+
+# Count unchanged — zero-amount ETX produces no rootnet message
+read rootnet_msgs subnet2
+expect result.count = 6
