@@ -128,3 +128,37 @@ expect result.balance = 600_000
 # TokenA still unaffected
 read token_balance subnet1 TokenA
 expect result.balance = 1_100_000
+
+# ──────────────────────────────────────────────────
+# Test 5: Edge cases
+# ──────────────────────────────────────────────────
+
+mint_token subnet2 TokenB 0
+checkpoint subnet2
+
+block 114
+
+# Zero mint is a no-op
+read token_balance subnet2 TokenB
+expect result.balance = 600_000
+
+# Mint I256::MAX (2^255 - 1) to push TokenA to a 256-bit balance
+# I256::MAX = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+# I256::MAX fits within U256, so the monitor handles it without overflowing
+mint_token subnet1 TokenA 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet1
+
+block 115
+
+# 1_100_000 + I256::MAX
+read token_balance subnet1 TokenA
+expect result.balance = 57896044618658097711785492504343953926634992332820282019728792003956565919967
+
+# Burn back I256::MAX to restore
+burn_token subnet1 TokenA 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet1
+
+block 116
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000

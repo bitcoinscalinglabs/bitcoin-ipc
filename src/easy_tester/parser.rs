@@ -4,7 +4,7 @@ use crate::easy_tester::{
     error::EasyTesterError,
     model::{
         generate_validator, normalize_numeric_literal, parse_u16_allow_underscores,
-        parse_u64_allow_underscores, OutputDb,
+        parse_u64_allow_underscores, parse_u256_allow_underscores, OutputDb,
         OutputExpectTarget, ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TesterConfig,
     },
 };
@@ -449,7 +449,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             original_line,
                         ));
                     }
-                    let initial_supply = parse_u64_allow_underscores(tokens[4]).map_err(|e| {
+                    let initial_supply = parse_u256_allow_underscores(tokens[4]).map_err(|e| {
                         EasyTesterError::parse(
                             path.clone(),
                             line_no,
@@ -478,13 +478,16 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             original_line,
                         ));
                     }
+                    let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                    })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
                         text: original_line.to_string(),
                         cmd: ScenarioCommand::MintToken {
                             subnet_name: tokens[1].to_string(),
                             token_name: tokens[2].to_string(),
-                            amount: normalize_numeric_literal(tokens[3]),
+                            amount,
                         },
                     });
                 }
@@ -498,13 +501,16 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             original_line,
                         ));
                     }
+                    let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                    })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
                         text: original_line.to_string(),
                         cmd: ScenarioCommand::BurnToken {
                             subnet_name: tokens[1].to_string(),
                             token_name: tokens[2].to_string(),
-                            amount: normalize_numeric_literal(tokens[3]),
+                            amount,
                         },
                     });
                 }
@@ -518,6 +524,9 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             original_line,
                         ));
                     }
+                    let amount = parse_u256_allow_underscores(tokens[4]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                    })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
                         text: original_line.to_string(),
@@ -525,7 +534,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             src_subnet: tokens[1].to_string(),
                             dst_subnet: tokens[2].to_string(),
                             token_name: tokens[3].to_string(),
-                            amount: normalize_numeric_literal(tokens[4]),
+                            amount,
                         },
                     });
                 }

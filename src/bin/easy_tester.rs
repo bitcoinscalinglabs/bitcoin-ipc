@@ -169,14 +169,14 @@ fn run_scenario<T: Tester>(
                 token_name,
                 amount,
             } => {
-                tester.exec_mint_token(working_height, &subnet_name, &token_name, &amount).map_err(annotate)?;
+                tester.exec_mint_token(working_height, &subnet_name, &token_name, amount).map_err(annotate)?;
             }
             ScenarioCommand::BurnToken {
                 subnet_name,
                 token_name,
                 amount,
             } => {
-                tester.exec_burn_token(working_height, &subnet_name, &token_name, &amount).map_err(annotate)?;
+                tester.exec_burn_token(working_height, &subnet_name, &token_name, amount).map_err(annotate)?;
             }
             ScenarioCommand::ErcTransfer {
                 src_subnet,
@@ -189,7 +189,7 @@ fn run_scenario<T: Tester>(
                     &src_subnet,
                     &dst_subnet,
                     &token_name,
-                    &amount,
+                    amount,
                 ).map_err(annotate)?;
             }
             ScenarioCommand::OutputRead { db, args } => {

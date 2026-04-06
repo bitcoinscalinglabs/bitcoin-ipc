@@ -70,34 +70,126 @@ const _: () = {
 
 use alloy_primitives::{I256, U256};
 
-/// Serde shim for `I256` that works with both human-readable formats (JSON) and
-/// binary formats (postcard). Alloy's built-in I256 impl always calls
-/// `deserializer.deserialize_any(...)`, which postcard rejects because it is not
-/// a self-describing format. We always use `deserialize_str` instead, which
-/// round-trips correctly with the decimal string that `collect_str` writes.
-mod i256_str_serde {
-    use alloy_primitives::I256;
-    use serde::{Deserializer, Serializer, de};
+/// Compact length-prefixed encoding for U256 and I256, usable as `#[serde(with = "...")]`.
+///
+/// Wire format for unsigned (compact_amount::u256):
+///   [1-byte length N][N bytes big-endian value, no leading zeros]
+///
+/// Wire format for signed (compact_amount::i256):
+///   [1-byte header: high bit = sign, low 7 bits = N][N bytes big-endian absolute value]
+mod compact_amount {
+    use alloy_primitives::{Sign, I256, U256};
+    use serde::{de, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &I256, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(v)
+    fn encode_magnitude(abs: U256) -> Vec<u8> {
+        let bytes = abs.to_be_bytes::<32>();
+        let leading = bytes.iter().take_while(|&&b| b == 0).count();
+        let payload = &bytes[leading..];
+        let mut buf = Vec::with_capacity(1 + payload.len());
+        buf.push(payload.len() as u8);
+        buf.extend_from_slice(payload);
+        buf
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<I256, D::Error> {
-        struct StrVisitor;
-        impl de::Visitor<'_> for StrVisitor {
-            type Value = I256;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "a decimal string for a 256-bit signed integer")
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<I256, E> {
-                v.parse().map_err(de::Error::custom)
-            }
-            fn visit_string<E: de::Error>(self, v: String) -> Result<I256, E> {
-                self.visit_str(&v)
+    fn decode_magnitude<E: de::Error>(v: &[u8]) -> Result<U256, E> {
+        if v.is_empty() {
+            return Err(E::custom("empty compact amount"));
+        }
+        let n = (v[0] & 0x7F) as usize; // low 7 bits = length; high bit reserved for i256 sign
+        if n > 32 {
+            return Err(E::custom("compact amount length > 32"));
+        }
+        if v.len() != 1 + n {
+            return Err(E::custom("compact amount length mismatch"));
+        }
+        let mut be = [0u8; 32];
+        if n > 0 {
+            be[32 - n..].copy_from_slice(&v[1..]);
+        }
+        Ok(U256::from_be_bytes(be))
+    }
+
+    pub mod u256 {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
+            if s.is_human_readable() {
+                serde::Serialize::serialize(v, s)
+            } else {
+                s.serialize_bytes(&encode_magnitude(*v))
             }
         }
-        d.deserialize_str(StrVisitor)
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<U256, D::Error> {
+            if d.is_human_readable() {
+                return serde::Deserialize::deserialize(d);
+            }
+            struct V;
+            impl<'de> de::Visitor<'de> for V {
+                type Value = U256;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "compact U256")
+                }
+                fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<U256, E> {
+                    decode_magnitude(v)
+                }
+            }
+            d.deserialize_bytes(V)
+        }
+    }
+
+    pub mod i256 {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &I256, s: S) -> Result<S::Ok, S::Error> {
+            if s.is_human_readable() {
+                return s.collect_str(v);
+            }
+            let (sign, abs) = v.into_sign_and_abs();
+            let mut buf = encode_magnitude(abs);
+            if sign == Sign::Negative {
+                buf[0] |= 0x80;
+            }
+            s.serialize_bytes(&buf)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<I256, D::Error> {
+            if d.is_human_readable() {
+                struct StrV;
+                impl de::Visitor<'_> for StrV {
+                    type Value = I256;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "decimal string for I256")
+                    }
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<I256, E> {
+                        v.parse().map_err(de::Error::custom)
+                    }
+                }
+                return d.deserialize_str(StrV);
+            }
+            struct V;
+            impl<'de> de::Visitor<'de> for V {
+                type Value = I256;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "compact I256")
+                }
+                fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<I256, E> {
+                    if v.is_empty() {
+                        return Err(E::custom("empty compact I256"));
+                    }
+                    let negative = (v[0] & 0x80) != 0;
+                    let abs = decode_magnitude(v)?;
+                    let sign = if negative {
+                        Sign::Negative
+                    } else {
+                        Sign::Positive
+                    };
+                    I256::checked_from_sign_and_abs(sign, abs)
+                        .ok_or_else(|| E::custom("I256 overflow (negative zero)"))
+                }
+            }
+            d.deserialize_bytes(V)
+        }
     }
 }
 
@@ -1312,7 +1404,7 @@ pub struct IpcErcTokenRegistration {
     pub decimals: u8,
     /// T.totalSupply() at registration time.
     /// Seeds the balance ledger for S_home.
-    #[serde(default)]
+    #[serde(default, with = "compact_amount::u256")]
     pub initial_supply: U256,
 }
 
@@ -1324,12 +1416,7 @@ pub struct IpcErcSupplyAdjustment {
     /// The token contract address on the home subnet
     pub home_token_address: alloy_primitives::Address,
     /// Supply change. Positive = mint, negative = burn.
-    ///
-    /// Uses a custom serde shim: alloy's I256 always calls `deserialize_any`, which
-    /// postcard (a non-self-describing format) does not support. We force
-    /// `deserialize_str` instead, which round-trips correctly with the string
-    /// representation that `collect_str` writes.
-    #[serde(with = "i256_str_serde")]
+    #[serde(with = "compact_amount::i256")]
     pub delta: I256,
 }
 
@@ -1356,6 +1443,7 @@ pub struct IpcCrossSubnetErcTransfer {
 struct IpcCrossSubnetErcTransferWire {
     home_subnet_id: SubnetId,
     home_token_address: alloy_primitives::Address,
+    #[serde(with = "compact_amount::u256")]
     amount: U256,
     recipient: alloy_primitives::Address,
 }
@@ -7669,5 +7757,84 @@ mod validate_erc_batch_tests {
                 .contains("Insufficient balance"),
             "wrong error message"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_amount_tests {
+    use super::compact_amount;
+    use alloy_primitives::{I256, U256};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Uw(#[serde(with = "compact_amount::u256")] U256);
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Iw(#[serde(with = "compact_amount::i256")] I256);
+
+    fn rt_u256(v: U256) -> U256 {
+        let enc = postcard::to_stdvec(&Uw(v)).unwrap();
+        postcard::from_bytes::<Uw>(&enc).unwrap().0
+    }
+
+    fn rt_i256(v: I256) -> I256 {
+        let enc = postcard::to_stdvec(&Iw(v)).unwrap();
+        postcard::from_bytes::<Iw>(&enc).unwrap().0
+    }
+
+    fn wire_len_u256(v: U256) -> usize {
+        postcard::to_stdvec(&Uw(v)).unwrap().len()
+    }
+
+    #[test]
+    fn u256_roundtrips() {
+        assert_eq!(rt_u256(U256::ZERO), U256::ZERO);
+        assert_eq!(rt_u256(U256::from(1u64)), U256::from(1u64));
+        assert_eq!(rt_u256(U256::from(255u64)), U256::from(255u64));
+        assert_eq!(rt_u256(U256::from(256u64)), U256::from(256u64));
+        assert_eq!(rt_u256(U256::from(1_000_000u64)), U256::from(1_000_000u64));
+        assert_eq!(rt_u256(U256::from(u64::MAX)), U256::from(u64::MAX));
+        assert_eq!(rt_u256(U256::MAX), U256::MAX);
+    }
+
+    #[test]
+    fn u256_wire_sizes() {
+        // postcard wraps serialize_bytes as [varint(len)][bytes], adding 1 byte overhead.
+        // Total: 1 (outer varint) + 1 (inner length N) + N (payload) = 2 + N bytes.
+        assert_eq!(wire_len_u256(U256::ZERO), 2); // N=0
+        assert_eq!(wire_len_u256(U256::from(255u64)), 3); // N=1
+        assert_eq!(wire_len_u256(U256::from(1_000_000u64)), 5); // 0x0F4240 → N=3
+        assert_eq!(wire_len_u256(U256::MAX), 34); // N=32; 1 byte more than raw U256
+    }
+
+    #[test]
+    fn i256_roundtrips() {
+        assert_eq!(rt_i256(I256::ZERO), I256::ZERO);
+        assert_eq!(
+            rt_i256(I256::try_from(1i64).unwrap()),
+            I256::try_from(1i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(-1i64).unwrap()),
+            I256::try_from(-1i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(300_000i64).unwrap()),
+            I256::try_from(300_000i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(-200_000i64).unwrap()),
+            I256::try_from(-200_000i64).unwrap()
+        );
+        assert_eq!(rt_i256(I256::MAX), I256::MAX);
+        assert_eq!(rt_i256(I256::MIN), I256::MIN);
+    }
+
+    #[test]
+    fn i256_sign_preserved() {
+        let pos = I256::try_from(1_000_000i64).unwrap();
+        let neg = I256::try_from(-1_000_000i64).unwrap();
+        assert!(rt_i256(pos) > I256::ZERO);
+        assert!(rt_i256(neg) < I256::ZERO);
     }
 }

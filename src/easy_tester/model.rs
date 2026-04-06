@@ -99,28 +99,26 @@ pub enum ScenarioCommand {
         subnet_name: String,
         name: String,
         symbol: String,
-        initial_supply: u64,
+        initial_supply: alloy_primitives::U256,
     },
     /// Queue a mint supply adjustment (queues ETS for next checkpoint)
     MintToken {
         subnet_name: String,
         token_name: String,
-        amount: String,
+        amount: alloy_primitives::U256,
     },
     /// Queue a burn supply adjustment (queues ETS for next checkpoint)
     BurnToken {
         subnet_name: String,
         token_name: String,
-        amount: String,
+        amount: alloy_primitives::U256,
     },
     /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint)
     ErcTransfer {
         src_subnet: String,
         dst_subnet: String,
-        /// Token name (must match a previously registered token)
         token_name: String,
-        /// Amount as decimal string (e.g. "1000")
-        amount: String,
+        amount: alloy_primitives::U256,
     },
     OutputRead {
         db: OutputDb,
@@ -169,6 +167,12 @@ pub fn normalize_numeric_literal(s: &str) -> String {
 pub fn parse_u64_allow_underscores(s: &str) -> Result<u64, String> {
     normalize_numeric_literal(s)
         .parse::<u64>()
+        .map_err(|e| format!("invalid number '{s}': {e}"))
+}
+
+pub fn parse_u256_allow_underscores(s: &str) -> Result<alloy_primitives::U256, String> {
+    normalize_numeric_literal(s)
+        .parse::<alloy_primitives::U256>()
         .map_err(|e| format!("invalid number '{s}': {e}"))
 }
 

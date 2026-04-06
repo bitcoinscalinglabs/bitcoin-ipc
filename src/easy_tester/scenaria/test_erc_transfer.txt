@@ -158,12 +158,57 @@ checkpoint subnet1
 
 block 123
 
-# Batch rejected — subnet2 count unchanged at 4
+# Batch rejected — counts unchanged
 read rootnet_msgs subnet2
 expect result.count = 4
 
-block 125
-
-# Batch rejected — subnet3 count unchanged at 3
 read rootnet_msgs subnet3
 expect result.count = 3
+
+# ──────────────────────────────────────────────────
+# Test 6 (edge): Full 256-bit arithmetic
+# Register BigToken with U256::MAX initial supply on subnet1.
+# Transfer U256::MAX to subnet2, then subnet2 forwards U256::MAX/2 to subnet3.
+# U256::MAX   = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+# U256::MAX/2 = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+# ──────────────────────────────────────────────────
+
+block 130
+
+register_token subnet1 BigToken BTK 115792089237316195423570985008687907853269984665640564039457584007913129639935
+checkpoint subnet1
+
+block 131
+
+# Fan-out: subnet2 and subnet3 each receive the BigToken registration
+read rootnet_msgs subnet2
+expect result.count = 5
+expect result.4.kind = erc_registration
+expect result.4.tokenName = BigToken
+
+read rootnet_msgs subnet3
+expect result.count = 4
+expect result.3.kind = erc_registration
+expect result.3.tokenName = BigToken
+
+# Transfer U256::MAX — subnet1 sends its entire BigToken balance to subnet2
+erc_transfer subnet1 subnet2 BigToken 115792089237316195423570985008687907853269984665640564039457584007913129639935
+checkpoint subnet1
+
+block 132
+
+read rootnet_msgs subnet2
+expect result.count = 6
+expect result.5.kind = erc_transfer
+expect result.5.amount = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+
+# subnet2 forwards half (U256::MAX/2) to subnet3
+erc_transfer subnet2 subnet3 BigToken 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet2
+
+block 133
+
+read rootnet_msgs subnet3
+expect result.count = 5
+expect result.4.kind = erc_transfer
+expect result.4.amount = 57896044618658097711785492504343953926634992332820282019728792003956564819967

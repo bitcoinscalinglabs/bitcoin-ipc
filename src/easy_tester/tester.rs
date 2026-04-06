@@ -44,7 +44,7 @@ pub trait Tester {
         _subnet_name: &str,
         _name: &str,
         _symbol: &str,
-        _initial_supply: u64,
+        _initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         Err(EasyTesterError::runtime(
             "register_token is not supported by this tester",
@@ -56,7 +56,7 @@ pub trait Tester {
         _height: u64,
         _subnet_name: &str,
         _token_name: &str,
-        _amount: &str,
+        _amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         Err(EasyTesterError::runtime(
             "mint_token is not supported by this tester",
@@ -68,7 +68,7 @@ pub trait Tester {
         _height: u64,
         _subnet_name: &str,
         _token_name: &str,
-        _amount: &str,
+        _amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         Err(EasyTesterError::runtime(
             "burn_token is not supported by this tester",
@@ -81,7 +81,7 @@ pub trait Tester {
         _src_subnet: &str,
         _dst_subnet: &str,
         _token_name: &str,
-        _amount: &str,
+        _amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         Err(EasyTesterError::runtime(
             "erc_transfer is not supported by this tester",

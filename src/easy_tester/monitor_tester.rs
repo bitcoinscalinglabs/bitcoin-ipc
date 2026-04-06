@@ -17,7 +17,7 @@ use crate::{
         error::EasyTesterError,
         model::{
             build_create_subnet_msg, OutputDb, OutputExpectTarget,
-            SetupSpec, ValidatorSpec,
+            parse_u256_allow_underscores, SetupSpec, ValidatorSpec,
         },
         provider_client::ProviderClient,
         tester::Tester,
@@ -325,7 +325,7 @@ pub struct MonitorTester {
     pending_supply_adjustments: HashMap<String, Vec<IpcErcSupplyAdjustment>>,
     pending_erc_transfers: HashMap<String, Vec<IpcCrossSubnetErcTransfer>>,
     last_rootnet_msgs: Option<LastRootnetMsgs>,
-    last_token_balance: Option<u64>,
+    last_token_balance: Option<alloy_primitives::U256>,
     last_reward_results: Option<LastRewardResults>,
     checkpoint_heights: HashMap<String, u64>,
     all_sk_hex: Vec<String>,
@@ -1065,7 +1065,7 @@ impl Tester for MonitorTester {
         subnet_name: &str,
         name: &str,
         symbol: &str,
-        initial_supply: u64,
+        initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
 
@@ -1088,7 +1088,7 @@ impl Tester for MonitorTester {
             name: name.to_string(),
             symbol: symbol.to_string(),
             decimals: 18,
-            initial_supply: alloy_primitives::U256::from(initial_supply),
+            initial_supply,
         };
 
         self.registered_tokens.insert(
@@ -1112,7 +1112,7 @@ impl Tester for MonitorTester {
         _height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
         let (_, addr) = self.registered_tokens.get(token_name).ok_or_else(|| {
@@ -1120,11 +1120,8 @@ impl Tester for MonitorTester {
         })?;
         let addr = *addr;
 
-        let amount_u64: u64 = amount_str
-            .parse()
-            .map_err(|e| EasyTesterError::runtime(format!("invalid amount: {e}")))?;
-        let delta = alloy_primitives::I256::try_from(amount_u64 as i64)
-            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+        let delta = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("mint amount too large for I256: {e}")))?;
 
         self.pending_supply_adjustments
             .entry(subnet_name.to_string())
@@ -1141,7 +1138,7 @@ impl Tester for MonitorTester {
         _height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
         let (_, addr) = self.registered_tokens.get(token_name).ok_or_else(|| {
@@ -1149,11 +1146,10 @@ impl Tester for MonitorTester {
         })?;
         let addr = *addr;
 
-        let amount_u64: u64 = amount_str
-            .parse()
-            .map_err(|e| EasyTesterError::runtime(format!("invalid amount: {e}")))?;
-        let delta = alloy_primitives::I256::try_from(-(amount_u64 as i64))
-            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+        let pos = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
+        let delta = pos.checked_neg()
+            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
 
         self.pending_supply_adjustments
             .entry(subnet_name.to_string())
@@ -1171,7 +1167,7 @@ impl Tester for MonitorTester {
         src_subnet: &str,
         dst_subnet: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         let dst_subnet_id = self.resolve_subnet_id(dst_subnet)?;
         let (home_subnet_name, home_token_address) =
@@ -1182,12 +1178,6 @@ impl Tester for MonitorTester {
         let home_token_address = *home_token_address;
 
         let home_subnet_id = self.resolve_subnet_id(&home_subnet_name)?;
-
-        let amount = alloy_primitives::U256::from(
-            amount_str
-                .parse::<u64>()
-                .map_err(|e| EasyTesterError::runtime(format!("invalid amount: {e}")))?,
-        );
 
         self.pending_erc_transfers
             .entry(src_subnet.to_string())
@@ -1263,7 +1253,9 @@ impl Tester for MonitorTester {
                 let resp: GetTokenBalanceLocalResponse =
                     self.rpc_call("gettokenbalance", params)?;
 
-                let val: u64 = resp.balance.parse().unwrap_or(u64::MAX);
+                let val = parse_u256_allow_underscores(&resp.balance).map_err(|e| {
+                    EasyTesterError::runtime(format!("token balance parse error: {e}"))
+                })?;
                 println!(
                     "OUTPUT read token_balance subnet='{}' token='{}': {}",
                     subnet_name, token_name, val
@@ -1378,10 +1370,9 @@ impl Tester for MonitorTester {
         if let Some(balance) = self.last_token_balance {
             match target.path.as_str() {
                 "balance" => {
-                    let expected: u64 =
-                        expected_value.parse::<u64>().map_err(|e| {
-                            EasyTesterError::runtime(format!("balance must be numeric: {e}"))
-                        })?;
+                    let expected = parse_u256_allow_underscores(expected_value).map_err(|e| {
+                        EasyTesterError::runtime(format!("balance must be numeric: {e}"))
+                    })?;
                     if balance != expected {
                         return Err(EasyTesterError::runtime(format!(
                             "EXPECT failed (line {}): result.balance expected {}, got {}",
@@ -1537,8 +1528,8 @@ fn json_nested_field(
     Ok(match val {
         serde_json::Value::String(s) => {
             // U256 and similar types serialize as "0x..." hex strings; convert to decimal.
-            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                if let Ok(n) = u128::from_str_radix(hex, 16) {
+            if s.starts_with("0x") || s.starts_with("0X") {
+                if let Ok(n) = s.parse::<alloy_primitives::U256>() {
                     return Ok(n.to_string());
                 }
             }

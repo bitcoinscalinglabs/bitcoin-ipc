@@ -10,36 +10,17 @@ cargo run --bin easy_tester -- --scenario <scenario_file> --tester <config_file>
 
 ## Existing tests
 
-Three scenarios are included under `src/easy_tester/scenaria/`. Run all three against the db tester:
+Several scenarios are included under `src/easy_tester/scenaria/`. Example run against the db tester:
 
 ```bash
 cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/db.txt
-cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_balances.txt --tester src/easy_tester/testers/db.txt
-cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_rewards.txt       --tester src/easy_tester/testers/db.txt
 ```
 
-| Scenario | What it covers |
-|---|---|
-| `test_erc_transfer.txt` | Token registration (ETR) and cross-subnet ERC20 transfers (ETX) |
-| `test_erc_balances.txt` | Token balance tracking across mint, burn, and multi-hop transfers |
-| `test_rewards.txt` | Validator reward distribution over multiple snapshot periods |
-
-To run against the monitor tester (requires `bitcoind` in PATH):
+Example run against the monitor tester (requires `bitcoind` in PATH):
 
 ```bash
 cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/monitor.txt
 ```
-
----
-
-Example:
-
-```
-cargo run --bin easy_tester -- \
-  --scenario src/easy_tester/scenaria/test_erc_transfer.txt \
-  --tester src/easy_tester/testers/db.txt
-```
-
 ---
 
 ## Config file format

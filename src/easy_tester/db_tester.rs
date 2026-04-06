@@ -45,7 +45,7 @@ pub struct DbTester {
     pending_supply_adjustments: HashMap<String, Vec<IpcErcSupplyAdjustment>>,
     pending_erc_transfers: HashMap<String, Vec<IpcCrossSubnetErcTransfer>>,
     last_rootnet_msgs: Option<LastRootnetMsgs>,
-    last_token_balance: Option<u64>,
+    last_token_balance: Option<alloy_primitives::U256>,
     // Reward fields
     reward_tracker: Option<RewardTracker>,
     last_reward_results: Option<LastRewardResults>,
@@ -412,7 +412,7 @@ impl DbTester {
         subnet_name: &str,
         name: &str,
         symbol: &str,
-        initial_supply: u64,
+        initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
 
@@ -439,7 +439,7 @@ impl DbTester {
             name: name.to_string(),
             symbol: symbol.to_string(),
             decimals: 18,
-            initial_supply: alloy_primitives::U256::from(initial_supply),
+            initial_supply,
         };
 
         self.registered_tokens
@@ -463,7 +463,7 @@ impl DbTester {
         src_subnet: &str,
         dst_subnet: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(src_subnet)?;
         let destination_subnet_id = self.resolve_subnet_id(dst_subnet)?;
@@ -476,11 +476,6 @@ impl DbTester {
         })?;
 
         let home_subnet_id = self.resolve_subnet_id(reg_subnet)?;
-
-        let amount =
-            alloy_primitives::U256::from(amount_str.parse::<u64>().map_err(|e| {
-                EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}"))
-            })?);
 
         let etx = IpcCrossSubnetErcTransfer {
             home_subnet_id,
@@ -497,7 +492,7 @@ impl DbTester {
 
         info!(
             "Queued ERC transfer from subnet '{}' to subnet '{}', token='{}', amount={}",
-            src_subnet, dst_subnet, token_name, amount_str
+            src_subnet, dst_subnet, token_name, amount
         );
         Ok(())
     }
@@ -507,18 +502,15 @@ impl DbTester {
         _height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
         let (_, reg) = self.registered_tokens.get(token_name).ok_or_else(|| {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let amount_u64: u64 = amount_str
-            .parse::<u64>()
-            .map_err(|e| EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}")))?;
-        let delta = alloy_primitives::I256::try_from(amount_u64 as i64)
-            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+        let delta = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("mint amount too large for I256: {e}")))?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -529,10 +521,7 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!(
-            "Queued mint for token '{}' on subnet '{}', amount={}",
-            token_name, subnet_name, amount_str
-        );
+        info!("Queued mint for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
         Ok(())
     }
 
@@ -541,18 +530,17 @@ impl DbTester {
         _height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount_str: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.resolve_subnet_id(subnet_name)?;
         let (_, reg) = self.registered_tokens.get(token_name).ok_or_else(|| {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let amount_u64: u64 = amount_str
-            .parse::<u64>()
-            .map_err(|e| EasyTesterError::runtime(format!("invalid amount '{amount_str}': {e}")))?;
-        let delta = alloy_primitives::I256::try_from(-(amount_u64 as i64))
-            .map_err(|e| EasyTesterError::runtime(format!("amount too large: {e}")))?;
+        let pos = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
+        let delta = pos.checked_neg()
+            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -563,10 +551,7 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!(
-            "Queued burn for token '{}' on subnet '{}', amount={}",
-            token_name, subnet_name, amount_str
-        );
+        info!("Queued burn for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
         Ok(())
     }
 
@@ -745,7 +730,7 @@ impl Tester for DbTester {
         subnet_name: &str,
         name: &str,
         symbol: &str,
-        initial_supply: u64,
+        initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.queue_token_registration(height, subnet_name, name, symbol, initial_supply)
     }
@@ -755,7 +740,7 @@ impl Tester for DbTester {
         height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.queue_mint(height, subnet_name, token_name, amount)
     }
@@ -765,7 +750,7 @@ impl Tester for DbTester {
         height: u64,
         subnet_name: &str,
         token_name: &str,
-        amount: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.queue_burn(height, subnet_name, token_name, amount)
     }
@@ -776,7 +761,7 @@ impl Tester for DbTester {
         src_subnet: &str,
         dst_subnet: &str,
         token_name: &str,
-        amount: &str,
+        amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
         self.queue_erc_transfer(height, src_subnet, dst_subnet, token_name, amount)
     }
@@ -839,12 +824,11 @@ impl Tester for DbTester {
                     .get_token_balance(home_subnet_id, reg.home_token_address, subnet_id)
                     .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
 
-                let val: u64 = balance.try_into().unwrap_or(u64::MAX);
                 println!(
                     "OUTPUT read token_balance subnet='{}' token='{}': {}",
-                    subnet_name, token_name, val
+                    subnet_name, token_name, balance
                 );
-                self.last_token_balance = Some(val);
+                self.last_token_balance = Some(balance);
             }
 
             OutputDb::RewardResults => {
@@ -1026,10 +1010,9 @@ impl Tester for DbTester {
             let parts: Vec<&str> = target.path.split('.').collect();
             match parts.as_slice() {
                 ["balance"] => {
-                    let expected: u64 =
-                        expected_value.parse::<u64>().map_err(|e| {
-                            EasyTesterError::runtime(format!("balance must be numeric: {e}"))
-                        })?;
+                    use crate::easy_tester::model::parse_u256_allow_underscores;
+                    let expected = parse_u256_allow_underscores(expected_value)
+                        .map_err(|e| EasyTesterError::runtime(format!("balance must be numeric: {e}")))?;
                     if balance != expected {
                         return Err(EasyTesterError::runtime(format!(
                             "EXPECT failed (line {}): result.balance expected {}, got {}",
