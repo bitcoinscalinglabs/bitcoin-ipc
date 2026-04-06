@@ -767,11 +767,11 @@ pub async fn gen_bootstrap_handover(
 pub struct GenCheckpointPsbtResponse {
     // Checkpoint
     unsigned_psbt: bitcoin::Psbt,
-    pub unsigned_psbt_base64: String,
+    unsigned_psbt_base64: String,
     unsigned_psbt_hash: bitcoin::hashes::sha256::Hash,
     psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
     // Batch transfer reveal
-    pub batch_transfer_tx_hex: Option<String>,
+    batch_transfer_tx_hex: Option<String>,
 }
 
 pub async fn gen_checkpoint_psbt(
@@ -1297,13 +1297,13 @@ pub async fn dev_multisign_psbt(
 
 #[derive(Serialize, Deserialize)]
 pub struct FinalizeCheckpointPsbtParams {
-    pub subnet_id: SubnetId,
-    pub unsigned_psbt_base64: String,
-    pub signatures: Vec<(
+    subnet_id: SubnetId,
+    unsigned_psbt_base64: String,
+    signatures: Vec<(
         bitcoin::XOnlyPublicKey,
         Vec<bitcoin::secp256k1::schnorr::Signature>,
     )>,
-    pub batch_transfer_tx_hex: Option<String>,
+    batch_transfer_tx_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -39,18 +39,19 @@ impl SetupSpec {
     }
 }
 
+/// Configuration parsed from the separate config file (not the scenario file).
 #[derive(Debug, Clone)]
 pub enum TesterConfig {
-    RewardTester {
-        activation_height: u64,
-        snapshot_length: u64,
+    Db {
+        activation_height: Option<u64>,
+        snapshot_length: Option<u64>,
     },
-    ErcTransferTester,
-}
-
-#[derive(Debug, Clone)]
-pub struct TestConfig {
-    pub tester: TesterConfig,
+    Monitor {
+        activation_height: Option<u64>,
+        snapshot_length: Option<u64>,
+        monitor_log_level: Option<String>,
+        provider_log_level: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +99,7 @@ pub enum ScenarioCommand {
         subnet_name: String,
         name: String,
         symbol: String,
-        decimals: u8,
+        initial_supply: u64,
     },
     /// Queue a mint supply adjustment (queues ETS for next checkpoint)
     MintToken {
@@ -144,18 +145,29 @@ pub enum ScenarioCommand {
 pub struct OutputExpectTarget {
     /// The dotted path after "result." (e.g. "count", "0.kind", "rewards_list.validator1")
     pub path: String,
+    /// Line number in the scenario file where this expect command appears.
+    pub line_no: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedTest {
-    pub config: TestConfig,
     pub setup: SetupSpec,
-    pub scenario: Vec<ScenarioCommand>,
+    pub scenario: Vec<(usize, ScenarioCommand)>,
+}
+
+/// Strip underscores from a token that is entirely digits and underscores
+/// (e.g. `1_000_000` → `"1000000"`). Strings with non-digit characters
+/// (e.g. `erc_registration`, `subnet_a`) are returned unchanged.
+pub fn normalize_numeric_literal(s: &str) -> String {
+    if s.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        s.chars().filter(|c| *c != '_').collect()
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn parse_u64_allow_underscores(s: &str) -> Result<u64, String> {
-    let normalized: String = s.chars().filter(|c| *c != '_').collect();
-    normalized
+    normalize_numeric_literal(s)
         .parse::<u64>()
         .map_err(|e| format!("invalid number '{s}': {e}"))
 }

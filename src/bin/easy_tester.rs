@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
-use bitcoin_ipc::easy_tester::model::TesterConfig;
-use bitcoin_ipc::easy_tester::{parse_test_file, ErcTransferTester, ScenarioCommand, Tester};
+use bitcoin_ipc::easy_tester::{
+    error::EasyTesterError, parse_config_file, parse_test_file, validate_scenario_for_tester,
+    DbTester, MonitorTester, ScenarioCommand, Tester, TesterConfig,
+};
 
 #[tokio::main]
 async fn main() {
@@ -14,133 +16,167 @@ async fn main() {
 async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let mut args = std::env::args().skip(1);
-    let Some(path) = args.next() else {
-        eprintln!("usage: easy_tester <scenario_file>");
+    let mut scenario_path: Option<String> = None;
+    let mut config_path: Option<String> = None;
+
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--scenario" => {
+                scenario_path = args.next();
+                if scenario_path.is_none() {
+                    eprintln!("error: --scenario requires a value");
+                    std::process::exit(2);
+                }
+            }
+            "--tester" => {
+                config_path = args.next();
+                if config_path.is_none() {
+                    eprintln!("error: --tester requires a value");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                eprintln!("error: unexpected argument '{other}'");
+                eprintln!("usage: easy_tester --scenario <scenario_file> --tester <config_file>");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let (Some(scenario_path), Some(config_path)) = (scenario_path, config_path) else {
+        eprintln!("usage: easy_tester --scenario <scenario_file> --tester <config_file>");
         std::process::exit(2);
     };
 
-    if args.next().is_some() {
-        eprintln!("usage: easy_tester <scenario_file>");
-        std::process::exit(2);
-    }
-
-    let path = PathBuf::from(path);
-    let parsed = parse_test_file(&path)?;
-
+    let config = parse_config_file(PathBuf::from(&config_path))?;
+    let parsed = parse_test_file(PathBuf::from(&scenario_path))?;
+    validate_scenario_for_tester(&parsed, &config)?;
     let scenario = parsed.scenario.clone();
-    match parsed.config.tester {
-        TesterConfig::RewardTester {
+
+    match config {
+        TesterConfig::Db {
             activation_height,
             snapshot_length,
         } => {
-            let mut tester = bitcoin_ipc::easy_tester::RewardTester::new(
+            let mut tester =
+                DbTester::new(parsed.setup, activation_height, snapshot_length).await?;
+            run_scenario(&mut tester, scenario, 1)?;
+        }
+        TesterConfig::Monitor {
+            activation_height,
+            snapshot_length,
+            monitor_log_level,
+            provider_log_level,
+        } => {
+            let mut tester = MonitorTester::new(
                 parsed.setup,
                 activation_height,
                 snapshot_length,
+                monitor_log_level,
+                provider_log_level,
             )
             .await?;
-            run_scenario(&mut tester, scenario)?;
-        }
-        TesterConfig::ErcTransferTester => {
-            let mut tester = ErcTransferTester::new(parsed.setup).await?;
-            run_scenario(&mut tester, scenario)?;
+            run_scenario(&mut tester, scenario, 101)?;
         }
     }
+
     Ok(())
 }
 
 fn run_scenario<T: Tester>(
     tester: &mut T,
-    scenario: Vec<ScenarioCommand>,
+    scenario: Vec<(usize, ScenarioCommand)>,
+    starting_block: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut mined_height: u64 = 0;
-    let mut current_block: Option<u64> = None;
+    if starting_block < 1 {
+        return Err("starting_block must be >= 1".into());
+    }
+    let mut working_height: u64 = starting_block;
 
-    for cmd in scenario {
+    for (line_no, cmd) in scenario {
+        let annotate = |e: EasyTesterError| -> Box<dyn std::error::Error> {
+            format!("line {line_no}: {e}").into()
+        };
         match cmd {
             ScenarioCommand::Block { height } => {
-                // Close previous block (mine it), then mine empty blocks up to height-1.
-                if let Some(prev) = current_block.take() {
-                    if prev > mined_height {
-                        tester.exec_mine_block(prev)?;
-                        mined_height = prev;
-                    }
+                if height < working_height {
+                    return Err(annotate(EasyTesterError::runtime("Scenario blocks cannot be decreasing")));
                 }
-
-                if height > 0 && mined_height < height.saturating_sub(1) {
-                    for h in (mined_height + 1)..=height.saturating_sub(1) {
-                        tester.exec_mine_block(h)?;
-                        mined_height = h;
-                    }
+                for h in working_height..height {
+                    tester.exec_mine_block(h).map_err(&annotate)?;
                 }
-
-                current_block = Some(height);
+                working_height = height;
             }
             ScenarioCommand::Create { subnet_name } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_create_subnet(height, &subnet_name)?;
+                tester.exec_create_subnet(working_height, &subnet_name).map_err(annotate)?;
             }
             ScenarioCommand::Join {
                 subnet_name,
                 validator_name,
                 collateral_sats,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_join_subnet(height, &subnet_name, &validator_name, collateral_sats)?;
+                tester.exec_join_subnet(
+                    working_height,
+                    &subnet_name,
+                    &validator_name,
+                    collateral_sats,
+                ).map_err(annotate)?;
             }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
                 amount_sats,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_stake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
+                tester.exec_stake_subnet(
+                    working_height,
+                    &subnet_name,
+                    &validator_name,
+                    amount_sats,
+                ).map_err(annotate)?;
             }
             ScenarioCommand::Unstake {
                 subnet_name,
                 validator_name,
                 amount_sats,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_unstake_subnet(height, &subnet_name, &validator_name, amount_sats)?;
+                tester.exec_unstake_subnet(
+                    working_height,
+                    &subnet_name,
+                    &validator_name,
+                    amount_sats,
+                ).map_err(annotate)?;
             }
             ScenarioCommand::Checkpoint { subnet_name } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_checkpoint_subnet(height, &subnet_name)?;
+                tester.exec_checkpoint_subnet(working_height, &subnet_name).map_err(annotate)?;
             }
             ScenarioCommand::RegisterToken {
                 subnet_name,
                 name,
                 symbol,
-                decimals,
+                initial_supply,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_register_token(height, &subnet_name, &name, &symbol, decimals)?;
+                tester.exec_register_token(
+                    working_height,
+                    &subnet_name,
+                    &name,
+                    &symbol,
+                    initial_supply,
+                ).map_err(annotate)?;
             }
             ScenarioCommand::MintToken {
                 subnet_name,
                 token_name,
                 amount,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_mint_token(height, &subnet_name, &token_name, &amount)?;
+                tester.exec_mint_token(working_height, &subnet_name, &token_name, &amount).map_err(annotate)?;
             }
             ScenarioCommand::BurnToken {
                 subnet_name,
                 token_name,
                 amount,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_burn_token(height, &subnet_name, &token_name, &amount)?;
+                tester.exec_burn_token(working_height, &subnet_name, &token_name, &amount).map_err(annotate)?;
             }
             ScenarioCommand::ErcTransfer {
                 src_subnet,
@@ -148,30 +184,26 @@ fn run_scenario<T: Tester>(
                 token_name,
                 amount,
             } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_erc_transfer(height, &src_subnet, &dst_subnet, &token_name, &amount)?;
+                tester.exec_erc_transfer(
+                    working_height,
+                    &src_subnet,
+                    &dst_subnet,
+                    &token_name,
+                    &amount,
+                ).map_err(annotate)?;
             }
             ScenarioCommand::OutputRead { db, args } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_output_read(height, db, &args)?;
+                tester.exec_output_read(working_height, db, &args).map_err(annotate)?;
             }
             ScenarioCommand::OutputExpect {
                 target,
                 expected_value,
-            } => {
-                let height = current_block
-                    .ok_or("scenario error: must set 'block <height>' before actions")?;
-                tester.exec_output_expect(height, target, &expected_value)?;
-            }
-        }
-    }
-
-    // Mine/close the final block, if any.
-    if let Some(final_height) = current_block {
-        if final_height > mined_height {
-            tester.exec_mine_block(final_height)?;
+            } => match tester.exec_output_expect(working_height, target, &expected_value) {
+                Ok(msg) => println!("OUTPUT expect {} \x1b[32m(ok)\x1b[0m", msg),
+                Err(e) => {
+                    return Err(format!("line {line_no}: {} \x1b[31m(fail)\x1b[0m", e).into());
+                }
+            },
         }
     }
 

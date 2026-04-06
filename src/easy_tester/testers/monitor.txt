@@ -1,0 +1,6 @@
+tester monitor
+activation_height 1
+snapshot_length 10
+
+monitor_log_level info
+provider_log_level info

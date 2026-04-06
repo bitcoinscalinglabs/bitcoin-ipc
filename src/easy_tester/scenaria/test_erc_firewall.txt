@@ -1,0 +1,109 @@
+# Test ERC firewall enforcement
+#
+# The firewall prevents state changes when an operation would exceed
+# the available token balance. Tests:
+# 1. Single transfer exceeding balance is rejected
+# 2. Batch of transfers whose total exceeds balance is rejected (entire batch)
+# 3. Burn exceeding balance (when balance = 0) is rejected
+setup
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+
+
+scenario
+
+block 102
+create subnet1
+create subnet2
+
+block 103
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+
+join subnet2 validator1 100_000_000
+join subnet2 validator2 100_000_000
+join subnet2 validator3 100_000_000
+join subnet2 validator4 100_000_000
+
+# ──────────────────────────────────────────────────
+# Setup: Register token with initial supply = 100,000
+# ──────────────────────────────────────────────────
+
+block 105
+register_token subnet1 TokenA TKA 100_000
+checkpoint subnet1
+
+block 106
+read token_balance subnet1 TokenA
+expect result.balance = 100_000
+
+# ──────────────────────────────────────────────────
+# Test 1: Single transfer exceeding balance is rejected
+# ──────────────────────────────────────────────────
+
+erc_transfer subnet1 subnet2 TokenA 200_000
+checkpoint subnet1
+
+block 107
+
+# balance unchanged (transfer was dropped)
+read token_balance subnet1 TokenA
+expect result.balance = 100_000
+
+read token_balance subnet2 TokenA
+expect result.balance = 0
+
+# ──────────────────────────────────────────────────
+# Test 2: Batch of transfers whose total exceeds balance is rejected
+# Two transfers of 60_000 each = 120_000 total > 100_000 balance.
+# The monitor rejects the entire batch — both balances unchanged.
+# ──────────────────────────────────────────────────
+
+erc_transfer subnet1 subnet2 TokenA 60_000
+erc_transfer subnet1 subnet2 TokenA 60_000
+checkpoint subnet1
+
+block 108
+
+# Entire batch rejected — subnet1 balance unchanged
+read token_balance subnet1 TokenA
+expect result.balance = 100_000
+
+read token_balance subnet2 TokenA
+expect result.balance = 0
+
+# ──────────────────────────────────────────────────
+# Test 3: Burn exceeding balance (balance = 0) is rejected
+# First drain all tokens to reach balance = 0, then try to burn more.
+# ──────────────────────────────────────────────────
+
+burn_token subnet1 TokenA 100_000
+checkpoint subnet1
+
+block 109
+
+# Burn succeeds: balance goes to 0
+read token_balance subnet1 TokenA
+expect result.balance = 0
+
+burn_token subnet1 TokenA 1
+checkpoint subnet1
+
+block 110
+
+# Burn failed — balance still 0
+read token_balance subnet1 TokenA
+expect result.balance = 0

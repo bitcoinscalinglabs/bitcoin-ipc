@@ -3,15 +3,14 @@ use std::{collections::HashSet, fs, path::PathBuf};
 use crate::easy_tester::{
     error::EasyTesterError,
     model::{
-        generate_validator, parse_u16_allow_underscores, parse_u64_allow_underscores, OutputDb,
-        OutputExpectTarget, ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TestConfig,
-        TesterConfig,
+        generate_validator, normalize_numeric_literal, parse_u16_allow_underscores,
+        parse_u64_allow_underscores, OutputDb,
+        OutputExpectTarget, ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TesterConfig,
     },
 };
 
 enum Section {
     None,
-    Config,
     Setup,
     Scenario,
 }
@@ -172,7 +171,6 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
     })?;
 
     let mut section = Section::None;
-    let mut config: Option<TestConfig> = None;
     let mut setup = SetupSpec::new();
     let mut scenario_entries: Vec<ScenarioEntry> = Vec::new();
 
@@ -202,95 +200,17 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
 
         match section {
             Section::None => {
-                if tokens.len() == 1 && tokens[0] == "config" {
-                    section = Section::Config;
+                if tokens.len() == 1 && tokens[0] == "setup" {
+                    seen_setup = true;
+                    section = Section::Setup;
                     continue;
                 }
                 return Err(EasyTesterError::parse(
                     path.clone(),
                     line_no,
-                    "expected 'config' as the first section",
+                    "expected 'setup' as the first section",
                     original_line,
                 ));
-            }
-            Section::Config => {
-                if tokens.len() == 1 && tokens[0] == "setup" {
-                    if config.is_none() {
-                        return Err(EasyTesterError::parse(
-                            path.clone(),
-                            line_no,
-                            "missing required 'tester ...' line in config section",
-                            original_line,
-                        ));
-                    }
-                    seen_setup = true;
-                    section = Section::Setup;
-                    continue;
-                }
-
-                if tokens[0] != "tester" {
-                    return Err(EasyTesterError::parse(
-                        path.clone(),
-                        line_no,
-                        "unknown config directive (expected 'tester ...')",
-                        original_line,
-                    ));
-                }
-
-                if config.is_some() {
-                    return Err(EasyTesterError::parse(
-                        path.clone(),
-                        line_no,
-                        "tester already specified",
-                        original_line,
-                    ));
-                }
-
-                if tokens.len() < 2 {
-                    return Err(EasyTesterError::parse(
-                        path.clone(),
-                        line_no,
-                        "tester line requires a tester name",
-                        original_line,
-                    ));
-                }
-
-                let tester_name = tokens[1];
-                match tester_name {
-                    "RewardTester" => {
-                        let kv = parse_kv_pairs(&tokens[2..]).map_err(|e| {
-                            EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                        })?;
-                        let activation_height =
-                            require_kv_u64(&kv, "activation_height").map_err(|e| {
-                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                            })?;
-                        let snapshot_length =
-                            require_kv_u64(&kv, "snapshot_length").map_err(|e| {
-                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                            })?;
-
-                        config = Some(TestConfig {
-                            tester: TesterConfig::RewardTester {
-                                activation_height,
-                                snapshot_length,
-                            },
-                        });
-                    }
-                    "ErcTransferTester" => {
-                        config = Some(TestConfig {
-                            tester: TesterConfig::ErcTransferTester,
-                        });
-                    }
-                    _ => {
-                        return Err(EasyTesterError::parse(
-                            path.clone(),
-                            line_no,
-                            format!("unknown tester '{tester_name}'"),
-                            original_line,
-                        ));
-                    }
-                }
             }
             Section::Setup => {
                 if tokens.len() == 1 && tokens[0] == "scenario" {
@@ -520,20 +440,20 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     });
                 }
                 "register_token" => {
-                    // register_token <subnet> <name> <symbol> <decimals>
+                    // register_token <subnet> <name> <symbol> <initial_supply>
                     if tokens.len() != 5 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "register_token syntax: register_token <subnet> <name> <symbol> <decimals>",
+                            "register_token syntax: register_token <subnet> <name> <symbol> <initial_supply>",
                             original_line,
                         ));
                     }
-                    let decimals: u8 = tokens[4].parse().map_err(|e| {
+                    let initial_supply = parse_u64_allow_underscores(tokens[4]).map_err(|e| {
                         EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            format!("invalid decimals: {e}"),
+                            format!("invalid initial_supply: {e}"),
                             original_line,
                         )
                     })?;
@@ -544,7 +464,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             subnet_name: tokens[1].to_string(),
                             name: tokens[2].to_string(),
                             symbol: tokens[3].to_string(),
-                            decimals,
+                            initial_supply,
                         },
                     });
                 }
@@ -564,7 +484,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         cmd: ScenarioCommand::MintToken {
                             subnet_name: tokens[1].to_string(),
                             token_name: tokens[2].to_string(),
-                            amount: tokens[3].to_string(),
+                            amount: normalize_numeric_literal(tokens[3]),
                         },
                     });
                 }
@@ -584,7 +504,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         cmd: ScenarioCommand::BurnToken {
                             subnet_name: tokens[1].to_string(),
                             token_name: tokens[2].to_string(),
-                            amount: tokens[3].to_string(),
+                            amount: normalize_numeric_literal(tokens[3]),
                         },
                     });
                 }
@@ -605,7 +525,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             src_subnet: tokens[1].to_string(),
                             dst_subnet: tokens[2].to_string(),
                             token_name: tokens[3].to_string(),
-                            amount: tokens[4].to_string(),
+                            amount: normalize_numeric_literal(tokens[4]),
                         },
                     });
                 }
@@ -623,7 +543,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     })?;
                     let args = tokens[2..]
                         .iter()
-                        .map(|s| (*s).to_string())
+                        .map(|s| normalize_numeric_literal(s))
                         .collect::<Vec<_>>();
                     validate_output_args(&path, line_no, original_line, db, &args)?;
 
@@ -641,7 +561,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         text: original_line.to_string(),
                         cmd: ScenarioCommand::OutputExpect {
                             target,
-                            expected_value,
+                            expected_value: normalize_numeric_literal(&expected_value),
                         },
                     });
                 }
@@ -667,7 +587,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
 
     if !seen_setup {
         return Err(EasyTesterError::runtime(
-            "test file did not contain a 'setup' section (after 'config')",
+            "test file did not contain a 'setup' section",
         ));
     }
     if !seen_scenario {
@@ -682,23 +602,13 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
         )));
     }
 
-    let Some(config) = config else {
-        return Err(EasyTesterError::runtime(
-            "test file did not contain a valid 'config' section",
-        ));
-    };
-
     validate_scenario(&path, &setup, &scenario_entries)?;
     let scenario = scenario_entries
         .into_iter()
-        .map(|e| e.cmd)
+        .map(|e| (e.line_no, e.cmd))
         .collect::<Vec<_>>();
 
-    Ok(ParsedTest {
-        config,
-        setup,
-        scenario,
-    })
+    Ok(ParsedTest { setup, scenario })
 }
 
 struct ScenarioEntry {
@@ -1182,6 +1092,7 @@ fn parse_output_expect(
 
     let target = OutputExpectTarget {
         path: path.to_string(),
+        line_no,
     };
 
     Ok((target, rhs_str))
@@ -1275,54 +1186,124 @@ fn validate_output_args(
     Ok(())
 }
 
-fn parse_kv_pairs(tokens: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
-    let mut flat: Vec<String> = Vec::new();
-    for t in tokens {
-        if *t == "=" {
-            flat.push("=".to_string());
+/// Parse a separate tester config file (space-separated `key value` lines, no `=`).
+///
+/// Supported keys: `tester`, `activation_height`, `snapshot_length`.
+/// `tester` must be `db` or `local_monitor`.
+pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyTesterError> {
+    let path = path.into();
+    let raw = fs::read_to_string(&path).map_err(|e| EasyTesterError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+
+    let mut tester_type: Option<String> = None;
+    let mut activation_height: Option<u64> = None;
+    let mut snapshot_length: Option<u64> = None;
+    let mut monitor_log_level: Option<String> = None;
+    let mut provider_log_level: Option<String> = None;
+
+    for (idx0, original_line) in raw.lines().enumerate() {
+        let line_no = idx0 + 1;
+        let without_comment = original_line
+            .split_once('#')
+            .map(|(before, _)| before)
+            .unwrap_or(original_line);
+        let line_trimmed = without_comment.trim();
+        if line_trimmed.is_empty() {
             continue;
         }
-        if let Some((k, v)) = t.split_once('=') {
-            if k.trim().is_empty() {
-                return Err(format!("invalid token '{t}'"));
+        let tokens: Vec<&str> = line_trimmed.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        if tokens.len() != 2 {
+            return Err(EasyTesterError::parse(
+                path.clone(),
+                line_no,
+                format!("config lines must be 'key value' (got {} tokens)", tokens.len()),
+                original_line,
+            ));
+        }
+        match tokens[0] {
+            "tester" => {
+                tester_type = Some(tokens[1].to_string());
             }
-            flat.push(k.trim().to_string());
-            flat.push("=".to_string());
-            flat.push(v.trim().to_string());
-        } else {
-            flat.push((*t).to_string());
+            "activation_height" => {
+                activation_height = Some(
+                    parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?,
+                );
+            }
+            "snapshot_length" => {
+                snapshot_length = Some(
+                    parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?,
+                );
+            }
+            "monitor_log_level" => {
+                monitor_log_level = Some(tokens[1].to_string());
+            }
+            "provider_log_level" => {
+                provider_log_level = Some(tokens[1].to_string());
+            }
+            other => {
+                return Err(EasyTesterError::parse(
+                    path.clone(),
+                    line_no,
+                    format!("unknown config key '{other}' (supported: tester, activation_height, snapshot_length, monitor_log_level, provider_log_level)"),
+                    original_line,
+                ));
+            }
         }
     }
 
-    let mut i = 0usize;
-    let mut out = std::collections::HashMap::new();
-    while i < flat.len() {
-        let key = flat
-            .get(i)
-            .ok_or_else(|| "expected key".to_string())?
-            .to_string();
-        let eq = flat.get(i + 1).ok_or_else(|| "expected '='".to_string())?;
-        if eq != "=" {
-            return Err(format!("expected '=' after '{key}'"));
-        }
-        let value = flat
-            .get(i + 2)
-            .ok_or_else(|| format!("expected value after '{key}='"))?
-            .to_string();
-        if out.insert(key.clone(), value).is_some() {
-            return Err(format!("duplicate config key '{key}'"));
-        }
-        i += 3;
+    let Some(tester_type) = tester_type else {
+        return Err(EasyTesterError::runtime(
+            "config file missing required 'tester' line",
+        ));
+    };
+
+    match tester_type.as_str() {
+        "db" => Ok(TesterConfig::Db {
+            activation_height,
+            snapshot_length,
+        }),
+        "monitor" => Ok(TesterConfig::Monitor {
+            activation_height,
+            snapshot_length,
+            monitor_log_level,
+            provider_log_level,
+        }),
+        other => Err(EasyTesterError::runtime(format!(
+            "unknown tester '{other}' (expected 'db' or 'monitor')"
+        ))),
     }
-    Ok(out)
 }
 
-fn require_kv_u64(
-    map: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<u64, String> {
-    let v = map
-        .get(key)
-        .ok_or_else(|| format!("missing required config key '{key}'"))?;
-    parse_u64_allow_underscores(v)
+/// Validate block heights in `parsed` against `config`.
+///
+/// For `monitor`, the first `block N` command must have N ≥ 102 (bitcoind
+/// pre-mines 101 blocks on startup, so height 101 is already confirmed and
+/// `mine_to_height(101)` would be a no-op).
+pub fn validate_scenario_for_tester(
+    parsed: &ParsedTest,
+    config: &TesterConfig,
+) -> Result<(), EasyTesterError> {
+    if !matches!(config, TesterConfig::Monitor { .. }) {
+        return Ok(());
+    }
+    for (_line_no, cmd) in &parsed.scenario {
+        if let ScenarioCommand::Block { height } = cmd {
+            if *height < 102 {
+                return Err(EasyTesterError::runtime(format!(
+                    "monitor tester: block heights must be ≥ 102 \
+                     (bitcoind pre-mines 101 blocks; got block {height})"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

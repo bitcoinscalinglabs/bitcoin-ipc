@@ -1,41 +1,41 @@
-# Test ERC20 balance tracking, supply adjustments, and firewall enforcement
+# Test ERC20 balance tracking and supply adjustments
 #
 # Scenario tests:
 # 1. Registration seeds S_home balance with initialSupply
 # 2. Transfer debits source, credits destination
-# 3. Firewall: transfer exceeding balance is dropped
-# 4. Mint increases S_home balance
-# 5. Burn decreases S_home balance
-# 6. Multi-token isolation (token A balance doesn't affect token B)
-
-config
-tester ErcTransferTester
-
+# 3. Mint increases S_home balance
+# 4. Burn decreases S_home balance
+# 5. Multi-token isolation (token A balance doesn't affect token B)
+# 6. Burn exactly equal to balance succeeds
+# 7. Non-home subnet forwards tokens
 setup
 validator1
 validator2
 validator3
 validator4
+
 subnet1
 whitelist validator1 validator2 validator3 validator4
 min 4
+
 subnet2
 whitelist validator1 validator2 validator3 validator4
 min 4
 
+
+
 scenario
 
-block 1
+block 102
 create subnet1
 create subnet2
 
-block 2
+block 103
 join subnet1 validator1 100_000_000
 join subnet1 validator2 100_000_000
 join subnet1 validator3 100_000_000
 join subnet1 validator4 100_000_000
 
-block 3
 join subnet2 validator1 100_000_000
 join subnet2 validator2 100_000_000
 join subnet2 validator3 100_000_000
@@ -45,13 +45,14 @@ join subnet2 validator4 100_000_000
 # Test 1: Registration seeds balance
 # ──────────────────────────────────────────────────
 
-block 10
-register_token subnet1 TokenA TKA 18
+block 105
+register_token subnet1 TokenA TKA 1_000_000
 checkpoint subnet1
 
+block 106
 # subnet1 (home) should have balance = initialSupply (1,000,000)
 read token_balance subnet1 TokenA
-expect result.balance = 1000000
+expect result.balance = 1_000_000
 
 # subnet2 should have balance = 0
 read token_balance subnet2 TokenA
@@ -61,9 +62,10 @@ expect result.balance = 0
 # Test 2: Valid transfer debits/credits
 # ──────────────────────────────────────────────────
 
-block 11
 erc_transfer subnet1 subnet2 TokenA 100000
 checkpoint subnet1
+
+block 107
 
 # subnet1: 1,000,000 - 100,000 = 900,000
 read token_balance subnet1 TokenA
@@ -73,48 +75,32 @@ expect result.balance = 900000
 read token_balance subnet2 TokenA
 expect result.balance = 100000
 
-# Transfer should have been delivered
+# Both the registration and the transfer should be visible across all blocks so far
 read rootnet_msgs subnet2
 expect result.count = 2
+expect result.0.kind = erc_registration
 expect result.1.kind = erc_transfer
-expect result.1.amount = 100000
+expect result.1.amount = 100_000
 
 # ──────────────────────────────────────────────────
-# Test 3: Firewall — transfer exceeding balance dropped
+# Test 3: Mint increases S_home balance
 # ──────────────────────────────────────────────────
 
-block 12
-erc_transfer subnet1 subnet2 TokenA 999999
+mint_token subnet1 TokenA 500_000
 checkpoint subnet1
 
-# subnet1 balance should be unchanged (transfer was dropped)
+block 109
+
+# subnet1: 900_000 + 500_000 = 1_400_000
 read token_balance subnet1 TokenA
-expect result.balance = 900000
-
-# subnet2 balance unchanged
-read token_balance subnet2 TokenA
-expect result.balance = 100000
-
-# No new rootnet message delivered (the invalid ETX was dropped)
-read rootnet_msgs subnet2
-expect result.count = 2
-
-# ──────────────────────────────────────────────────
-# Test 4: Mint increases S_home balance
-# ──────────────────────────────────────────────────
-
-block 13
-mint_token subnet1 TokenA 500000
-checkpoint subnet1
-
-# subnet1: 900,000 + 500,000 = 1,400,000
-read token_balance subnet1 TokenA
-expect result.balance = 1400000
+expect result.balance = 1_400_000
 
 # Now a large transfer should succeed
-block 14
+
 erc_transfer subnet1 subnet2 TokenA 1000000
 checkpoint subnet1
+
+block 110
 
 read token_balance subnet1 TokenA
 expect result.balance = 400000
@@ -123,86 +109,88 @@ read token_balance subnet2 TokenA
 expect result.balance = 1100000
 
 # ──────────────────────────────────────────────────
-# Test 5: Burn decreases S_home balance
+# Test 4: Burn decreases S_home balance
 # ──────────────────────────────────────────────────
 
-block 15
 burn_token subnet1 TokenA 300000
 checkpoint subnet1
+
+block 111
 
 read token_balance subnet1 TokenA
 expect result.balance = 100000
 
+# Other subnet's balance unchanged
+read token_balance subnet2 TokenA
+expect result.balance = 1100000
+
 # ──────────────────────────────────────────────────
-# Test 6: Multi-token isolation
+# Test 5: Multi-token isolation
+# Transfer of TokenA should not affect TokenB
 # ──────────────────────────────────────────────────
 
-block 16
-register_token subnet1 TokenB TKB 8
+# balances of TokenA at this point:
+# subnet1: 100_000, subnet2: 1_100_000,
+
+register_token subnet1 TokenB TKB 1_000_000
 checkpoint subnet1
 
-read token_balance subnet1 TokenB
-expect result.balance = 1000000
+block 112
 
-# Transfer of TokenA should not affect TokenB
-block 17
+read token_balance subnet1 TokenB
+expect result.balance = 1_000_000
+read token_balance subnet1 TokenA
+expect result.balance = 100_000
+read token_balance subnet2 TokenA
+expect result.balance = 1_100_000
+
 erc_transfer subnet1 subnet2 TokenA 50000
 checkpoint subnet1
 
+block 113
+
 read token_balance subnet1 TokenA
-expect result.balance = 50000
+expect result.balance = 50_000
 
 # TokenB unchanged
 read token_balance subnet1 TokenB
-expect result.balance = 1000000
+expect result.balance = 1_000_000
+
+# balances of TokenA at this point:
+# subnet1: 50_000, subnet2: 1_150_000,
+# balances of TokenB at this point:
+# subnet1: 1_000_000, subnet2: 0,
 
 # ──────────────────────────────────────────────────
-# Test 7: Multiple ETX in one checkpoint — total exceeds balance
-# subnet1 has 50,000 TokenA. Two transfers of 30,000 each = 60,000 > 50,000.
-# The monitor should accept the first and drop the second.
+# Test 6: Burn exactly equal to balance succeeds
 # ──────────────────────────────────────────────────
 
-block 18
-erc_transfer subnet1 subnet2 TokenA 30000
-erc_transfer subnet1 subnet2 TokenA 30000
-checkpoint subnet1
+block 115
 
-# First transfer goes through: 50,000 - 30,000 = 20,000
-# Second transfer dropped: 20,000 < 30,000
-read token_balance subnet1 TokenA
-expect result.balance = 20000
-
-# subnet2 was at 1,150,000 (1,100,000 from test 4 + 50,000 from test 6) + 30,000 = 1,180,000
-read token_balance subnet2 TokenA
-expect result.balance = 1180000
-
-# ──────────────────────────────────────────────────
-# Test 8: Burn exceeding balance is dropped
-# subnet1 has 20,000 TokenA. Burn 50,000 should be dropped.
-# ──────────────────────────────────────────────────
-
-block 19
 burn_token subnet1 TokenA 50000
 checkpoint subnet1
 
-# Balance unchanged — burn was dropped
+block 116
+
+# Burn succeeds: balance goes to 0
 read token_balance subnet1 TokenA
-expect result.balance = 20000
+expect result.balance = 0
 
 # ──────────────────────────────────────────────────
-# Test 9: Non-home subnet forwards tokens
-# subnet2 has 1,130,000 TokenA (received from subnet1).
-# subnet2 transfers 500,000 to subnet1 (back to home).
+# Test 7: Non-home subnet forwards tokens
+# subnet2 has 1,150,000 TokenA. Transfer 500,000 to subnet1.
 # ──────────────────────────────────────────────────
 
-block 20
-erc_transfer subnet2 subnet1 TokenA 500000
+erc_transfer subnet2 subnet1 TokenA 500_000
 checkpoint subnet2
 
-# subnet2: 1,180,000 - 500,000 = 680,000
-read token_balance subnet2 TokenA
-expect result.balance = 680000
+block 118
 
-# subnet1: 20,000 + 500,000 = 520,000
+# subnet2: 1,150,000 - 500,000 = 650,000
+read token_balance subnet2 TokenA
+expect result.balance = 650000
+
+# subnet1: 0 + 500,000 = 500,000
 read token_balance subnet1 TokenA
-expect result.balance = 520000
+expect result.balance = 500000
+

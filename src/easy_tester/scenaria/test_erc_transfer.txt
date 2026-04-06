@@ -8,9 +8,6 @@
 # - ETX appears as ErcTransfer rootnet message on subnet2 only
 # - Nonce ordering: ErcRegistration < ErcTransfer on same destination
 
-config
-tester ErcTransferTester
-
 setup
 validator1
 validator2
@@ -29,27 +26,27 @@ min 4
 scenario
 
 # Create subnets
-block 1
+block 102
 create subnet1
 create subnet2
 create subnet3
 
 # Bootstrap subnet1
-block 2
+block 103
 join subnet1 validator1 100_000_000
 join subnet1 validator2 100_000_000
 join subnet1 validator3 100_000_000
 join subnet1 validator4 100_000_000
 
 # Bootstrap subnet2
-block 3
+
 join subnet2 validator1 100_000_000
 join subnet2 validator2 100_000_000
 join subnet2 validator3 100_000_000
 join subnet2 validator4 100_000_000
 
 # Bootstrap subnet3
-block 4
+block 104
 join subnet3 validator1 100_000_000
 join subnet3 validator2 100_000_000
 join subnet3 validator3 100_000_000
@@ -59,9 +56,11 @@ join subnet3 validator4 100_000_000
 # Test 1: ETR fan-out to multiple subnets
 # ──────────────────────────────────────────────────
 
-block 10
-register_token subnet1 MyToken MTK 18
+block 110
+register_token subnet1 MyToken MTK 1_000_000
 checkpoint subnet1
+
+block 111
 
 # subnet2 should have 1 ErcRegistration
 read rootnet_msgs subnet2
@@ -84,9 +83,10 @@ expect result.count = 0
 # Test 2: ETX goes only to destination subnet
 # ──────────────────────────────────────────────────
 
-block 11
 erc_transfer subnet1 subnet2 MyToken 1000
 checkpoint subnet1
+
+block 112
 
 # subnet2 gets the transfer (nonce 1, after the registration at nonce 0)
 read rootnet_msgs subnet2
@@ -103,17 +103,18 @@ expect result.count = 1
 # Test 3: Mixed ETR + ETX in same checkpoint
 # ──────────────────────────────────────────────────
 
-block 12
-register_token subnet1 AnotherToken ATK 8
+register_token subnet1 AnotherToken ATK 1_000_000
 erc_transfer subnet1 subnet2 AnotherToken 5000
 checkpoint subnet1
+
+block 114
 
 # subnet2: registration(2) + transfer(3) = 4 total
 read rootnet_msgs subnet2
 expect result.count = 4
 expect result.2.kind = erc_registration
 expect result.2.tokenName = AnotherToken
-expect result.2.tokenDecimals = 8
+expect result.2.tokenDecimals = 18
 expect result.3.kind = erc_transfer
 expect result.3.amount = 5000
 
@@ -127,9 +128,12 @@ expect result.1.tokenName = AnotherToken
 # Test 4: Transfer to subnet3 (different destination)
 # ──────────────────────────────────────────────────
 
-block 13
+block 115
+
 erc_transfer subnet1 subnet3 MyToken 7777
 checkpoint subnet1
+
+block 116
 
 # subnet3 gets the transfer now
 read rootnet_msgs subnet3
@@ -143,22 +147,23 @@ expect result.count = 4
 
 # ──────────────────────────────────────────────────
 # Test 5: Duplicate token registration (same homeSubnet + homeToken)
-# Should not crash — L2 contract ignores duplicates.
-# bitcoin-ipc still delivers it as a rootnet message.
+# validate_erc_batch_data rejects re-registration (existing balance > 0).
+# The entire batch is dropped — no new rootnet messages delivered.
 # ──────────────────────────────────────────────────
 
-block 14
-register_token subnet1 MyToken MTK 18
+block 120
+
+register_token subnet1 MyToken MTK 1_000_000
 checkpoint subnet1
 
-# subnet2 gets the duplicate registration (nonce 4), total 5
-read rootnet_msgs subnet2
-expect result.count = 5
-expect result.4.kind = erc_registration
-expect result.4.tokenName = MyToken
+block 123
 
-# subnet3 also gets it (nonce 3), total 4
-read rootnet_msgs subnet3
+# Batch rejected — subnet2 count unchanged at 4
+read rootnet_msgs subnet2
 expect result.count = 4
-expect result.3.kind = erc_registration
-expect result.3.tokenName = MyToken
+
+block 125
+
+# Batch rejected — subnet3 count unchanged at 3
+read rootnet_msgs subnet3
+expect result.count = 3

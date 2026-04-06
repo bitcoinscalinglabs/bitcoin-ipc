@@ -70,6 +70,37 @@ const _: () = {
 
 use alloy_primitives::{I256, U256};
 
+/// Serde shim for `I256` that works with both human-readable formats (JSON) and
+/// binary formats (postcard). Alloy's built-in I256 impl always calls
+/// `deserializer.deserialize_any(...)`, which postcard rejects because it is not
+/// a self-describing format. We always use `deserialize_str` instead, which
+/// round-trips correctly with the decimal string that `collect_str` writes.
+mod i256_str_serde {
+    use alloy_primitives::I256;
+    use serde::{Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(v: &I256, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<I256, D::Error> {
+        struct StrVisitor;
+        impl de::Visitor<'_> for StrVisitor {
+            type Value = I256;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a decimal string for a 256-bit signed integer")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<I256, E> {
+                v.parse().map_err(de::Error::custom)
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<I256, E> {
+                self.visit_str(&v)
+            }
+        }
+        d.deserialize_str(StrVisitor)
+    }
+}
+
 // Define the IPC tags enum
 #[derive(Debug, PartialEq)]
 pub enum IpcTag {
@@ -1293,6 +1324,12 @@ pub struct IpcErcSupplyAdjustment {
     /// The token contract address on the home subnet
     pub home_token_address: alloy_primitives::Address,
     /// Supply change. Positive = mint, negative = burn.
+    ///
+    /// Uses a custom serde shim: alloy's I256 always calls `deserialize_any`, which
+    /// postcard (a non-self-describing format) does not support. We force
+    /// `deserialize_str` instead, which round-trips correctly with the string
+    /// representation that `collect_str` writes.
+    #[serde(with = "i256_str_serde")]
     pub delta: I256,
 }
 
@@ -7448,9 +7485,7 @@ mod validate_erc_batch_tests {
         let db = test_utils::create_test_db();
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
-        assert!(
-            validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok()
-        );
+        assert!(validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok());
     }
 
     #[test]
@@ -7458,9 +7493,7 @@ mod validate_erc_batch_tests {
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(1000u64));
-        assert!(
-            validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok()
-        );
+        assert!(validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok());
     }
 
     #[test]
@@ -7520,8 +7553,7 @@ mod validate_erc_batch_tests {
         // source_subnet holds 1000 of the foreign token
         let db = db_with_balance(home, token, source, U256::from(1000u64));
         assert!(
-            validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db)
-                .is_ok()
+            validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db).is_ok()
         );
     }
 
@@ -7536,7 +7568,10 @@ mod validate_erc_batch_tests {
             validate_erc_batch_data(source, &[etr(token, 1000), etr(token, 2000)], &[], &[], &db);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("registered more than once"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("registered more than once"),
             "wrong error message"
         );
     }
@@ -7549,7 +7584,10 @@ mod validate_erc_batch_tests {
         let result = validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("already registered"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already registered"),
             "wrong error message"
         );
     }
@@ -7562,7 +7600,10 @@ mod validate_erc_batch_tests {
         let result = validate_erc_batch_data(source, &[], &[ets_burn(token, 200)], &[], &db);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Burn exceeds balance"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Burn exceeds balance"),
             "wrong error message"
         );
     }
@@ -7577,7 +7618,10 @@ mod validate_erc_batch_tests {
             validate_erc_batch_data(source, &[], &[], &[etx(source, token, 200, dest)], &db);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Insufficient balance"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient balance"),
             "wrong error message"
         );
     }
@@ -7619,7 +7663,10 @@ mod validate_erc_batch_tests {
         );
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Insufficient balance"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient balance"),
             "wrong error message"
         );
     }
