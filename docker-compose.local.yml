@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: docker-deploy-local/Dockerfile
+      additional_contexts:
+        ipc: ../ipc
       args:
         # Set EMISSION_CHAIN_FEATURES=true to enable; unset = false
         EMISSION_CHAIN_FEATURES: "${EMISSION_CHAIN_FEATURES:-false}"
@@ -26,6 +28,8 @@ services:
       # This is for some ipc-cli commands to work properly from inside the container.
       - $HOME/.ipc:/root/.ipc
       - $HOME/.ipc:/$HOME/.ipc
+      # Mount local IPC repo for fast contract iteration (overrides the copy from ipc-builder)
+      - ../ipc:/workspace/ipc
       # Mount Docker socket so calls to docker from the container are handled by the host's Docker daemon
       - /var/run/docker.sock:/var/run/docker.sock
     environment:

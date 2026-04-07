@@ -110,6 +110,13 @@ fi
 
 cd "$IPC_DIR"
 
+# Build fendermint Docker image on-demand if it doesn't exist
+if ! docker images --format '{{.Repository}}' | grep -q '^fendermint$'; then
+    echo "Building fendermint Docker image (first time only)..."
+    cd fendermint && make docker-build
+    cd "$IPC_DIR"
+fi
+
 # Define hardcoded ports and auth tokens for each validator
 PORT_1="3030"
 PORT_2="3031"
