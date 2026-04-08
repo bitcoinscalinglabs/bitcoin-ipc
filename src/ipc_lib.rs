@@ -3138,7 +3138,7 @@ impl IpcBatchTransferMsg {
                     etr.initial_supply,
                 )?;
                 debug!(
-                    "Seeded balance for token {} on home subnet {}",
+                    "Stored balance for token {} on home subnet {}",
                     etr.home_token_address, source_subnet_id
                 );
 
@@ -3156,11 +3156,11 @@ impl IpcBatchTransferMsg {
                         txid,
                     };
                     db.add_rootnet_msg(&mut wtxn, subnet.id, rootnet_msg)?;
-                    debug!(
-                        "Added ERC token registration for subnet {}, token: {}",
-                        subnet.id, etr.home_token_address
-                    );
                 }
+                debug!(
+                    "Stored ERC token registration to the DB, token: {}",
+                    etr.home_token_address
+                );
             }
         }
 

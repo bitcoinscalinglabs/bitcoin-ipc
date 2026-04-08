@@ -140,6 +140,10 @@ pub fn unspenable_internal_key() -> XOnlyPublicKey {
 /// # Returns
 ///
 /// * `()` - The function returns a BitcoinUtilsError if the transaction was accepted by the mempool.`
+// TODO(bitcoincore-rpc): when `txs.len() > 1`, Core treats this as a package
+// `testmempoolaccept` call. Bitcoin Core 28 reshaped the package response
+// (per-TX `allowed` is no longer guaranteed) and bitcoincore-rpc 0.19.0 — the
+// last release before the crate was archived — fails to deserialize it.
 pub fn submit_to_mempool(
     rpc: &Client,
     txs: Vec<transaction::Transaction>,

@@ -3,7 +3,7 @@
 
 COMPOSE_FILE := docker-compose.local.yml
 
-.PHONY: local-build local-up local-down local-reset-fendermint local-reset-ipc-cli local-delete-data
+.PHONY: local-build local-up local-down local-reset-fendermint local-reset-fendermint-deps local-reset-ipc-cli local-delete-data
 
 # Build the bitcoin-ipc image (both bitcoin-ipc and ipc-cli stages built in parallel).
 local-build:
@@ -23,6 +23,11 @@ local-reset-fendermint:
 	docker exec bitcoin-ipc rm -f /workspace/ipc/fendermint/.contracts-gen
 	docker rmi fendermint:latest || true
 	@echo "Fendermint image removed and contracts cache cleared."
+
+# Rebuild fendermint deps cache (run after Cargo.lock changes in ../ipc).
+local-reset-fendermint-deps:
+	docker rmi fendermint-deps:latest || true
+	@echo "Fendermint deps cache removed. Will be rebuilt on next fendermint build."
 
 # Rebuild ipc-cli from the mounted ../ipc source inside the running container.
 local-reset-ipc-cli:

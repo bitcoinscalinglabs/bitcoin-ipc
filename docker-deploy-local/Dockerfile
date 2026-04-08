@@ -154,8 +154,10 @@ RUN set -e; \
     docker --version
 
 # Install Bitcoin Core
+# Pinned to 27.x: bitcoincore-rpc 0.19.0 cannot deserialize Core 28's reshaped
+# `testmempoolaccept` package response.
 ARG TARGETARCH
-RUN BITCOIN_VERSION=28.1 && \
+RUN BITCOIN_VERSION=27.2 && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         BITCOIN_ARCH="x86_64-linux-gnu"; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
