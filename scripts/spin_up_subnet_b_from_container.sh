@@ -241,12 +241,12 @@ done
 
 echo "All validators have been started for subnet $SUBNET_ID!"
 
-# Start relayers for validators 1-4 (logs under /root/logs)
-mkdir -p /root/logs
+# Start relayers for validators 1-4 (logs under /root/.ipc/logs)
+mkdir -p /root/.ipc/logs
 echo "Starting relayers for validators 1-4..."
 for n in 1 2 3 4; do
-    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" >> "/root/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
-    echo "  Relayer for validator${n} started (log: /root/logs/relayer-subnet-b-validator${n}.log)"
+    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" >> "/root/.ipc/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
+    echo "  Relayer for validator${n} started (log: /root/.ipc/logs/relayer-subnet-b-validator${n}.log)"
 done
 
 echo ""

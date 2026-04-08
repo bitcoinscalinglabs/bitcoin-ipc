@@ -3156,6 +3156,10 @@ impl IpcBatchTransferMsg {
                         txid,
                     };
                     db.add_rootnet_msg(&mut wtxn, subnet.id, rootnet_msg)?;
+                    debug!(
+                        "Added ERC token registration for subnet {}, token: {}",
+                        subnet.id, etr.home_token_address
+                    );
                 }
                 debug!(
                     "Stored ERC token registration to the DB, token: {}",

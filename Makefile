@@ -9,9 +9,9 @@ COMPOSE_FILE := docker-compose.local.yml
 local-build:
 	docker compose -f $(COMPOSE_FILE) build
 
-# Start the container (builds if needed).
+# Start the container.
 local-up:
-	docker compose -f $(COMPOSE_FILE) up --build
+	docker compose -f $(COMPOSE_FILE) up
 
 # Stop and remove the container.
 local-down:

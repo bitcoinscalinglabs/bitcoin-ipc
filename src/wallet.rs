@@ -116,7 +116,7 @@ pub fn get_unspent_for_address(
             .then(a.txid.cmp(&b.txid))
             .then(a.vout.cmp(&b.vout))
     });
-    debug!("get_unspent_for_address {addr}: {unspent:?}");
+    // debug!("get_unspent_for_address {addr}: {unspent:?}");
     Ok(unspent)
 }
 
