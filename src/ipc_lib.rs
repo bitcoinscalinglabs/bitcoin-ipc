@@ -3308,13 +3308,18 @@ impl IpcBatchTransferMsg {
             };
             db.add_rootnet_msg(&mut wtxn, etx.destination_subnet_id, rootnet_msg)?;
             debug!(
-                "Added ERC transfer for subnet {}, token: {}, recipient: {}",
+                "Stored ERC transfer for subnet {}, token: {}, recipient: {}",
                 etx.destination_subnet_id, etx.home_token_address, etx.recipient
             );
         }
 
         // Commit all changes
         wtxn.commit()?;
+
+        debug!(
+            "Stored BatchTransfer data for checkpoint #{} for subnet {}",
+            checkpoint_number, self.subnet_id
+        );
 
         Ok(checkpoint)
     }

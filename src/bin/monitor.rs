@@ -156,12 +156,12 @@ where
             rpc,
             watchonly_rpc,
             check_interval,
-        cancel_token,
-        current_height: 0,
-        side_effects: Vec::new(),
-        reward_tracker: None,
+            cancel_token,
+            current_height: 0,
+            side_effects: Vec::new(),
+            reward_tracker: None,
+        }
     }
-}
 
     #[cfg(feature = "emission_chain")]
     /// Sets the reward tracker. Must be called to enable reward bookkeeping.
@@ -688,7 +688,7 @@ where
             }
 
             IpcMessage::BatchTransfer(mut msg) => {
-                debug!("Found IPC message: {:?}", msg);
+                debug!("Found IPC message: {:#?}", msg);
 
                 msg.validate()?;
 
@@ -722,8 +722,8 @@ where
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
 
                 info!(
-                    "Processed BatchTransfer for Subnet ID: {} Checkpoint Txid: {} Number of transfers: {}",
-                    msg.subnet_id, msg.checkpoint_txid, msg.transfers.len(),
+                    "Processed BatchTransfer for Subnet ID: {} Checkpoint Txid: {}",
+                    msg.subnet_id, msg.checkpoint_txid,
                 );
 
                 Ok(())
