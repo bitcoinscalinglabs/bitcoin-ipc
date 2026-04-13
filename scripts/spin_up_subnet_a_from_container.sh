@@ -182,7 +182,7 @@ if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" 
     --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
     --env TOPDOWN_PROPOSAL_DELAY=0 \
     --env FM_PULL_SKIP=1 \
-    --env FM_LOG_LEVEL="info,fendermint=debug,tower=warn,libp2p=warn,tendermint=warn" \
+    --env FM_LOG_LEVEL="debug,fendermint=debug,tower=warn,libp2p=warn,tendermint=warn" \
     child-validator 2>&1); then
     echo "Error: failed to start validator 1" >&2
     echo "$VALIDATOR1_OUTPUT" >&2
