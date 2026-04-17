@@ -76,7 +76,7 @@ CREATE_PAYLOAD=$(cat <<'JSON'
   "params": {
     "min_validator_stake": 100000000,
     "min_validators": 4,
-    "bottomup_check_period": 60,
+    "bottomup_check_period": 30,
     "active_validators_limit": 10,
     "min_cross_msg_fee": 10,
     "whitelist": [
