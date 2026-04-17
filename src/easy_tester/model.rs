@@ -52,6 +52,36 @@ pub enum TesterConfig {
         monitor_log_level: Option<String>,
         provider_log_level: Option<String>,
     },
+    /// Fendermint tester — subnets come from the config file, issuers from
+    /// the scenario file.
+    Fendermint {
+        setup: FendermintSetup,
+    },
+}
+
+// ── Fendermint-specific setup types ────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FendermintIssuer {
+    pub name: String,
+    pub ipc_address: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FendermintSubnet {
+    pub name: String,
+    pub subnet_id: String,
+    pub eth_rpc_url: String,
+    pub provider_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FendermintSetup {
+    pub docker_container: String,
+    pub issuers: HashMap<String, FendermintIssuer>,
+    pub subnets: HashMap<String, FendermintSubnet>,
+    pub subnet_order: Vec<String>,
+    pub print_queries: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +96,8 @@ pub enum OutputDb {
     RootnetMsgs,
     /// Read token balance: `read token_balance <subnet> <token_name>`
     TokenBalance,
+    /// FendermintTester only: `read token_metadata <subnet> <token_name>`
+    TokenMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -94,9 +126,11 @@ pub enum ScenarioCommand {
     Checkpoint {
         subnet_name: String,
     },
-    /// Register an ERC20 token on a subnet (queues ETR for next checkpoint)
+    /// Register an ERC20 token on a subnet (queues ETR for next checkpoint).
+    /// `issuer` is only set for FendermintTester scenarios.
     RegisterToken {
         subnet_name: String,
+        issuer: Option<String>,
         name: String,
         symbol: String,
         initial_supply: alloy_primitives::U256,
@@ -113,10 +147,24 @@ pub enum ScenarioCommand {
         token_name: String,
         amount: alloy_primitives::U256,
     },
-    /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint)
+    /// Pause execution for a fixed duration.
+    Wait {
+        seconds: u64,
+    },
+    /// Deposit native tokens (BTC) into a subnet for a given address.
+    Deposit {
+        subnet_name: String,
+        address_name: String,
+        amount_sats: u64,
+    },
+    /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint).
+    /// Db/MonitorTester: 4-arg form (no actors).
+    /// FendermintTester: 6-arg form with `src_actor` and `dst_actor`.
     ErcTransfer {
         src_subnet: String,
+        src_actor: Option<String>,
         dst_subnet: String,
+        dst_actor: Option<String>,
         token_name: String,
         amount: alloy_primitives::U256,
     },
@@ -150,6 +198,12 @@ pub struct OutputExpectTarget {
 #[derive(Debug, Clone)]
 pub struct ParsedTest {
     pub setup: SetupSpec,
+    pub scenario: Vec<(usize, ScenarioCommand)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFendermintTest {
+    pub setup: FendermintSetup,
     pub scenario: Vec<(usize, ScenarioCommand)>,
 }
 

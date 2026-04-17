@@ -1355,6 +1355,11 @@ impl Tester for MonitorTester {
                     db
                 )));
             }
+            OutputDb::TokenMetadata => {
+                return Err(EasyTesterError::runtime(
+                    "read token_metadata is not supported by MonitorTester",
+                ));
+            }
         }
 
         Ok(())

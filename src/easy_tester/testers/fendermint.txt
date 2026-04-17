@@ -1,0 +1,7 @@
+tester fendermint
+
+subnet1 /b4/t410fi6wjf3rduogixzbih3tmhhbpovjekcdbmk23kxi http://localhost:8545 http://localhost:3030
+
+subnet2 /b4/t410fg4bil4rro5xjzfigjy7xfiywn42jqz5xwashehq http://localhost:9545 http://localhost:3030
+
+print_ipc_queries on

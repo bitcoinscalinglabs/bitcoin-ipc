@@ -994,6 +994,11 @@ impl Tester for DbTester {
                     .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
                 );
             }
+            OutputDb::TokenMetadata => {
+                return Err(EasyTesterError::runtime(
+                    "read token_metadata is not supported by DbTester",
+                ));
+            }
         }
 
         Ok(())

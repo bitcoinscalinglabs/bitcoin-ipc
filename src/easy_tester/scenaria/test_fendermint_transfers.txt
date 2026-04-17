@@ -1,0 +1,91 @@
+setup
+tester fendermint
+
+issuer1 0x27b60d9f71d6806cca7d5a92b391093fe100f8e8
+user1 0x005e05dd763dd125473f8889726f7c305e50fcae
+user2 0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d
+
+scenario
+
+# fund users with 0.1 wBTC
+deposit subnet1 user1 10_000_000
+deposit subnet1 user2 10_000_000
+deposit subnet2 user1 10_000_000
+deposit subnet2 user2 10_000_000
+
+# Wait for deposits to be processed
+wait 60
+
+# Deploy TOKEN1 on subnet1 with 1M supply (issuer1 holds all)
+register_token subnet1 issuer1 TOKEN1 TK1 1_000_000
+
+read token_balance subnet1 issuer1 TOKEN1
+expect result.balance = 1_000_000
+
+# Transfer 10 from issuer1@subnet1 to user2@subnet2
+erc_transfer subnet1 issuer1 subnet2 user2 TOKEN1 10
+
+read token_balance subnet1 issuer1 TOKEN1
+expect result.balance = 999_990
+
+read token_balance subnet2 user2 TOKEN1
+expect result.balance = 10
+
+# Transfer back 5 tokens from user2@subnet2 to user1@subnet1
+erc_transfer subnet2 user2 subnet1 user1 TOKEN1 5
+
+read token_balance subnet1 user1 TOKEN1
+expect result.balance = 5
+
+read token_balance subnet2 user2 TOKEN1
+expect result.balance = 5
+
+# Transfer 2 tokens from user1@subnet1 to user2@subnet2
+erc_transfer subnet1 user1 subnet2 user2 TOKEN1 2
+
+read token_balance subnet1 user1 TOKEN1
+expect result.balance = 3
+
+read token_balance subnet2 user2 TOKEN1
+expect result.balance = 7
+
+# ── Multiple tokens on subnet2 ──────────────────────────────────────────
+
+# Deploy ALPHA and BETA on subnet2
+register_token subnet2 issuer1 ALPHA ALP 1_000_000_000
+register_token subnet2 issuer1 BETA BET 200_000
+register_token subnet2 user1 ONE_MORE OM1 10_000_000_000
+register_token subnet2 user2 YET_MORE OM2 11_000_000_000
+
+read token_balance subnet2 issuer1 ALPHA
+expect result.balance = 1_000_000_000
+
+read token_balance subnet2 issuer1 BETA
+expect result.balance = 200_000
+
+# Transfer 500_000_000 ALPHA from issuer1@subnet2 to user1@subnet1
+erc_transfer subnet2 issuer1 subnet1 user1 ALPHA 500_000_000
+
+read token_balance subnet2 issuer1 ALPHA
+expect result.balance = 500_000_000
+
+read token_balance subnet1 user1 ALPHA
+expect result.balance = 500_000_000
+
+# Transfer 50 BETA from issuer1@subnet2 to user1@subnet1
+erc_transfer subnet2 issuer1 subnet1 user1 BETA 50
+
+read token_balance subnet2 issuer1 BETA
+expect result.balance = 199_950
+
+read token_balance subnet1 user1 BETA
+expect result.balance = 50
+
+# Transfer 500_000_000 more ALPHA from issuer1@subnet2 to user1@subnet1
+erc_transfer subnet2 issuer1 subnet1 user1 ALPHA 500_000_000
+
+read token_balance subnet2 issuer1 ALPHA
+expect result.balance = 0
+
+read token_balance subnet1 user1 ALPHA
+expect result.balance = 1_000_000_000

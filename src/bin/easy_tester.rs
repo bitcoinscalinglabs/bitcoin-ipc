@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use bitcoin_ipc::easy_tester::{
-    error::EasyTesterError, parse_config_file, parse_test_file, validate_scenario_for_tester,
-    DbTester, MonitorTester, ScenarioCommand, Tester, TesterConfig,
+    error::EasyTesterError, parse_config_file, parse_fendermint_test_file, parse_test_file,
+    validate_scenario_for_tester, DbTester, FendermintTester, MonitorTester, ScenarioCommand,
+    Tester, TesterConfig,
 };
 
 #[tokio::main]
@@ -50,34 +51,73 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config = parse_config_file(PathBuf::from(&config_path))?;
-    let parsed = parse_test_file(PathBuf::from(&scenario_path))?;
-    validate_scenario_for_tester(&parsed, &config)?;
-    let scenario = parsed.scenario.clone();
+
+    // Quick check: does the scenario file contain "tester fendermint"?
+    let scenario_text = std::fs::read_to_string(&scenario_path)?;
+    let scenario_is_fendermint = scenario_text
+        .lines()
+        .any(|l| l.split('#').next().unwrap_or("").trim() == "tester fendermint");
 
     match config {
-        TesterConfig::Db {
-            activation_height,
-            snapshot_length,
-        } => {
-            let mut tester =
-                DbTester::new(parsed.setup, activation_height, snapshot_length).await?;
-            run_scenario(&mut tester, scenario, 1)?;
+        TesterConfig::Fendermint { setup } => {
+            if !scenario_is_fendermint {
+                eprintln!(
+                    "error: tester config is 'fendermint' but the scenario file does not contain \
+                     'tester fendermint' in its setup section.\n\
+                     Fendermint scenarios require a different setup format (issuers + subnets).\n\
+                     Use a fendermint-specific scenario file, or switch to a db/monitor tester config."
+                );
+                std::process::exit(1);
+            }
+            let parsed = parse_fendermint_test_file(PathBuf::from(&scenario_path), setup)?;
+            let scenario = parsed.scenario;
+            let mut tester = FendermintTester::new(parsed.setup)?;
+            tester.run(scenario)?;
         }
-        TesterConfig::Monitor {
-            activation_height,
-            snapshot_length,
-            monitor_log_level,
-            provider_log_level,
-        } => {
-            let mut tester = MonitorTester::new(
-                parsed.setup,
-                activation_height,
-                snapshot_length,
-                monitor_log_level,
-                provider_log_level,
-            )
-            .await?;
-            run_scenario(&mut tester, scenario, 101)?;
+        _ => {
+            if scenario_is_fendermint {
+                eprintln!(
+                    "error: scenario file contains 'tester fendermint' but the tester config is '{}'.\n\
+                     Fendermint scenarios can only run with a fendermint tester config.",
+                    match &config {
+                        TesterConfig::Db { .. } => "db",
+                        TesterConfig::Monitor { .. } => "monitor",
+                        TesterConfig::Fendermint { .. } => unreachable!(),
+                    }
+                );
+                std::process::exit(1);
+            }
+            let parsed = parse_test_file(PathBuf::from(&scenario_path))?;
+            validate_scenario_for_tester(&parsed, &config)?;
+            let scenario = parsed.scenario.clone();
+
+            match config {
+                TesterConfig::Db {
+                    activation_height,
+                    snapshot_length,
+                } => {
+                    let mut tester =
+                        DbTester::new(parsed.setup, activation_height, snapshot_length).await?;
+                    run_scenario(&mut tester, scenario, 1)?;
+                }
+                TesterConfig::Monitor {
+                    activation_height,
+                    snapshot_length,
+                    monitor_log_level,
+                    provider_log_level,
+                } => {
+                    let mut tester = MonitorTester::new(
+                        parsed.setup,
+                        activation_height,
+                        snapshot_length,
+                        monitor_log_level,
+                        provider_log_level,
+                    )
+                    .await?;
+                    run_scenario(&mut tester, scenario, 101)?;
+                }
+                TesterConfig::Fendermint { .. } => unreachable!(),
+            }
         }
     }
 
@@ -152,6 +192,7 @@ fn run_scenario<T: Tester>(
             }
             ScenarioCommand::RegisterToken {
                 subnet_name,
+                issuer: _,
                 name,
                 symbol,
                 initial_supply,
@@ -178,9 +219,18 @@ fn run_scenario<T: Tester>(
             } => {
                 tester.exec_burn_token(working_height, &subnet_name, &token_name, amount).map_err(annotate)?;
             }
+            ScenarioCommand::Wait { seconds } => {
+                println!("line {line_no}: Waiting {seconds} seconds...");
+                std::thread::sleep(std::time::Duration::from_secs(seconds));
+            }
+            ScenarioCommand::Deposit { .. } => {
+                unimplemented!("deposit is only supported by the FendermintTester");
+            }
             ScenarioCommand::ErcTransfer {
                 src_subnet,
+                src_actor: _,
                 dst_subnet,
+                dst_actor: _,
                 token_name,
                 amount,
             } => {

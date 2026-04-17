@@ -30,9 +30,10 @@ local-reset-fendermint-deps:
 	@echo "Fendermint deps cache removed. Will be rebuilt on next fendermint build."
 
 # Rebuild ipc-cli from the mounted ../ipc source inside the running container.
+# Will not work if relayers are running, because they are using the ipc-cli binary.
 local-reset-ipc-cli:
 	docker exec bitcoin-ipc bash -c \
-		"cd /workspace/ipc && cd contracts && ln -sf contracts src && make gen && cargo build --release -p ipc-cli && cp target/release/ipc-cli /usr/local/bin/"
+		"cd /workspace/ipc && cd contracts && ln -sf contracts src && make gen && cd /workspace/ipc && cargo build --release -p ipc-cli && cp target/release/ipc-cli /usr/local/bin/"
 	@echo "ipc-cli rebuilt and installed."
 
 # Reset all local data (Bitcoin chain, IPC config, etc.).
