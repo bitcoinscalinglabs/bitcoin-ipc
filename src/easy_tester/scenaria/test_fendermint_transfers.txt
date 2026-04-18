@@ -7,14 +7,8 @@ user2 0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d
 
 scenario
 
-# fund users with 0.1 wBTC
-deposit subnet1 user1 10_000_000
-deposit subnet1 user2 10_000_000
-deposit subnet2 user1 10_000_000
-deposit subnet2 user2 10_000_000
-
-# Wait for deposits to be processed
-wait 60
+# Make sure the users have wBTC in their account
+# so they can pay for tx fees.
 
 # Deploy TOKEN1 on subnet1 with 1M supply (issuer1 holds all)
 register_token subnet1 issuer1 TOKEN1 TK1 1_000_000
