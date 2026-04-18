@@ -1,5 +1,5 @@
 tester monitor
-activation_height 1
+activation_height 101
 snapshot_length 10
 
 monitor_log_level info

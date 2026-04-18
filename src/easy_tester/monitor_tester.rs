@@ -328,7 +328,7 @@ pub struct MonitorTester {
     last_token_balance: Option<alloy_primitives::U256>,
     last_reward_results: Option<LastRewardResults>,
     checkpoint_heights: HashMap<String, u64>,
-    all_sk_hex: Vec<String>,
+    all_sk_hex: HashMap<String, String>,
     /// Subnet names for which the bootstrap handover has already been broadcast.
     done_handovers: std::collections::HashSet<String>,
     /// Directory where log files are written.
@@ -350,7 +350,7 @@ impl MonitorTester {
             monitor_pid: u32,
             provider_pid: u32,
             provider_port: u16,
-            all_sk_hex: Vec<String>,
+            all_sk_hex: HashMap<String, String>,
         }
 
         // Set FVM network to match NETWORK (Regtest → Testnet prefix for addresses).
@@ -428,10 +428,10 @@ impl MonitorTester {
             )?;
 
             // 7. Write validator SK files
-            let mut all_sk_hex = Vec::new();
+            let mut all_sk_hex = HashMap::new();
             for (name, v) in &setup.validators {
                 write_validator_sk(&datadir, name, &v.secret_key)?;
-                all_sk_hex.push(hex::encode(v.secret_key.secret_bytes()));
+                all_sk_hex.insert(name.clone(), hex::encode(v.secret_key.secret_bytes()));
             }
             let primary_validator = setup
                 .validators
@@ -554,6 +554,21 @@ impl MonitorTester {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    /// Returns the secret keys (hex) for validators in a subnet's whitelist.
+    fn sk_hex_for_subnet(&self, subnet_name: &str) -> Vec<String> {
+        self.setup
+            .subnets
+            .get(subnet_name)
+            .map(|subnet| {
+                subnet
+                    .whitelist_names
+                    .iter()
+                    .filter_map(|name| self.all_sk_hex.get(name).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn resolve_subnet_id(&self, subnet_name: &str) -> Result<SubnetId, EasyTesterError> {
         self.created_subnets
             .get(subnet_name)
@@ -656,7 +671,7 @@ impl MonitorTester {
 
         let sign_params = DevMultisignPsbtParams {
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
-            secret_keys: self.all_sk_hex.clone(),
+            secret_keys: self.sk_hex_for_subnet(subnet_name),
         };
         let sign_resp: DevMultisignPsbtResponse =
             self.rpc_call("dev_multisignpsbt", sign_params)?;
@@ -733,7 +748,7 @@ impl MonitorTester {
 
         let sign_params = DevMultisignPsbtParams {
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
-            secret_keys: self.all_sk_hex.clone(),
+            secret_keys: self.sk_hex_for_subnet(subnet_name),
         };
         let sign_resp: DevMultisignPsbtResponse =
             self.rpc_call("dev_multisignpsbt", sign_params)?;
