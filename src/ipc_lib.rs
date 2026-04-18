@@ -1595,49 +1595,9 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             )));
         }
 
-        // Validate token registrations
-        for etr in &self.token_registrations {
-            if etr.home_token_address == alloy_primitives::Address::ZERO {
-                return Err(IpcValidateError::InvalidField(
-                    "token_registration.home_token_address",
-                    "Token address must not be zero".to_string(),
-                ));
-            }
-            if etr.name.is_empty() {
-                return Err(IpcValidateError::InvalidField(
-                    "token_registration.name",
-                    "Token name must not be empty".to_string(),
-                ));
-            }
-            if etr.symbol.is_empty() {
-                return Err(IpcValidateError::InvalidField(
-                    "token_registration.symbol",
-                    "Token symbol must not be empty".to_string(),
-                ));
-            }
-        }
-
-        // Validate ERC transfers
-        for etx in &self.token_transfers {
-            if etx.amount == U256::ZERO {
-                return Err(IpcValidateError::InvalidField(
-                    "erc_transfer.amount",
-                    "ERC transfer amount must be greater than zero".to_string(),
-                ));
-            }
-            if etx.home_token_address == alloy_primitives::Address::ZERO {
-                return Err(IpcValidateError::InvalidField(
-                    "erc_transfer.home_token_address",
-                    "ERC transfer token address must not be zero".to_string(),
-                ));
-            }
-            if etx.recipient == alloy_primitives::Address::ZERO {
-                return Err(IpcValidateError::InvalidField(
-                    "erc_transfer.recipient",
-                    "ERC transfer recipient must not be zero".to_string(),
-                ));
-            }
-        }
+        // ERC fields (token_registrations, token_supply_adjustments, token_transfers)
+        // are validated in IpcBatchTransferMsg::validate(), which is the message that
+        // actually carries them on Bitcoin (the batch transfer reveal tx, not the checkpoint tx).
 
         // Check if the change address is valid
         if let Some(change_address) = &self.change_address {
@@ -2708,13 +2668,10 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
     // 4. Transfers (ETX) — must not exceed running balance on the source subnet.
     for etx in token_transfers {
         if etx.amount == U256::ZERO {
-            trace!(
+            return Err(IpcValidateError::InvalidMsg(format!(
                 "Zero-amount ETX for token ({},{}) on subnet {}",
-                etx.home_subnet_id,
-                etx.home_token_address,
-                source_subnet_id
-            );
-            continue;
+                etx.home_subnet_id, etx.home_token_address, source_subnet_id
+            )));
         }
         let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
         let bal = match final_balances.entry(key) {
@@ -2820,12 +2777,6 @@ impl IpcValidate for IpcBatchTransferMsg {
 
         // Check if the ERC transfers are valid
         for etx in &self.token_transfers {
-            if etx.amount == U256::ZERO {
-                return Err(IpcValidateError::InvalidField(
-                    "erc_transfer.amount",
-                    "ERC transfer amount must be greater than zero".to_string(),
-                ));
-            }
             if etx.home_token_address == alloy_primitives::Address::ZERO {
                 return Err(IpcValidateError::InvalidField(
                     "erc_transfer.home_token_address",
@@ -2836,6 +2787,12 @@ impl IpcValidate for IpcBatchTransferMsg {
                 return Err(IpcValidateError::InvalidField(
                     "erc_transfer.recipient",
                     "ERC transfer recipient must not be zero".to_string(),
+                ));
+            }
+            if etx.amount == U256::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "erc_transfer.amount",
+                    "ERC transfer amount must be greater than zero".to_string(),
                 ));
             }
         }
@@ -7049,180 +7006,7 @@ mod checkpoint_msg_tests {
     }
 
     #[test]
-    fn test_validate_rejects_zero_amount_etx() {
-        let subnet_state = test_utils::generate_subnet(4);
-        let destination_subnet = test_utils::generate_subnet(4);
-        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-
-        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
-        etx.amount = U256::ZERO; // zero amount
-
-        let checkpoint_msg = IpcCheckpointSubnetMsg {
-            subnet_id: subnet_state.id,
-            checkpoint_hash,
-            checkpoint_height: 50,
-            unstakes: vec![],
-            withdrawals: vec![],
-            transfers: vec![],
-            token_registrations: vec![],
-            token_supply_adjustments: vec![],
-            token_transfers: vec![etx],
-            change_address: Some(subnet_state.committee.multisig_address.clone()),
-            next_committee_configuration_number: 1,
-            is_kill_checkpoint: false,
-        };
-
-        let result = checkpoint_msg.validate();
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("amount must be greater than zero"),
-            "Should reject zero-amount ERC transfer"
-        );
-    }
-
-    #[test]
-    fn test_validate_rejects_empty_token_name() {
-        let subnet_state = test_utils::generate_subnet(4);
-        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-
-        let mut etr = test_utils::create_rand_erc_token_registration();
-        etr.name = "".to_string();
-
-        let checkpoint_msg = IpcCheckpointSubnetMsg {
-            subnet_id: subnet_state.id,
-            checkpoint_hash,
-            checkpoint_height: 50,
-            unstakes: vec![],
-            withdrawals: vec![],
-            transfers: vec![],
-            token_registrations: vec![etr],
-            token_supply_adjustments: vec![],
-            token_transfers: vec![],
-            change_address: Some(subnet_state.committee.multisig_address.clone()),
-            next_committee_configuration_number: 1,
-            is_kill_checkpoint: false,
-        };
-
-        let result = checkpoint_msg.validate();
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("name must not be empty"),
-            "Should reject empty token name"
-        );
-    }
-
-    #[test]
-    fn test_validate_rejects_empty_token_symbol() {
-        let subnet_state = test_utils::generate_subnet(4);
-        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-
-        let mut etr = test_utils::create_rand_erc_token_registration();
-        etr.symbol = "".to_string();
-
-        let checkpoint_msg = IpcCheckpointSubnetMsg {
-            subnet_id: subnet_state.id,
-            checkpoint_hash,
-            checkpoint_height: 50,
-            unstakes: vec![],
-            withdrawals: vec![],
-            transfers: vec![],
-            token_registrations: vec![etr],
-            token_supply_adjustments: vec![],
-            token_transfers: vec![],
-            change_address: Some(subnet_state.committee.multisig_address.clone()),
-            next_committee_configuration_number: 1,
-            is_kill_checkpoint: false,
-        };
-
-        let result = checkpoint_msg.validate();
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("symbol must not be empty"),
-            "Should reject empty token symbol"
-        );
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_token_address_etx() {
-        let subnet_state = test_utils::generate_subnet(4);
-        let destination_subnet = test_utils::generate_subnet(4);
-        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-
-        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
-        etx.home_token_address = alloy_primitives::Address::ZERO;
-
-        let checkpoint_msg = IpcCheckpointSubnetMsg {
-            subnet_id: subnet_state.id,
-            checkpoint_hash,
-            checkpoint_height: 50,
-            unstakes: vec![],
-            withdrawals: vec![],
-            transfers: vec![],
-            token_registrations: vec![],
-            token_supply_adjustments: vec![],
-            token_transfers: vec![etx],
-            change_address: Some(subnet_state.committee.multisig_address.clone()),
-            next_committee_configuration_number: 1,
-            is_kill_checkpoint: false,
-        };
-
-        let result = checkpoint_msg.validate();
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("token address must not be zero"),
-            "Should reject zero token address"
-        );
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_recipient_etx() {
-        let subnet_state = test_utils::generate_subnet(4);
-        let destination_subnet = test_utils::generate_subnet(4);
-        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-
-        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
-        etx.recipient = alloy_primitives::Address::ZERO;
-
-        let checkpoint_msg = IpcCheckpointSubnetMsg {
-            subnet_id: subnet_state.id,
-            checkpoint_hash,
-            checkpoint_height: 50,
-            unstakes: vec![],
-            withdrawals: vec![],
-            transfers: vec![],
-            token_registrations: vec![],
-            token_supply_adjustments: vec![],
-            token_transfers: vec![etx],
-            change_address: Some(subnet_state.committee.multisig_address.clone()),
-            next_committee_configuration_number: 1,
-            is_kill_checkpoint: false,
-        };
-
-        let result = checkpoint_msg.validate();
-        assert!(result.is_err());
-        assert!(
-            format!("{:?}", result.unwrap_err()).contains("recipient must not be zero"),
-            "Should reject zero recipient"
-        );
-    }
-
-    #[test]
-    fn test_batch_transfer_validate_rejects_invalid_etr() {
+    fn test_batch_transfer_validate_rejects_empty_token_name() {
         let mut etr = test_utils::create_rand_erc_token_registration();
         etr.name = "".to_string();
 
@@ -7242,7 +7026,91 @@ mod checkpoint_msg_tests {
     }
 
     #[test]
-    fn test_batch_transfer_validate_rejects_invalid_etx() {
+    fn test_batch_transfer_validate_rejects_empty_token_symbol() {
+        let mut etr = test_utils::create_rand_erc_token_registration();
+        etr.symbol = "".to_string();
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("symbol must not be empty"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_token_address_etr() {
+        let mut etr = test_utils::create_rand_erc_token_registration();
+        etr.home_token_address = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("Token address must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_token_address_etx() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+        etx.home_token_address = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("token address must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_recipient_etx() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+        etx.recipient = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("recipient must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_amount_etx() {
         let subnet_state = test_utils::generate_subnet(4);
         let destination_subnet = test_utils::generate_subnet(4);
         let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
@@ -7797,6 +7665,22 @@ mod validate_erc_batch_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Insufficient balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_etx_zero_amount_rejected() {
+        let source = test_utils::generate_subnet(4).id;
+        let dest = test_utils::generate_subnet(4).id;
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000));
+
+        let result =
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 0, dest)], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Zero-amount ETX"),
             "wrong error message"
         );
     }

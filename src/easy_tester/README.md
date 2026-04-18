@@ -8,24 +8,11 @@ cargo run --bin easy_tester -- --scenario <scenario_file> --tester <config_file>
 
 ---
 
-## Existing tests
-
-Several scenarios are included under `src/easy_tester/scenaria/`. Example run against the db tester:
-
-```bash
-cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/db.txt
-```
-
-Example run against the monitor tester (requires `bitcoind` in PATH):
-
-```bash
-cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/monitor.txt
-```
----
-
 ## Config file format
 
 Space-separated `key value` lines (no `=`). Stored in `src/easy_tester/testers/`.
+
+### Db / Monitor tester config
 
 | Key | Values | Notes |
 |-----|--------|-------|
@@ -37,9 +24,20 @@ Space-separated `key value` lines (no `=`). Stored in `src/easy_tester/testers/`
 
 For the monitor tester, logs from `bitcoind`, `monitor`, `provider`, and the RPC client are written to `/tmp/easy_tester/` (overwritten on each run) and are not printed to the terminal. The log file locations are printed at the end of the run.
 
+### Fendermint tester config
+
+| Key | Values | Notes |
+|-----|--------|-------|
+| `tester` | `fendermint` | required |
+| `subnet1 <id> <eth_rpc> <provider_url>` | — | declare a subnet (repeat for each) |
+| `docker_container` | container name | defaults to `bitcoin-ipc` |
+| `print_ipc_queries` | `on` \| `off` | print all ipc-cli / cast commands before execution |
+
+Issuers (actors with EVM addresses) are declared in the scenario file's `setup` section, not in the config.
+
 ---
 
-## Scenario file format
+## Scenario file format (Db / Monitor tester)
 
 A block line sets the current height; all commands that follow run at that height.
 
@@ -56,6 +54,14 @@ expect result.count = 1
 expect result.0.kind = erc_registration
 ```
 
+### Setup section
+
+```
+setup
+validators validator1 validator2 validator3
+subnet subnet_a min 2 whitelist validator1 validator2 validator3
+```
+
 ### Commands
 
 | Command | Description |
@@ -70,18 +76,48 @@ expect result.0.kind = erc_registration
 | `mint_token <subnet> <token> <amount>` | Queue a supply increase (ETS). |
 | `burn_token <subnet> <token> <amount>` | Queue a supply decrease (ETS). |
 | `erc_transfer <src_subnet> <dst_subnet> <token> <amount>` | Queue a cross-subnet ERC20 transfer (ETX). |
+| `wait <seconds>` | Pause execution for a fixed duration. |
 | `read rootnet_msgs <subnet>` | Read rootnet messages for the subnet (from all Bitcoin blocks). |
 | `read token_balance <subnet> <token>` | Read and cache the token balance on the subnet. |
 | `read reward_results <snapshot>` | Read reward results for the given snapshot. |
 | `expect result.<path> = <value>` | Assert a field in the **last** `read` result. |
 
-### Setup section (top of scenario file)
+---
+
+## Scenario file format (Fendermint tester)
+
+The fendermint tester uses a different scenario syntax. It runs against live fendermint subnets inside the Docker deployment.
+
+### Setup section
+
+Declares the tester type and the actors (issuers/users) with their EVM addresses:
 
 ```
 setup
-validators validator1 validator2 validator3
-subnet subnet_a min 2 whitelist validator1 validator2 validator3
+tester fendermint
+
+issuer1 0x27b60d9f71d6806cca7d5a92b391093fe100f8e8
+user1 0x005e05dd763dd125473f8889726f7c305e50fcae
+user2 0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d
+
+scenario
 ```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `register_token <subnet> <issuer> <name> <symbol> <initial_supply>` | Deploy a BridgeableToken contract and register it on the gateway. Issuer receives the initial supply. |
+| `deposit <subnet> <address_name> <amount_sats>` | Deposit native tokens (BTC) into a subnet for an address. |
+| `erc_transfer <src_subnet> <src_actor> <dst_subnet> <dst_actor> <token> <amount>` | Cross-subnet ERC20 transfer. Amounts are in whole tokens (scaled by 10^18 internally). |
+| `mint_token <subnet> <token> <amount>` | Mint additional tokens (issuer only). |
+| `burn_token <subnet> <token> <amount>` | Burn tokens (uses `burnFrom`). |
+| `wait <seconds>` | Pause execution for a fixed duration. |
+| `read token_balance <subnet> <actor> <token>` | Read an actor's token balance on a subnet. |
+| `read token_metadata <subnet> <token>` | Read token metadata (name, symbol, decimals, wrapped address). |
+| `expect result.<field> = <value>` | Assert a field from the last `read`. Retries automatically (polls every 5s, up to 90s) to allow for cross-subnet settlement. |
+
+Unsupported commands (`block`, `checkpoint`, `create`, `join`, `stake`, `unstake`) are rejected at parse time.
 
 ---
 
@@ -121,3 +157,38 @@ It runs a real integration stack: spawns `bitcoind`, compiles and starts `monito
 | `reward_results` | yes | `getrewardedcollaterals`; supports `expect` |
 | `committee` | no | no provider endpoint — use `DbTester` |
 | `reward_candidates` | no | no provider endpoint — use `DbTester` |
+
+### `FendermintTester` (`tester fendermint`)
+
+Tests against live fendermint subnets running inside the Docker deployment. Deploys real ERC20 tokens, performs cross-subnet transfers via `ipc-cli`, and reads balances via `cast call`.
+
+- Requires the Docker container (`bitcoin-ipc`) to be running with subnets spun up and relayers active.
+- Issuer private keys are discovered from the `ipc-cli wallet list` output at startup.
+- Gateway addresses are discovered from the validator's `config.toml`.
+- Subnet liveness is verified (blocks advancing) before the scenario starts.
+- `expect` commands automatically retry the preceding `read` (polling every 5s, up to 90s) to wait for cross-subnet settlement.
+
+---
+
+## All tests
+
+### Db and Monitor tests
+
+```bash
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/db.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_transfer.txt --tester src/easy_tester/testers/monitor.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_balances.txt --tester src/easy_tester/testers/db.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_balances.txt --tester src/easy_tester/testers/monitor.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_firewall.txt --tester src/easy_tester/testers/db.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_firewall.txt --tester src/easy_tester/testers/monitor.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_mint_burn.txt --tester src/easy_tester/testers/db.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_erc_mint_burn.txt --tester src/easy_tester/testers/monitor.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_rewards.txt --tester src/easy_tester/testers/db.txt &&
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_rewards.txt --tester src/easy_tester/testers/monitor.txt
+```
+
+### Fendermint tests
+
+```bash
+cargo run --bin easy_tester -- --scenario src/easy_tester/scenaria/test_fendermint_transfers.txt --tester src/easy_tester/testers/fendermint.txt
+```
