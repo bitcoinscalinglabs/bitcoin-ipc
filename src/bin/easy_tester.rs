@@ -223,8 +223,14 @@ fn run_scenario<T: Tester>(
                 println!("line {line_no}: Waiting {seconds} seconds...");
                 std::thread::sleep(std::time::Duration::from_secs(seconds));
             }
-            ScenarioCommand::Deposit { .. } => {
-                unimplemented!("deposit is only supported by the FendermintTester");
+            ScenarioCommand::Deposit {
+                subnet_name,
+                address_name,
+                amount_sats,
+            } => {
+                tester
+                    .exec_deposit(working_height, &subnet_name, &address_name, amount_sats)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::ErcTransfer {
                 src_subnet,

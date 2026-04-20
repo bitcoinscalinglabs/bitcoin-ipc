@@ -26,11 +26,17 @@ join subnet1 validator2 200_000_000
 join subnet1 validator3 300_000_000
 join subnet1 validator4 400_000_000
 
+block 107
+deposit subnet1 validator1 500_000_000
+deposit subnet1 validator2 500_000_000
+deposit subnet1 validator3 500_000_000
+deposit subnet1 validator4 500_000_000
+
 block 111
 read reward_results 0 # snapshot 0: blocks 101-110
 expect result.total_rewarded_collateral = 0 # subnet not active for whole snapshot
 
-block 115
+block 114
 join subnet1 validator5 500_000_000
 
 block 116
@@ -41,33 +47,46 @@ read reward_results 1 # snapshot 1: blocks 111-120
 expect result.rewards_list.validator1 = 100_000_000 # validators 1-4 in subnet for whole snapshot
 expect result.rewards_list.validator5 = 0 # validator 5 not in subnet for whole snapshot
 
+block 129
+join subnet1 validator6 600_000_000
+
 block 131
 read reward_results 2 # snapshot 2: blocks 121-130
 expect result.total_rewarded_collateral = 1_500_000_000 # validators 1-5 in subnet for whole snapshot
 expect result.rewards_list.validator5 = 500_000_000
 
-join subnet1 validator6 600_000_000
 checkpoint subnet1 # validator6 effectively joins at block 131
 
-block 140 # last block of snapshot 3
+block 138
 join subnet1 validator7 700_000_000
 unstake subnet1 validator2 100_000_000
+
+block 140
 checkpoint subnet1
 
 block 141
+
 read reward_results 3 # snapshot 3: blocks 131-140
 expect result.total_rewarded_collateral = 2_000_000_000
-expect result.rewards_list.validator2 = 100_000_000 # validator2's minimum collateral across snapshot was 100_000_000
+
+# validator2's minimum collateral across snapshot was 100_000_000
+# (the rotation checkpoint was written at height 140)
+expect result.rewards_list.validator2 = 100_000_000
+
 expect result.rewards_list.validator6 = 600_000_000 # validator6 joined on the first block of the snapshot
 expect result.rewards_list.validator7 = 0 # validator7 joined on the first block of the snapshot
 
 block 151
+
 read reward_results 4 # snapshot 4: blocks 141-150
+
 expect result.rewards_list.validator2 = 100_000_000 # validator2's collateral is still 100_000_000
+
 expect result.rewards_list.validator7 = 700_000_000 # validator7 joined on the first block of the snapshot
 
-block 152
 stake subnet1 validator4 400_000_000
+
+block 153
 checkpoint subnet1
 
 block 161

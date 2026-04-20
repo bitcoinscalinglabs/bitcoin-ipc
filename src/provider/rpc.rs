@@ -1150,7 +1150,25 @@ pub async fn dev_gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
-    let next_committee = subnet.committee.clone();
+    // Look up the actual next committee when a rotation is requested,
+    // so the checkpoint exhausts the old committee's UTXOs and sends
+    // change to the new committee's multisig address.
+    let current_cfg = subnet.committee.configuration_number;
+    let next_committee = if msg.next_committee_configuration_number > current_cfg {
+        data.db
+            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
+            .map_err(|e| {
+                error!("Error getting stake change from Db: {}", e);
+                RpcError::DbError(e)
+            })?
+            .ok_or(RpcError::InvalidParams(format!(
+                "Stake change with configuration number {} not found.",
+                msg.next_committee_configuration_number
+            )))?
+            .committee_after_change
+    } else {
+        subnet.committee.clone()
+    };
 
     // balance check intentionally omitted
 

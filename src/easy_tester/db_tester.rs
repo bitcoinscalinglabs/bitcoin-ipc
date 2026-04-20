@@ -685,6 +685,23 @@ impl Tester for DbTester {
         self.unstake_subnet(height, subnet_name, validator_name, amount_sats)
     }
 
+    fn exec_deposit(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        address_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError> {
+        // The db tester has no real Bitcoin UTXOs, so deposit is a no-op.
+        // We still resolve the subnet to catch typos early.
+        self.resolve_subnet_id(subnet_name)?;
+        info!(
+            "Deposit (no-op for db tester): {} sats to '{}' on subnet '{}'",
+            amount_sats, address_name, subnet_name
+        );
+        Ok(())
+    }
+
     fn exec_checkpoint_subnet(
         &mut self,
         height: u64,

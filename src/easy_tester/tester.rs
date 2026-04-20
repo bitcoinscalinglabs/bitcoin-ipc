@@ -88,6 +88,18 @@ pub trait Tester {
         ))
     }
 
+    fn exec_deposit(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _address_name: &str,
+        _amount_sats: u64,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "deposit is not supported by this tester",
+        ))
+    }
+
     fn exec_output_read(
         &mut self,
         height: u64,

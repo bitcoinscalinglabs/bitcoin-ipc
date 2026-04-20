@@ -45,6 +45,39 @@ const PROVIDER_READY_TIMEOUT_SECS: u64 = 30;
 const MONITOR_POLL_INTERVAL: u64 = 1;
 const CONFIRM_POLL_TIMEOUT_SECS: u64 = 60;
 
+// ── helper: RAII guard that kills tracked PIDs on drop ───────────────────────
+//
+// Used during startup to ensure already-spawned processes are cleaned up if a
+// later step fails.  Call `disarm()` once startup succeeds to transfer
+// ownership to `MonitorTester` (whose own `Drop` handles the normal path).
+
+struct ProcessGuard {
+    pids: Vec<u32>,
+}
+
+impl ProcessGuard {
+    fn new() -> Self {
+        Self { pids: Vec::new() }
+    }
+
+    fn track(&mut self, pid: u32) {
+        self.pids.push(pid);
+    }
+
+    /// Consume the guard without killing anything.  Returns the tracked PIDs.
+    fn disarm(mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pids)
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        for &pid in &self.pids {
+            kill_pid(pid);
+        }
+    }
+}
+
 // ── helper: find a free TCP port ──────────────────────────────────────────────
 
 fn free_port() -> u16 {
@@ -309,12 +342,21 @@ struct LastRewardResults {
 
 /// The MonitorTester spawns real bitcoind, monitor, and provider processes
 /// and exercises the full integration stack.
+///
+/// One provider is started per validator declared in setup (up to 7).
+/// Validator-specific operations (join, stake, unstake, fund) are routed
+/// to the provider that holds that validator's key.  Read-only and dev
+/// operations go to the first provider (validator1).
 pub struct MonitorTester {
     setup: SetupSpec,
-    provider_url: String,
+    /// Default provider URL (validator1's) for non-validator-specific calls.
+    default_provider_url: String,
+    /// Validator name → provider URL.
+    validator_provider_urls: HashMap<String, String>,
     bitcoind_pid: u32,
     monitor_pid: u32,
-    provider_pid: u32,
+    /// PIDs of all provider processes (one per validator).
+    provider_pids: Vec<u32>,
     tmpdir: TempDir,
     current_block: u64,
     /// Subnet name → SubnetId
@@ -348,8 +390,8 @@ impl MonitorTester {
             tmpdir: TempDir,
             bitcoind_pid: u32,
             monitor_pid: u32,
-            provider_pid: u32,
-            provider_port: u16,
+            /// One (validator_name, pid, port) per validator.
+            providers: Vec<(String, u32, u16)>,
             all_sk_hex: HashMap<String, String>,
         }
 
@@ -370,6 +412,9 @@ impl MonitorTester {
         open_log("rpc_client.log")?;
 
         let started = tokio::task::block_in_place(|| -> Result<Started, EasyTesterError> {
+            // Guard kills all tracked child processes if we return early with an error.
+            let mut guard = ProcessGuard::new();
+
             // 1. Verify required binaries
             which("bitcoind")?;
             which("bitcoin-cli")?;
@@ -381,11 +426,10 @@ impl MonitorTester {
             let monitor_bin = release_dir.join("monitor");
             let provider_bin = release_dir.join("provider");
 
-            // 3. Temp dir + ports
+            // 3. Temp dir
             let tmpdir = tempfile::tempdir()
                 .map_err(|e| EasyTesterError::runtime(format!("tempdir failed: {e}")))?;
             let datadir = tmpdir.path().to_path_buf();
-            let provider_port = free_port();
 
             // 4. Write bitcoin.conf
             write_bitcoin_conf(&datadir)?;
@@ -408,7 +452,8 @@ impl MonitorTester {
                 .spawn()
                 .map_err(|e| EasyTesterError::runtime(format!("failed to spawn bitcoind: {e}")))?;
             let bitcoind_pid = bitcoind.id();
-            std::mem::forget(bitcoind); // process runs independently; killed by PID in Drop
+            std::mem::forget(bitcoind);
+            guard.track(bitcoind_pid);
 
             // 6. Wait for bitcoind, then mine 101 blocks
             wait_for_bitcoind(&datadir, BITCOIND_READY_TIMEOUT_SECS)?;
@@ -441,37 +486,24 @@ impl MonitorTester {
                 .unwrap_or_else(|| "validator1".to_string());
             let primary_sk_path = datadir.join(format!("{primary_validator}.sk"));
 
-            // 8. Create DB dir, write separate .env files for monitor and provider
-            // (they share all settings but may have different RUST_LOG).
+            // 8. Create shared DB dir + monitor .env
             let db_url = datadir.join("db");
             std::fs::create_dir_all(&db_url)
                 .map_err(|e| EasyTesterError::runtime(format!("failed to create db dir: {e}")))?;
+            let db_url_str = db_url.to_str().unwrap_or("/tmp/db");
+
+            // Monitor uses the primary validator SK (only needed for key-based
+            // identity, not for signing transactions).
+            let monitor_port = free_port(); // not actually contacted, but .env requires it
             let monitor_env_path = datadir.join("monitor.env");
-            let provider_env_path = datadir.join("provider.env");
-            let common_args = (
-                provider_port,
-                db_url.to_str().unwrap_or("/tmp/db"),
+            write_env(
+                &monitor_env_path,
+                monitor_port,
+                db_url_str,
                 primary_sk_path.to_str().unwrap_or("/tmp/validator1.sk"),
                 activation_height,
                 snapshot_length,
-            );
-            write_env(
-                &monitor_env_path,
-                common_args.0,
-                common_args.1,
-                common_args.2,
-                common_args.3,
-                common_args.4,
                 monitor_log_level.as_deref(),
-            )?;
-            write_env(
-                &provider_env_path,
-                common_args.0,
-                common_args.1,
-                common_args.2,
-                common_args.3,
-                common_args.4,
-                provider_log_level.as_deref(),
             )?;
 
             // 9. Start monitor
@@ -484,9 +516,10 @@ impl MonitorTester {
                 .map_err(|e| EasyTesterError::runtime(format!("failed to spawn monitor: {e}")))?;
             let monitor_pid = monitor.id();
             std::mem::forget(monitor);
+            guard.track(monitor_pid);
 
             // 9b. Wait for the monitor to create the LMDB database file before
-            // starting the provider (which opens the DB in read-only mode).
+            // starting providers (they open the DB in read-only mode).
             let mdb_file = db_url.join("data.mdb");
             let db_deadline = Instant::now() + Duration::from_secs(30);
             while !mdb_file.exists() {
@@ -498,43 +531,95 @@ impl MonitorTester {
                 thread::sleep(Duration::from_millis(200));
             }
 
-            // 10. Start provider
-            let provider_log = open_log("provider.log")?;
-            let provider = Command::new(&provider_bin)
-                .args(["--env", provider_env_path.to_str().unwrap()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(provider_log))
-                .spawn()
-                .map_err(|e| EasyTesterError::runtime(format!("failed to spawn provider: {e}")))?;
-            let provider_pid = provider.id();
-            std::mem::forget(provider);
+            // 10. Start one provider per validator.
+            // Sorted by name so validator1 is always first (= default provider).
+            let mut sorted_validators: Vec<&String> = setup.validators.keys().collect();
+            sorted_validators.sort();
 
-            // 11. Poll until provider responds to HTTP (not just TCP port open).
-            wait_for_provider_http(provider_port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS)?;
+            let mut providers: Vec<(String, u32, u16)> = Vec::new();
+            for name in &sorted_validators {
+                let port = free_port();
+                let sk_path = datadir.join(format!("{name}.sk"));
+                let env_path = datadir.join(format!("provider-{name}.env"));
+                write_env(
+                    &env_path,
+                    port,
+                    db_url_str,
+                    sk_path.to_str().unwrap_or("/tmp/validator.sk"),
+                    activation_height,
+                    snapshot_length,
+                    provider_log_level.as_deref(),
+                )?;
+                let prov_log = open_log(&format!("provider-{name}.log"))?;
+                let child = Command::new(&provider_bin)
+                    .args(["--env", env_path.to_str().unwrap()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(prov_log))
+                    .spawn()
+                    .map_err(|e| {
+                        EasyTesterError::runtime(format!(
+                            "failed to spawn provider for {name}: {e}"
+                        ))
+                    })?;
+                let pid = child.id();
+                std::mem::forget(child);
+                guard.track(pid);
+                providers.push(((*name).clone(), pid, port));
+            }
+
+            // 11. Poll until every provider responds to HTTP.
+            for (name, _pid, port) in &providers {
+                wait_for_provider_http(*port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS)
+                    .map_err(|e| {
+                        EasyTesterError::runtime(format!(
+                            "provider for {name} (port {port}) failed to start: {e}"
+                        ))
+                    })?;
+            }
+
+            // Success — disarm the guard so processes survive past this scope.
+            guard.disarm();
 
             Ok(Started {
                 tmpdir,
                 bitcoind_pid,
                 monitor_pid,
-                provider_pid,
-                provider_port,
+                providers,
                 all_sk_hex,
             })
         })?;
 
-        let provider_url = format!("http://127.0.0.1:{}/api", started.provider_port);
+        let mut validator_provider_urls = HashMap::new();
+        let mut provider_pids = Vec::new();
+        for (name, pid, port) in &started.providers {
+            validator_provider_urls
+                .insert(name.clone(), format!("http://127.0.0.1:{port}/api"));
+            provider_pids.push(*pid);
+        }
+        let default_provider_url = validator_provider_urls
+            .get(&started.providers[0].0)
+            .cloned()
+            .expect("at least one validator/provider must exist");
 
+        let pids_str: Vec<String> = started
+            .providers
+            .iter()
+            .map(|(n, pid, _)| format!("{n}={pid}"))
+            .collect();
         eprintln!(
-            "MonitorTester ready (bitcoind={} monitor={} provider={}). Logs: {LOG_DIR}/",
-            started.bitcoind_pid, started.monitor_pid, started.provider_pid,
+            "MonitorTester ready (bitcoind={} monitor={} providers=[{}]). Logs: {LOG_DIR}/",
+            started.bitcoind_pid,
+            started.monitor_pid,
+            pids_str.join(", "),
         );
 
         Ok(Self {
             setup,
-            provider_url,
+            default_provider_url,
+            validator_provider_urls,
             bitcoind_pid: started.bitcoind_pid,
             monitor_pid: started.monitor_pid,
-            provider_pid: started.provider_pid,
+            provider_pids,
             tmpdir: started.tmpdir,
             current_block: 101,
             created_subnets: HashMap::new(),
@@ -569,6 +654,41 @@ impl MonitorTester {
             .unwrap_or_default()
     }
 
+    /// Returns the secret keys (hex) for validators in the current committee,
+    /// ordered to match the committee's validator list.
+    fn sk_hex_for_committee(&self, committee: &crate::db::SubnetCommittee) -> Vec<String> {
+        committee
+            .validators
+            .iter()
+            .filter_map(|cv| {
+                self.setup
+                    .validators
+                    .values()
+                    .find(|v| v.pubkey == cv.pubkey)
+                    .and_then(|v| self.all_sk_hex.get(&v.name).cloned())
+            })
+            .collect()
+    }
+
+    /// Find the name of a setup validator that is in the given committee and
+    /// has a running provider.  Used to route checkpoint RPCs to a provider
+    /// whose configured validator is still a committee member.
+    fn find_committee_validator_name(
+        &self,
+        committee: &crate::db::SubnetCommittee,
+    ) -> Result<String, EasyTesterError> {
+        for cv in &committee.validators {
+            if let Some(v) = self.setup.validators.values().find(|v| v.pubkey == cv.pubkey) {
+                if self.validator_provider_urls.contains_key(&v.name) {
+                    return Ok(v.name.clone());
+                }
+            }
+        }
+        Err(EasyTesterError::runtime(
+            "no setup validator with a provider found in the current committee".to_string(),
+        ))
+    }
+
     fn resolve_subnet_id(&self, subnet_name: &str) -> Result<SubnetId, EasyTesterError> {
         self.created_subnets
             .get(subnet_name)
@@ -584,28 +704,62 @@ impl MonitorTester {
         })
     }
 
-    /// Synchronous JSON-RPC call to the provider via plain TCP+HTTP.
+    /// Synchronous JSON-RPC call to the default provider (validator1).
     fn rpc_call<Req, Resp>(&self, method: &str, params: Req) -> Result<Resp, EasyTesterError>
     where
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        // Check process is still alive
-        let alive = Command::new("kill")
-            .args(["-0", &self.provider_pid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !alive {
-            return Err(EasyTesterError::runtime(format!(
-                "provider process (pid={}) is no longer running",
-                self.provider_pid
-            )));
+        self.rpc_call_to(&self.default_provider_url, method, params)
+    }
+
+    /// Synchronous JSON-RPC call routed to a specific validator's provider.
+    fn rpc_call_as<Req, Resp>(
+        &self,
+        validator_name: &str,
+        method: &str,
+        params: Req,
+    ) -> Result<Resp, EasyTesterError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let url = self.validator_provider_urls.get(validator_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!(
+                "no provider for validator '{validator_name}'"
+            ))
+        })?;
+        self.rpc_call_to(url, method, params)
+    }
+
+    /// Low-level JSON-RPC call to a given provider URL.
+    fn rpc_call_to<Req, Resp>(
+        &self,
+        url: &str,
+        method: &str,
+        params: Req,
+    ) -> Result<Resp, EasyTesterError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        // Check that at least one provider is still alive.
+        let any_alive = self.provider_pids.iter().any(|pid| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if !any_alive {
+            return Err(EasyTesterError::runtime(
+                "no provider processes are running".to_string(),
+            ));
         }
         // Suppress logging for high-frequency polling calls to keep rpc_client.log readable.
         let silent = matches!(method, "getconfirmedcount");
         let log_file = if silent { None } else { Some(self.log_dir.join("rpc_client.log")) };
-        ProviderClient::new(self.provider_url.clone(), AUTH_TOKEN.to_string(), log_file)
+        ProviderClient::new(url.to_string(), AUTH_TOKEN.to_string(), log_file)
             .call(method, params)
     }
 
@@ -729,11 +883,27 @@ impl MonitorTester {
             .or_insert(1);
         let checkpoint_height = *checkpoint_height;
 
+        // Determine if there is a pending committee rotation.
+        // If a waiting_committee exists, its configuration_number is the next one.
+        let subnet_state: crate::db::SubnetState =
+            self.rpc_call("getsubnet", SubnetIdParam { subnet_id })?;
+        let current_cfg = subnet_state.committee.configuration_number;
+        let next_cfg = subnet_state
+            .waiting_committee
+            .as_ref()
+            .map(|wc| wc.configuration_number)
+            .filter(|&wc_cfg| wc_cfg > current_cfg)
+            .unwrap_or(0);
+
+        // Route checkpoint RPCs to a provider whose validator is still in the
+        // committee (the default provider's validator may have left).
+        let committee_validator_name = self.find_committee_validator_name(&subnet_state.committee)?;
+
         let msg = IpcCheckpointSubnetMsg {
             subnet_id,
             checkpoint_hash: random_sha256(),
             checkpoint_height,
-            next_committee_configuration_number: 0,
+            next_committee_configuration_number: next_cfg,
             withdrawals: vec![],
             transfers: vec![],
             token_registrations,
@@ -744,14 +914,15 @@ impl MonitorTester {
             is_kill_checkpoint: false,
         };
 
-        let gen_resp: GenCheckpointPsbtResult = self.rpc_call("dev_gencheckpointpsbt", msg)?;
+        let gen_resp: GenCheckpointPsbtResult =
+            self.rpc_call_as(&committee_validator_name, "dev_gencheckpointpsbt", msg)?;
 
         let sign_params = DevMultisignPsbtParams {
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
-            secret_keys: self.sk_hex_for_subnet(subnet_name),
+            secret_keys: self.sk_hex_for_committee(&subnet_state.committee),
         };
         let sign_resp: DevMultisignPsbtResponse =
-            self.rpc_call("dev_multisignpsbt", sign_params)?;
+            self.rpc_call_as(&committee_validator_name, "dev_multisignpsbt", sign_params)?;
 
         let finalize_params = FinalizeCheckpointLocalParams {
             subnet_id,
@@ -759,7 +930,8 @@ impl MonitorTester {
             signatures: sign_resp.signatures,
             batch_transfer_tx_hex: gen_resp.batch_transfer_tx_hex,
         };
-        let _: serde_json::Value = self.rpc_call("finalizecheckpointpsbt", finalize_params)?;
+        let _: serde_json::Value =
+            self.rpc_call_as(&committee_validator_name, "finalizecheckpointpsbt", finalize_params)?;
 
         info!(
             "Checkpoint #{} for subnet '{}' finalized",
@@ -913,7 +1085,9 @@ fn random_sha256() -> sha256::Hash {
 
 impl Drop for MonitorTester {
     fn drop(&mut self) {
-        kill_pid(self.provider_pid);
+        for &pid in &self.provider_pids {
+            kill_pid(pid);
+        }
         kill_pid(self.monitor_pid);
         // Ask bitcoind to stop gracefully, then force-kill
         let datadir = self.tmpdir.path().to_path_buf();
@@ -987,11 +1161,36 @@ impl Tester for MonitorTester {
             pubkey: v.pubkey,
         };
 
-        let _: serde_json::Value = self.rpc_call("joinsubnet", req)?;
+        let _: serde_json::Value = self.rpc_call_as(validator_name, "joinsubnet", req)?;
 
         info!(
             "Joined validator '{}' to subnet '{}'",
             validator_name, subnet_name
+        );
+        Ok(())
+    }
+
+    fn exec_deposit(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        address_name: &str,
+        amount_sats: u64,
+    ) -> Result<(), EasyTesterError> {
+        let subnet_id = self.resolve_subnet_id(subnet_name)?;
+        let v = self.resolve_validator(address_name)?.clone();
+        let eth_address = eth_addr_from_x_only_pubkey(v.pubkey);
+
+        let msg = crate::ipc_lib::IpcFundSubnetMsg {
+            subnet_id,
+            amount: bitcoin::Amount::from_sat(amount_sats),
+            address: eth_address,
+        };
+        let _: serde_json::Value = self.rpc_call_as(address_name, "fundsubnet", msg)?;
+
+        info!(
+            "Deposited {} sats to '{}' on subnet '{}'",
+            amount_sats, address_name, subnet_name
         );
         Ok(())
     }
@@ -1012,7 +1211,7 @@ impl Tester for MonitorTester {
             pubkey: v.pubkey,
         };
 
-        let _: serde_json::Value = self.rpc_call("stakecollateral", params)?;
+        let _: serde_json::Value = self.rpc_call_as(validator_name, "stakecollateral", params)?;
 
         info!(
             "Staked {} sats for '{}' on subnet '{}'",
@@ -1037,7 +1236,7 @@ impl Tester for MonitorTester {
             pubkey: Some(v.pubkey),
         };
 
-        let _: serde_json::Value = self.rpc_call("unstakecollateral", params)?;
+        let _: serde_json::Value = self.rpc_call_as(validator_name, "unstakecollateral", params)?;
 
         info!(
             "Unstaked {} sats for '{}' from subnet '{}'",
