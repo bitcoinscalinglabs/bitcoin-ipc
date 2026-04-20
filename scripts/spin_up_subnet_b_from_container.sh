@@ -110,6 +110,13 @@ fi
 
 cd "$IPC_DIR"
 
+# Build fendermint Docker image on-demand if it doesn't exist
+if ! docker images --format '{{.Repository}}' | grep -q '^fendermint$'; then
+    echo "Building fendermint Docker image (first time only)..."
+    cd fendermint && make docker-build
+    cd "$IPC_DIR"
+fi
+
 # Define hardcoded ports and auth tokens for each validator
 PORT_1="3030"
 PORT_2="3031"
@@ -218,32 +225,49 @@ run_validator() {
         --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
         --env TOPDOWN_PROPOSAL_DELAY=0 \
         --env FM_PULL_SKIP=1 \
-        child-validator > /dev/null 2>&1
+        --env FM_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
+        child-validator > "/root/.ipc/logs/spin-up-subnet-b-validator-${validator_num}.log" 2>&1
+
+    # Verify containers are actually running (cargo-make can exit 0 despite failures)
+    for svc in fendermint cometbft ethapi; do
+        if ! docker ps --format '{{.Names}}' | grep -q "^validator-${validator_num}-subnet-b-${svc}$"; then
+            echo "Error: validator-${validator_num}-subnet-b-${svc} container not running after cargo-make completed." >&2
+            return 1
+        fi
+    done
     echo "Validator $validator_num started!"
 }
 
-# Start other validators in parallel
-pids=()
-run_validator 2 27756 27757 9645 27755 "$API_URL_2" "$BEARER_TOKEN_2" & pids+=("$!")
-run_validator 3 27856 27857 9745 27855 "$API_URL_3" "$BEARER_TOKEN_3" & pids+=("$!")
-run_validator 4 27956 27957 9845 27955 "$API_URL_4" "$BEARER_TOKEN_4" & pids+=("$!")
-
-for pid in "${pids[@]}"; do
-    wait "$pid"
+# Start other validators sequentially (serialized to avoid a macOS Docker Desktop
+# shared-volume race in cargo-make's `genesis-write` task: a delayed write flush
+# can collide with the subsequent cp, producing "replaced while being copied").
+mkdir -p /root/.ipc/logs
+for args in \
+    "2 27756 27757 9645 27755 $API_URL_2 $BEARER_TOKEN_2" \
+    "3 27856 27857 9745 27855 $API_URL_3 $BEARER_TOKEN_3" \
+    "4 27956 27957 9845 27955 $API_URL_4 $BEARER_TOKEN_4"
+do
+    # shellcheck disable=SC2086
+    set -- $args
+    validator_num=$1
+    if ! run_validator "$@"; then
+        echo "Error: validator $validator_num failed to start. See log: /root/.ipc/logs/spin-up-subnet-b-validator-${validator_num}.log" >&2
+        echo "Aborting." >&2
+        exit 1
+    fi
 done
 
 echo "All validators have been started for subnet $SUBNET_ID!"
 
-# Start relayers for validators 1-4 (logs under /root/logs)
-mkdir -p /root/logs
+# Start relayers for validators 1-4 (logs under /root/.ipc/logs)
+mkdir -p /root/.ipc/logs
 echo "Starting relayers for validators 1-4..."
 for n in 1 2 3 4; do
-    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" >> "/root/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
-    echo "  Relayer for validator${n} started (log: /root/logs/relayer-subnet-b-validator${n}.log)"
+    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" >> "/root/.ipc/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
+    echo "  Relayer for validator${n} started (log: /root/.ipc/logs/relayer-subnet-b-validator${n}.log)"
 done
 
 echo ""
 echo "To save bootstrap information, run the following commands:"
 echo "export CometBftID=$COMETBFT_ID"
 echo "export ResolverAddress=$RESOLVER_ADDR"
-

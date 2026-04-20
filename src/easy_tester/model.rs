@@ -39,17 +39,49 @@ impl SetupSpec {
     }
 }
 
+/// Configuration parsed from the separate config file (not the scenario file).
 #[derive(Debug, Clone)]
 pub enum TesterConfig {
-    RewardTester {
-        activation_height: u64,
-        snapshot_length: u64,
+    Db {
+        activation_height: Option<u64>,
+        snapshot_length: Option<u64>,
+    },
+    Monitor {
+        activation_height: Option<u64>,
+        snapshot_length: Option<u64>,
+        monitor_log_level: Option<String>,
+        provider_log_level: Option<String>,
+    },
+    /// Fendermint tester — subnets come from the config file, issuers from
+    /// the scenario file.
+    Fendermint {
+        setup: FendermintSetup,
     },
 }
 
+// ── Fendermint-specific setup types ────────────────────────────────────
+
 #[derive(Debug, Clone)]
-pub struct TestConfig {
-    pub tester: TesterConfig,
+pub struct FendermintIssuer {
+    pub name: String,
+    pub ipc_address: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FendermintSubnet {
+    pub name: String,
+    pub subnet_id: String,
+    pub eth_rpc_url: String,
+    pub provider_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FendermintSetup {
+    pub docker_container: String,
+    pub issuers: HashMap<String, FendermintIssuer>,
+    pub subnets: HashMap<String, FendermintSubnet>,
+    pub subnet_order: Vec<String>,
+    pub print_queries: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +93,11 @@ pub enum OutputDb {
     Committee,
     RewardCandidates,
     RewardResults,
+    RootnetMsgs,
+    /// Read token balance: `read token_balance <subnet> <token_name>`
+    TokenBalance,
+    /// FendermintTester only: `read token_metadata <subnet> <token_name>`
+    TokenMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -89,33 +126,107 @@ pub enum ScenarioCommand {
     Checkpoint {
         subnet_name: String,
     },
+    /// Register an ERC20 token on a subnet (queues ETR for next checkpoint).
+    /// `issuer` is only set for FendermintTester scenarios.
+    RegisterToken {
+        subnet_name: String,
+        issuer: Option<String>,
+        name: String,
+        symbol: String,
+        initial_supply: alloy_primitives::U256,
+    },
+    /// Queue a mint supply adjustment (queues ETS for next checkpoint)
+    MintToken {
+        subnet_name: String,
+        token_name: String,
+        amount: alloy_primitives::U256,
+    },
+    /// Queue a burn supply adjustment (queues ETS for next checkpoint)
+    BurnToken {
+        subnet_name: String,
+        token_name: String,
+        amount: alloy_primitives::U256,
+    },
+    /// Pause execution for a fixed duration.
+    Wait {
+        seconds: u64,
+    },
+    /// Deposit native tokens (BTC) into a subnet for a given address.
+    Deposit {
+        subnet_name: String,
+        address_name: String,
+        amount_sats: u64,
+    },
+    /// Queue an ERC20 cross-subnet transfer (queues ETX for next checkpoint).
+    /// Db/MonitorTester: 4-arg form (no actors).
+    /// FendermintTester: 6-arg form with `src_actor` and `dst_actor`.
+    ErcTransfer {
+        src_subnet: String,
+        src_actor: Option<String>,
+        dst_subnet: String,
+        dst_actor: Option<String>,
+        token_name: String,
+        amount: alloy_primitives::U256,
+    },
     OutputRead {
         db: OutputDb,
         args: Vec<String>,
     },
     OutputExpect {
         target: OutputExpectTarget,
-        expected_sats: u64,
+        /// The expected value as a raw string. Testers parse as u64 or compare as string.
+        expected_value: String,
     },
 }
 
+/// Generic expect target — always starts with `result.`.
+/// The tester interprets the path based on what was last read.
+/// Examples:
+///   result.count = 3
+///   result.0.kind = 2
+///   result.0.tokenDecimals = 18
+///   result.rewards_list.validator1 = 100_000_000
+///   result.total_rewarded_collateral = 1_000_000_000
 #[derive(Debug, Clone)]
-pub enum OutputExpectTarget {
-    RewardResultsRewardsList { key: String },
-    RewardResultsTotalRewardedCollateral,
+pub struct OutputExpectTarget {
+    /// The dotted path after "result." (e.g. "count", "0.kind", "rewards_list.validator1")
+    pub path: String,
+    /// Line number in the scenario file where this expect command appears.
+    pub line_no: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedTest {
-    pub config: TestConfig,
     pub setup: SetupSpec,
-    pub scenario: Vec<ScenarioCommand>,
+    pub scenario: Vec<(usize, ScenarioCommand)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFendermintTest {
+    pub setup: FendermintSetup,
+    pub scenario: Vec<(usize, ScenarioCommand)>,
+}
+
+/// Strip underscores from a token that is entirely digits and underscores
+/// (e.g. `1_000_000` → `"1000000"`). Strings with non-digit characters
+/// (e.g. `erc_registration`, `subnet_a`) are returned unchanged.
+pub fn normalize_numeric_literal(s: &str) -> String {
+    if s.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        s.chars().filter(|c| *c != '_').collect()
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn parse_u64_allow_underscores(s: &str) -> Result<u64, String> {
-    let normalized: String = s.chars().filter(|c| *c != '_').collect();
-    normalized
+    normalize_numeric_literal(s)
         .parse::<u64>()
+        .map_err(|e| format!("invalid number '{s}': {e}"))
+}
+
+pub fn parse_u256_allow_underscores(s: &str) -> Result<alloy_primitives::U256, String> {
+    normalize_numeric_literal(s)
+        .parse::<alloy_primitives::U256>()
         .map_err(|e| format!("invalid number '{s}': {e}"))
 }
 

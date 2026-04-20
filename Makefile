@@ -3,36 +3,41 @@
 
 COMPOSE_FILE := docker-compose.local.yml
 
-.PHONY: local-ipc-build local-build local-up local-down local-reset-fendermint local-reset-data
+.PHONY: local-build local-up local-down local-reset-fendermint local-reset-fendermint-deps local-reset-ipc-cli local-delete-data
 
-# Build the IPC builder image
-# Run once, or when the IPC repo / Dockerfile.ipc changes.
-local-ipc-build:
-	docker build -f docker-deploy-local/Dockerfile.ipc -t ipc-builder:latest .
-
-# Build the bitcoin-ipc image (not the ipc repo).
+# Build the bitcoin-ipc image (both bitcoin-ipc and ipc-cli stages built in parallel).
 local-build:
 	docker compose -f $(COMPOSE_FILE) build
 
-# Start the container. Builds ipc-builder if missing.
+# Start the container.
 local-up:
-	@if ! docker image inspect ipc-builder:latest >/dev/null 2>&1; then $(MAKE) local-ipc-build; fi
 	docker compose -f $(COMPOSE_FILE) up
 
 # Stop and remove the container.
 local-down:
 	docker compose -f $(COMPOSE_FILE) down
 
-# Delete the local fendermint Docker image and pull the latest IPC repo inside the
-# bitcoin-ipc container. The next subnet spin-up will rebuild fendermint from the new code.
+# Delete the fendermint Docker image and clear the contracts cache.
+# Fendermint will be rebuilt from mounted ../ipc when a spin-up script runs.
 local-reset-fendermint:
-	docker exec bitcoin-ipc git -C /workspace/ipc pull
+	docker exec bitcoin-ipc rm -f /workspace/ipc/fendermint/.contracts-gen
 	docker rmi fendermint:latest || true
-	@echo "Fendermint image removed and workspace/ipc updated."
+	@echo "Fendermint image removed and contracts cache cleared."
 
-# Reset the local data (Bitcoin chain, IPC config, etc.).
-# Run 'make docker-up' to start fresh.
-local-reset-data:
+# Rebuild fendermint deps cache (run after Cargo.lock changes in ../ipc).
+local-reset-fendermint-deps:
+	docker rmi fendermint-deps:latest || true
+	@echo "Fendermint deps cache removed. Will be rebuilt on next fendermint build."
+
+# Rebuild ipc-cli from the mounted ../ipc source inside the running container.
+# Will not work if relayers are running, because they are using the ipc-cli binary.
+local-reset-ipc-cli:
+	docker exec bitcoin-ipc bash -c \
+		"cd /workspace/ipc && cd contracts && ln -sf contracts src && make gen && cd /workspace/ipc && cargo build --release -p ipc-cli && cp target/release/ipc-cli /usr/local/bin/"
+	@echo "ipc-cli rebuilt and installed."
+
+# Reset all local data (Bitcoin chain, IPC config, etc.).
+local-delete-data:
 	docker compose -f $(COMPOSE_FILE) down -v
 	rm -rf $(HOME)/.ipc
 	@echo "Data reset complete."

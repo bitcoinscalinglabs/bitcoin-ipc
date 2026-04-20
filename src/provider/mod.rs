@@ -1,4 +1,4 @@
-mod rpc;
+pub mod rpc;
 mod server;
 
 pub use rpc::ServerData;

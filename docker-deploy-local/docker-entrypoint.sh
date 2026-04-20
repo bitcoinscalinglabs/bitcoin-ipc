@@ -76,8 +76,8 @@ fi
 # Entities we run monitors/providers for
 ids="validator1 validator2 validator3 validator4 validator5 validator6 user1 user2"
 
-# Start miner + monitors + providers (background, logs under /root/logs)
-mkdir -p /root/logs
+# Start miner + monitors + providers (background, logs under /root/.ipc/logs)
+mkdir -p /root/.ipc/logs
 miner_pid=""
 monitor_pids=()
 monitor_ids=()
@@ -86,20 +86,20 @@ provider_ids=()
 
 # 0) Start miner
 echo "Starting miner..."
-bash /workspace/bitcoin-ipc/scripts/miner.sh >> "/root/logs/miner.log" 2>&1 &
+bash /workspace/bitcoin-ipc/scripts/miner.sh >> "/root/.ipc/logs/miner.log" 2>&1 &
 miner_pid=$!
 
 # Wait 2s, then check miner
 sleep 2
 if ! kill -0 "$miner_pid" 2>/dev/null; then
     echo "Error: miner did not start. Log:" >&2
-    [ -f "/root/logs/miner.log" ] && cat "/root/logs/miner.log" >&2
+    [ -f "/root/.ipc/logs/miner.log" ] && cat "/root/.ipc/logs/miner.log" >&2
 fi
 
 # 1) Start all monitors
 for id in $ids; do
     echo "Starting monitor for ${id}..."
-    monitor --env "/root/.ipc/${id}/.env" >> "/root/logs/monitor-${id}.log" 2>&1 &
+    monitor --env "/root/.ipc/${id}/.env" >> "/root/.ipc/logs/monitor-${id}.log" 2>&1 &
     monitor_pids+=($!)
     monitor_ids+=("$id")
 done
@@ -111,7 +111,7 @@ i=0
 for id in "${monitor_ids[@]}"; do
     if ! kill -0 "${monitor_pids[$i]}" 2>/dev/null; then
         echo "Error: monitor for ${id} did not start. Log:" >&2
-        [ -f "/root/logs/monitor-${id}.log" ] && cat "/root/logs/monitor-${id}.log" >&2
+        [ -f "/root/.ipc/logs/monitor-${id}.log" ] && cat "/root/.ipc/logs/monitor-${id}.log" >&2
     fi
     i=$((i + 1))
 done
@@ -119,7 +119,7 @@ done
 # 2) Start all providers
 for id in $ids; do
     echo "Starting provider for ${id}..."
-    provider --env "/root/.ipc/${id}/.env" >> "/root/logs/provider-${id}.log" 2>&1 &
+    provider --env "/root/.ipc/${id}/.env" >> "/root/.ipc/logs/provider-${id}.log" 2>&1 &
     provider_pids+=($!)
     provider_ids+=("$id")
 done
@@ -131,7 +131,7 @@ i=0
 for id in "${provider_ids[@]}"; do
     if ! kill -0 "${provider_pids[$i]}" 2>/dev/null; then
         echo "Error: provider for ${id} did not start. Log:" >&2
-        [ -f "/root/logs/provider-${id}.log" ] && cat "/root/logs/provider-${id}.log" >&2
+        [ -f "/root/.ipc/logs/provider-${id}.log" ] && cat "/root/.ipc/logs/provider-${id}.log" >&2
     fi
     i=$((i + 1))
 done

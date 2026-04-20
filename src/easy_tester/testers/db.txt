@@ -1,0 +1,3 @@
+tester db
+activation_height 101
+snapshot_length 10

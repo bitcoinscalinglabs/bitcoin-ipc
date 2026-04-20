@@ -1,0 +1,185 @@
+# Test ERC20 token registration, mint, and burn
+#
+# Scenario tests:
+# 1. Registration seeds S_home balance with initialSupply
+# 2. Mint increases S_home balance
+# 3. Burn decreases S_home balance
+# 4. Multi-token isolation: mint/burn on TokenB does not affect TokenA
+setup
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+
+
+scenario
+
+block 102
+create subnet1
+create subnet2
+
+block 103
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+
+join subnet2 validator1 100_000_000
+join subnet2 validator2 100_000_000
+join subnet2 validator3 100_000_000
+join subnet2 validator4 100_000_000
+
+# ──────────────────────────────────────────────────
+# Test 1: Registration seeds home balance with initialSupply
+# TokenA registered on subnet1, TokenB registered on subnet2
+# ──────────────────────────────────────────────────
+
+block 105
+register_token subnet1 TokenA TKA 1_000_000
+checkpoint subnet1
+
+block 106
+register_token subnet2 TokenB TKB 500_000
+checkpoint subnet2
+
+block 107
+# TokenA: subnet1 (home) = initialSupply, subnet2 = 0
+read token_balance subnet1 TokenA
+expect result.balance = 1_000_000
+read token_balance subnet2 TokenA
+expect result.balance = 0
+
+# TokenB: subnet2 (home) = initialSupply, subnet1 = 0
+read token_balance subnet2 TokenB
+expect result.balance = 500_000
+read token_balance subnet1 TokenB
+expect result.balance = 0
+
+# ──────────────────────────────────────────────────
+# Test 2: Mint increases S_home balance
+# ──────────────────────────────────────────────────
+
+mint_token subnet1 TokenA 300_000
+checkpoint subnet1
+
+block 109
+
+# subnet1 TokenA: 1_000_000 + 300_000 = 1_300_000
+read token_balance subnet1 TokenA
+expect result.balance = 1_300_000
+
+# TokenB unaffected by TokenA mint
+read token_balance subnet2 TokenB
+expect result.balance = 500_000
+
+# ──────────────────────────────────────────────────
+# Test 3: Burn decreases S_home balance
+# ──────────────────────────────────────────────────
+
+burn_token subnet1 TokenA 200_000
+checkpoint subnet1
+
+block 110
+
+# subnet1 TokenA: 1_300_000 - 200_000 = 1_100_000
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+# TokenB still unaffected
+read token_balance subnet2 TokenB
+expect result.balance = 500_000
+
+# ──────────────────────────────────────────────────
+# Test 4: Multi-token isolation
+# Mint and burn on TokenB do not affect TokenA
+# ──────────────────────────────────────────────────
+
+mint_token subnet2 TokenB 200_000
+checkpoint subnet2
+
+block 112
+
+# subnet2 TokenB: 500_000 + 200_000 = 700_000
+read token_balance subnet2 TokenB
+expect result.balance = 700_000
+
+# TokenA unaffected by TokenB mint
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+burn_token subnet2 TokenB 100_000
+checkpoint subnet2
+
+block 113
+
+# subnet2 TokenB: 700_000 - 100_000 = 600_000
+read token_balance subnet2 TokenB
+expect result.balance = 600_000
+
+# TokenA still unaffected
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+# ──────────────────────────────────────────────────
+# Test 5: Edge cases
+# ──────────────────────────────────────────────────
+
+mint_token subnet2 TokenB 0
+checkpoint subnet2
+
+block 114
+
+# Zero mint is a no-op
+read token_balance subnet2 TokenB
+expect result.balance = 600_000
+
+# Mint I256::MAX (2^255 - 1) to push TokenA to a 256-bit balance
+# I256::MAX = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+# I256::MAX fits within U256, so the monitor handles it without overflowing
+mint_token subnet1 TokenA 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet1
+
+block 115
+
+# 1_100_000 + I256::MAX
+read token_balance subnet1 TokenA
+expect result.balance = 57896044618658097711785492504343953926634992332820282019728792003956565919967
+
+# Burn back I256::MAX to restore
+burn_token subnet1 TokenA 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet1
+
+block 116
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+# ──────────────────────────────────────────────────
+# Test 6: Zero-amount mint and burn
+# The monitor skips zero-delta supply adjustments; balance is unchanged.
+# ──────────────────────────────────────────────────
+
+mint_token subnet1 TokenA 0
+checkpoint subnet1
+
+block 117
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000
+
+burn_token subnet1 TokenA 0
+checkpoint subnet1
+
+block 118
+
+read token_balance subnet1 TokenA
+expect result.balance = 1_100_000

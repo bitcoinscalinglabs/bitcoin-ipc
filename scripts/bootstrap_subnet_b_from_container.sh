@@ -32,6 +32,7 @@ FUND1=210000000
 FUND2=220000000
 FUND3=230000000
 FUND4=240000000
+FUND_USER=200000000
 
 rpc_post_raw_or_die() {
   local label="$1"
@@ -76,7 +77,7 @@ CREATE_PAYLOAD=$(cat <<'JSON'
   "params": {
     "min_validator_stake": 100000000,
     "min_validators": 4,
-    "bottomup_check_period": 60,
+    "bottomup_check_period": 30,
     "active_validators_limit": 10,
     "min_cross_msg_fee": 10,
     "whitelist": [
@@ -245,6 +246,10 @@ echo "Calling fund_subnet for validator3..."
 fund_subnet "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$SUBNET_ID" "0x646Aed5404567ae15648E9b9B0004cbAfb126949" "$FUND3"
 echo "Calling fund_subnet for validator4..."
 fund_subnet "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$SUBNET_ID" "0xbce2f194e9628e6ae06fa0d85dd57cd5579213bf" "$FUND4"
+echo "Calling fund_subnet for user1..."
+fund_subnet "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$SUBNET_ID" "0x005e05dd763dd125473f8889726f7c305e50fcae" "$FUND_USER"
+echo "Calling fund_subnet for user2..."
+fund_subnet "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$SUBNET_ID" "0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d" "$FUND_USER"
 
 # 6. Mine one more blocks
 bitcoin-cli generatetoaddress 1 "$(bitcoin-cli -rpcwallet=default getnewaddress)" > /dev/null

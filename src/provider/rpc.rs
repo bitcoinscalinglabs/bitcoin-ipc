@@ -2,9 +2,9 @@ use crate::{
     bitcoin_utils,
     db::{self, DatabaseCore, StakingChange},
     ipc_lib::{
-        self, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcFundSubnetMsg, IpcJoinSubnetMsg,
-        IpcKillSubnetMsg, IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg,
-        IpcValidate, SubnetId,
+        self, validate_erc_batch_data, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg,
+        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcKillSubnetMsg, IpcPrefundSubnetMsg,
+        IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, wallet, NETWORK,
 };
@@ -126,7 +126,7 @@ pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSubnetResponse {
-    subnet_id: SubnetId,
+    pub subnet_id: SubnetId,
 }
 
 pub async fn create_subnet(
@@ -151,7 +151,7 @@ pub async fn create_subnet(
 /// Request struct for the join_subnet RPC endpoint.
 /// Separate from `IpcJoinSubnetMsg` because collateral is provided in the JSON request
 /// but skipped in postcard serialization (it's derived from the transaction output).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JoinSubnetRequest {
     pub subnet_id: SubnetId,
     #[serde(with = "bitcoin::amount::serde::as_sat")]
@@ -225,7 +225,7 @@ pub async fn join_subnet(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetGenesisInfoParams {
-    subnet_id: SubnetId,
+    pub subnet_id: SubnetId,
 }
 
 pub async fn get_genesis_info(
@@ -251,7 +251,7 @@ pub async fn get_genesis_info(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetSubnetParams {
-    subnet_id: SubnetId,
+    pub subnet_id: SubnetId,
 }
 
 pub async fn get_subnet(
@@ -358,8 +358,8 @@ pub async fn fund_subnet(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetRootnetMessagesParams {
-    subnet_id: SubnetId,
-    block_height: u64,
+    pub subnet_id: SubnetId,
+    pub block_height: u64,
 }
 
 pub async fn get_rootnet_messages(
@@ -389,6 +389,45 @@ pub async fn get_rootnet_messages(
             error!("Error getting rootnet messages from Db: {}", e);
             RpcError::DbError(e).into()
         })
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetTokenBalanceParams {
+    pub home_subnet_id: SubnetId,
+    pub home_token_address: alloy_primitives::Address,
+    pub subnet_id: SubnetId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetTokenBalanceResponse {
+    /// Balance as a decimal string (U256 may exceed u64).
+    pub balance: String,
+}
+
+pub async fn get_token_balance(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetTokenBalanceParams>,
+) -> Result<GetTokenBalanceResponse, JsonRpcError> {
+    info!(
+        "gettokenbalance: home_subnet={} token={} subnet={}",
+        params.home_subnet_id, params.home_token_address, params.subnet_id
+    );
+
+    let balance = data
+        .db
+        .get_token_balance(
+            params.home_subnet_id,
+            params.home_token_address,
+            params.subnet_id,
+        )
+        .map_err(|e| {
+            error!("Error getting token balance from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+
+    Ok(GetTokenBalanceResponse {
+        balance: balance.to_string(),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -955,6 +994,15 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
+    validate_erc_batch_data(
+        msg.subnet_id,
+        &msg.token_registrations,
+        &msg.token_supply_adjustments,
+        &msg.token_transfers,
+        &*data.db,
+    )
+    .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+
     let unsigned_psbt = msg
         .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
         .map_err(|e| {
@@ -1018,16 +1066,183 @@ pub async fn gen_checkpoint_psbt(
     })
 }
 
+/// Identical to `gen_checkpoint_psbt` but skips the token-transfer balance
+/// check.  Only available with the `dev` feature.  Used by the monitor tester
+/// to inject malicious checkpoints that exceed subnet balances so we can verify
+/// the monitor enforces the firewall on its side.
+#[cfg(feature = "dev")]
+pub async fn dev_gen_checkpoint_psbt(
+    data: Data<Arc<ServerData>>,
+    Params(mut msg): Params<IpcCheckpointSubnetMsg>,
+) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
+    info!("dev_gen_checkpoint_psbt (no balance check): {:?}", msg);
+
+    let (validator_xonly_pubkey, validator_sk) = match data.validator {
+        Some(validator) => validator,
+        None => {
+            error!("No validator keypair configured.");
+            return Err(
+                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
+            );
+        }
+    };
+
+    if let Err(err) = msg.validate() {
+        error!("Invalid checkpoint message={msg:?}: {err}");
+        return Err(RpcError::InvalidParams(err.to_string()).into());
+    }
+
+    if msg.change_address.is_some() {
+        return Err(
+            RpcError::InvalidParams("Specifying change address not supported".to_string()).into(),
+        );
+    }
+
+    if !msg.unstakes.len().is_zero() {
+        return Err(
+            RpcError::InvalidParams("Specifying unstakes not supported".to_string()).into(),
+        );
+    }
+
+    let subnet = data
+        .db
+        .get_subnet_state(msg.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet info from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    if !subnet.is_validator(&validator_xonly_pubkey) {
+        error!("Configured validator isn't a validator in the specified subnet.");
+        return Err(RpcError::InvalidParams(
+            "Configured validator isn't a validator in the specified subnet.".to_string(),
+        )
+        .into());
+    }
+
+    if subnet.is_killed() {
+        error!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        );
+        return Err(RpcError::InvalidParams(format!(
+            "Subnet {} is killed, cannot generate checkpoint.",
+            msg.subnet_id
+        ))
+        .into());
+    }
+
+    msg.update_subnets_for_transfer(&*data.db).map_err(|e| {
+        error!("Error updating subnets for transfer: {}", e);
+        RpcError::InvalidParams(e.to_string())
+    })?;
+
+    let unspent = subnet
+        .committee
+        .get_unspent(&data.btc_watchonly_rpc)
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
+
+    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
+
+    // Look up the actual next committee when a rotation is requested,
+    // so the checkpoint exhausts the old committee's UTXOs and sends
+    // change to the new committee's multisig address.
+    let current_cfg = subnet.committee.configuration_number;
+    let next_committee = if msg.next_committee_configuration_number > current_cfg {
+        data.db
+            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
+            .map_err(|e| {
+                error!("Error getting stake change from Db: {}", e);
+                RpcError::DbError(e)
+            })?
+            .ok_or(RpcError::InvalidParams(format!(
+                "Stake change with configuration number {} not found.",
+                msg.next_committee_configuration_number
+            )))?
+            .committee_after_change
+    } else {
+        subnet.committee.clone()
+    };
+
+    // balance check intentionally omitted
+
+    let unsigned_psbt = msg
+        .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
+        .map_err(|e| {
+            error!(
+                "Error generating checkpoint psbt for subnet_id={}: {}",
+                &msg.subnet_id, e
+            );
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    let checkpoint_txid = unsigned_psbt.unsigned_tx.compute_txid();
+
+    let batch_transfer_tx = msg
+        .make_reveal_batch_transfer_tx(
+            checkpoint_txid,
+            fee_rate,
+            &subnet.committee.address_checked(),
+        )
+        .map_err(|e| {
+            error!(
+                "Error generating batch transfer tx for subnet_id={}: {}",
+                &msg.subnet_id, e
+            );
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    trace!(
+        "checkpoint_txid={} batch_transfer_txid={:?}",
+        checkpoint_txid,
+        batch_transfer_tx.clone().map(|tx| tx.compute_txid()),
+    );
+
+    let batch_transfer_tx_hex =
+        batch_transfer_tx.map(|tx| bitcoin::consensus::encode::serialize_hex(&tx));
+
+    let validator_keypair = validator_sk.keypair(&secp);
+
+    let (_, psbt_inputs_signatures) =
+        multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
+            |e| {
+                error!(
+                    "Error signing multisig spend psbt for subnet_id={}: {}",
+                    &msg.subnet_id, e
+                );
+                RpcError::InternalError(e.to_string())
+            },
+        )?;
+
+    let unsigned_psbt_bytes = unsigned_psbt.serialize();
+    let unsigned_psbt_hash = bitcoin::hashes::sha256::Hash::hash(&unsigned_psbt_bytes);
+    let unsigned_psbt_base64 = BASE64_STANDARD.encode(unsigned_psbt_bytes);
+
+    Ok(GenCheckpointPsbtResponse {
+        unsigned_psbt_base64,
+        unsigned_psbt_hash,
+        psbt_inputs_signatures,
+        unsigned_psbt,
+        batch_transfer_tx_hex,
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct DevMultisignPsbtParams {
-    unsigned_psbt_base64: String,
-    secret_keys: Vec<String>,
+    pub unsigned_psbt_base64: String,
+    pub secret_keys: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct DevMultisignPsbtResponse {
     // Include signatures for each input, mapped by pubkey
-    signatures: Vec<(
+    pub signatures: Vec<(
         bitcoin::XOnlyPublicKey,
         Vec<bitcoin::secp256k1::schnorr::Signature>,
     )>,
@@ -1532,8 +1747,8 @@ pub async fn unstake_collateral(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetStakeChangesParams {
-    subnet_id: SubnetId,
-    block_height: u64,
+    pub subnet_id: SubnetId,
+    pub block_height: u64,
 }
 
 pub async fn get_stake_changes(
@@ -1663,7 +1878,7 @@ pub async fn kill_subnet(
 
 #[derive(Serialize, Deserialize)]
 pub struct GetKillRequestsParams {
-    subnet_id: SubnetId,
+    pub subnet_id: SubnetId,
 }
 
 pub async fn get_kill_requests(
@@ -1882,6 +2097,8 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("killsubnet", kill_subnet)
         // rootnet messages
         .with_method("getrootnetmessages", get_rootnet_messages)
+        // token balance
+        .with_method("gettokenbalance", get_token_balance)
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
         .with_method("genbootstraphandover", gen_bootstrap_handover)
@@ -1904,7 +2121,8 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     // dev methods
     let server = server
         .with_method("dev_multisignpsbt", dev_multisign_psbt)
-        .with_method("dev_killsubnet", dev_kill_subnet);
+        .with_method("dev_killsubnet", dev_kill_subnet)
+        .with_method("dev_gencheckpointpsbt", dev_gen_checkpoint_psbt);
 
     server.finish()
 }

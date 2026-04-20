@@ -68,6 +68,131 @@ const _: () = {
     assert!(IPC_KILL_SUBNET_TAG.len() == IPC_TAG_LENGTH);
 };
 
+use alloy_primitives::{I256, U256};
+
+/// Compact length-prefixed encoding for U256 and I256, usable as `#[serde(with = "...")]`.
+///
+/// Wire format for unsigned (compact_amount::u256):
+///   [1-byte length N][N bytes big-endian value, no leading zeros]
+///
+/// Wire format for signed (compact_amount::i256):
+///   [1-byte header: high bit = sign, low 7 bits = N][N bytes big-endian absolute value]
+mod compact_amount {
+    use alloy_primitives::{Sign, I256, U256};
+    use serde::{de, Deserializer, Serializer};
+
+    fn encode_magnitude(abs: U256) -> Vec<u8> {
+        let bytes = abs.to_be_bytes::<32>();
+        let leading = bytes.iter().take_while(|&&b| b == 0).count();
+        let payload = &bytes[leading..];
+        let mut buf = Vec::with_capacity(1 + payload.len());
+        buf.push(payload.len() as u8);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    fn decode_magnitude<E: de::Error>(v: &[u8]) -> Result<U256, E> {
+        if v.is_empty() {
+            return Err(E::custom("empty compact amount"));
+        }
+        let n = (v[0] & 0x7F) as usize; // low 7 bits = length; high bit reserved for i256 sign
+        if n > 32 {
+            return Err(E::custom("compact amount length > 32"));
+        }
+        if v.len() != 1 + n {
+            return Err(E::custom("compact amount length mismatch"));
+        }
+        let mut be = [0u8; 32];
+        if n > 0 {
+            be[32 - n..].copy_from_slice(&v[1..]);
+        }
+        Ok(U256::from_be_bytes(be))
+    }
+
+    pub mod u256 {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
+            if s.is_human_readable() {
+                serde::Serialize::serialize(v, s)
+            } else {
+                s.serialize_bytes(&encode_magnitude(*v))
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<U256, D::Error> {
+            if d.is_human_readable() {
+                return serde::Deserialize::deserialize(d);
+            }
+            struct V;
+            impl<'de> de::Visitor<'de> for V {
+                type Value = U256;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "compact U256")
+                }
+                fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<U256, E> {
+                    decode_magnitude(v)
+                }
+            }
+            d.deserialize_bytes(V)
+        }
+    }
+
+    pub mod i256 {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &I256, s: S) -> Result<S::Ok, S::Error> {
+            if s.is_human_readable() {
+                return s.collect_str(v);
+            }
+            let (sign, abs) = v.into_sign_and_abs();
+            let mut buf = encode_magnitude(abs);
+            if sign == Sign::Negative {
+                buf[0] |= 0x80;
+            }
+            s.serialize_bytes(&buf)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<I256, D::Error> {
+            if d.is_human_readable() {
+                struct StrV;
+                impl de::Visitor<'_> for StrV {
+                    type Value = I256;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(f, "decimal string for I256")
+                    }
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<I256, E> {
+                        v.parse().map_err(de::Error::custom)
+                    }
+                }
+                return d.deserialize_str(StrV);
+            }
+            struct V;
+            impl<'de> de::Visitor<'de> for V {
+                type Value = I256;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "compact I256")
+                }
+                fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<I256, E> {
+                    if v.is_empty() {
+                        return Err(E::custom("empty compact I256"));
+                    }
+                    let negative = (v[0] & 0x80) != 0;
+                    let abs = decode_magnitude(v)?;
+                    let sign = if negative {
+                        Sign::Negative
+                    } else {
+                        Sign::Positive
+                    };
+                    I256::checked_from_sign_and_abs(sign, abs)
+                        .ok_or_else(|| E::custom("I256 overflow (negative zero)"))
+                }
+            }
+            d.deserialize_bytes(V)
+        }
+    }
+}
+
 // Define the IPC tags enum
 #[derive(Debug, PartialEq)]
 pub enum IpcTag {
@@ -1264,6 +1389,81 @@ pub struct IpcCrossSubnetTransfer {
     pub subnet_user_address: alloy_primitives::Address,
 }
 
+/// ERC20 token registration metadata (IPC:ETR).
+/// Does not include home_subnet — that is tracked separately (e.g. as the DB key,
+/// or derived from the checkpoint's OP_RETURN subnet ID).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcErcTokenRegistration {
+    /// The token contract address on the home subnet
+    pub home_token_address: alloy_primitives::Address,
+    /// ERC20 name
+    pub name: String,
+    /// ERC20 symbol
+    pub symbol: String,
+    /// ERC20 decimals
+    pub decimals: u8,
+    /// T.totalSupply() at registration time.
+    /// Seeds the balance ledger for S_home.
+    #[serde(default, with = "compact_amount::u256")]
+    pub initial_supply: U256,
+}
+
+/// ERC20 supply adjustment (IPC:ETS — ERC Token Supply).
+/// Encodes a mint (positive delta) or burn (negative delta) event on S_home.
+/// The monitor accepts EMS records only from the token's home subnet.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcErcSupplyAdjustment {
+    /// The token contract address on the home subnet
+    pub home_token_address: alloy_primitives::Address,
+    /// Supply change. Positive = mint, negative = burn.
+    #[serde(with = "compact_amount::i256")]
+    pub delta: I256,
+}
+
+/// ERC20 cross-subnet transfer (IPC:ETX).
+/// In the wire format (BatchTransferWireData), destination_subnet_id is the HashMap key
+/// and is NOT repeated in each record — reconstructed on deserialization.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpcCrossSubnetErcTransfer {
+    /// The home subnet where the token originates
+    pub home_subnet_id: SubnetId,
+    /// The token contract address on the home subnet
+    pub home_token_address: alloy_primitives::Address,
+    /// Transfer amount
+    pub amount: U256,
+    /// The destination subnet for this transfer
+    pub destination_subnet_id: SubnetId,
+    /// The recipient address on the destination subnet
+    pub recipient: alloy_primitives::Address,
+}
+
+/// Wire-only inner type for ERC transfers, grouped by destination_subnet_id.
+/// destination_subnet_id is the HashMap key — not repeated in each record.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct IpcCrossSubnetErcTransferWire {
+    home_subnet_id: SubnetId,
+    home_token_address: alloy_primitives::Address,
+    #[serde(with = "compact_amount::u256")]
+    amount: U256,
+    recipient: alloy_primitives::Address,
+}
+
+/// Wire format for the batch transfer witness blob.
+/// Record ordering: transfers, token_registrations, supply_adjustments, erc_transfers.
+/// (ETR before ETS before ETX — guarantees metadata and supply are available before transfers.)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct BatchTransferWireData {
+    /// Native BTC transfers grouped by destination subnet
+    transfers: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>>,
+    /// ERC20 token registrations (IPC:ETR)
+    token_registrations: Vec<IpcErcTokenRegistration>,
+    /// ERC20 supply adjustments (IPC:ETS) — mint/burn on S_home
+    #[serde(default)]
+    token_supply_adjustments: Vec<IpcErcSupplyAdjustment>,
+    /// ERC20 cross-subnet transfers grouped by destination subnet (IPC:ETX)
+    token_transfers: HashMap<Txid20, Vec<IpcCrossSubnetErcTransferWire>>,
+}
+
 /// Checkpoint message for a subnet
 /// Note: currently the maximum number of withdrawals and transfers is 255 each
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1282,6 +1482,15 @@ pub struct IpcCheckpointSubnetMsg {
     /// Cross-subnet transfers
     #[serde(default)]
     pub transfers: Vec<IpcCrossSubnetTransfer>,
+    /// ERC20 token registrations (IPC:ETR)
+    #[serde(default)]
+    pub token_registrations: Vec<IpcErcTokenRegistration>,
+    /// ERC20 supply adjustments (IPC:ETS) — mint/burn on S_home
+    #[serde(default)]
+    pub token_supply_adjustments: Vec<IpcErcSupplyAdjustment>,
+    /// ERC20 cross-subnet transfers (IPC:ETX)
+    #[serde(default)]
+    pub token_transfers: Vec<IpcCrossSubnetErcTransfer>,
     /// Unstakes for validators leaving the subnet
     #[serde(default, skip_deserializing)]
     pub unstakes: Vec<IpcUnstake>,
@@ -1386,6 +1595,10 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
             )));
         }
 
+        // ERC fields (token_registrations, token_supply_adjustments, token_transfers)
+        // are validated in IpcBatchTransferMsg::validate(), which is the message that
+        // actually carries them on Bitcoin (the batch transfer reveal tx, not the checkpoint tx).
+
         // Check if the change address is valid
         if let Some(change_address) = &self.change_address {
             if !change_address.is_valid_for_network(NETWORK) {
@@ -1459,8 +1672,7 @@ impl IpcCheckpointSubnetMsg {
         op_return_data[Self::MARKERS_OFFSET] = self.withdrawals.len().min(255) as u8; // Withdrawal count
         op_return_data[Self::MARKERS_OFFSET + 1] = self.transfers.len().min(255) as u8; // Transfer count
         op_return_data[Self::MARKERS_OFFSET + 2] = self.unstakes.len().min(255) as u8; // Unstake count
-
-        // Add committee configuration number
+                                                                                       // Add committee configuration number
         op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::KILLED_OFFSET]
             .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
@@ -1523,28 +1735,50 @@ impl IpcCheckpointSubnetMsg {
     }
 
     fn make_batched_transfer_data(&self) -> Result<Vec<u8>, IpcLibError> {
-        // Group transfers by destination subnet_id
+        // Group native transfers by destination subnet_id
         let mut transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
             HashMap::new();
-
         for transfer in &self.transfers {
             let key = transfer.destination_subnet_id.txid20();
-            let entry = transfers_by_subnet.entry(key).or_default();
-
-            entry.push((transfer.subnet_user_address, transfer.amount));
+            transfers_by_subnet
+                .entry(key)
+                .or_default()
+                .push((transfer.subnet_user_address, transfer.amount));
         }
 
-        let transfers_binary = postcard::to_stdvec(&transfers_by_subnet).map_err(|e| {
+        // Group ERC transfers by destination subnet_id
+        let mut erc_by_subnet: HashMap<Txid20, Vec<IpcCrossSubnetErcTransferWire>> = HashMap::new();
+        for etx in &self.token_transfers {
+            let wire = IpcCrossSubnetErcTransferWire {
+                home_subnet_id: etx.home_subnet_id,
+                home_token_address: etx.home_token_address,
+                amount: etx.amount,
+                recipient: etx.recipient,
+            };
+            erc_by_subnet
+                .entry(etx.destination_subnet_id.txid20())
+                .or_default()
+                .push(wire);
+        }
+
+        let wire_data = BatchTransferWireData {
+            transfers: transfers_by_subnet,
+            token_registrations: self.token_registrations.clone(),
+            token_supply_adjustments: self.token_supply_adjustments.clone(),
+            token_transfers: erc_by_subnet,
+        };
+
+        let binary: Vec<u8> = postcard::to_stdvec(&wire_data).map_err(|e| {
             IpcLibError::from(IpcValidateError::InvalidMsg(format!(
-                "Failed to serialize transfers: {}",
+                "Failed to serialize batch transfer data: {}",
                 e
             )))
         })?;
 
         // Combine UTF-8 tag and binary data
-        let mut complete_data = Vec::with_capacity(IPC_TRANSFER_TAG.len() + transfers_binary.len());
+        let mut complete_data = Vec::with_capacity(IPC_TRANSFER_TAG.len() + binary.len());
         complete_data.extend_from_slice(IPC_TRANSFER_TAG.as_bytes()); // UTF-8 tag prefix
-        complete_data.extend_from_slice(&transfers_binary); // Binary data follows
+        complete_data.extend_from_slice(&binary); // Binary data follows
 
         Ok(complete_data)
     }
@@ -1574,7 +1808,7 @@ impl IpcCheckpointSubnetMsg {
             commit_spend_info.merkle_root(),
         );
 
-        // Reveal transaction info
+        // Make the reveal transaction to calculate weight
 
         let control_block = commit_spend_info
             .control_block(&(
@@ -1592,8 +1826,6 @@ impl IpcCheckpointSubnetMsg {
                 .minimal_non_dust_custom(fee_rate),
             script_pubkey: return_address.script_pubkey(),
         };
-
-        // Make the reveal transaction to calculate weight
 
         let reveal_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -1637,6 +1869,7 @@ impl IpcCheckpointSubnetMsg {
             script_pubkey: commit_script_pubkey,
         };
 
+        // returns: txOut of commitTx, witness of  batchTransferTx, txOut of revealTx
         Ok((commit_tx_out, reveal_witness, reveal_tx_out))
     }
 
@@ -1667,7 +1900,11 @@ impl IpcCheckpointSubnetMsg {
     /// Returns the vout of the batched transfer commit output, if present
     /// Useful for constructing the reveal transaction
     fn batch_transfer_commit_outpoint(&self, txid: bitcoin::Txid) -> Option<bitcoin::OutPoint> {
-        if self.transfers.is_empty() {
+        if self.transfers.is_empty()
+            && self.token_registrations.is_empty()
+            && self.token_supply_adjustments.is_empty()
+            && self.token_transfers.is_empty()
+        {
             return None;
         }
 
@@ -1686,7 +1923,11 @@ impl IpcCheckpointSubnetMsg {
         fee_rate: bitcoin::FeeRate,
         return_address: &bitcoin::Address,
     ) -> Result<Option<Transaction>, IpcLibError> {
-        if self.transfers.is_empty() {
+        if self.transfers.is_empty()
+            && self.token_registrations.is_empty()
+            && self.token_supply_adjustments.is_empty()
+            && self.token_transfers.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1767,13 +2008,16 @@ impl IpcCheckpointSubnetMsg {
         //
         // Add batched transfer output commit tx, if present
         //
-        let has_transfers = !self.transfers.is_empty();
+        let has_transfers = !self.transfers.is_empty()
+            || !self.token_registrations.is_empty()
+            || !self.token_supply_adjustments.is_empty()
+            || !self.token_transfers.is_empty();
         if has_transfers {
-            let (batch_transfer_tx_out, _, _) =
+            let (commit_tx_out, _, _) =
                 self.make_batched_transfer(fee_rate, &committee.address_checked())?;
 
             // Push commit tx output
-            tx_outs.push(batch_transfer_tx_out);
+            tx_outs.push(commit_tx_out);
 
             // Group transfers by subnet id (txid20)
             let mut transfers_by_subnet: HashMap<
@@ -2157,6 +2401,9 @@ impl IpcCheckpointSubnetMsg {
             unstakes,
             withdrawals,
             transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             change_address,
             is_kill_checkpoint: kill_checkpoint,
         })
@@ -2316,6 +2563,138 @@ impl IpcCheckpointSubnetMsg {
     }
 }
 
+/// Validate ERC batch data (registrations, supply adjustments, transfers) against the
+/// current DB state.  Called by both the provider (before generating the PSBT) and the
+/// monitor (before writing state).  Returns `Err` on the first violation; the caller
+/// must treat any error as a fully invalid batch and take no action.
+///
+/// Validation order: registrations -> mints -> burns -> transfers. A shared
+/// `final_balances` map is updated in-memory as each operation is applied, so a
+/// token that is registered, minted, burned, and transferred all in one checkpoint
+/// is accounted for correctly.
+pub fn validate_erc_batch_data<D: db::DatabaseCore>(
+    source_subnet_id: SubnetId,
+    token_registrations: &[IpcErcTokenRegistration],
+    token_supply_adjustments: &[IpcErcSupplyAdjustment],
+    token_transfers: &[IpcCrossSubnetErcTransfer],
+    db: &D,
+) -> Result<(), IpcValidateError> {
+    // key: "{home_subnet_id}:{home_token_address}"
+    let mut final_balances: std::collections::HashMap<String, U256> =
+        std::collections::HashMap::new();
+
+    // 1. Registrations — must be new tokens, no duplicates within the batch.
+    for etr in token_registrations {
+        let key = format!("{}:{}", source_subnet_id, etr.home_token_address);
+        if final_balances.contains_key(&key) {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Token ({},{}) registered more than once in the same checkpoint",
+                source_subnet_id, etr.home_token_address
+            )));
+        }
+        let existing = db
+            .get_token_balance(source_subnet_id, etr.home_token_address, source_subnet_id)
+            .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+        if existing > U256::ZERO {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Token ({},{}) is already registered (existing balance: {})",
+                source_subnet_id, etr.home_token_address, existing
+            )));
+        }
+        if etr.initial_supply == U256::ZERO {
+            trace!(
+                "Zero initial_supply for token ({},{}) on subnet {}",
+                source_subnet_id,
+                etr.home_token_address,
+                source_subnet_id
+            );
+        }
+        final_balances.insert(key, etr.initial_supply);
+    }
+
+    // 2. Mints (positive ETS delta) — increase the running balance.
+    for ets in token_supply_adjustments {
+        if ets.delta.is_negative() {
+            continue;
+        }
+        let (_, mint_amount) = ets.delta.into_sign_and_abs();
+        if mint_amount == U256::ZERO {
+            trace!(
+                "Zero-delta mint for token ({},{}) on subnet {} — no-op",
+                source_subnet_id,
+                ets.home_token_address,
+                source_subnet_id
+            );
+            continue;
+        }
+        let key = format!("{}:{}", source_subnet_id, ets.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        *bal = bal.saturating_add(mint_amount);
+    }
+
+    // 3. Burns (negative ETS delta) — must not exceed running balance.
+    for ets in token_supply_adjustments {
+        if !ets.delta.is_negative() {
+            continue;
+        }
+        let (_, burn_amount) = ets.delta.into_sign_and_abs();
+        let key = format!("{}:{}", source_subnet_id, ets.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        if *bal < burn_amount {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Burn exceeds balance for token ({},{}): has {}, burn {}",
+                source_subnet_id, ets.home_token_address, bal, burn_amount
+            )));
+        }
+        *bal -= burn_amount;
+    }
+
+    // 4. Transfers (ETX) — must not exceed running balance on the source subnet.
+    for etx in token_transfers {
+        if etx.amount == U256::ZERO {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Zero-amount ETX for token ({},{}) on subnet {}",
+                etx.home_subnet_id, etx.home_token_address, source_subnet_id
+            )));
+        }
+        let key = format!("{}:{}", etx.home_subnet_id, etx.home_token_address);
+        let bal = match final_balances.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let fetched = db
+                    .get_token_balance(etx.home_subnet_id, etx.home_token_address, source_subnet_id)
+                    .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
+                e.insert(fetched)
+            }
+        };
+        if *bal < etx.amount {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Insufficient balance for token ({},{}): has {}, needs {}",
+                etx.home_subnet_id, etx.home_token_address, bal, etx.amount
+            )));
+        }
+        *bal -= etx.amount;
+    }
+
+    Ok(())
+}
+
 /// Batch transfer message
 /// It lacks important information so it must be
 /// fetch from the checkpoint transaction and validated
@@ -2329,6 +2708,12 @@ pub struct IpcBatchTransferMsg {
     pub checkpoint_vout: u32,
     /// Cross-subnet transfers
     pub transfers: Vec<IpcCrossSubnetTransfer>,
+    /// ERC20 token registrations (IPC:ETR)
+    pub token_registrations: Vec<IpcErcTokenRegistration>,
+    /// ERC20 supply adjustments (IPC:ETS)
+    pub token_supply_adjustments: Vec<IpcErcSupplyAdjustment>,
+    /// ERC20 cross-subnet transfers (IPC:ETX)
+    pub token_transfers: Vec<IpcCrossSubnetErcTransfer>,
 }
 
 impl IpcValidate for IpcBatchTransferMsg {
@@ -2341,9 +2726,13 @@ impl IpcValidate for IpcBatchTransferMsg {
             ));
         }
 
-        if self.transfers.is_empty() {
+        if self.transfers.is_empty()
+            && self.token_registrations.is_empty()
+            && self.token_supply_adjustments.is_empty()
+            && self.token_transfers.is_empty()
+        {
             return Err(IpcValidateError::InvalidMsg(
-                "Batch transfer message must have at least one transfer".to_string(),
+                "Batch transfer message must have at least one transfer, token registration, or ERC transfer".to_string(),
             ));
         }
 
@@ -2364,16 +2753,60 @@ impl IpcValidate for IpcBatchTransferMsg {
             }
         }
 
+        // Check if the token registrations are valid
+        for etr in &self.token_registrations {
+            if etr.home_token_address == alloy_primitives::Address::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "token_registration.home_token_address",
+                    "Token address must not be zero".to_string(),
+                ));
+            }
+            if etr.name.is_empty() {
+                return Err(IpcValidateError::InvalidField(
+                    "token_registration.name",
+                    "Token name must not be empty".to_string(),
+                ));
+            }
+            if etr.symbol.is_empty() {
+                return Err(IpcValidateError::InvalidField(
+                    "token_registration.symbol",
+                    "Token symbol must not be empty".to_string(),
+                ));
+            }
+        }
+
+        // Check if the ERC transfers are valid
+        for etx in &self.token_transfers {
+            if etx.home_token_address == alloy_primitives::Address::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "erc_transfer.home_token_address",
+                    "ERC transfer token address must not be zero".to_string(),
+                ));
+            }
+            if etx.recipient == alloy_primitives::Address::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "erc_transfer.recipient",
+                    "ERC transfer recipient must not be zero".to_string(),
+                ));
+            }
+            if etx.amount == U256::ZERO {
+                return Err(IpcValidateError::InvalidField(
+                    "erc_transfer.amount",
+                    "ERC transfer amount must be greater than zero".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
 
 impl IpcBatchTransferMsg {
-    /// Makes a map of transfers by subnet txid20 from the witness data.
+    /// Deserializes the witness data into a BatchTransferWireData struct.
     /// Witness data must be already processed to extract the pushdata.
-    pub fn witness_to_transfers_map(
+    pub(crate) fn witness_to_wire_data(
         witness_data: &[u8],
-    ) -> Result<HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>>, IpcLibError> {
+    ) -> Result<BatchTransferWireData, IpcLibError> {
         if witness_data.len() < IPC_TAG_LENGTH
             || &witness_data[..IPC_TAG_LENGTH] != IPC_TRANSFER_TAG.as_bytes()
         {
@@ -2383,16 +2816,15 @@ impl IpcBatchTransferMsg {
             ));
         }
 
-        // Deserialize the transfers
-        let transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
+        let wire_data: BatchTransferWireData =
             postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..]).map_err(|e| {
                 IpcLibError::MsgParseError(
                     IPC_TRANSFER_TAG,
-                    format!("Failed to deserialize transfers: {}", e),
+                    format!("Failed to deserialize batch transfer data: {}", e),
                 )
             })?;
 
-        Ok(transfers_by_subnet)
+        Ok(wire_data)
     }
 
     /// Reconstructs an IpcBatchTransferMsg from a Bitcoin transaction.
@@ -2427,23 +2859,12 @@ impl IpcBatchTransferMsg {
             Err(_) => return Err(err("Failed to extract witness data".into())),
         };
 
-        // Verify tag
-        if witness_data.len() < IPC_TAG_LENGTH
-            || &witness_data[..IPC_TAG_LENGTH] != IPC_TRANSFER_TAG.as_bytes()
-        {
-            return Err(err(format!(
-                "Invalid tag: expected '{}' prefix",
-                IPC_TRANSFER_TAG
-            )));
-        }
+        // Deserialize wire data (validates tag internally)
+        let wire_data = Self::witness_to_wire_data(&witness_data)
+            .map_err(|e| err(format!("Failed to deserialize batch transfer data: {}", e)))?;
 
-        // Deserialize the transfers
-        let transfers_by_subnet: HashMap<Txid20, Vec<(alloy_primitives::Address, Amount)>> =
-            postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..])
-                .map_err(|e| err(format!("Failed to deserialize transfers: {}", e)))?;
-
-        // Collect all cross-subnet transfers with proper subnet info
-        let transfers = transfers_by_subnet
+        // Collect all native cross-subnet transfers with proper subnet info
+        let transfers = wire_data.transfers
             .into_iter()
             .filter_map(|(txid20, transfer_list)| {
                 let destination_subnet_id = SubnetId::from_txid20(&txid20);
@@ -2479,8 +2900,28 @@ impl IpcBatchTransferMsg {
             })
             .collect::<Vec<_>>();
 
-        if transfers.is_empty() {
-            return Err(err("No valid transfers found".into()));
+        // Flatten ERC transfers — reconstruct destination_subnet_id from HashMap key
+        let erc_transfers = wire_data
+            .token_transfers
+            .into_iter()
+            .flat_map(|(txid20, records)| {
+                let destination_subnet_id = SubnetId::from_txid20(&txid20);
+                records.into_iter().map(move |w| IpcCrossSubnetErcTransfer {
+                    home_subnet_id: w.home_subnet_id,
+                    home_token_address: w.home_token_address,
+                    amount: w.amount,
+                    destination_subnet_id,
+                    recipient: w.recipient,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if transfers.is_empty()
+            && wire_data.token_registrations.is_empty()
+            && wire_data.token_supply_adjustments.is_empty()
+            && erc_transfers.is_empty()
+        {
+            return Err(err("No valid data found in batch transfer".into()));
         }
 
         Ok(Self {
@@ -2489,6 +2930,9 @@ impl IpcBatchTransferMsg {
             checkpoint_txid,
             checkpoint_vout,
             transfers,
+            token_registrations: wire_data.token_registrations,
+            token_supply_adjustments: wire_data.token_supply_adjustments,
+            token_transfers: erc_transfers,
         })
     }
 
@@ -2521,7 +2965,7 @@ impl IpcBatchTransferMsg {
                 self.checkpoint_vout
             )))?;
 
-        // Extract withdrawal and transfer counts from checkpoint metadata
+        // Extract counts from checkpoint metadata
         let (_, transfer_count, _, _) =
             match IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(metadata_tx_out) {
                 Ok(counts) => counts,
@@ -2575,6 +3019,16 @@ impl IpcBatchTransferMsg {
                 ))
             })?;
 
+        // Validate ERC batch data before touching the DB.
+        // Any violation means the entire BatchTransferMsg is malformed — ignore it.
+        validate_erc_batch_data(
+            source_subnet_id,
+            &self.token_registrations,
+            &self.token_supply_adjustments,
+            &self.token_transfers,
+            db,
+        )?;
+
         // Update the checkpoint with the batch transfer information
         checkpoint.batch_transfer_txid = Some(txid);
         checkpoint.batch_transfer_block_height = Some(block_height);
@@ -2625,8 +3079,204 @@ impl IpcBatchTransferMsg {
             );
         }
 
+        // Save ERC token registrations (IPC:ETR) — fan out to all known subnets
+        // except the source (home) subnet itself.
+        // Also seed the balance ledger: balance(homeSubnet, token, S_home) = initialSupply.
+        if !self.token_registrations.is_empty() {
+            let all_subnets = db.get_all_subnets()?;
+            for etr in &self.token_registrations {
+                // Seed balance for S_home with initial_supply (validation already
+                // confirmed this is a new token).
+                db.set_token_balance(
+                    &mut wtxn,
+                    source_subnet_id,
+                    etr.home_token_address,
+                    source_subnet_id,
+                    etr.initial_supply,
+                )?;
+                debug!(
+                    "Stored balance for token {} on home subnet {}",
+                    etr.home_token_address, source_subnet_id
+                );
+
+                for subnet in &all_subnets {
+                    if subnet.id == source_subnet_id {
+                        continue;
+                    }
+                    let nonce = db.get_next_rootnet_msg_nonce_txn(&wtxn, subnet.id)?;
+                    let rootnet_msg = db::RootnetMessage::ErcRegistration {
+                        home_subnet_id: source_subnet_id,
+                        registration: etr.clone(),
+                        block_height,
+                        block_hash,
+                        nonce,
+                        txid,
+                    };
+                    db.add_rootnet_msg(&mut wtxn, subnet.id, rootnet_msg)?;
+                    debug!(
+                        "Added ERC token registration for subnet {}, token: {}",
+                        subnet.id, etr.home_token_address
+                    );
+                }
+                debug!(
+                    "Stored ERC token registration to the DB, token: {}",
+                    etr.home_token_address
+                );
+            }
+        }
+
+        // Process ERC supply adjustments (IPC:ETS) — mints first, then burns.
+        // Order must match validate_erc_batch_data() so that a batch containing
+        // both a burn and a mint for the same token is applied consistently.
+        for ems in self
+            .token_supply_adjustments
+            .iter()
+            .filter(|e| !e.delta.is_negative())
+        {
+            let current_balance = db.get_token_balance_txn(
+                &wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+            )?;
+            let (_, mint_amount) = ems.delta.into_sign_and_abs();
+            let new_balance = current_balance.saturating_add(mint_amount);
+            db.set_token_balance(
+                &mut wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+                new_balance,
+            )?;
+            debug!(
+                "Applied mint of amount {} for token {} on subnet {}",
+                mint_amount, ems.home_token_address, source_subnet_id
+            );
+        }
+
+        for ems in self
+            .token_supply_adjustments
+            .iter()
+            .filter(|e| e.delta.is_negative())
+        {
+            let current_balance = db.get_token_balance_txn(
+                &wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+            )?;
+            let (_, burn_amount) = ems.delta.into_sign_and_abs();
+            let Some(new_balance) = current_balance.checked_sub(burn_amount) else {
+                error!(
+                    "ETS burn underflow for token {} on subnet {}: balance {}, burn {} \
+                     — should have been caught by validate_erc_batch_data()",
+                    ems.home_token_address, source_subnet_id, current_balance, burn_amount,
+                );
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "ETS burn underflow for token {}: balance {}, burn {}",
+                    ems.home_token_address, current_balance, burn_amount
+                ))
+                .into());
+            };
+            db.set_token_balance(
+                &mut wtxn,
+                source_subnet_id,
+                ems.home_token_address,
+                source_subnet_id,
+                new_balance,
+            )?;
+            debug!(
+                "Applied burn of amount {} for token {} on subnet {}",
+                burn_amount, ems.home_token_address, source_subnet_id
+            );
+        }
+
+        // Save ERC transfers (IPC:ETX) — firewall: check source has sufficient balance
+        for etx in &self.token_transfers {
+            if etx.amount == U256::ZERO {
+                debug!(
+                    "Skipping zero-amount ETX for token ({},{}) on subnet {}",
+                    etx.home_subnet_id, etx.home_token_address, source_subnet_id
+                );
+                continue;
+            }
+            let src_balance = db.get_token_balance_txn(
+                &wtxn,
+                etx.home_subnet_id,
+                etx.home_token_address,
+                source_subnet_id,
+            )?;
+
+            // Debit source
+            let Some(new_src) = src_balance.checked_sub(etx.amount) else {
+                error!(
+                    "ETX underflow for token {} from subnet {} to {}: balance {}, amount {} \
+                     — should have been caught by validate_erc_batch_data()",
+                    etx.home_token_address,
+                    source_subnet_id,
+                    etx.destination_subnet_id,
+                    src_balance,
+                    etx.amount,
+                );
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "ETX underflow for token {}: balance {}, amount {}",
+                    etx.home_token_address, src_balance, etx.amount
+                ))
+                .into());
+            };
+            db.set_token_balance(
+                &mut wtxn,
+                etx.home_subnet_id,
+                etx.home_token_address,
+                source_subnet_id,
+                new_src,
+            )?;
+
+            // Credit destination
+            let dst_balance = db.get_token_balance_txn(
+                &wtxn,
+                etx.home_subnet_id,
+                etx.home_token_address,
+                etx.destination_subnet_id,
+            )?;
+            let new_dst = dst_balance.checked_add(etx.amount).unwrap_or_else(|| {
+                error!(
+                    "Balance overflow crediting subnet {} for token {} — clamping to MAX",
+                    etx.destination_subnet_id, etx.home_token_address
+                );
+                U256::MAX
+            });
+            db.set_token_balance(
+                &mut wtxn,
+                etx.home_subnet_id,
+                etx.home_token_address,
+                etx.destination_subnet_id,
+                new_dst,
+            )?;
+
+            // Store rootnet message for destination subnet
+            let nonce = db.get_next_rootnet_msg_nonce_txn(&wtxn, etx.destination_subnet_id)?;
+            let rootnet_msg = db::RootnetMessage::ErcTransfer {
+                msg: etx.clone(),
+                block_height,
+                block_hash,
+                nonce,
+                txid,
+            };
+            db.add_rootnet_msg(&mut wtxn, etx.destination_subnet_id, rootnet_msg)?;
+            debug!(
+                "Stored ERC transfer for subnet {}, token: {}, recipient: {}",
+                etx.destination_subnet_id, etx.home_token_address, etx.recipient
+            );
+        }
+
         // Commit all changes
         wtxn.commit()?;
+
+        debug!(
+            "Stored BatchTransfer data for checkpoint #{} for subnet {}",
+            checkpoint_number, self.subnet_id
+        );
 
         Ok(checkpoint)
     }
@@ -5029,6 +5679,9 @@ mod checkpoint_msg_tests {
             unstakes: vec![unstake],
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
@@ -5069,6 +5722,9 @@ mod checkpoint_msg_tests {
             unstakes: vec![],
             withdrawals: vec![],
             transfers,
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
@@ -5220,6 +5876,9 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             withdrawals: vec![withdrawal, withdrawal2],
             transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
@@ -5301,6 +5960,9 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             withdrawals: vec![],
             transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
@@ -5412,12 +6074,13 @@ mod checkpoint_msg_tests {
             184, 68, 188, 69, 78, 68, 56, 244, 0, 144, 78,
         ];
 
+        let old_len = old_checkpoint_1_transfer.len() as isize;
+        let new_len = checkpoint_1_transfers.len() as isize;
         println!(
-            "Bincode size 1 transfer: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
-            old_checkpoint_1_transfer.len(),
-            checkpoint_1_transfers.len(),
-            old_checkpoint_1_transfer.len() as isize - checkpoint_1_transfers.len() as isize,
-            100 - (checkpoint_1_transfers.len() * 100 / old_checkpoint_1_transfer.len()),
+            "Bincode size 1 transfer: {}\nPostcard size: {}\nDiff: {} bytes",
+            old_len,
+            new_len,
+            old_len - new_len,
         );
 
         let checkpoint_5_transfers = create_test_checkpoint_msg_multiple_transfers(5)
@@ -5436,12 +6099,13 @@ mod checkpoint_msg_tests {
             188, 69, 78, 68, 56, 244, 4, 251, 176, 54,
         ];
 
+        let old_len = old_checkpoint_5_batch_transfers.len() as isize;
+        let new_len = checkpoint_5_transfers.len() as isize;
         println!(
-            "Bincode size 5 transfers: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
-            old_checkpoint_5_batch_transfers.len(),
-            checkpoint_5_transfers.len(),
-            old_checkpoint_5_batch_transfers.len() as isize - checkpoint_5_transfers.len() as isize,
-            100 - (checkpoint_5_transfers.len() * 100 / old_checkpoint_5_batch_transfers.len()),
+            "Bincode size 5 transfers: {}\nPostcard size: {}\nDiff: {} bytes",
+            old_len,
+            new_len,
+            old_len - new_len,
         );
 
         let checkpoint_15_transfers = create_test_checkpoint_msg_multiple_transfers(15)
@@ -5472,13 +6136,13 @@ mod checkpoint_msg_tests {
             188, 69, 78, 68, 56, 244, 14, 251, 192, 93,
         ];
 
+        let old_len = old_checkpoint_15_batch_transfers.len() as isize;
+        let new_len = checkpoint_15_transfers.len() as isize;
         println!(
-            "Bincode size 15 transfers: {}\nPostcard size: {}\nSavings: {} bytes ({}% savings)",
-            old_checkpoint_15_batch_transfers.len(),
-            checkpoint_15_transfers.len(),
-            old_checkpoint_15_batch_transfers.len() as isize
-                - checkpoint_15_transfers.len() as isize,
-            100 - (checkpoint_15_transfers.len() * 100 / old_checkpoint_15_batch_transfers.len()),
+            "Bincode size 15 transfers: {}\nPostcard size: {}\nDiff: {} bytes",
+            old_len,
+            new_len,
+            old_len - new_len,
         );
     }
 
@@ -5490,12 +6154,13 @@ mod checkpoint_msg_tests {
         // 1. Serialize the transfer data using make_batched_transfer_data
         let serialized = checkpoint_msg.make_batched_transfer_data().unwrap();
 
-        let transfers_map = IpcBatchTransferMsg::witness_to_transfers_map(&serialized).unwrap();
+        let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&serialized).unwrap();
 
-        // One subnet
-        assert_eq!(1, transfers_map.len());
+        // One subnet for native transfers
+        assert_eq!(1, wire_data.transfers.len());
 
-        let transfers = transfers_map
+        let transfers = wire_data
+            .transfers
             .get(
                 // All transfers go to the same subnet in this test
                 &checkpoint_msg
@@ -5508,6 +6173,8 @@ mod checkpoint_msg_tests {
             .unwrap();
 
         assert_eq!(checkpoint_msg.transfers.len(), transfers.len());
+        assert!(wire_data.token_registrations.is_empty());
+        assert!(wire_data.token_transfers.is_empty());
     }
 
     #[test]
@@ -5565,6 +6232,9 @@ mod checkpoint_msg_tests {
             checkpoint_hash,
             checkpoint_height: 50,
             transfers: vec![transfer1.clone(), transfer2.clone(), transfer3.clone()],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             withdrawals: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
@@ -5946,6 +6616,9 @@ mod checkpoint_msg_tests {
             checkpoint_height: 50,
             withdrawals: vec![],
             transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
             unstakes: vec![unstake1.clone(), unstake2.clone(), unstake3.clone()],
             change_address: None, // Kill checkpoints shouldn't have change address
             next_committee_configuration_number: 1,
@@ -6163,5 +6836,931 @@ mod checkpoint_msg_tests {
                 parsed_msg
             );
         }
+    }
+
+    // ---- ERC token registration (ETR) and ERC transfer (ETX) tests ----
+
+    fn create_test_checkpoint_msg_with_etr_etx() -> IpcCheckpointSubnetMsg {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        let transfer = test_utils::create_rand_ipc_cross_subnet_transfer(&destination_subnet, None);
+        let etr = test_utils::create_rand_erc_token_registration();
+        let etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+
+        IpcCheckpointSubnetMsg {
+            subnet_id: subnet_state.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            unstakes: vec![],
+            withdrawals: vec![],
+            transfers: vec![transfer],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+            change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        }
+    }
+
+    #[test]
+    fn test_etr_etx_serialization_roundtrip() {
+        let checkpoint_msg = create_test_checkpoint_msg_with_etr_etx();
+
+        // Serialize
+        let serialized = checkpoint_msg.make_batched_transfer_data().unwrap();
+
+        // Deserialize
+        let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&serialized).unwrap();
+
+        // Verify native transfers
+        assert_eq!(wire_data.transfers.len(), 1);
+
+        // Verify token registrations roundtrip
+        assert_eq!(wire_data.token_registrations.len(), 1);
+        let etr = &wire_data.token_registrations[0];
+        assert_eq!(
+            etr.home_token_address,
+            checkpoint_msg.token_registrations[0].home_token_address
+        );
+        assert_eq!(etr.name, "TestToken");
+        assert_eq!(etr.symbol, "TT");
+        assert_eq!(etr.decimals, 18);
+
+        // Verify ERC transfers roundtrip
+        assert_eq!(wire_data.token_transfers.len(), 1);
+        let dst_key = checkpoint_msg.token_transfers[0]
+            .destination_subnet_id
+            .txid20();
+        let etx_list = wire_data.token_transfers.get(&dst_key).unwrap();
+        assert_eq!(etx_list.len(), 1);
+        assert_eq!(
+            etx_list[0].home_subnet_id,
+            checkpoint_msg.token_transfers[0].home_subnet_id
+        );
+        assert_eq!(
+            etx_list[0].home_token_address,
+            checkpoint_msg.token_transfers[0].home_token_address
+        );
+        assert_eq!(etx_list[0].amount, checkpoint_msg.token_transfers[0].amount);
+        assert_eq!(
+            etx_list[0].recipient,
+            checkpoint_msg.token_transfers[0].recipient
+        );
+    }
+
+    #[test]
+    fn test_etr_only_checkpoint_has_batch_transfer() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet_state.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            unstakes: vec![],
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![test_utils::create_rand_erc_token_registration()],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+            change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        checkpoint_msg.validate().unwrap();
+
+        // ETR-only should still produce a batch transfer reveal tx
+        let data = checkpoint_msg.make_batched_transfer_data().unwrap();
+        assert!(
+            data.len() > IPC_TAG_LENGTH,
+            "ETR-only should produce non-empty witness data"
+        );
+
+        let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&data).unwrap();
+        assert!(wire_data.transfers.is_empty());
+        assert_eq!(wire_data.token_registrations.len(), 1);
+        assert!(wire_data.token_transfers.is_empty());
+    }
+
+    #[test]
+    fn test_etx_only_checkpoint_has_batch_transfer() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet_state.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            unstakes: vec![],
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![test_utils::create_rand_erc_transfer(
+                subnet_state.id,
+                destination_subnet.id,
+            )],
+            change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        checkpoint_msg.validate().unwrap();
+
+        let data = checkpoint_msg.make_batched_transfer_data().unwrap();
+        let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&data).unwrap();
+        assert!(wire_data.transfers.is_empty());
+        assert!(wire_data.token_registrations.is_empty());
+        assert_eq!(wire_data.token_transfers.len(), 1);
+    }
+
+    #[test]
+    fn test_mixed_checkpoint_markers() {
+        let checkpoint_msg = create_test_checkpoint_msg_with_etr_etx();
+        let fee_rate = bitcoin::FeeRate::from_sat_per_vb(10).unwrap();
+
+        let metadata_tx_out = checkpoint_msg.make_metadata_tx_out(fee_rate);
+        let (withdrawal_count, transfer_count, unstake_count, killed) =
+            IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&metadata_tx_out)
+                .expect("Should extract markers");
+
+        assert_eq!(withdrawal_count, 0);
+        assert_eq!(transfer_count, 1);
+        assert_eq!(unstake_count, 0);
+        assert!(!killed);
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_empty_token_name() {
+        let mut etr = test_utils::create_rand_erc_token_registration();
+        etr.name = "".to_string();
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("name must not be empty"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_empty_token_symbol() {
+        let mut etr = test_utils::create_rand_erc_token_registration();
+        etr.symbol = "".to_string();
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("symbol must not be empty"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_token_address_etr() {
+        let mut etr = test_utils::create_rand_erc_token_registration();
+        etr.home_token_address = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![etr],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("Token address must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_token_address_etx() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+        etx.home_token_address = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("token address must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_recipient_etx() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+        etx.recipient = alloy_primitives::Address::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("recipient must not be zero"));
+    }
+
+    #[test]
+    fn test_batch_transfer_validate_rejects_zero_amount_etx() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let destination_subnet = test_utils::generate_subnet(4);
+        let mut etx = test_utils::create_rand_erc_transfer(subnet_state.id, destination_subnet.id);
+        etx.amount = U256::ZERO;
+
+        let batch_msg = IpcBatchTransferMsg {
+            subnet_id: SubnetId::default(),
+            checkpoint_txid: test_utils::create_rand_txid(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx],
+        };
+
+        let result = batch_msg.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("amount must be greater than zero"));
+    }
+
+    #[test]
+    fn test_multiple_erc_transfers_to_different_subnets_roundtrip() {
+        let subnet_state = test_utils::generate_subnet(4);
+        let dest1 = test_utils::generate_subnet(4);
+        let dest2 = test_utils::generate_subnet(4);
+        let checkpoint_hash = bitcoin::hashes::sha256::Hash::from_str(
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        )
+        .unwrap();
+
+        let etx1 = test_utils::create_rand_erc_transfer(subnet_state.id, dest1.id);
+        let etx2 = test_utils::create_rand_erc_transfer(subnet_state.id, dest2.id);
+        let etx3 = test_utils::create_rand_erc_transfer(subnet_state.id, dest1.id);
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet_state.id,
+            checkpoint_hash,
+            checkpoint_height: 50,
+            unstakes: vec![],
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![
+                test_utils::create_rand_erc_token_registration(),
+                test_utils::create_rand_erc_token_registration(),
+            ],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![etx1, etx2, etx3],
+            change_address: Some(subnet_state.committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        checkpoint_msg.validate().unwrap();
+
+        // Verify markers
+        let fee_rate = bitcoin::FeeRate::from_sat_per_vb(10).unwrap();
+        let metadata_tx_out = checkpoint_msg.make_metadata_tx_out(fee_rate);
+        IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&metadata_tx_out).unwrap();
+
+        // Verify roundtrip
+        let data = checkpoint_msg.make_batched_transfer_data().unwrap();
+        let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&data).unwrap();
+
+        assert_eq!(wire_data.token_registrations.len(), 2);
+        // 3 ETX across 2 destination subnets
+        let total_etx: usize = wire_data.token_transfers.values().map(|v| v.len()).sum();
+        assert_eq!(total_etx, 3);
+        assert_eq!(
+            wire_data.token_transfers.len(),
+            2,
+            "Should have 2 destination subnets"
+        );
+    }
+
+    // ── U256 arithmetic tests ──
+
+    // ── U256/I256 arithmetic tests (using alloy_primitives) ──
+
+    #[test]
+    fn test_u256_arithmetic() {
+        let a = U256::from(1000u64);
+        let b = U256::from(2000u64);
+        assert_eq!(a + b, U256::from(3000u64));
+        assert_eq!(b - a, U256::from(1000u64));
+        assert!(a < b);
+        assert!(a.checked_sub(b).is_none());
+    }
+
+    #[test]
+    fn test_i256_supply_adjustment() {
+        let balance = U256::from(1000u64);
+        let mint_delta = I256::try_from(500i64).unwrap();
+        let burn_delta = I256::try_from(-300i64).unwrap();
+
+        // Mint: balance + positive delta
+        let balance_i = I256::try_from(balance).unwrap();
+        let after_mint: U256 = (balance_i + mint_delta).into_raw().into();
+        assert_eq!(after_mint, U256::from(1500u64));
+
+        // Burn: balance + negative delta
+        let after_burn_i = I256::try_from(after_mint).unwrap() + burn_delta;
+        assert!(after_burn_i >= I256::ZERO);
+        let after_burn: U256 = after_burn_i.into_raw().into();
+        assert_eq!(after_burn, U256::from(1200u64));
+    }
+
+    #[test]
+    fn test_i256_underflow_detection() {
+        let balance = U256::from(100u64);
+        let burn_delta = I256::try_from(-200i64).unwrap();
+        let result = I256::try_from(balance).unwrap() + burn_delta;
+        assert!(result < I256::ZERO, "Should detect underflow");
+    }
+
+    // ── Checkpoint output structure tests for ETR/ETX-only checkpoints ──
+
+    #[test]
+    fn test_etr_only_checkpoint_output_structure() {
+        let subnet = test_utils::generate_subnet(3);
+        let committee = &subnet.committee;
+        let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet.id,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::from_str(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
+            checkpoint_height: 50,
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![test_utils::create_rand_erc_token_registration()],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+            unstakes: vec![],
+            change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
+            .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx;
+
+        // ETR-only: should have exactly 3 outputs:
+        // 1. OP_RETURN metadata
+        // 2. Batch transfer commit output (for the witness blob)
+        // 3. Change output
+        // NO value-transfer outputs to destination subnets
+        assert_eq!(
+            checkpoint_tx.output.len(),
+            3,
+            "ETR-only checkpoint should have 3 outputs (OP_RETURN + commit + change)"
+        );
+        assert!(
+            checkpoint_tx.output[0].script_pubkey.is_op_return(),
+            "First output should be OP_RETURN"
+        );
+        // Second output is the commit (P2TR)
+        assert!(
+            !checkpoint_tx.output[1].script_pubkey.is_op_return(),
+            "Second output should be the commit output, not OP_RETURN"
+        );
+
+        // Reveal tx should exist (the witness blob needs to be published)
+        let reveal_tx = checkpoint_msg
+            .make_reveal_batch_transfer_tx(
+                checkpoint_tx.compute_txid(),
+                fee_rate,
+                &committee.address_checked(),
+            )
+            .unwrap();
+        assert!(
+            reveal_tx.is_some(),
+            "ETR-only checkpoint should produce a reveal transaction"
+        );
+    }
+
+    #[test]
+    fn test_etx_only_checkpoint_output_structure() {
+        let subnet = test_utils::generate_subnet(3);
+        let destination = test_utils::generate_subnet(3);
+        let committee = &subnet.committee;
+        let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet.id,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::from_str(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
+            checkpoint_height: 50,
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![test_utils::create_rand_erc_transfer(
+                subnet.id,
+                destination.id,
+            )],
+            unstakes: vec![],
+            change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
+            .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx;
+
+        // ETX-only (no native transfers): should have exactly 3 outputs:
+        // 1. OP_RETURN metadata
+        // 2. Batch transfer commit output (for the witness blob)
+        // 3. Change output
+        // NO BTC value-transfer outputs — ETX doesn't move BTC between multisigs
+        assert_eq!(
+            checkpoint_tx.output.len(),
+            3,
+            "ETX-only checkpoint should have 3 outputs (OP_RETURN + commit + change)"
+        );
+        assert!(
+            checkpoint_tx.output[0].script_pubkey.is_op_return(),
+            "First output should be OP_RETURN"
+        );
+    }
+
+    #[test]
+    fn test_mixed_native_and_erc_checkpoint_output_structure() {
+        let subnet = test_utils::generate_subnet(3);
+        let destination = test_utils::generate_subnet(3);
+        let committee = &subnet.committee;
+        let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+
+        let native_transfer = IpcCrossSubnetTransfer {
+            amount: Amount::from_sat(30000),
+            destination_subnet_id: destination.id,
+            subnet_multisig_address: Some(destination.committee.multisig_address.clone()),
+            subnet_user_address: test_utils::create_rand_eth_addr(),
+        };
+
+        let checkpoint_msg = IpcCheckpointSubnetMsg {
+            subnet_id: subnet.id,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::from_str(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
+            checkpoint_height: 50,
+            withdrawals: vec![],
+            transfers: vec![native_transfer],
+            token_registrations: vec![test_utils::create_rand_erc_token_registration()],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![test_utils::create_rand_erc_transfer(
+                subnet.id,
+                destination.id,
+            )],
+            unstakes: vec![],
+            change_address: Some(committee.multisig_address.clone()),
+            next_committee_configuration_number: 1,
+            is_kill_checkpoint: false,
+        };
+
+        let fee_rate = DEFAULT_BTC_FEE_RATE;
+        let checkpoint_psbt = checkpoint_msg
+            .to_checkpoint_psbt(committee, committee, fee_rate, &utxos)
+            .unwrap();
+        let checkpoint_tx = checkpoint_psbt.unsigned_tx;
+
+        // Mixed native + ERC: should have 4 outputs:
+        // 1. OP_RETURN metadata
+        // 2. Batch transfer commit output
+        // 3. Native transfer value output (to destination multisig)
+        // 4. Change output
+        // The ETR and ETX are in the witness blob — no extra outputs for them
+        assert_eq!(
+            checkpoint_tx.output.len(),
+            4,
+            "Mixed checkpoint should have 4 outputs (OP_RETURN + commit + 1 native transfer + change)"
+        );
+        assert!(
+            checkpoint_tx.output[0].script_pubkey.is_op_return(),
+            "First output should be OP_RETURN"
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_erc_batch_tests {
+    use super::*;
+    use crate::db::DatabaseCore;
+    use crate::test_utils;
+
+    /// Seed a fresh DB with a single token balance entry.
+    fn db_with_balance(
+        home_subnet: SubnetId,
+        token: alloy_primitives::Address,
+        holder: SubnetId,
+        balance: U256,
+    ) -> crate::db::HeedDb {
+        let db = test_utils::create_test_db();
+        let mut wtxn = db.write_txn().unwrap();
+        db.set_token_balance(&mut wtxn, home_subnet, token, holder, balance)
+            .unwrap();
+        wtxn.commit().unwrap();
+        db
+    }
+
+    fn etr(token: alloy_primitives::Address, initial_supply: u64) -> IpcErcTokenRegistration {
+        IpcErcTokenRegistration {
+            home_token_address: token,
+            name: "Token".to_string(),
+            symbol: "TK".to_string(),
+            decimals: 18,
+            initial_supply: U256::from(initial_supply),
+        }
+    }
+
+    fn ets_mint(token: alloy_primitives::Address, amount: i64) -> IpcErcSupplyAdjustment {
+        IpcErcSupplyAdjustment {
+            home_token_address: token,
+            delta: I256::try_from(amount).unwrap(),
+        }
+    }
+
+    fn ets_burn(token: alloy_primitives::Address, amount: i64) -> IpcErcSupplyAdjustment {
+        IpcErcSupplyAdjustment {
+            home_token_address: token,
+            delta: I256::try_from(-amount).unwrap(),
+        }
+    }
+
+    fn etx(
+        home: SubnetId,
+        token: alloy_primitives::Address,
+        amount: u64,
+        dest: SubnetId,
+    ) -> IpcCrossSubnetErcTransfer {
+        IpcCrossSubnetErcTransfer {
+            home_subnet_id: home,
+            home_token_address: token,
+            amount: U256::from(amount),
+            destination_subnet_id: dest,
+            recipient: test_utils::create_rand_eth_addr(),
+        }
+    }
+
+    // ── happy paths ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_batch_ok() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        assert!(validate_erc_batch_data(source, &[], &[], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_new_registration_ok() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_mint_ok() {
+        // Minting always succeeds (increases balance); DB balance starts at 0.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_burn_within_balance_ok() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000u64));
+        assert!(validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok());
+    }
+
+    #[test]
+    fn test_transfer_within_balance_ok() {
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000u64));
+        assert!(
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 500, dest)], &db)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_register_then_transfer_in_same_batch_ok() {
+        // Token registered with initial_supply=1000 and transferred 500 in the same checkpoint.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        assert!(validate_erc_batch_data(
+            source,
+            &[etr(token, 1000)],
+            &[],
+            &[etx(source, token, 500, dest)],
+            &db,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_mint_before_burn_order_in_batch_ok() {
+        // Even when the burn appears before the mint in the slice, mints are processed first.
+        // DB balance = 100, batch has burn 250 then mint 300.
+        // Expected: mint first → 400, then burn → 150. Should pass.
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[ets_burn(token, 250), ets_mint(token, 300)],
+            &[],
+            &db,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_foreign_token_transfer_ok() {
+        // Token's home subnet differs from the checkpoint submitter.
+        let home = test_utils::generate_subnet_id();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        // source_subnet holds 1000 of the foreign token
+        let db = db_with_balance(home, token, source, U256::from(1000u64));
+        assert!(
+            validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db).is_ok()
+        );
+    }
+
+    // ── error paths ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_duplicate_registration_in_batch_err() {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let result =
+            validate_erc_batch_data(source, &[etr(token, 1000), etr(token, 2000)], &[], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("registered more than once"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_re_registration_of_existing_token_err() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(500u64));
+        let result = validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already registered"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_burn_exceeds_balance_err() {
+        let source = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        let result = validate_erc_batch_data(source, &[], &[ets_burn(token, 200)], &[], &db);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Burn exceeds balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_transfer_exceeds_balance_err() {
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(100u64));
+        let result =
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 200, dest)], &db);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_register_then_over_transfer_err() {
+        // Register with initial_supply=100, transfer 200 — should fail.
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet_id();
+        let dest = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let result = validate_erc_batch_data(
+            source,
+            &[etr(token, 100)],
+            &[],
+            &[etx(source, token, 200, dest)],
+            &db,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_two_transfers_same_token_cumulative_check_err() {
+        // Balance = 300; two transfers of 200 each — second exceeds remaining balance.
+        let source = test_utils::generate_subnet_id();
+        let dest1 = test_utils::generate_subnet_id();
+        let dest2 = test_utils::generate_subnet_id();
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(300u64));
+        let result = validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[
+                etx(source, token, 200, dest1),
+                etx(source, token, 200, dest2),
+            ],
+            &db,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Insufficient balance"),
+            "wrong error message"
+        );
+    }
+
+    #[test]
+    fn test_etx_zero_amount_rejected() {
+        let source = test_utils::generate_subnet(4).id;
+        let dest = test_utils::generate_subnet(4).id;
+        let token = test_utils::create_rand_eth_addr();
+        let db = db_with_balance(source, token, source, U256::from(1000));
+
+        let result =
+            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 0, dest)], &db);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Zero-amount ETX"),
+            "wrong error message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_amount_tests {
+    use super::compact_amount;
+    use alloy_primitives::{I256, U256};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Uw(#[serde(with = "compact_amount::u256")] U256);
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Iw(#[serde(with = "compact_amount::i256")] I256);
+
+    fn rt_u256(v: U256) -> U256 {
+        let enc = postcard::to_stdvec(&Uw(v)).unwrap();
+        postcard::from_bytes::<Uw>(&enc).unwrap().0
+    }
+
+    fn rt_i256(v: I256) -> I256 {
+        let enc = postcard::to_stdvec(&Iw(v)).unwrap();
+        postcard::from_bytes::<Iw>(&enc).unwrap().0
+    }
+
+    fn wire_len_u256(v: U256) -> usize {
+        postcard::to_stdvec(&Uw(v)).unwrap().len()
+    }
+
+    #[test]
+    fn u256_roundtrips() {
+        assert_eq!(rt_u256(U256::ZERO), U256::ZERO);
+        assert_eq!(rt_u256(U256::from(1u64)), U256::from(1u64));
+        assert_eq!(rt_u256(U256::from(255u64)), U256::from(255u64));
+        assert_eq!(rt_u256(U256::from(256u64)), U256::from(256u64));
+        assert_eq!(rt_u256(U256::from(1_000_000u64)), U256::from(1_000_000u64));
+        assert_eq!(rt_u256(U256::from(u64::MAX)), U256::from(u64::MAX));
+        assert_eq!(rt_u256(U256::MAX), U256::MAX);
+    }
+
+    #[test]
+    fn u256_wire_sizes() {
+        // postcard wraps serialize_bytes as [varint(len)][bytes], adding 1 byte overhead.
+        // Total: 1 (outer varint) + 1 (inner length N) + N (payload) = 2 + N bytes.
+        assert_eq!(wire_len_u256(U256::ZERO), 2); // N=0
+        assert_eq!(wire_len_u256(U256::from(255u64)), 3); // N=1
+        assert_eq!(wire_len_u256(U256::from(1_000_000u64)), 5); // 0x0F4240 → N=3
+        assert_eq!(wire_len_u256(U256::MAX), 34); // N=32; 1 byte more than raw U256
+    }
+
+    #[test]
+    fn i256_roundtrips() {
+        assert_eq!(rt_i256(I256::ZERO), I256::ZERO);
+        assert_eq!(
+            rt_i256(I256::try_from(1i64).unwrap()),
+            I256::try_from(1i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(-1i64).unwrap()),
+            I256::try_from(-1i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(300_000i64).unwrap()),
+            I256::try_from(300_000i64).unwrap()
+        );
+        assert_eq!(
+            rt_i256(I256::try_from(-200_000i64).unwrap()),
+            I256::try_from(-200_000i64).unwrap()
+        );
+        assert_eq!(rt_i256(I256::MAX), I256::MAX);
+        assert_eq!(rt_i256(I256::MIN), I256::MIN);
+    }
+
+    #[test]
+    fn i256_sign_preserved() {
+        let pos = I256::try_from(1_000_000i64).unwrap();
+        let neg = I256::try_from(-1_000_000i64).unwrap();
+        assert!(rt_i256(pos) > I256::ZERO);
+        assert!(rt_i256(neg) < I256::ZERO);
     }
 }

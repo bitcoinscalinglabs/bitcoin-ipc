@@ -1,0 +1,230 @@
+# Test ERC token registration and transfer via checkpoints
+#
+# Scenario:
+# - Three subnets (subnet1, subnet2, subnet3) with 4 validators each
+# - subnet1 registers a token → checkpoint includes ETR
+# - ETR fans out to subnet2 AND subnet3 (but not subnet1)
+# - subnet1 queues an ERC transfer to subnet2 → checkpoint includes ETX
+# - ETX appears as ErcTransfer rootnet message on subnet2 only
+# - Nonce ordering: ErcRegistration < ErcTransfer on same destination
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+subnet3
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+# Create subnets
+block 102
+create subnet1
+create subnet2
+create subnet3
+
+# Bootstrap subnet1
+block 103
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+
+# Bootstrap subnet2
+
+join subnet2 validator1 100_000_000
+join subnet2 validator2 100_000_000
+join subnet2 validator3 100_000_000
+join subnet2 validator4 100_000_000
+
+# Bootstrap subnet3
+block 104
+join subnet3 validator1 100_000_000
+join subnet3 validator2 100_000_000
+join subnet3 validator3 100_000_000
+join subnet3 validator4 100_000_000
+
+# ──────────────────────────────────────────────────
+# Test 1: ETR fan-out to multiple subnets
+# ──────────────────────────────────────────────────
+
+block 110
+register_token subnet1 MyToken MTK 1_000_000
+checkpoint subnet1
+
+block 111
+
+# subnet2 should have 1 ErcRegistration
+read rootnet_msgs subnet2
+expect result.count = 1
+expect result.0.kind = erc_registration
+expect result.0.tokenName = MyToken
+expect result.0.tokenDecimals = 18
+
+# subnet3 should ALSO have 1 ErcRegistration (fan-out to all non-home subnets)
+read rootnet_msgs subnet3
+expect result.count = 1
+expect result.0.kind = erc_registration
+expect result.0.tokenName = MyToken
+
+# subnet1 (home) should have NO rootnet messages
+read rootnet_msgs subnet1
+expect result.count = 0
+
+# ──────────────────────────────────────────────────
+# Test 2: ETX goes only to destination subnet
+# ──────────────────────────────────────────────────
+
+erc_transfer subnet1 subnet2 MyToken 1000
+checkpoint subnet1
+
+block 112
+
+# subnet2 gets the transfer (nonce 1, after the registration at nonce 0)
+read rootnet_msgs subnet2
+expect result.count = 2
+expect result.0.kind = erc_registration
+expect result.1.kind = erc_transfer
+expect result.1.amount = 1000
+
+# subnet3 should NOT get the transfer (it was only for subnet2)
+read rootnet_msgs subnet3
+expect result.count = 1
+
+# ──────────────────────────────────────────────────
+# Test 3: Mixed ETR + ETX in same checkpoint
+# ──────────────────────────────────────────────────
+
+register_token subnet1 AnotherToken ATK 1_000_000
+erc_transfer subnet1 subnet2 AnotherToken 5000
+checkpoint subnet1
+
+block 114
+
+# subnet2: registration(2) + transfer(3) = 4 total
+read rootnet_msgs subnet2
+expect result.count = 4
+expect result.2.kind = erc_registration
+expect result.2.tokenName = AnotherToken
+expect result.2.tokenDecimals = 18
+expect result.3.kind = erc_transfer
+expect result.3.amount = 5000
+
+# subnet3: only gets the new registration (nonce 1), no transfer
+read rootnet_msgs subnet3
+expect result.count = 2
+expect result.1.kind = erc_registration
+expect result.1.tokenName = AnotherToken
+
+# ──────────────────────────────────────────────────
+# Test 4: Transfer to subnet3 (different destination)
+# ──────────────────────────────────────────────────
+
+block 115
+
+erc_transfer subnet1 subnet3 MyToken 7777
+checkpoint subnet1
+
+block 116
+
+# subnet3 gets the transfer now
+read rootnet_msgs subnet3
+expect result.count = 3
+expect result.2.kind = erc_transfer
+expect result.2.amount = 7777
+
+# subnet2 is unaffected
+read rootnet_msgs subnet2
+expect result.count = 4
+
+# ──────────────────────────────────────────────────
+# Test 5: Duplicate token registration (same homeSubnet + homeToken)
+# validate_erc_batch_data rejects re-registration (existing balance > 0).
+# The entire batch is dropped — no new rootnet messages delivered.
+# ──────────────────────────────────────────────────
+
+block 120
+
+register_token subnet1 MyToken MTK 1_000_000
+checkpoint subnet1
+
+block 123
+
+# Batch rejected — counts unchanged
+read rootnet_msgs subnet2
+expect result.count = 4
+
+read rootnet_msgs subnet3
+expect result.count = 3
+
+# ──────────────────────────────────────────────────
+# Test 6 (edge): Full 256-bit arithmetic
+# Register BigToken with U256::MAX initial supply on subnet1.
+# Transfer U256::MAX to subnet2, then subnet2 forwards U256::MAX/2 to subnet3.
+# U256::MAX   = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+# U256::MAX/2 = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+# ──────────────────────────────────────────────────
+
+block 130
+
+register_token subnet1 BigToken BTK 115792089237316195423570985008687907853269984665640564039457584007913129639935
+checkpoint subnet1
+
+block 131
+
+# Fan-out: subnet2 and subnet3 each receive the BigToken registration
+read rootnet_msgs subnet2
+expect result.count = 5
+expect result.4.kind = erc_registration
+expect result.4.tokenName = BigToken
+
+read rootnet_msgs subnet3
+expect result.count = 4
+expect result.3.kind = erc_registration
+expect result.3.tokenName = BigToken
+
+# Transfer U256::MAX — subnet1 sends its entire BigToken balance to subnet2
+erc_transfer subnet1 subnet2 BigToken 115792089237316195423570985008687907853269984665640564039457584007913129639935
+checkpoint subnet1
+
+block 132
+
+read rootnet_msgs subnet2
+expect result.count = 6
+expect result.5.kind = erc_transfer
+expect result.5.amount = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+
+# subnet2 forwards half (U256::MAX/2) to subnet3
+erc_transfer subnet2 subnet3 BigToken 57896044618658097711785492504343953926634992332820282019728792003956564819967
+checkpoint subnet2
+
+block 133
+
+read rootnet_msgs subnet3
+expect result.count = 5
+expect result.4.kind = erc_transfer
+expect result.4.amount = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+
+# ──────────────────────────────────────────────────
+# Test 7: Zero-amount transfer is rejected
+# The entire batch is invalid — no balance change, no rootnet message.
+# ──────────────────────────────────────────────────
+
+block 140
+
+erc_transfer subnet1 subnet2 MyToken 0
+checkpoint subnet1
+
+block 141
+
+# Batch rejected — count unchanged
+read rootnet_msgs subnet2
+expect result.count = 6
