@@ -23,3 +23,6 @@ Deleting the database and rerunning monitor should not cause any issues, as only
 ## Configuration
 
 See `.env.example` for the list of environment variables. Example `.env` files can be found in `internal/demo.ipc`.
+
+## Usage and auditing
+**‼️ All modules in the Bitcoin-IPC stack have not been audited or otherwise verified. We strongly advise against deploying IPC on mainnet and/or using it with tokens with real value.**
