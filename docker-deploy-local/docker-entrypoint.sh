@@ -1,19 +1,6 @@
 #!/bin/bash
 set -e
 
-# Build fendermint Docker image if Docker socket is available and image doesn't exist
-if command -v docker > /dev/null && docker info > /dev/null 2>&1; then
-    if ! docker images | grep -q fendermint; then
-        echo "Building fendermint Docker image..."
-        cd /workspace/ipc/fendermint
-        make docker-build || echo "Warning: fendermint Docker image build failed"
-    else
-        echo "Fendermint Docker image already exists, I will not build it again."
-    fi
-else
-    echo "Note: Docker not available or socket not mounted. Fendermint image will need to be built separately."
-fi
-
 # Initialize Bitcoin config only if bitcoin.conf doesn't exist.
 # Do not modify any other contents of /root/.bitcoin.
 if [ -f /root/.bitcoin/bitcoin.conf ]; then
