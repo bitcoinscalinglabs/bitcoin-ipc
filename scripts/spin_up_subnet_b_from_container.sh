@@ -183,6 +183,7 @@ if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" 
     --env TOPDOWN_PROPOSAL_DELAY=0 \
     --env FM_PULL_SKIP=1 \
     --env FM_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
+    --env ETHAPI_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
     child-validator 2>&1); then
     echo "Error: failed to start validator 1" >&2
     echo "$VALIDATOR1_OUTPUT" >&2
@@ -226,6 +227,7 @@ run_validator() {
         --env TOPDOWN_PROPOSAL_DELAY=0 \
         --env FM_PULL_SKIP=1 \
         --env FM_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
+        --env ETHAPI_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
         child-validator > "/root/.ipc/logs/spin-up-subnet-b-validator-${validator_num}.log" 2>&1
 
     # Verify containers are actually running (cargo-make can exit 0 despite failures)
