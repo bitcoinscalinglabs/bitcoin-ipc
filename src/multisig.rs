@@ -660,7 +660,7 @@ pub fn finalize_spend_psbt_from_sigs(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
     committee_keys: &[WeightedKey],
-    committee_threshold: u32,
+    committee_threshold: Power,
     psbt: &bitcoin::Psbt,
     signature_sets: &[&[bitcoin::secp256k1::schnorr::Signature]],
 ) -> Result<Transaction, MultisigError> {
