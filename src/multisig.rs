@@ -178,7 +178,7 @@ pub fn multisig_spend_max_witness_size(public_keys: &[WeightedKey], threshold: P
 	    // varint for the number of witnesses, which is a signature for each committee member + script + control block
 	    bitcoin::VarInt::from(committee_size + 2).size()
 	    // each schnorr sig
-        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * threshold as usize
+        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * committee_size
         // script size
         + VarInt::from(script_size).size()
         // control block size
