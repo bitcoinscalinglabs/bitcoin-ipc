@@ -33,6 +33,11 @@ use crate::{
     WATCHONLY_WALLET_SUFFIX,
 };
 
+/// How long to wait between retries when bitcoind reports the wallet is mid-load.
+const WALLET_LOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Maximum number of `load_wallet` attempts before giving up. 20 × 500 ms = 10 s,
+const WALLET_LOAD_MAX_RETRIES: u32 = 20;
+
 /// Returns the number of blocks to wait for before considering a
 /// confirmed in a given network.
 pub const fn confirmations(network: Network) -> u64 {
@@ -69,8 +74,11 @@ pub fn make_rpc_client_from_env() -> Client {
             panic!("Error making bitcoincore rpc client: {}", e);
         }
     };
-    // Ignore any errors by loadwallet, as the wallet may already be loaded
-    let _ = rpc.load_wallet(&wallet_name);
+    // The wallet named by WALLET_NAME is provisioned externally before the
+    // monitor/provider start (by the deployment's bitcoin setup); we only load
+    // it here. A wallet that won't load breaks every later RPC, so fail loud.
+    load_wallet(&rpc, &wallet_name)
+        .unwrap_or_else(|e| panic!("Error loading wallet {}: {}", wallet_name, e));
     rpc
 }
 
@@ -427,23 +435,44 @@ pub fn create_or_load_wallet(
         "Wallet '{}' already exists. Attempting to load it.",
         wallet_name
     );
-    let loaded = rpc.load_wallet(wallet_name);
+    load_wallet(rpc, wallet_name)
+}
 
-    match loaded {
-        Ok(_) => {
-            trace!("Loaded wallet '{}'", wallet_name);
-            Ok(())
-        }
-        Err(e) => {
-            if !e.to_string().contains("already loaded") {
-                error!("Error loading wallet '{}': {}", wallet_name, e);
-                Err(BitcoinUtilsError::BitcoinRpcError(e))
-            } else {
-                trace!("Wallet already loaded '{}'", wallet_name);
-                Ok(())
+/// Load a wallet that already exists, retrying if bitcoind reports it is mid-loading.
+/// bitcoind serialises wallet loads; if it is already mid-loading this wallet
+/// (e.g. it auto-reloaded on startup and our call raced it), it returns -4
+/// "Wallet already loading". Retry briefly before propagating — the load
+/// finishes within a couple of seconds in practice.
+pub fn load_wallet(rpc: &Client, wallet_name: &str) -> Result<(), BitcoinUtilsError> {
+    for attempt in 1..=WALLET_LOAD_MAX_RETRIES {
+        match rpc.load_wallet(wallet_name) {
+            Ok(_) => {
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+
+                if msg.contains("already loaded") {
+                    break;
+                }
+
+                if attempt == WALLET_LOAD_MAX_RETRIES {
+                    error!("Error loading wallet '{}': {}", wallet_name, e);
+                    return Err(BitcoinUtilsError::BitcoinRpcError(e));
+                }
+
+                if msg.contains("already loading") {
+                    debug!(
+                        "bitcoind is mid-loading wallet '{}', retry {}/{}",
+                        wallet_name, attempt, WALLET_LOAD_MAX_RETRIES,
+                    );
+                }
+                std::thread::sleep(WALLET_LOAD_RETRY_DELAY);
             }
         }
     }
+    trace!("Loaded wallet '{}'", wallet_name);
+    Ok(())
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
