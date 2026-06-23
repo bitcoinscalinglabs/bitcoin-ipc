@@ -1,8 +1,9 @@
 use std::env;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::Parser;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use thiserror::Error;
 use tokio::signal;
 use tokio::time::Duration;
@@ -88,9 +89,36 @@ async fn main() {
     #[cfg(feature = "emission_chain")]
     monitor.set_reward_tracker();
 
-    // Spawn monitor task
-
-    let monitor_handle = tokio::spawn(async move { monitor.sync_and_listen().await });
+    // Spawn monitor task. A transient bitcoind RPC failure (dropped/refused connection,
+    // bitcoind restarting) is retried with backoff instead of killing the process:
+    // sync() reloads the last processed block from the DB on re-entry, so this resumes
+    // rather than restarting. Non-RPC errors (DB, config) still propagate and exit.
+    let retry_cancel = cancel_token.clone();
+    let monitor_handle = tokio::spawn(async move {
+        let max_backoff = Duration::from_secs(30);
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let started = Instant::now();
+            match monitor.sync_and_listen().await {
+                // Completed, or returned because of cancellation.
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) => {
+                    if retry_cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    // Reset backoff after a healthy stretch so an isolated blip
+                    // recovers fast while a sustained outage backs off.
+                    if started.elapsed() > Duration::from_secs(60) {
+                        backoff = Duration::from_secs(1);
+                    }
+                    warn!("Monitor RPC error (ran {:?}), retrying in {:?}: {:?}", started.elapsed(), backoff, e);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    });
 
     // Listen for ctrl+c
 
@@ -116,6 +144,13 @@ async fn main() {
     }
 
     info!("Shutting down");
+}
+
+/// Transient errors worth retrying — the bitcoind RPC class (dropped/refused
+/// connection, bitcoind restarting, wallet mid-load). DB, config, and IPC errors
+/// are real and are not retried.
+fn is_retryable(e: &MonitorError) -> bool {
+    matches!(e, MonitorError::BitcoinRpcError(_))
 }
 
 /// Side-effects that need to be executed after processing blocks
