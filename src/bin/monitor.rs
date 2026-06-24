@@ -100,7 +100,8 @@ async fn main() {
         loop {
             let started = Instant::now();
             match monitor.sync_and_listen().await {
-                // Completed, or returned because of cancellation.
+                // sync_and_listen() expected to run until cancelled by the user
+                // or crashed due to unhandled error.
                 Ok(()) => return Ok(()),
                 Err(e) if is_retryable(&e) => {
                     if retry_cancel.is_cancelled() {
@@ -111,7 +112,12 @@ async fn main() {
                     if started.elapsed() > Duration::from_secs(60) {
                         backoff = Duration::from_secs(1);
                     }
-                    warn!("Monitor RPC error (ran {:?}), retrying in {:?}: {:?}", started.elapsed(), backoff, e);
+                    warn!(
+                        "A retriable error occured, retrying in {:?}. Error: {:?}. Ran {:?}.",
+                        backoff,
+                        e,
+                        started.elapsed()
+                    );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(max_backoff);
                 }
