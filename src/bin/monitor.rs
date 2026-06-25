@@ -389,13 +389,45 @@ where
 
         if !import_addresses.is_empty() {
             // Import all addresses in a batch, each with its own timestamp
-            bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)?;
+            match bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)
+            {
+                Ok(_) => {
+                    debug!("Imported {} addresses in batch.", import_addresses.len());
+                    // Clear processed side effects
+                    self.side_effects.clear();
+                    return Ok(());
+                }
+                Err(e) => {
+                    // import_address_batch() may:
+                    // (1) time out (because importdescriptors may take minutes or hours:
+                    // https://bitcoincore.org/en/doc/27.0.0/rpc/wallet/importdescriptors/)
+                    // (2) Return error "Wallet is currently rescanning", if the import of
+                    // another address is still in progress.
+                    // For such not-fatal errors, we swallow the error here, log a warning, but do not
+                    // remove the address from side_effects and retry in the next cycle.
 
-            debug!("Imported {} addresses in batch.", import_addresses.len());
+                    // Case (1)
+                    if matches!(
+                        &e,
+                        bitcoincore_rpc::Error::JsonRpc(
+                            bitcoincore_rpc::jsonrpc::Error::Transport(_)
+                        )
+                    ) {
+                        warn!("Watch-only import RPC transport error (timeout or connection); will retry.");
+                        return Ok(());
+                    }
+                    // Case (2)
+                    if matches!(&e, bitcoincore_rpc::Error::JsonRpc(_))
+                        && e.to_string().to_lowercase().contains("rescanning")
+                    {
+                        warn!("Watch-only wallet is rescanning; will retry.");
+                        return Ok(());
+                    }
+                    return Err(e.into());
+                }
+            }
         }
 
-        // Clear processed side effects
-        self.side_effects.clear();
         Ok(())
     }
 
