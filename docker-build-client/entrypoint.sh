@@ -20,7 +20,8 @@ fi
 : "${DATABASE_URL:=/var/lib/bsl/db}"
 : "${MONITOR_SYNC_BATCH_SIZE:=1000}"
 : "${SUBNET_ID:=/b4}"
-: "${RUST_LOG:=bitcoin_ipc=info,monitor=info,provider=info,bitcoincore_rpc=error}"
+
+: "${RUST_LOG:=error,bitcoin_ipc=info,monitor=info,provider=info}"
 TUNNEL_KEY="${TUNNEL_KEY:-/run/tunnel_key}"
 LOCAL_RPC_PORT=18443
 RPC_URL="http://127.0.0.1:${LOCAL_RPC_PORT}"
