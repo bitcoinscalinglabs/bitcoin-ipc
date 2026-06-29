@@ -1,12 +1,10 @@
 # Builds the public BSL client image and pushes it to GHCR.
 #
-# The image needs source from two repos, so each build job checks out this repo
-# (bitcoin-ipc: monitor, provider) and the public ipc repo (ipc-cli) as sibling
-# directories, then builds docker-build-client/Dockerfile against that context.
-#
-# Multi-arch is built on NATIVE runners (amd64 on ubuntu-latest, arm64 on
-# ubuntu-24.04-arm), and the merge job assembles the digests into the
-#:testnet manifest list.
+# ipc-cli's Rust bindings are generated from the compiled Solidity ABIs, so the
+# `contracts` job compiles them once (Foundry + pnpm) and shares contracts/out as
+# an artifact. The `build` matrix then builds docker-build-client/Dockerfile on
+# native runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm), each pushing
+# its arch by digest; the `merge` job assembles the :testnet manifest list.
 name: bsl-client image
 
 on:
@@ -26,7 +24,42 @@ env:
   REGISTRY_IMAGE: ghcr.io/bitcoinscalinglabs/bsl-client
 
 jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ipc (with submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: bitcoinscalinglabs/ipc
+          ref: main
+          path: ipc
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Compile contract ABIs
+        run: make -C ipc/contracts compile-abi
+
+      - name: Upload contract ABIs
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-out
+          path: ipc/contracts/out
+          if-no-files-found: error
+          retention-days: 1
+
   build:
+    needs: contracts
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
@@ -35,6 +68,13 @@ jobs:
           - linux/amd64
           - linux/arm64
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Prepare platform tag
         run: |
           platform=${{ matrix.platform }}
@@ -51,6 +91,17 @@ jobs:
           repository: bitcoinscalinglabs/ipc
           ref: main
           path: ipc
+
+      - name: Restore contract ABIs
+        uses: actions/download-artifact@v4
+        with:
+          name: contracts-out
+          path: ipc/contracts/out
+
+      - name: Verify ABIs restored
+        run: |
+          test -f ipc/contracts/out/IDiamond.sol/IDiamond.json \
+            || { echo "::error::contract ABIs missing at ipc/contracts/out — the contracts job artifact did not restore correctly"; exit 1; }
 
       - name: Docker metadata (labels)
         id: meta
