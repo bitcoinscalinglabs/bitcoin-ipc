@@ -29,18 +29,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout ipc (BSL bitcoin branch, with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: bitcoinscalinglabs/ipc
           ref: bitcoin
           path: ipc
           submodules: recursive
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9.3.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 18
 
@@ -49,10 +49,13 @@ jobs:
           version: nightly
 
       - name: Compile contract ABIs
-        run: make -C ipc/contracts compile-abi
+        run: |
+          cd ipc/contracts
+          ln -sf contracts src
+          make compile-abi
 
       - name: Upload contract ABIs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contracts-out
           path: ipc/contracts/out
@@ -82,27 +85,29 @@ jobs:
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Checkout bitcoin-ipc
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: bitcoin-ipc
 
       - name: Checkout ipc (BSL bitcoin branch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: bitcoinscalinglabs/ipc
           ref: bitcoin
           path: ipc
 
       - name: Restore contract ABIs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: contracts-out
           path: ipc/contracts/out
 
       - name: Verify ABIs restored
         run: |
-          test -f ipc/contracts/out/IDiamond.sol/IDiamond.json \
-            || { echo "::error::contract ABIs missing at ipc/contracts/out — the contracts job artifact did not restore correctly"; exit 1; }
+          for f in IDiamond.sol/IDiamond.json RewardToken.sol/RewardToken.json; do
+            test -f "ipc/contracts/out/$f" \
+              || { echo "::error::missing ABI ipc/contracts/out/$f — the contracts job did not produce/restore it"; exit 1; }
+          done
 
       - name: Docker metadata (labels)
         id: meta
@@ -137,7 +142,7 @@ jobs:
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -149,7 +154,7 @@ jobs:
     needs: build
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
