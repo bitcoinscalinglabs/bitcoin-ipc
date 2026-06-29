@@ -183,6 +183,7 @@ if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" 
     --env TOPDOWN_PROPOSAL_DELAY=0 \
     --env FM_PULL_SKIP=1 \
     --env FM_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
+    --env ETHAPI_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
     child-validator 2>&1); then
     echo "Error: failed to start validator 1" >&2
     echo "$VALIDATOR1_OUTPUT" >&2
@@ -226,6 +227,7 @@ run_validator() {
         --env TOPDOWN_PROPOSAL_DELAY=0 \
         --env FM_PULL_SKIP=1 \
         --env FM_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
+        --env ETHAPI_LOG_LEVEL="info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn" \
         child-validator > "/root/.ipc/logs/spin-up-subnet-b-validator-${validator_num}.log" 2>&1
 
     # Verify containers are actually running (cargo-make can exit 0 despite failures)
@@ -259,11 +261,12 @@ done
 
 echo "All validators have been started for subnet $SUBNET_ID!"
 
-# Start relayers for validators 1-4 (logs under /root/.ipc/logs)
+# Start relayers for validators 1-4 (logs under /root/.ipc/logs).
+# Truncate the log on each spin-up so it only reflects the current subnet.
 mkdir -p /root/.ipc/logs
 echo "Starting relayers for validators 1-4..."
 for n in 1 2 3 4; do
-    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" >> "/root/.ipc/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
+    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" > "/root/.ipc/logs/relayer-subnet-b-validator${n}.log" 2>&1 &
     echo "  Relayer for validator${n} started (log: /root/.ipc/logs/relayer-subnet-b-validator${n}.log)"
 done
 

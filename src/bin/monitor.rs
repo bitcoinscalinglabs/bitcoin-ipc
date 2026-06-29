@@ -1,14 +1,15 @@
 use std::env;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::Parser;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use thiserror::Error;
 use tokio::signal;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use bitcoin::BlockHash;
+use bitcoin::{Block, BlockHash};
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
@@ -21,6 +22,11 @@ trait Database: DatabaseCore + DatabaseRewardExtensions {}
 impl<T: DatabaseCore + DatabaseRewardExtensions> Database for T {}
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Default blocks per batched fetch during cold sync; override with
+/// `MONITOR_SYNC_BATCH_SIZE`. Higher cuts round-trips but raises per-batch
+/// memory (≈ N × block size).
+const DEFAULT_SYNC_BATCH_SIZE: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -77,10 +83,18 @@ async fn main() {
         .map(|s| Duration::from_secs(s.parse::<u64>().unwrap_or(DEFAULT_POLL_INTERVAL.as_secs())))
         .unwrap_or(DEFAULT_POLL_INTERVAL);
 
+    // Cold-sync batch size (number of blocks per batched RPC round-trip)
+    let sync_batch_size = std::env::var("MONITOR_SYNC_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SYNC_BATCH_SIZE);
+
     let mut monitor = Monitor::new(
         db,
         btc_rpc,
         btc_watchonly_rpc,
+        sync_batch_size,
         poll_interval,
         cancel_token.clone(),
     );
@@ -88,9 +102,42 @@ async fn main() {
     #[cfg(feature = "emission_chain")]
     monitor.set_reward_tracker();
 
-    // Spawn monitor task
-
-    let monitor_handle = tokio::spawn(async move { monitor.sync_and_listen().await });
+    // Spawn monitor task. A transient bitcoind RPC failure (dropped/refused connection,
+    // bitcoind restarting) is retried with backoff instead of killing the process:
+    // sync() reloads the last processed block from the DB on re-entry, so this resumes
+    // rather than restarting. Non-RPC errors (DB, config) still propagate and exit.
+    let retry_cancel = cancel_token.clone();
+    let monitor_handle = tokio::spawn(async move {
+        let max_backoff = Duration::from_secs(30);
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let started = Instant::now();
+            match monitor.sync_and_listen().await {
+                // sync_and_listen() expected to run until cancelled by the user
+                // or crashed due to unhandled error.
+                Ok(()) => return Ok(()),
+                Err(e) if is_retryable(&e) => {
+                    if retry_cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    // Reset backoff after a healthy stretch so an isolated blip
+                    // recovers fast while a sustained outage backs off.
+                    if started.elapsed() > Duration::from_secs(60) {
+                        backoff = Duration::from_secs(1);
+                    }
+                    warn!(
+                        "A retriable error occured, retrying in {:?}. Error: {:?}. Ran {:?}.",
+                        backoff,
+                        e,
+                        started.elapsed()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    });
 
     // Listen for ctrl+c
 
@@ -118,6 +165,13 @@ async fn main() {
     info!("Shutting down");
 }
 
+/// Transient errors worth retrying — the bitcoind RPC class (dropped/refused
+/// connection, bitcoind restarting, wallet mid-load). DB, config, and IPC errors
+/// are real and are not retried.
+fn is_retryable(e: &MonitorError) -> bool {
+    matches!(e, MonitorError::BitcoinRpcError(_))
+}
+
 /// Side-effects that need to be executed after processing blocks
 #[derive(Debug)]
 enum SideEffect {
@@ -133,6 +187,7 @@ struct Monitor<D: Database> {
     db: D,
     rpc: bitcoincore_rpc::Client,
     watchonly_rpc: bitcoincore_rpc::Client,
+    sync_batch_size: u64,
     check_interval: Duration,
     current_height: u64,
     cancel_token: CancellationToken,
@@ -148,6 +203,7 @@ where
         db: D,
         rpc: bitcoincore_rpc::Client,
         watchonly_rpc: bitcoincore_rpc::Client,
+        sync_batch_size: u64,
         check_interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -155,6 +211,7 @@ where
             db,
             rpc,
             watchonly_rpc,
+            sync_batch_size,
             check_interval,
             cancel_token,
             current_height: 0,
@@ -199,40 +256,52 @@ where
                 ));
             }
 
-            // Process blocks from current_height to latest_block_height
+            // Catch up in batched windows. current_height advances per
+            // block so a crash or cancellation mid-window resumes cleanly.
             while self.current_height < latest_block_height {
                 if self.cancel_token.is_cancelled() {
                     debug!("Cancellation requested, stopping sync");
                     return Ok(false);
                 }
 
-                let next_height = self.current_height + 1;
-                match self.process_block(next_height).await {
-                    Ok(_) => {
-                        info!("Processed block {}", next_height);
-                        self.current_height = next_height;
-                        if let Err(e) = self.db.set_last_processed_block(self.current_height) {
-                            error!("Failed to update last processed block: {:?}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error processing block {}: {:?}.", next_height, e);
-                        // Retry logic can be added here if needed
+                let window_start = self.current_height + 1;
+                let window_end =
+                    (self.current_height + self.sync_batch_size).min(latest_block_height);
+
+                let blocks = bitcoin_utils::fetch_blocks_batched(
+                    self.rpc.get_jsonrpc_client(),
+                    window_start,
+                    window_end,
+                )?;
+
+                for (offset, (block_hash, block)) in blocks.into_iter().enumerate() {
+                    let height = window_start + offset as u64;
+                    if let Err(e) = self.process_block_data(height, block_hash, block).await {
+                        error!("Error processing block {}: {:?}.", height, e);
                         return Err(e);
                     }
-                }
+                    debug!("Processed block {}", height);
+                    self.current_height = height;
+                    if let Err(e) = self.db.set_last_processed_block(self.current_height) {
+                        error!("Failed to update last processed block: {:?}", e);
+                    }
 
-                // Reward bookkeeping hooks (must run after processing all tx in each block).
-
-                if let Some(ref mut reward_tracker) = self.reward_tracker {
-                    match reward_tracker.update_after_block(&self.db, next_height) {
-                        Ok(_) => {}
-                        Err(e) => error!(
-                            "Error updating reward bookkeeping after block {}: {:?}",
-                            next_height, e
-                        ),
+                    // Reward bookkeeping hooks (must run after processing all tx in each block).
+                    if let Some(ref mut reward_tracker) = self.reward_tracker {
+                        match reward_tracker.update_after_block(&self.db, height) {
+                            Ok(_) => {}
+                            Err(e) => error!(
+                                "Error updating reward bookkeeping after block {}: {:?}",
+                                height, e
+                            ),
+                        }
                     }
                 }
+
+                info!(
+                    "Synced blocks {}..={} (tip {})",
+                    window_start, window_end, latest_block_height
+                );
             }
 
             // Refetch the latest block height
@@ -348,13 +417,45 @@ where
 
         if !import_addresses.is_empty() {
             // Import all addresses in a batch, each with its own timestamp
-            bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)?;
+            match bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)
+            {
+                Ok(_) => {
+                    debug!("Imported {} addresses in batch.", import_addresses.len());
+                    // Clear processed side effects
+                    self.side_effects.clear();
+                    return Ok(());
+                }
+                Err(e) => {
+                    // import_address_batch() may:
+                    // (1) time out (because importdescriptors may take minutes or hours:
+                    // https://bitcoincore.org/en/doc/27.0.0/rpc/wallet/importdescriptors/)
+                    // (2) Return error "Wallet is currently rescanning", if the import of
+                    // another address is still in progress.
+                    // For such not-fatal errors, we swallow the error here, log a warning, but do not
+                    // remove the address from side_effects and retry in the next cycle.
 
-            debug!("Imported {} addresses in batch.", import_addresses.len());
+                    // Case (1)
+                    if matches!(
+                        &e,
+                        bitcoincore_rpc::Error::JsonRpc(
+                            bitcoincore_rpc::jsonrpc::Error::Transport(_)
+                        )
+                    ) {
+                        warn!("Watch-only import RPC transport error (timeout or connection); will retry.");
+                        return Ok(());
+                    }
+                    // Case (2)
+                    if matches!(&e, bitcoincore_rpc::Error::JsonRpc(_))
+                        && e.to_string().to_lowercase().contains("rescanning")
+                    {
+                        warn!("Watch-only wallet is rescanning; will retry.");
+                        return Ok(());
+                    }
+                    return Err(e.into());
+                }
+            }
         }
 
-        // Clear processed side effects
-        self.side_effects.clear();
         Ok(())
     }
 
@@ -398,7 +499,18 @@ where
         debug!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
+        self.process_block_data(block_height, block_hash, block)
+            .await
+    }
 
+    /// Processes an already-fetched block. Shared by `process_block` (single
+    /// fetch) and the batched cold-sync path.
+    async fn process_block_data(
+        &mut self,
+        block_height: u64,
+        block_hash: BlockHash,
+        block: Block,
+    ) -> Result<(), MonitorError> {
         for tx in block.txdata {
             self.process_transaction(&tx, block_height, block_hash, block.header.time)
                 .await?;

@@ -277,6 +277,54 @@ pub async fn get_subnet(
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct GetSubnetBalanceResponse {
+    /// Address of the subnet's current committee multisig. Useful for callers
+    /// that want to top up (refund) the multisig.
+    pub multisig_address: String,
+    pub balance_sats: u64,
+    pub utxo_count: usize,
+}
+
+/// Returns the on-chain balance of the subnet — i.e. the sats held by the
+/// current committee multisig, summed across all unspent outputs the watch-only
+/// wallet tracks for it. The monitor auto-imports the multisig on CREATE /
+/// handover, so no setup needed.
+pub async fn get_subnet_balance(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetSubnetParams>,
+) -> Result<GetSubnetBalanceResponse, JsonRpcError> {
+    info!("getsubnetbalance: {}", params.subnet_id);
+
+    let subnet_state = data
+        .db
+        .get_subnet_state(params.subnet_id)
+        .map_err(|e| {
+            error!("Error getting subnet state from Db: {}", e);
+            RpcError::DbError(e)
+        })?
+        .ok_or_else(|| {
+            error!("Subnet {} not found.", params.subnet_id);
+            RpcError::InvalidParams(format!("Subnet {} not found.", params.subnet_id))
+        })?;
+
+    let multisig_address = subnet_state.multisig_address();
+
+    let unspent = wallet::get_unspent_for_address(&data.btc_watchonly_rpc, &multisig_address)
+        .map_err(|e| {
+            error!("Error listing unspent for multisig {}: {}", multisig_address, e);
+            RpcError::InternalError(e.to_string())
+        })?;
+
+    let balance_sats: u64 = unspent.iter().map(|u| u.amount.to_sat()).sum();
+
+    Ok(GetSubnetBalanceResponse {
+        multisig_address: multisig_address.to_string(),
+        balance_sats,
+        utxo_count: unspent.len(),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct PrefundSubnetResponse {
     prefund_txid: bitcoin::Txid,
 }
@@ -2091,6 +2139,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("createsubnet", create_subnet)
         .with_method("joinsubnet", join_subnet)
         .with_method("getsubnet", get_subnet)
+        .with_method("getsubnetbalance", get_subnet_balance)
         .with_method("getgenesisinfo", get_genesis_info)
         .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)

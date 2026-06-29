@@ -22,7 +22,7 @@ use bitcoin::{
     script::{Instruction, PushBytes},
     secp256k1::Secp256k1,
     taproot::{LeafVersion, TaprootBuilder},
-    Address, Amount, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
+    Address, Amount, Block, BlockHash, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
 };
 
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
@@ -32,6 +32,11 @@ use crate::{
     BTC_CONFIRMATIONS, DEFAULT_BTC_FEE_RATE, MAXIMUM_BTC_FEE_RATE, MINIMUM_BTC_FEE_RATE,
     WATCHONLY_WALLET_SUFFIX,
 };
+
+/// How long to wait between retries when bitcoind reports the wallet is mid-load.
+const WALLET_LOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Maximum number of `load_wallet` attempts before giving up. 20 × 500 ms = 10 s,
+const WALLET_LOAD_MAX_RETRIES: u32 = 20;
 
 /// Returns the number of blocks to wait for before considering a
 /// confirmed in a given network.
@@ -69,8 +74,11 @@ pub fn make_rpc_client_from_env() -> Client {
             panic!("Error making bitcoincore rpc client: {}", e);
         }
     };
-    // Ignore any errors by loadwallet, as the wallet may already be loaded
-    let _ = rpc.load_wallet(&wallet_name);
+    // The wallet named by WALLET_NAME is provisioned externally before the
+    // monitor/provider start (by the deployment's bitcoin setup); we only load
+    // it here. A wallet that won't load breaks every later RPC, so fail loud.
+    load_wallet(&rpc, &wallet_name)
+        .unwrap_or_else(|e| panic!("Error loading wallet {}: {}", wallet_name, e));
     rpc
 }
 
@@ -105,6 +113,62 @@ pub fn init_rpc_client(
     let full_url = format!("{}/wallet/{}", rpc_url.trim_end_matches('/'), wallet_name);
     let rpc = Client::new(&full_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
+}
+
+/// Fetches blocks for the inclusive height range `[start, end]` in two batched
+/// round-trips (hashes, then verbosity-0 blocks) rather than two per block,
+/// returned in ascending-height order with their hash. `client` is a node-level
+/// JSON-RPC client, e.g. `bitcoincore_rpc::Client::get_jsonrpc_client`.
+pub fn fetch_blocks_batched(
+    client: &bitcoincore_rpc::jsonrpc::Client,
+    start: u64,
+    end: u64,
+) -> Result<Vec<(BlockHash, Block)>, bitcoincore_rpc::Error> {
+    use bitcoincore_rpc::jsonrpc;
+    use bitcoincore_rpc::Error;
+
+    // 1) Resolve every height in the window to a hash in a single batched request.
+    let hash_params: Vec<_> = (start..=end).map(|h| jsonrpc::arg([h])).collect();
+    let hash_reqs: Vec<_> = hash_params
+        .iter()
+        .map(|p| client.build_request("getblockhash", Some(&**p)))
+        .collect();
+    let hashes: Vec<BlockHash> = client
+        .send_batch(&hash_reqs)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.ok_or_else(|| {
+                Error::ReturnedError(format!(
+                    "missing getblockhash response for height {}",
+                    start + i as u64
+                ))
+            })?
+            .result::<BlockHash>()
+            .map_err(Error::from)
+        })
+        .collect::<Result<_, _>>()?;
+
+    // 2) Fetch each block as raw hex (verbosity 0) in a single batched request.
+    let block_params: Vec<_> = hashes.iter().map(|h| jsonrpc::arg((h, 0))).collect();
+    let block_reqs: Vec<_> = block_params
+        .iter()
+        .map(|p| client.build_request("getblock", Some(&**p)))
+        .collect();
+    let block_resps = client.send_batch(&block_reqs)?;
+
+    let mut blocks = Vec::with_capacity(hashes.len());
+    for (i, r) in block_resps.into_iter().enumerate() {
+        let hex = r
+            .ok_or_else(|| {
+                Error::ReturnedError(format!("missing getblock response for {}", hashes[i]))
+            })?
+            .result::<String>()?;
+        let block: Block = bitcoin::consensus::encode::deserialize_hex(&hex)?;
+        blocks.push((hashes[i], block));
+    }
+
+    Ok(blocks)
 }
 
 /// Returns a provably unspendable internal key
@@ -427,23 +491,44 @@ pub fn create_or_load_wallet(
         "Wallet '{}' already exists. Attempting to load it.",
         wallet_name
     );
-    let loaded = rpc.load_wallet(wallet_name);
+    load_wallet(rpc, wallet_name)
+}
 
-    match loaded {
-        Ok(_) => {
-            trace!("Loaded wallet '{}'", wallet_name);
-            Ok(())
-        }
-        Err(e) => {
-            if !e.to_string().contains("already loaded") {
-                error!("Error loading wallet '{}': {}", wallet_name, e);
-                Err(BitcoinUtilsError::BitcoinRpcError(e))
-            } else {
-                trace!("Wallet already loaded '{}'", wallet_name);
-                Ok(())
+/// Load a wallet that already exists, retrying if bitcoind reports it is mid-loading.
+/// bitcoind serialises wallet loads; if it is already mid-loading this wallet
+/// (e.g. it auto-reloaded on startup and our call raced it), it returns -4
+/// "Wallet already loading". Retry briefly before propagating — the load
+/// finishes within a couple of seconds in practice.
+pub fn load_wallet(rpc: &Client, wallet_name: &str) -> Result<(), BitcoinUtilsError> {
+    for attempt in 1..=WALLET_LOAD_MAX_RETRIES {
+        match rpc.load_wallet(wallet_name) {
+            Ok(_) => {
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+
+                if msg.contains("already loaded") {
+                    break;
+                }
+
+                if attempt == WALLET_LOAD_MAX_RETRIES {
+                    error!("Error loading wallet '{}': {}", wallet_name, e);
+                    return Err(BitcoinUtilsError::BitcoinRpcError(e));
+                }
+
+                if msg.contains("already loading") {
+                    debug!(
+                        "bitcoind is mid-loading wallet '{}', retry {}/{}",
+                        wallet_name, attempt, WALLET_LOAD_MAX_RETRIES,
+                    );
+                }
+                std::thread::sleep(WALLET_LOAD_RETRY_DELAY);
             }
         }
     }
+    trace!("Loaded wallet '{}'", wallet_name);
+    Ok(())
 }
 
 pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {

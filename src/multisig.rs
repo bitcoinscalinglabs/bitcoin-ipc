@@ -178,7 +178,7 @@ pub fn multisig_spend_max_witness_size(public_keys: &[WeightedKey], threshold: P
 	    // varint for the number of witnesses, which is a signature for each committee member + script + control block
 	    bitcoin::VarInt::from(committee_size + 2).size()
 	    // each schnorr sig
-        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * threshold as usize
+        + VarInt::from(bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE).size() * committee_size
         // script size
         + VarInt::from(script_size).size()
         // control block size
@@ -660,7 +660,7 @@ pub fn finalize_spend_psbt_from_sigs(
     secp: &Secp256k1<All>,
     subnet_id: &SubnetId,
     committee_keys: &[WeightedKey],
-    committee_threshold: u32,
+    committee_threshold: Power,
     psbt: &bitcoin::Psbt,
     signature_sets: &[&[bitcoin::secp256k1::schnorr::Signature]],
 ) -> Result<Transaction, MultisigError> {
