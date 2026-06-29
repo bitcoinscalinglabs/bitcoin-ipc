@@ -1,8 +1,9 @@
 # Builds the public BSL client image and pushes it to GHCR.
 #
-# ipc-cli's Rust bindings are generated from the compiled Solidity ABIs, so the
-# `contracts` job compiles them once (Foundry + pnpm) and shares contracts/out as
-# an artifact. The `build` matrix then builds docker-build-client/Dockerfile on
+# ipc-cli is built from the ipc repo's `bitcoin` branch. Its Rust bindings are generated from
+# the compiled Solidity ABIs, so the `contracts` job compiles them once (Foundry +
+# pnpm) and shares contracts/out as an artifact. The `build` matrix then builds
+# docker-build-client/Dockerfile on
 # native runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm), each pushing
 # its arch by digest; the `merge` job assembles the :testnet manifest list.
 name: bsl-client image
@@ -27,11 +28,11 @@ jobs:
   contracts:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout ipc (with submodules)
+      - name: Checkout ipc (BSL bitcoin branch, with submodules)
         uses: actions/checkout@v4
         with:
           repository: bitcoinscalinglabs/ipc
-          ref: main
+          ref: bitcoin
           path: ipc
           submodules: recursive
 
@@ -85,11 +86,11 @@ jobs:
         with:
           path: bitcoin-ipc
 
-      - name: Checkout ipc (public, main)
+      - name: Checkout ipc (BSL bitcoin branch)
         uses: actions/checkout@v4
         with:
           repository: bitcoinscalinglabs/ipc
-          ref: main
+          ref: bitcoin
           path: ipc
 
       - name: Restore contract ABIs
