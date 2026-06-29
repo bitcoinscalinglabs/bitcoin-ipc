@@ -9,7 +9,7 @@ use tokio::signal;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use bitcoin::BlockHash;
+use bitcoin::{Block, BlockHash};
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
@@ -22,6 +22,11 @@ trait Database: DatabaseCore + DatabaseRewardExtensions {}
 impl<T: DatabaseCore + DatabaseRewardExtensions> Database for T {}
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Default blocks per batched fetch during cold sync; override with
+/// `MONITOR_SYNC_BATCH_SIZE`. Higher cuts round-trips but raises per-batch
+/// memory (≈ N × block size).
+const DEFAULT_SYNC_BATCH_SIZE: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -78,10 +83,18 @@ async fn main() {
         .map(|s| Duration::from_secs(s.parse::<u64>().unwrap_or(DEFAULT_POLL_INTERVAL.as_secs())))
         .unwrap_or(DEFAULT_POLL_INTERVAL);
 
+    // Cold-sync batch size (number of blocks per batched RPC round-trip)
+    let sync_batch_size = std::env::var("MONITOR_SYNC_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SYNC_BATCH_SIZE);
+
     let mut monitor = Monitor::new(
         db,
         btc_rpc,
         btc_watchonly_rpc,
+        sync_batch_size,
         poll_interval,
         cancel_token.clone(),
     );
@@ -174,6 +187,7 @@ struct Monitor<D: Database> {
     db: D,
     rpc: bitcoincore_rpc::Client,
     watchonly_rpc: bitcoincore_rpc::Client,
+    sync_batch_size: u64,
     check_interval: Duration,
     current_height: u64,
     cancel_token: CancellationToken,
@@ -189,6 +203,7 @@ where
         db: D,
         rpc: bitcoincore_rpc::Client,
         watchonly_rpc: bitcoincore_rpc::Client,
+        sync_batch_size: u64,
         check_interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -196,6 +211,7 @@ where
             db,
             rpc,
             watchonly_rpc,
+            sync_batch_size,
             check_interval,
             cancel_token,
             current_height: 0,
@@ -240,40 +256,52 @@ where
                 ));
             }
 
-            // Process blocks from current_height to latest_block_height
+            // Catch up in batched windows. current_height advances per
+            // block so a crash or cancellation mid-window resumes cleanly.
             while self.current_height < latest_block_height {
                 if self.cancel_token.is_cancelled() {
                     debug!("Cancellation requested, stopping sync");
                     return Ok(false);
                 }
 
-                let next_height = self.current_height + 1;
-                match self.process_block(next_height).await {
-                    Ok(_) => {
-                        info!("Processed block {}", next_height);
-                        self.current_height = next_height;
-                        if let Err(e) = self.db.set_last_processed_block(self.current_height) {
-                            error!("Failed to update last processed block: {:?}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Error processing block {}: {:?}.", next_height, e);
-                        // Retry logic can be added here if needed
+                let window_start = self.current_height + 1;
+                let window_end =
+                    (self.current_height + self.sync_batch_size).min(latest_block_height);
+
+                let blocks = bitcoin_utils::fetch_blocks_batched(
+                    self.rpc.get_jsonrpc_client(),
+                    window_start,
+                    window_end,
+                )?;
+
+                for (offset, (block_hash, block)) in blocks.into_iter().enumerate() {
+                    let height = window_start + offset as u64;
+                    if let Err(e) = self.process_block_data(height, block_hash, block).await {
+                        error!("Error processing block {}: {:?}.", height, e);
                         return Err(e);
                     }
-                }
+                    debug!("Processed block {}", height);
+                    self.current_height = height;
+                    if let Err(e) = self.db.set_last_processed_block(self.current_height) {
+                        error!("Failed to update last processed block: {:?}", e);
+                    }
 
-                // Reward bookkeeping hooks (must run after processing all tx in each block).
-
-                if let Some(ref mut reward_tracker) = self.reward_tracker {
-                    match reward_tracker.update_after_block(&self.db, next_height) {
-                        Ok(_) => {}
-                        Err(e) => error!(
-                            "Error updating reward bookkeeping after block {}: {:?}",
-                            next_height, e
-                        ),
+                    // Reward bookkeeping hooks (must run after processing all tx in each block).
+                    if let Some(ref mut reward_tracker) = self.reward_tracker {
+                        match reward_tracker.update_after_block(&self.db, height) {
+                            Ok(_) => {}
+                            Err(e) => error!(
+                                "Error updating reward bookkeeping after block {}: {:?}",
+                                height, e
+                            ),
+                        }
                     }
                 }
+
+                info!(
+                    "Synced blocks {}..={} (tip {})",
+                    window_start, window_end, latest_block_height
+                );
             }
 
             // Refetch the latest block height
@@ -471,7 +499,18 @@ where
         debug!("Processing block {}", block_height);
         let block_hash = self.rpc.get_block_hash(block_height)?;
         let block = self.rpc.get_block(&block_hash)?;
+        self.process_block_data(block_height, block_hash, block)
+            .await
+    }
 
+    /// Processes an already-fetched block. Shared by `process_block` (single
+    /// fetch) and the batched cold-sync path.
+    async fn process_block_data(
+        &mut self,
+        block_height: u64,
+        block_hash: BlockHash,
+        block: Block,
+    ) -> Result<(), MonitorError> {
         for tx in block.txdata {
             self.process_transaction(&tx, block_height, block_hash, block.header.time)
                 .await?;

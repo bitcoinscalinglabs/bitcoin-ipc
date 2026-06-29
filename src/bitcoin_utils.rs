@@ -22,7 +22,7 @@ use bitcoin::{
     script::{Instruction, PushBytes},
     secp256k1::Secp256k1,
     taproot::{LeafVersion, TaprootBuilder},
-    Address, Amount, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
+    Address, Amount, Block, BlockHash, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
 };
 
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
@@ -113,6 +113,62 @@ pub fn init_rpc_client(
     let full_url = format!("{}/wallet/{}", rpc_url.trim_end_matches('/'), wallet_name);
     let rpc = Client::new(&full_url, Auth::UserPass(rpc_user, rpc_pass))?;
     Ok(rpc)
+}
+
+/// Fetches blocks for the inclusive height range `[start, end]` in two batched
+/// round-trips (hashes, then verbosity-0 blocks) rather than two per block,
+/// returned in ascending-height order with their hash. `client` is a node-level
+/// JSON-RPC client, e.g. `bitcoincore_rpc::Client::get_jsonrpc_client`.
+pub fn fetch_blocks_batched(
+    client: &bitcoincore_rpc::jsonrpc::Client,
+    start: u64,
+    end: u64,
+) -> Result<Vec<(BlockHash, Block)>, bitcoincore_rpc::Error> {
+    use bitcoincore_rpc::jsonrpc;
+    use bitcoincore_rpc::Error;
+
+    // 1) Resolve every height in the window to a hash in a single batched request.
+    let hash_params: Vec<_> = (start..=end).map(|h| jsonrpc::arg([h])).collect();
+    let hash_reqs: Vec<_> = hash_params
+        .iter()
+        .map(|p| client.build_request("getblockhash", Some(&**p)))
+        .collect();
+    let hashes: Vec<BlockHash> = client
+        .send_batch(&hash_reqs)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.ok_or_else(|| {
+                Error::ReturnedError(format!(
+                    "missing getblockhash response for height {}",
+                    start + i as u64
+                ))
+            })?
+            .result::<BlockHash>()
+            .map_err(Error::from)
+        })
+        .collect::<Result<_, _>>()?;
+
+    // 2) Fetch each block as raw hex (verbosity 0) in a single batched request.
+    let block_params: Vec<_> = hashes.iter().map(|h| jsonrpc::arg((h, 0))).collect();
+    let block_reqs: Vec<_> = block_params
+        .iter()
+        .map(|p| client.build_request("getblock", Some(&**p)))
+        .collect();
+    let block_resps = client.send_batch(&block_reqs)?;
+
+    let mut blocks = Vec::with_capacity(hashes.len());
+    for (i, r) in block_resps.into_iter().enumerate() {
+        let hex = r
+            .ok_or_else(|| {
+                Error::ReturnedError(format!("missing getblock response for {}", hashes[i]))
+            })?
+            .result::<String>()?;
+        let block: Block = bitcoin::consensus::encode::deserialize_hex(&hex)?;
+        blocks.push((hashes[i], block));
+    }
+
+    Ok(blocks)
 }
 
 /// Returns a provably unspendable internal key
