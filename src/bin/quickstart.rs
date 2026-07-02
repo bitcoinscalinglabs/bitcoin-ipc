@@ -60,9 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if default wallet already exists by trying to load it first
+    // Check if default wallet already exists by trying to load it first.
+    // "true" = load_on_startup, so default is flagged for auto-reload here.
     let wallet_load = Command::new("bitcoin-cli")
-        .args(["--regtest", "loadwallet", "default"])
+        .args(["--regtest", "loadwallet", "default", "true"])
         .output();
 
     let wallets_exist = match wallet_load {
@@ -93,10 +94,11 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     if wallets_exist {
         println!("Default wallet exists, skipping wallet creation.");
 
-        // Load all wallets
+        // Load all wallets. Trailing "true" = load_on_startup so bitcoind auto-reloads
+        // them on restart.
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(["--regtest", "loadwallet", wallet])
+                .args(["--regtest", "loadwallet", wallet, "true"])
                 .output()?;
 
             if output.status.success() {
@@ -112,10 +114,22 @@ async fn setup_bitcoin_wallets() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("Creating Bitcoin wallets...");
 
-        // Create wallets
+        // Create wallets. Positional args set load_on_startup=true (arg 6) so bitcoind
+        // auto-reloads them on restart.
+        // disable_private_keys=false blank=false passphrase="" avoid_reuse=false descriptors=true load_on_startup=true
         for wallet in &wallet_names {
             let output = Command::new("bitcoin-cli")
-                .args(["--regtest", "createwallet", wallet])
+                .args([
+                    "--regtest",
+                    "createwallet",
+                    wallet,
+                    "false",
+                    "false",
+                    "",
+                    "false",
+                    "true",
+                    "true",
+                ])
                 .output()?;
 
             if output.status.success() {

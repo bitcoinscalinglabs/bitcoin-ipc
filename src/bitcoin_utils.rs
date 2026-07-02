@@ -474,7 +474,21 @@ pub fn create_or_load_wallet(
     wallet_name: &str,
     disable_private_keys: bool,
 ) -> Result<(), BitcoinUtilsError> {
-    let wallet = rpc.create_wallet(wallet_name, Some(disable_private_keys), None, None, None);
+    // Positional createwallet args up to load_on_startup (pos 7); null keeps the defaults
+    // for blank/passphrase/avoid_reuse/descriptors. load_on_startup=true so a freshly
+    // created wallet also survives bitcoind restarts
+    let wallet = rpc.call::<bitcoincore_rpc::json::LoadWalletResult>(
+        "createwallet",
+        &[
+            wallet_name.into(),
+            disable_private_keys.into(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            true.into(),
+        ],
+    );
     if wallet.is_ok() {
         let wallet_info = wallet.unwrap();
         trace!("Created wallet '{}': {:?}", wallet_name, wallet_info);
@@ -501,7 +515,10 @@ pub fn create_or_load_wallet(
 /// finishes within a couple of seconds in practice.
 pub fn load_wallet(rpc: &Client, wallet_name: &str) -> Result<(), BitcoinUtilsError> {
     for attempt in 1..=WALLET_LOAD_MAX_RETRIES {
-        match rpc.load_wallet(wallet_name) {
+        match rpc.call::<bitcoincore_rpc::json::LoadWalletResult>(
+            "loadwallet",
+            &[wallet_name.into(), true.into()],
+        ) {
             Ok(_) => {
                 break;
             }
