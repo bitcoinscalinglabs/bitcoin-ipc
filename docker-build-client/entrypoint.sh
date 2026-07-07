@@ -20,6 +20,13 @@ fi
 : "${DATABASE_URL:=/var/lib/bsl/db}"
 : "${MONITOR_SYNC_BATCH_SIZE:=1000}"
 : "${SUBNET_ID:=/b4}"
+# Optional cross-subnet (fevm) config vars, from bsl.env.
+: "${SUBNET2_ID:=}"
+: "${URL:=}"
+: "${URL2:=}"
+: "${TOKEN:=}"
+: "${GATEWAY_ADDR:=}"
+: "${REGISTRY_ADDR:=}"
 
 : "${RUST_LOG:=error,bitcoin_ipc=info,monitor=info,provider=info}"
 TUNNEL_KEY="${TUNNEL_KEY:-/run/tunnel_key}"
@@ -74,6 +81,26 @@ network_type = "btc"
 provider_http = "http://127.0.0.1:${PROVIDER_PORT}/api"
 auth_token = "$PROVIDER_AUTH_TOKEN"
 EOF
+
+# Populate ipc config file.
+append_fevm_subnet() {
+  local id="$1" base="$2"
+  [ -n "$id" ] && [ -n "$base" ] && [ -n "$GATEWAY_ADDR" ] && [ -n "$REGISTRY_ADDR" ] || return 0
+  cat >> /root/.ipc/config.toml <<EOF
+
+[[subnets]]
+id = "$id"
+
+[subnets.config]
+network_type = "fevm"
+provider_http = "${base}${TOKEN}"
+gateway_addr = "$GATEWAY_ADDR"
+registry_addr = "$REGISTRY_ADDR"
+EOF
+  echo "  config.toml: added fevm entry for $id"
+}
+append_fevm_subnet "$SUBNET_ID"  "$URL"
+append_fevm_subnet "$SUBNET2_ID" "$URL2"
 
 echo "==> starting monitor"
 monitor --env /etc/bsl/stack.env &
