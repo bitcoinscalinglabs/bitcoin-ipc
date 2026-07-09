@@ -21,7 +21,7 @@ fi
 : "${MONITOR_SYNC_BATCH_SIZE:=1000}"
 : "${SUBNET_ID:=/b4}"
 # Optional cross-subnet (fevm) config vars, from bsl.env.
-: "${SUBNET2_ID:=}"
+: "${SUBNET_ID2:=}"
 : "${URL:=}"
 : "${URL2:=}"
 : "${TOKEN:=}"
@@ -100,7 +100,7 @@ EOF
   echo "  config.toml: added fevm entry for $id"
 }
 append_fevm_subnet "$SUBNET_ID"  "$URL"
-append_fevm_subnet "$SUBNET2_ID" "$URL2"
+append_fevm_subnet "$SUBNET_ID2" "$URL2"
 
 echo "==> starting monitor"
 monitor --env /etc/bsl/stack.env &
