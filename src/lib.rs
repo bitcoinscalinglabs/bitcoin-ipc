@@ -39,7 +39,7 @@ pub const L1_NAME: &str = match NETWORK {
 pub const BTC_CONFIRMATIONS: u64 = bitcoin_utils::confirmations(NETWORK);
 
 pub const DEFAULT_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(10);
-pub const MINIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(1);
+pub const MINIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(2);
 pub const MAXIMUM_BTC_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_unchecked(100);
 
 /// Name of the wallet used to store the subnet validator multisig addresses
