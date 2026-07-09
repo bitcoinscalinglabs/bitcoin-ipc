@@ -35,6 +35,11 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-debug}
       - HOST_HOME_DIR=$HOME
+      # Emission-chain runtime config for the monitor/provider (default off). ACTIVATION_HEIGHT
+      # and SNAPSHOT_LENGTH must match what the subnet-A genesis is spun up with.
+      - EMISSION_CHAIN_FEATURES=${EMISSION_CHAIN_FEATURES:-false}
+      - ACTIVATION_HEIGHT=${ACTIVATION_HEIGHT:-}
+      - SNAPSHOT_LENGTH=${SNAPSHOT_LENGTH:-}
       # IPC addresses and whitelist (default values, can be overridden from host)
       - IPC_ADDRESS_OF_VALIDATOR_1=${IPC_ADDRESS_OF_VALIDATOR_1:-0x27b60d9f71d6806cca7d5a92b391093fe100f8e8}
       - IPC_ADDRESS_OF_VALIDATOR_2=${IPC_ADDRESS_OF_VALIDATOR_2:-0xd9c4c92ca843a53bff146c79b5d32ca4b9321414}
