@@ -2087,6 +2087,7 @@ impl IpcCheckpointSubnetMsg {
             exhaust_unspent,
             &tx_outs,
             &fee_rate,
+            multisig::CHECKPOINT_CONSOLIDATION_LIMIT,
         )?;
 
         // dbg!(&checkpoint_tx);
@@ -2156,6 +2157,7 @@ impl IpcCheckpointSubnetMsg {
                     exhaust_unspent,
                     &tx_outs,
                     &fee_rate,
+                    multisig::CHECKPOINT_CONSOLIDATION_LIMIT,
                 )?;
             }
         }
@@ -2171,6 +2173,7 @@ impl IpcCheckpointSubnetMsg {
             exhaust_unspent,
             &tx_outs,
             &fee_rate,
+            multisig::CHECKPOINT_CONSOLIDATION_LIMIT,
         )?;
 
         debug!("Checkpoint TX: {checkpoint_tx:?}");

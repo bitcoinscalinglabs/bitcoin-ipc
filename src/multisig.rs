@@ -127,6 +127,15 @@ pub fn multisig_threshold(total_power: Power) -> Power {
 pub const POWER_SCALE_FACTOR: u64 = 10_000;
 pub const MAX_POWER: u64 = u32::MAX as u64;
 
+/// How many extra (smallest) committee UTXOs a checkpoint folds in beyond what
+/// coin-selection needs. Data-carrying checkpoints leak a small commit-reveal
+/// "reveal" UTXO each time; greedy largest-first selection never spends them, so
+/// they accumulate until a committee rotation must sweep them all at once (which
+/// then produces an oversized, unbroadcastable transaction). Sweeping a bounded
+/// number per checkpoint keeps the committee UTXO set small and drains any backlog
+/// gradually. The cap keeps a single checkpoint from growing too large.
+pub const CHECKPOINT_CONSOLIDATION_LIMIT: usize = 50;
+
 /// Converts a Bitcoin Amount to a power/weight value (u32) using a fixed scale factor.
 /// Discards small satoshi values based on the provided minimum amount.
 //
@@ -199,6 +208,9 @@ pub fn select_coins(
     base_tx_weight: Weight,
     satisfaction_weight_per_input: Weight,
     change_address: &Address,
+    // Fold in up to this many of the smallest leftover UTXOs beyond what is needed to
+    // cover the target, to drain accumulated dust. Pass 0 for plain coin-selection.
+    consolidation_limit: usize,
 ) -> Result<
     (
         // The list of selected UTXOs
@@ -209,7 +221,7 @@ pub fn select_coins(
     MultisigError,
 > {
     let mut utxos = utxos.to_vec();
-    // Sort UTXOs deterministically by amount, txid and vout
+    // Sort UTXOs deterministically by amount, txid and vout — largest first.
     utxos.sort_by(|a, b| {
         b.amount
             .cmp(&a.amount)
@@ -229,10 +241,10 @@ pub fn select_coins(
     let mut total_amount = Amount::ZERO;
     let mut total_weight = base_tx_weight;
 
-    for utxo in utxos {
-        // Append the utxo
+    // Phase 1: greedily take the largest UTXOs until the target plus fee is covered.
+    let mut covered_index = None;
+    for (index, utxo) in utxos.iter().enumerate() {
         selected.push(utxo.clone());
-
         total_amount += utxo.amount;
         total_weight += satisfaction_weight_per_input;
 
@@ -241,33 +253,75 @@ pub fn select_coins(
             .expect("fee rate shouldn't overflow");
 
         if total_amount >= target + total_fee {
-            let change = total_amount - target - total_fee;
-            trace!(
-                "Selected coins for target amount {}. Total amount: {}, total fee: {}, change: {}",
-                target,
-                total_amount,
-                total_fee,
-                change
-            );
-
-            // if change is non-dust, return it
-            if change > non_dust_change_tx_out.value {
-                let change_tx_out = bitcoin::TxOut {
-                    value: change,
-                    script_pubkey: change_address.script_pubkey(),
-                };
-                return Ok((selected, Some(change_tx_out)));
-            } else {
-                return Ok((selected, None));
-            }
+            covered_index = Some(index);
+            break;
         }
     }
 
-    Err(MultisigError::CoinSelectionFailed(
+    let covered_index = covered_index.ok_or(MultisigError::CoinSelectionFailed(
         "Insufficient funds".to_string(),
-    ))
+    ))?;
+
+    // Phase 2: consolidation. Fold in up to `consolidation_limit` of the smallest
+    // remaining UTXOs (the tail of the largest-first order), so leaked commit-reveal
+    // dust does not accumulate. Their value flows into the change output. This is
+    // best-effort: an input is only swept while the change stays above dust, so
+    // consolidation can never turn a spendable set into an unbuildable transaction.
+    // `consolidation_limit == 0` makes this a no-op and leaves behaviour unchanged.
+    for utxo in utxos[covered_index + 1..]
+        .iter()
+        .rev()
+        .take(consolidation_limit)
+    {
+        let next_weight = total_weight + satisfaction_weight_per_input;
+        let next_amount = total_amount + utxo.amount;
+        let next_fee = fee_rate
+            .fee_wu(next_weight)
+            .expect("fee rate shouldn't overflow");
+        // Only sweep if change would still cover the dust threshold afterwards.
+        if next_amount < target + next_fee + non_dust_change_tx_out.value {
+            break;
+        }
+        selected.push(utxo.clone());
+        total_amount = next_amount;
+        total_weight = next_weight;
+    }
+
+    // Phase 3: compute the final fee and change over the full selected set.
+    let total_fee = fee_rate
+        .fee_wu(total_weight)
+        .expect("fee rate shouldn't overflow");
+    let change = total_amount
+        .checked_sub(target)
+        .and_then(|remainder| remainder.checked_sub(total_fee))
+        .ok_or(MultisigError::CoinSelectionFailed(
+            "Insufficient funds to cover outputs and fees".to_string(),
+        ))?;
+
+    trace!(
+        "Selected {} coins for target {}. Total: {}, fee: {}, change: {}",
+        selected.len(),
+        target,
+        total_amount,
+        total_fee,
+        change
+    );
+
+    // If change is non-dust, include it; otherwise it becomes extra fee.
+    if change > non_dust_change_tx_out.value {
+        Ok((
+            selected,
+            Some(TxOut {
+                value: change,
+                script_pubkey: change_address.script_pubkey(),
+            }),
+        ))
+    } else {
+        Ok((selected, None))
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn construct_spend_unsigned_transaction(
     committee_keys: &[WeightedKey],
     threshold: Power,
@@ -276,6 +330,8 @@ pub fn construct_spend_unsigned_transaction(
     exhaust_unspent: bool,
     tx_outs: &[TxOut],
     fee_rate: &FeeRate,
+    // Extra small UTXOs to sweep in the coin-selection path (ignored when exhausting).
+    consolidation_limit: usize,
 ) -> Result<Transaction, MultisigError> {
     trace!("Creating multisig spend tx for tx_outs={:?}", &tx_outs);
 
@@ -417,6 +473,7 @@ pub fn construct_spend_unsigned_transaction(
             base_tx_weight,
             spending_weight_per_input,
             committee_change_address,
+            consolidation_limit,
         )?;
 
         let inputs = selected_utxos
@@ -458,6 +515,8 @@ pub fn construct_spend_psbt(
     exhaust_unspent: bool,
     tx_outs: &[TxOut],
     fee_rate: &FeeRate,
+    // Extra small UTXOs to sweep in the coin-selection path (ignored when exhausting).
+    consolidation_limit: usize,
 ) -> Result<bitcoin::Psbt, MultisigError> {
     trace!("Creating multisig spend PSBT for tx_outs={:?}", &tx_outs);
 
@@ -470,6 +529,7 @@ pub fn construct_spend_psbt(
         exhaust_unspent,
         tx_outs,
         fee_rate,
+        consolidation_limit,
     )?;
 
     // Create the PSBT from the unsigned transaction
@@ -1304,12 +1364,78 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         )
         .unwrap();
 
         assert_eq!(selected.len(), 2);
         assert!(change.is_some());
         assert_eq!(change.unwrap().value, Amount::from_sat(450));
+    }
+
+    #[test]
+    fn test_consolidation_sweeps_dust() {
+        // One large UTXO that alone covers the target, plus dust UTXOs that greedy
+        // largest-first selection would never touch (distinct by vout).
+        let target = Amount::from_sat(1000);
+        let large_txid = "d7f3553b9631f48a2842a2cb6e0f2b6e344bf82d3ee78295a5361adc17b838b1";
+        let dust_txid = "7224e1f11ddc838100abd123d23af0d02493001fdd746685dc539fe062b45e3e";
+        let mut utxos = vec![create_test_utxo(100_000, large_txid, 0)];
+        for vout in 0..5u32 {
+            utxos.push(create_test_utxo(330, dust_txid, vout));
+        }
+
+        let fee_rate = FeeRate::from_sat_per_vb(1).expect("works");
+        let base_weight = Weight::from_wu(100);
+        let input_weight = Weight::from_wu(50);
+        let change_address = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .assume_checked();
+
+        // Limit 0: unchanged behaviour — greedy selection takes only the large UTXO.
+        let (selected, _) = select_coins(
+            target,
+            &utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+            0,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].amount, Amount::from_sat(100_000));
+
+        // Limit 3: additionally folds in the 3 smallest dust UTXOs, value into change.
+        let (selected, change) = select_coins(
+            target,
+            &utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+            3,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].amount, Amount::from_sat(100_000));
+        assert!(selected[1..]
+            .iter()
+            .all(|u| u.amount == Amount::from_sat(330)));
+        assert!(change.is_some());
+
+        // Limit exceeding the available dust sweeps them all without overshooting.
+        let (selected, _) = select_coins(
+            target,
+            &utxos,
+            fee_rate,
+            base_weight,
+            input_weight,
+            &change_address,
+            100,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 6); // large + all 5 dust
     }
 
     #[test]
@@ -1334,6 +1460,7 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         )
         .unwrap();
 
@@ -1370,6 +1497,7 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         );
 
         assert!(result.is_err());
@@ -1413,6 +1541,7 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         )
         .unwrap();
 
@@ -1444,6 +1573,7 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         );
 
         assert!(result.is_err());
@@ -1487,6 +1617,7 @@ mod coin_selection_tests {
             base_weight,
             input_weight,
             &change_address,
+            0,
         )
         .unwrap();
 
@@ -1591,6 +1722,7 @@ mod psbt_tests {
                 script_pubkey: destination.script_pubkey(),
             }],
             &fee_rate,
+            0,
         )
         .unwrap();
 
@@ -1746,6 +1878,7 @@ mod psbt_tests {
             false,
             &[tx_out],
             &fee_rate,
+            0,
         )
         .unwrap();
 
@@ -1937,6 +2070,7 @@ mod psbt_tests {
             false,
             &[tx_out],
             &fee_rate,
+            0,
         )
         .unwrap();
 
@@ -2415,6 +2549,7 @@ mod exhaust_unspent_tests {
             false, // don't exhaust
             &[tx_out.clone()],
             &fee_rate,
+            0,
         )
         .unwrap();
 
@@ -2435,6 +2570,7 @@ mod exhaust_unspent_tests {
             true, // exhaust all UTXOs
             &[tx_out.clone()],
             &fee_rate,
+            0,
         )
         .unwrap();
 
@@ -2503,6 +2639,7 @@ mod exhaust_unspent_tests {
             true, // exhaust all UTXOs
             &[tx_out, tx_out2],
             &fee_rate,
+            0,
         )
         .unwrap();
 

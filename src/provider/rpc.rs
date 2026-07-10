@@ -604,6 +604,7 @@ pub async fn gen_multisig_spend_psbt(
             script_pubkey: recipient.script_pubkey(),
         }],
         &fee_rate,
+        0,
     )
     .map_err(|e| {
         error!(
@@ -782,6 +783,7 @@ pub async fn gen_bootstrap_handover(
         true,
         &[],
         &fee_rate,
+        0,
     )
     .map_err(|e| {
         error!(
