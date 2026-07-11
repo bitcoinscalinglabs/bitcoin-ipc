@@ -190,6 +190,25 @@ pub fn import_address_batch(
     rpc.call("importdescriptors", &args)
 }
 
+/// Returns true if the address's descriptor is already registered in the (watch-only) wallet,
+/// regardless of whether its follow-up rescan has finished.
+///
+/// `importdescriptors` adds the descriptor immediately — the address becomes `ismine` and carries
+/// its label — and only then rescans historical blocks for its UTXOs in the background. That rescan
+/// can be slow (its RPC call may time out or report "wallet is rescanning"), but the registration
+/// itself is already done, so `getaddressinfo` returns the label/`ismine` even while the rescan is
+/// still in progress. Callers use this to avoid re-issuing `importdescriptors` for an address that
+/// is already registered (which would only contend the wallet lock and starve the running rescan).
+pub fn is_address_imported(
+    rpc: &Client,
+    address: &bitcoin::Address,
+) -> Result<bool, bitcoincore_rpc::Error> {
+    let info = rpc.get_address_info(address)?;
+    Ok(info.is_mine.unwrap_or(false)
+        || info.is_watchonly.unwrap_or(false)
+        || !info.labels.is_empty())
+}
+
 #[derive(Error, Debug)]
 pub enum WalletError {
     #[error(transparent)]

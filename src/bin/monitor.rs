@@ -416,11 +416,37 @@ where
             .collect();
 
         if !import_addresses.is_empty() {
-            // Import all addresses in a batch, each with its own timestamp
-            match bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &import_addresses)
-            {
+            // Drop addresses whose descriptor is already registered in the watch-only wallet.
+            //
+            // `importdescriptors` adds the descriptor immediately (the address becomes `ismine`
+            // and carries its label) and only then rescans historical blocks for its UTXOs in the
+            // background. That rescan is slow and its RPC call routinely times out or returns
+            // "wallet is rescanning" (handled below). Without this filter we would re-issue
+            // `importdescriptors` on every poll cycle until we observe an `Ok` — but each call
+            // contends the wallet lock and starves the running rescan, so the rescan never
+            // finishes, the `Ok` never comes, and we loop forever (fleet-wide, one bitcoind).
+            // Recognizing "already registered" lets us stop after the first attempt and let the
+            // background rescan complete undisturbed.
+            let pending: Vec<(bitcoin::Address, String, u32)> = import_addresses
+                .into_iter()
+                .filter(|(address, _, _)| {
+                    // On a query error, assume not-imported and let the import below run — it is
+                    // idempotent and its errors are swallowed, so this never gets stuck.
+                    !bitcoin_ipc::wallet::is_address_imported(&self.watchonly_rpc, address)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if pending.is_empty() {
+                // Every queued address is registered (its background rescan finishes on its own).
+                self.side_effects.clear();
+                return Ok(());
+            }
+
+            // Import the not-yet-registered addresses in a batch, each with its own timestamp.
+            match bitcoin_ipc::wallet::import_address_batch(&self.watchonly_rpc, &pending) {
                 Ok(_) => {
-                    debug!("Imported {} addresses in batch.", import_addresses.len());
+                    debug!("Imported {} addresses in batch.", pending.len());
                     // Clear processed side effects
                     self.side_effects.clear();
                     return Ok(());
@@ -431,8 +457,9 @@ where
                     // https://bitcoincore.org/en/doc/27.0.0/rpc/wallet/importdescriptors/)
                     // (2) Return error "Wallet is currently rescanning", if the import of
                     // another address is still in progress.
-                    // For such not-fatal errors, we swallow the error here, log a warning, but do not
-                    // remove the address from side_effects and retry in the next cycle.
+                    // In both cases the descriptor is (or will be) registered, so we swallow the
+                    // error, keep the side effects, and re-check next cycle — where the filter
+                    // above sees it registered and clears it, WITHOUT re-issuing importdescriptors.
 
                     // Case (1)
                     if matches!(
@@ -441,14 +468,14 @@ where
                             bitcoincore_rpc::jsonrpc::Error::Transport(_)
                         )
                     ) {
-                        warn!("Watch-only import RPC transport error (timeout or connection); will retry.");
+                        warn!("Watch-only import RPC transport error (timeout or connection); descriptor added, rescan continues in background.");
                         return Ok(());
                     }
                     // Case (2)
                     if matches!(&e, bitcoincore_rpc::Error::JsonRpc(_))
                         && e.to_string().to_lowercase().contains("rescanning")
                     {
-                        warn!("Watch-only wallet is rescanning; will retry.");
+                        warn!("Watch-only wallet is rescanning; descriptor added, will confirm next cycle.");
                         return Ok(());
                     }
                     return Err(e.into());
