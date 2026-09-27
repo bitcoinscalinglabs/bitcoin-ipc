@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Open the SSH tunnel to bitcoind, then run monitor + provider against it.
+# Connect to bitcoind (SSH tunnel or direct RPC), then run monitor + provider against it.
 set -euo pipefail
+# The config files written below hold credentials.
+umask 077
 
+# ssh-tunnel: bitcoind RPC reached through an SSH tunnel (SSH_HOST, SSH_USER, tunnel key).
+# direct:     bitcoind RPC reached at RPC_URL.
 : "${BITCOIN_CONN_MODE:=ssh-tunnel}"
-if [ "$BITCOIN_CONN_MODE" != "ssh-tunnel" ]; then
-  echo "ERROR: BITCOIN_CONN_MODE='$BITCOIN_CONN_MODE' not supported (only 'ssh-tunnel')." >&2
-  exit 1
-fi
+case "$BITCOIN_CONN_MODE" in
+  ssh-tunnel|direct) ;;
+  *) echo "ERROR: BITCOIN_CONN_MODE='$BITCOIN_CONN_MODE' not supported (ssh-tunnel|direct)." >&2
+     exit 1 ;;
+esac
 
-: "${SSH_HOST:?SSH_HOST required}"
-: "${SSH_USER:?SSH_USER required}"
 : "${RPC_USER:?RPC_USER required}"
 : "${RPC_PASS:?RPC_PASS required}"
 : "${WALLET_NAME:?WALLET_NAME required}"
@@ -29,28 +32,36 @@ fi
 : "${REGISTRY_ADDR:=}"
 
 : "${RUST_LOG:=error,bitcoin_ipc=info,monitor=info,provider=info}"
-TUNNEL_KEY="${TUNNEL_KEY:-/run/tunnel_key}"
-LOCAL_RPC_PORT=18443
-RPC_URL="http://127.0.0.1:${LOCAL_RPC_PORT}"
 
-[ -f "$TUNNEL_KEY" ] || { echo "ERROR: tunnel key not mounted at $TUNNEL_KEY" >&2; exit 1; }
-# ssh rejects a world-readable key, so copy the ro mount to a 600 file.
-install -m 600 "$TUNNEL_KEY" /tmp/tunnel_key
+if [ "$BITCOIN_CONN_MODE" = "ssh-tunnel" ]; then
+  : "${SSH_HOST:?SSH_HOST required}"
+  : "${SSH_USER:?SSH_USER required}"
+  TUNNEL_KEY="${TUNNEL_KEY:-/run/tunnel_key}"
+  LOCAL_RPC_PORT=18443
+  RPC_URL="http://127.0.0.1:${LOCAL_RPC_PORT}"
 
-echo "==> opening SSH tunnel to ${SSH_USER}@${SSH_HOST}"
-autossh -M 0 -f -N \
-  -L "${LOCAL_RPC_PORT}:127.0.0.1:18443" \
-  -i /tmp/tunnel_key \
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
-  "${SSH_USER}@${SSH_HOST}"
+  [ -f "$TUNNEL_KEY" ] || { echo "ERROR: tunnel key not mounted at $TUNNEL_KEY" >&2; exit 1; }
+  # ssh rejects a world-readable key, so copy the ro mount to a 600 file.
+  install -m 600 "$TUNNEL_KEY" /tmp/tunnel_key
 
-echo "==> waiting for bitcoind RPC via tunnel"
-for _ in $(seq 1 30); do
-  nc -z 127.0.0.1 "$LOCAL_RPC_PORT" && break
-  sleep 1
-done
-nc -z 127.0.0.1 "$LOCAL_RPC_PORT" || { echo "ERROR: tunnel to bitcoind not reachable" >&2; exit 1; }
+  echo "==> opening SSH tunnel to ${SSH_USER}@${SSH_HOST}"
+  autossh -M 0 -f -N \
+    -L "${LOCAL_RPC_PORT}:127.0.0.1:18443" \
+    -i /tmp/tunnel_key \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new \
+    "${SSH_USER}@${SSH_HOST}"
+
+  echo "==> waiting for bitcoind RPC via tunnel"
+  for _ in $(seq 1 30); do
+    nc -z 127.0.0.1 "$LOCAL_RPC_PORT" && break
+    sleep 1
+  done
+  nc -z 127.0.0.1 "$LOCAL_RPC_PORT" || { echo "ERROR: tunnel to bitcoind not reachable" >&2; exit 1; }
+else
+  : "${RPC_URL:?RPC_URL required in direct mode (e.g. http://host.docker.internal:18443)}"
+  echo "==> using bitcoind RPC at ${RPC_URL}"
+fi
 
 mkdir -p "$DATABASE_URL" /etc/bsl /root/.ipc
 cat > /etc/bsl/stack.env <<EOF
@@ -82,7 +93,7 @@ provider_http = "http://127.0.0.1:${PROVIDER_PORT}/api"
 auth_token = "$PROVIDER_AUTH_TOKEN"
 EOF
 
-# Populate ipc config file.
+# One fevm entry per L2 subnet with an RPC URL, for cross-subnet commands.
 append_fevm_subnet() {
   local id="$1" base="$2"
   [ -n "$id" ] && [ -n "$base" ] && [ -n "$GATEWAY_ADDR" ] && [ -n "$REGISTRY_ADDR" ] || return 0
@@ -106,9 +117,7 @@ echo "==> starting monitor"
 monitor --env /etc/bsl/stack.env &
 MON=$!
 
-# The provider opens the DB read-only and panics if the monitor hasn't created it
-# yet. Give the monitor a head start so the first attempt usually wins the race; the
-# retry loop below still covers a slower-than-expected monitor start.
+# The provider exits if the monitor has not created the DB yet: head start, then retry.
 sleep 5
 
 echo "==> starting provider"

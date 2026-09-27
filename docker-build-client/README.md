@@ -2,8 +2,10 @@
 
 Docker image for interacting with the Bitcoin-IPC framework. It reads the framework's
 state from Bitcoin — subnets, their validators, stakes, and checkpoints — and can act
-on it, for example joining a subnet as a validator. It reaches a Bitcoin node over an
-SSH tunnel (currently Bitcoin Core on the Regtest testnet only).
+on it, for example joining a subnet as a validator. It reaches a Bitcoin node
+(currently Bitcoin Core on the Regtest testnet only) in one of two modes, set by
+`BITCOIN_CONN_MODE`: `ssh-tunnel` (default; RPC through an SSH tunnel to `SSH_HOST`) or
+`direct` (RPC at `RPC_URL`, e.g. the operator's own node).
 
 The container runs three processes:
 
