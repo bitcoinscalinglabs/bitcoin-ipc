@@ -15,7 +15,9 @@ esac
 
 : "${RPC_USER:?RPC_USER required}"
 : "${RPC_PASS:?RPC_PASS required}"
-: "${WALLET_NAME:?WALLET_NAME required}"
+# FUND_WALLET: the bitcoind wallet that pays collateral and deposits (WALLET_NAME: older name).
+: "${FUND_WALLET:=${WALLET_NAME:-}}"
+: "${FUND_WALLET:?FUND_WALLET required}"
 : "${PROVIDER_AUTH_TOKEN:?PROVIDER_AUTH_TOKEN required}"
 : "${ACTIVATION_HEIGHT:?ACTIVATION_HEIGHT required}"
 : "${SNAPSHOT_LENGTH:?SNAPSHOT_LENGTH required}"
@@ -68,7 +70,7 @@ cat > /etc/bsl/stack.env <<EOF
 RPC_USER=$RPC_USER
 RPC_PASS=$RPC_PASS
 RPC_URL=$RPC_URL
-WALLET_NAME=$WALLET_NAME
+WALLET_NAME=$FUND_WALLET
 DATABASE_URL=$DATABASE_URL
 PROVIDER_PORT=$PROVIDER_PORT
 PROVIDER_AUTH_TOKEN=$PROVIDER_AUTH_TOKEN
@@ -77,7 +79,13 @@ SNAPSHOT_LENGTH=$SNAPSHOT_LENGTH
 MONITOR_SYNC_BATCH_SIZE=$MONITOR_SYNC_BATCH_SIZE
 RUST_LOG=$RUST_LOG
 EOF
-# No VALIDATOR_SK_PATH: the provider runs read/join-only, which needs no signing key.
+# Optional validator key: the provider signs unstake with it. Without it, the provider
+# still serves queries, join and stake.
+VALIDATOR_SK=/root/.ipc/validator.sk
+if [ -f "$VALIDATOR_SK" ]; then
+  echo "VALIDATOR_SK_PATH=$VALIDATOR_SK" >> /etc/bsl/stack.env
+  echo "==> provider signs with $VALIDATOR_SK"
+fi
 
 # ipc-cli operates on the subnet "as viewed by the parent", so the config entry is
 # the parent id (e.g. /b4), not the full child subnet id; commands pass --subnet.

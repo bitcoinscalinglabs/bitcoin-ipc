@@ -32,6 +32,11 @@ COPY ipc/contracts/contracts/examples/BridgeableToken.sol src/BridgeableToken.so
 RUN curl -fsSL https://github.com/OpenZeppelin/openzeppelin-contracts/archive/refs/tags/v5.0.2.tar.gz \
       | tar -xz && mkdir -p lib && mv openzeppelin-contracts-5.0.2 lib/openzeppelin-contracts \
  && chmod +x deploy.sh
+# BSC's USDT contract, unchanged, for the stablecoin example; compiled here so deploy is offline.
+WORKDIR /opt/bsl/examples/usdt
+COPY bitcoin-ipc/docker-build-client/examples/usdt/ .
+COPY bitcoin-ipc/scripts/stablecoin-example/usdt-bsc-token/src/BEP20USDT.sol src/BEP20USDT.sol
+RUN forge build && chmod +x deploy.sh
 WORKDIR /
 COPY bitcoin-ipc/docker-build-client/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
