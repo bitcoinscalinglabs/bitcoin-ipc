@@ -1,0 +1,27 @@
+--- /Users/orestis/git/bitcoinscalinglabs/bitcoin-ipc/src/test_sizes.rs	2026-09-27 14:12:34
++++ src/test_sizes.rs	2026-09-29 14:00:37
+@@ -85,8 +85,23 @@
+     // Generate the source subnet
+     //
+ 
+-    let subnet = generate_subnet(n_validators);
++    let mut subnet = generate_subnet(n_validators);
+ 
++    // The paper's rule: a checkpoint is signed by validators holding more than 2/3 of the stake,
++    // the smallest such set with equal stakes being floor(2n/3) + 1.
++    let quorum = (n_validators * 2 / 3 + 1) as crate::multisig::Power;
++    subnet.committee.threshold = quorum;
++    subnet.committee.multisig_address = multisig::create_subnet_multisig_address(
++        &secp256k1::Secp256k1::new(),
++        &subnet.id,
++        &subnet.committee.validator_weighted_keys(),
++        quorum,
++        crate::NETWORK,
++    )
++    .unwrap()
++    .as_unchecked()
++    .clone();
++
+     //
+     // Generate the checkpoint message contents
+     //
