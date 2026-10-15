@@ -1,0 +1,193 @@
+# A BSL validator node: the BSL client (monitor + provider), fendermint, CometBFT, the
+# Ethereum JSON-RPC API and a checkpoint relayer. All settings come from bsl.env:
+#
+#   docker compose --env-file bsl.env up -d
+#
+# The one-shot services (key-export, cometbft-init, node-init) are idempotent: they prepare
+# the node on the first start and verify it on later ones. Data lives in the named volumes
+# below; the bsl-client volumes are the ones `docker run` created, so the client's wallet
+# and database carry over.
+name: bsl-node
+
+x-client-image: &client-image ghcr.io/bitcoinscalinglabs/bsl-client:testnet
+x-fendermint-image: &fendermint-image ghcr.io/bitcoinscalinglabs/bsl-fendermint:testnet
+# The fendermint image is amd64 only (what the BSL validators run); arm64 hosts emulate it.
+x-fendermint-platform: &fendermint-platform linux/amd64
+x-cometbft-image: &cometbft-image cometbft/cometbft:v0.37.18
+x-log-level: &log-level info,fendermint=info,tower=warn,libp2p=warn,tendermint=warn
+
+services:
+  bsl-client:
+    image: *client-image
+    container_name: bsl-client
+    env_file: bsl.env
+    # Starts after key-export so the provider finds /root/.ipc/validator.sk and signs this
+    # validator's share of each checkpoint with it.
+    depends_on:
+      key-export:
+        condition: service_completed_successfully
+    volumes:
+      - bsl-client-db:/var/lib/bsl/db
+      - bsl-client-keys:/root/.ipc
+    ports:
+      - "127.0.0.1:3030:3030"
+    restart: unless-stopped
+
+  # Submits this subnet's checkpoints to Bitcoin, like every validator's relayer; the first
+  # submission of a checkpoint wins, the others are rejected as duplicates.
+  relayer:
+    image: *client-image
+    network_mode: "service:bsl-client"
+    volumes:
+      - bsl-client-keys:/root/.ipc
+    entrypoint: ["ipc-cli", "--config-path", "/root/.ipc/config.toml", "checkpoint", "relayer",
+                 "--subnet", "${NODE_SUBNET_ID:?}", "--checkpoint-interval-sec", "15"]
+    depends_on:
+      - bsl-client
+    restart: unless-stopped
+
+  # The key that joined the subnet, exported from the client's wallet: kept for the provider,
+  # and handed once to node-init, which converts it for fendermint and deletes the copy.
+  key-export:
+    image: *client-image
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        umask 077
+        mkdir -p /node/validator/keys
+        [ -s /root/.ipc/validator.sk ] || ipc-cli wallet export --wallet-type btc --address "$$NODE_VALIDATOR_ADDR" --hex > /root/.ipc/validator.sk
+        [ -s /node/validator/keys/validator_key.sk ] || cp /root/.ipc/validator.sk /node/validator/keys/eth.sk
+    environment:
+      NODE_VALIDATOR_ADDR: ${NODE_VALIDATOR_ADDR:?}
+    volumes:
+      - bsl-client-keys:/root/.ipc
+      - bsl-node:/node
+
+  # Root only because a fresh volume is root-owned; node-init hands the files to the
+  # CometBFT user afterwards.
+  cometbft-init:
+    image: *cometbft-image
+    user: "0"
+    command: ["init"]
+    environment:
+      CMTHOME: /node/validator/cometbft
+    volumes:
+      - bsl-node:/node
+
+  node-init:
+    image: *fendermint-image
+    platform: *fendermint-platform
+    entrypoint: ["bash", "/init.sh"]
+    environment:
+      NODE_SUBNET_ID: ${NODE_SUBNET_ID:?}
+      NODE_RPC_SERVERS: ${NODE_RPC_SERVERS:?}
+      PROVIDER_AUTH_TOKEN: ${PROVIDER_AUTH_TOKEN:?}
+      # The client's subnet is the emission chain; its reward parameters are only needed
+      # when this node validates that subnet.
+      SUBNET_ID: ${SUBNET_ID:?}
+      ACTIVATION_HEIGHT: ${ACTIVATION_HEIGHT:-}
+      SNAPSHOT_LENGTH: ${SNAPSHOT_LENGTH:-}
+    volumes:
+      - bsl-node:/data
+      - ./init.sh:/init.sh:ro
+    depends_on:
+      key-export:
+        condition: service_completed_successfully
+      cometbft-init:
+        condition: service_completed_successfully
+
+  fendermint:
+    image: *fendermint-image
+    platform: *fendermint-platform
+    init: true
+    # The chain name is the subnet id with "/" replaced by "-" and no leading "-".
+    entrypoint: ["bash", "-c", "export FM_CHAIN_NAME=$$(echo \"$$NODE_SUBNET_ID\" | sed -e 's|/|-|g' -e 's|:|_|g' -e 's|^-||'); exec docker-entry.sh --network=test run"]
+    environment:
+      NODE_SUBNET_ID: ${NODE_SUBNET_ID:?}
+      FM_DATA_DIR: /data/validator/fendermint/data
+      FM_LOG_DIR: /data/validator/fendermint/data/logs
+      FM_SNAPSHOTS_DIR: /data/validator/fendermint/snapshots
+      FM_SNAPSHOTS__ENABLED: "true"
+      FM_IPC__SUBNET_ID: ${NODE_SUBNET_ID:?}
+      FM_IPC__TOPDOWN__CHAIN_HEAD_DELAY: "0"
+      FM_IPC__TOPDOWN__PARENT_HTTP_ENDPOINT: http://bsl-client:3030/api
+      FM_IPC__TOPDOWN__PARENT_HTTP_AUTH_TOKEN: ${PROVIDER_AUTH_TOKEN:?}
+      FM_IPC__TOPDOWN__PARENT_HTTP_TIMEOUT: "60"
+      FM_IPC__TOPDOWN__PARENT_REGISTRY: "0x6A4884D2B6A597792dC68014D4B7C117cca5668e"
+      FM_IPC__TOPDOWN__PARENT_GATEWAY: "0x56948d2CFaa2EF355B8C08Ac925202db212146D1"
+      FM_IPC__TOPDOWN__EXPONENTIAL_BACK_OFF: "5"
+      FM_IPC__TOPDOWN__EXPONENTIAL_RETRY_LIMIT: "5"
+      FM_IPC__TOPDOWN__POLLING_INTERVAL: "10"
+      FM_IPC__TOPDOWN__PROPOSAL_DELAY: "0"
+      FM_IPC__TOPDOWN__MAX_PROPOSAL_RANGE: "100"
+      FM_RESOLVER__NETWORK__LOCAL_KEY: /data/validator/keys/network_key.sk
+      FM_RESOLVER__CONNECTION__LISTEN_ADDR: /ip4/0.0.0.0/tcp/26655
+      FM_RESOLVER__DISCOVERY__STATIC_ADDRESSES: ${NODE_RESOLVER_BOOTSTRAPS:?}
+      FM_RESOLVER__CONNECTION__EXTERNAL_ADDRESSES: ""
+      FM_TENDERMINT_RPC_URL: http://cometbft:26657
+      TENDERMINT_RPC_URL: http://cometbft:26657
+      FM_VALIDATOR_KEY__PATH: /data/validator/keys/validator_key.sk
+      FM_VALIDATOR_KEY__KIND: ethereum
+      LOG_LEVEL: *log-level
+      RUST_BACKTRACE: "1"
+    volumes:
+      - bsl-node:/data
+    depends_on:
+      node-init:
+        condition: service_completed_successfully
+      bsl-client:
+        condition: service_started
+    restart: unless-stopped
+
+  cometbft:
+    image: *cometbft-image
+    command: ["start"]
+    environment:
+      CMTHOME: /node/validator/cometbft
+      CMT_MONIKER: ${NODE_MONIKER:-bsl-node}
+      CMT_PROXY_APP: tcp://fendermint:26658
+      CMT_RPC_LADDR: tcp://0.0.0.0:26657
+      CMT_RPC_MAX_SUBSCRIPTION_CLIENTS: "10"
+      CMT_RPC_MAX_SUBSCRIPTIONS_PER_CLIENT: "1000"
+      CMT_P2P_PERSISTENT_PEERS: ${NODE_PEERS:?}
+      CMT_P2P_PEX: "false"
+      # The BSL validators are reached through one proxy address.
+      CMT_P2P_ALLOW_DUPLICATE_IP: "true"
+      CMT_STATESYNC_ENABLE: "true"
+      CMT_STATESYNC_RPC_SERVERS: ${NODE_RPC_SERVERS:?}
+      CMT_STATESYNC_TRUST_PERIOD: 168h0m0s
+    volumes:
+      - bsl-node:/node
+    ports:
+      - "127.0.0.1:26657:26657"
+    depends_on:
+      - fendermint
+    restart: unless-stopped
+
+  ethapi:
+    image: *fendermint-image
+    platform: *fendermint-platform
+    init: true
+    command: ["--network=test", "eth", "run"]
+    environment:
+      TENDERMINT_RPC_URL: http://cometbft:26657
+      TENDERMINT_WS_URL: ws://cometbft:26657/websocket
+      LOG_LEVEL: *log-level
+      RUST_BACKTRACE: "1"
+    ports:
+      - "127.0.0.1:8545:8545"
+    depends_on:
+      - cometbft
+    restart: unless-stopped
+
+volumes:
+  # Created by the client's `docker run`; never removed by compose.
+  bsl-client-db:
+    name: bsl-client-db
+    external: true
+  bsl-client-keys:
+    name: bsl-client-keys
+    external: true
+  bsl-node:
+    name: bsl-node
