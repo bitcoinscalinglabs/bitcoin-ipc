@@ -28,7 +28,7 @@ bitcoind -daemon -datadir=/root/.bitcoin -pid=/root/.bitcoin/bitcoind.pid
 sleep 3
 
 # Wait for Bitcoin Core to be ready
-MAX_RETRIES=3
+MAX_RETRIES=60
 RETRY_COUNT=0
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     if bitcoin-cli getblockchaininfo > /dev/null 2>&1; then
