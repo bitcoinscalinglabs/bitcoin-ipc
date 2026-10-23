@@ -10,6 +10,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use bitcoin::{Block, BlockHash};
+use bitcoin_ipc::collateral;
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
 use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
@@ -89,6 +90,10 @@ async fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_SYNC_BATCH_SIZE);
+
+    // The UE switch must agree with the blocks already processed
+    collateral::check_ue_activation(&db, collateral::ue_activation_height())
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let mut monitor = Monitor::new(
         db,
@@ -193,6 +198,8 @@ struct Monitor<D: Database> {
     cancel_token: CancellationToken,
     side_effects: Vec<SideEffect>,
     reward_tracker: Option<RewardTracker>,
+    /// Blocks from this height on are scanned for `join-ue`; `None` turns the feature off
+    ue_activation_height: Option<u64>,
 }
 
 impl<D> Monitor<D>
@@ -207,6 +214,14 @@ where
         check_interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
+        let ue_activation_height = collateral::ue_activation_height();
+        match ue_activation_height {
+            Some(height) => info!("Unilateral exit active from block {}", height),
+            None => info!(
+                "Unilateral exit off ({} not set)",
+                collateral::UE_ACTIVATION_HEIGHT_VAR
+            ),
+        }
         Self {
             db,
             rpc,
@@ -217,7 +232,13 @@ where
             current_height: 0,
             side_effects: Vec::new(),
             reward_tracker: None,
+            ue_activation_height,
         }
+    }
+
+    fn ue_active(&self, block_height: u64) -> bool {
+        self.ue_activation_height
+            .is_some_and(|activation| block_height >= activation)
     }
 
     #[cfg(feature = "emission_chain")]
@@ -538,6 +559,20 @@ where
         block_hash: BlockHash,
         block: Block,
     ) -> Result<(), MonitorError> {
+        // UE validators leave the committee one block before their collateral matures. The
+        // pass runs before the block's transactions, on the state the previous block left,
+        // so that a block replayed after a crash gives the same result.
+        if self.ue_active(block_height) {
+            for removal in
+                collateral::remove_matured_ue_validators(&self.db, block_height, block_hash)?
+            {
+                info!(
+                    "Subnet {} UE validator {} matured at block {}: {}",
+                    removal.subnet_id, removal.pubkey, block_height, removal.outcome
+                );
+            }
+        }
+
         for tx in block.txdata {
             self.process_transaction(&tx, block_height, block_hash, block.header.time)
                 .await?;
@@ -568,6 +603,14 @@ where
                         continue;
                     }
                 };
+
+                // join-ue is not parsed at all while unilateral exit is not active
+                if witness_data.starts_with(ipc_lib::IPC_JOIN_UE_TAG.as_bytes())
+                    && !self.ue_active(block_height)
+                {
+                    trace!("Skipping join-ue: unilateral exit is not active at this height");
+                    continue;
+                }
 
                 let ipc_message = IpcMessage::from_witness(witness_data);
                 let ipc_message = match ipc_message {
@@ -886,6 +929,39 @@ where
                 info!(
                     "Processed UnstakeCollateral for Subnet ID: {} Validator XPK: {:?} Amount: {}",
                     msg.subnet_id, msg.pubkey, msg.amount
+                );
+                Ok(())
+            }
+
+            IpcMessage::JoinUe(msg) => {
+                debug!("Found IPC message: {:?}", msg);
+
+                // The join-ue of a transaction is the one in the leaf of input 0; the scan
+                // finds messages in every witness element, so a copy elsewhere is not processed
+                let data = collateral::join_ue_leaf_data(tx)
+                    .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
+                let commit_txid = tx.input[0].previous_output.txid;
+                let commit = self.rpc.get_raw_transaction(&commit_txid, None)?;
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let checked = collateral::check_join_ue(&secp, tx, &commit, &data, block_height)
+                    .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
+                if checked.msg.signature != msg.signature {
+                    debug!("Ignoring a join-ue message outside the leaf of input 0");
+                    return Ok(());
+                }
+
+                if let Some(subnet) =
+                    collateral::process_join_ue(&self.db, &checked, txid, block_height, block_hash)?
+                {
+                    // Subnet bootstrapped
+                    let (committee_addr, label) = subnet.committee_address_label();
+                    self.import_watchonly_address(committee_addr, label, block_time);
+                }
+
+                let join = &checked.msg.join;
+                info!(
+                    "Processed JoinUe for Subnet ID: {} Validator XPK: {} Collateral: {} Timeout: {}",
+                    join.subnet_id, join.pubkey, join.collateral, checked.msg.timeout
                 );
                 Ok(())
             }

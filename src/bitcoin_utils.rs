@@ -286,12 +286,15 @@ pub fn make_op_return_script<T: AsRef<PushBytes>>(data: T) -> ScriptBuf {
 /// The commit transaction is funded and signed using the RPC wallet. It has enough value
 /// to cover for commit and reveal tx fees.
 /// The reveal transaction spends to the specified final address.
+/// `extra_commit_output`, if given, becomes output 1 of the commit transaction, before
+/// the wallet's change.
 pub fn create_commit_reveal_txs(
     rpc: &Client,
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     final_address: &Address,
     data: &[u8],
     amount_to_send: Option<Amount>,
+    extra_commit_output: Option<TxOut>,
 ) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
     trace!(
         "Creating commit-reveal tx for address={}, data={:02x?}",
@@ -338,6 +341,9 @@ pub fn create_commit_reveal_txs(
             script_pubkey: commit_script_pubkey.clone(),
         }],
     };
+    if let Some(extra) = extra_commit_output {
+        commit_tx.output.push(extra);
+    }
 
     //
     // Building reveal tx

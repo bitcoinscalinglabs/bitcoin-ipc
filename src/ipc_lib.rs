@@ -29,9 +29,9 @@ use crate::NETWORK;
 // Temporary prelude module to re-export the necessary types
 pub mod prelude {
     pub use super::{
-        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcMessage, IpcTag, SubnetId, IPC_CHECKPOINT_TAG,
-        IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_FUND_SUBNET_TAG, IPC_JOIN_SUBNET_TAG,
-        IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER,
+        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcMessage, IpcTag, SubnetId,
+        IPC_CHECKPOINT_TAG, IPC_CREATE_SUBNET_TAG, IPC_DELETE_SUBNET_TAG, IPC_FUND_SUBNET_TAG,
+        IPC_JOIN_SUBNET_TAG, IPC_JOIN_UE_TAG, IPC_PREFUND_SUBNET_TAG, IPC_TAG_DELIMITER,
     };
 }
 
@@ -53,9 +53,11 @@ pub const IPC_DELETE_SUBNET_TAG: &str = "IPCDEL";
 pub const IPC_STAKE_TAG: &str = "IPCSTK";
 pub const IPC_UNSTAKE_TAG: &str = "IPCUST";
 pub const IPC_KILL_SUBNET_TAG: &str = "IPCKIL";
+pub const IPC_JOIN_UE_TAG: &str = "IPCJUE";
 
 // Static assertion to verify tag lengths at compile time
 const _: () = {
+    assert!(IPC_JOIN_UE_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_CREATE_SUBNET_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_PREFUND_SUBNET_TAG.len() == IPC_TAG_LENGTH);
     assert!(IPC_JOIN_SUBNET_TAG.len() == IPC_TAG_LENGTH);
@@ -205,6 +207,7 @@ pub enum IpcTag {
     StakeCollateral,
     UnstakeCollateral,
     KillSubnet,
+    JoinUe,
 }
 
 impl IpcTag {
@@ -212,6 +215,7 @@ impl IpcTag {
         match self {
             Self::CreateSubnet => IPC_CREATE_SUBNET_TAG,
             Self::JoinSubnet => IPC_JOIN_SUBNET_TAG,
+            Self::JoinUe => IPC_JOIN_UE_TAG,
             Self::PrefundSubnet => IPC_PREFUND_SUBNET_TAG,
             Self::FundSubnet => IPC_FUND_SUBNET_TAG,
             Self::CheckpointSubnet => IPC_CHECKPOINT_TAG,
@@ -237,6 +241,7 @@ impl std::str::FromStr for IpcTag {
             IPC_STAKE_TAG => Ok(Self::StakeCollateral),
             IPC_UNSTAKE_TAG => Ok(Self::UnstakeCollateral),
             IPC_KILL_SUBNET_TAG => Ok(Self::KillSubnet),
+            IPC_JOIN_UE_TAG => Ok(Self::JoinUe),
             _ => Err(IpcSerializeError::UnknownTag(s.to_string())),
         }
     }
@@ -383,6 +388,7 @@ impl IpcCreateSubnetMsg {
             &secp,
             &return_address,
             &subnet_data,
+            None,
             None,
         )?;
 
@@ -644,6 +650,7 @@ impl IpcJoinSubnetMsg {
             multisig_address,
             &subnet_data,
             Some(self.collateral),
+            None,
         )?;
 
         let commit_txid = commit_tx.compute_txid();
@@ -853,6 +860,180 @@ impl IpcValidate for IpcJoinSubnetMsg {
             ));
         }
 
+        Ok(())
+    }
+}
+
+/// A join whose collateral is locked under the unilateral-exit script
+/// (see `collateral`) instead of the subnet multisig.
+///
+/// Wire format: `IPCJUE || postcard(join, timeout) || signature`, where the
+/// 64-byte signature is by the validator key (`join.pubkey`) on the tagged hash
+/// (BIP340 style, tag `JOIN_UE_SIGNATURE_TAG`) of every byte before it.
+#[derive(Debug, Clone)]
+pub struct IpcJoinUeMsg {
+    /// Today's join message; `collateral` is filled from the commit transaction
+    pub join: IpcJoinSubnetMsg,
+    /// Maturity height: from block `timeout + 1` on, the validator alone spends the collateral
+    pub timeout: u32,
+    /// Signature of the validator key on the bytes that precede it
+    pub signature: bitcoin::secp256k1::schnorr::Signature,
+}
+
+/// Tag of the join-ue signature digest: `sha256(sha256(tag) || sha256(tag) || bytes)`
+pub const JOIN_UE_SIGNATURE_TAG: &[u8] = b"IPCJUE/signature";
+
+/// A BIP340-style tagged hash
+pub fn tagged_sha256(tag: &[u8], data: &[u8]) -> [u8; 32] {
+    use bitcoin::hashes::{sha256, HashEngine};
+    let tag_hash = sha256::Hash::hash(tag);
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(data);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
+
+impl IpcJoinUeMsg {
+    const TAG: &str = IPC_JOIN_UE_TAG;
+
+    /// Builds the message and signs it with the validator's secret key
+    pub fn new_signed(
+        secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+        join: IpcJoinSubnetMsg,
+        timeout: u32,
+        secret_key: &bitcoin::secp256k1::SecretKey,
+    ) -> Self {
+        let msg = Self::signing_message(&join, timeout);
+        let signature = secp.sign_schnorr(&msg, &secret_key.keypair(secp));
+        Self {
+            join,
+            timeout,
+            signature,
+        }
+    }
+
+    /// The bytes that precede the signature: the tag, the join fields and the timeout
+    fn unsigned_bytes(join: &IpcJoinSubnetMsg, timeout: u32) -> Vec<u8> {
+        let body = postcard::to_stdvec(&(join, timeout))
+            .expect("join message fields serialize without error");
+        [Self::TAG.as_bytes(), &body].concat()
+    }
+
+    fn signing_message(join: &IpcJoinSubnetMsg, timeout: u32) -> bitcoin::secp256k1::Message {
+        Self::signing_message_of(&Self::unsigned_bytes(join, timeout))
+    }
+
+    /// The signed digest of the bytes that precede the signature
+    fn signing_message_of(unsigned: &[u8]) -> bitcoin::secp256k1::Message {
+        bitcoin::secp256k1::Message::from_digest(tagged_sha256(JOIN_UE_SIGNATURE_TAG, unsigned))
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, IpcSerializeError> {
+        let mut bytes = Self::unsigned_bytes(&self.join, self.timeout);
+        bytes.extend_from_slice(&self.signature.serialize());
+        Ok(bytes)
+    }
+
+    /// Parses the message and verifies its signature on the bytes that precede it,
+    /// so that a parsed message is always authentic.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, IpcSerializeError> {
+        let err = IpcSerializeError::DeserializationError;
+        if data.len() < IPC_TAG_LENGTH || &data[..IPC_TAG_LENGTH] != Self::TAG.as_bytes() {
+            return Err(err("Invalid message tag".to_string()));
+        }
+        let ((join, timeout), rest): ((IpcJoinSubnetMsg, u32), &[u8]) =
+            postcard::take_from_bytes(&data[IPC_TAG_LENGTH..]).map_err(|e| err(e.to_string()))?;
+        if rest.len() != SCHNORR_SIGNATURE_SIZE {
+            return Err(err(format!(
+                "Expected a {SCHNORR_SIGNATURE_SIZE}-byte signature after the message, found {} bytes",
+                rest.len()
+            )));
+        }
+        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(rest)
+            .map_err(|e| err(e.to_string()))?;
+        let unsigned = &data[..data.len() - SCHNORR_SIGNATURE_SIZE];
+        bitcoin::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(
+                &signature,
+                &Self::signing_message_of(unsigned),
+                &join.pubkey,
+            )
+            .map_err(|e| err(format!("Invalid signature: {e}")))?;
+        Ok(Self {
+            join,
+            timeout,
+            signature,
+        })
+    }
+
+    /// Builds the commit and reveal transactions, checks them as the monitor will, and
+    /// submits them. Returns the reveal txid, the join txid of the validator.
+    pub fn submit_to_bitcoin(&self, rpc: &bitcoincore_rpc::Client) -> Result<Txid, IpcLibError> {
+        use bitcoincore_rpc::RpcApi;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let data = self.to_bytes().map_err(|e| {
+            error!("Could not serialize join-ue msg: {}", e);
+            IpcValidateError::InvalidMsg("Could not serialize message".to_string())
+        })?;
+        let collateral = bitcoin::TxOut {
+            value: self.join.collateral,
+            script_pubkey: crate::collateral::ue_script_pubkey(
+                &secp,
+                &self.join.pubkey,
+                self.timeout,
+            )?,
+        };
+        // The reveal only carries the data; its dust goes back to the wallet
+        let return_address = wallet::get_new_address(rpc)?;
+
+        info!("Submitting join-ue msg to bitcoin. Data={:?}", self);
+
+        let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
+            rpc,
+            &secp,
+            &return_address,
+            &data,
+            None,
+            Some(collateral),
+        )?;
+
+        // The earliest block that can hold the reveal is the next one
+        let next_height = rpc
+            .get_block_count()
+            .map_err(bitcoin_utils::BitcoinUtilsError::from)?
+            + 1;
+        crate::collateral::check_join_ue(&secp, &reveal_tx, &commit_tx, &data, next_height)?;
+
+        let reveal_txid = reveal_tx.compute_txid();
+        debug!(
+            "Join-ue commit_txid={} reveal_txid={}",
+            commit_tx.compute_txid(),
+            reveal_txid
+        );
+
+        submit_to_mempool(rpc, vec![commit_tx, reveal_tx])?;
+        info!(
+            "Submitted join-ue msg for subnet_id={} join_txid={}",
+            self.join.subnet_id, reveal_txid
+        );
+        Ok(reveal_txid)
+    }
+}
+
+impl IpcValidate for IpcJoinUeMsg {
+    fn validate(&self) -> Result<(), IpcValidateError> {
+        self.join.validate()?;
+        if self.timeout >= crate::collateral::LOCKTIME_THRESHOLD {
+            return Err(IpcValidateError::InvalidField(
+                "timeout",
+                format!(
+                    "Timeout must be a block height below {}",
+                    crate::collateral::LOCKTIME_THRESHOLD
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -4695,6 +4876,7 @@ pub enum IpcMessage {
     StakeCollateral(IpcStakeCollateralMsg),
     UnstakeCollateral(IpcUnstakeCollateralMsg),
     KillSubnet(IpcKillSubnetMsg),
+    JoinUe(IpcJoinUeMsg),
 }
 
 impl IpcMessage {
@@ -4716,6 +4898,7 @@ impl IpcMessage {
             )?)),
 
             IpcTag::JoinSubnet => Ok(IpcMessage::JoinSubnet(IpcJoinSubnetMsg::from_bytes(&w)?)),
+            IpcTag::JoinUe => Ok(IpcMessage::JoinUe(IpcJoinUeMsg::from_bytes(&w)?)),
             //
             // The bellow messages will be processed from output
             //
@@ -4961,6 +5144,9 @@ pub enum IpcLibError {
 
     #[error(transparent)]
     MultisigError(#[from] crate::multisig::MultisigError),
+
+    #[error(transparent)]
+    CollateralError(#[from] crate::collateral::CollateralError),
 }
 
 #[cfg(test)]
@@ -4980,6 +5166,15 @@ mod tests {
     #[test]
     fn test_ipc_tag_as_str() {
         assert_eq!(IpcTag::CreateSubnet.as_str(), IPC_CREATE_SUBNET_TAG);
+    }
+
+    #[test]
+    fn test_tagged_sha256_vector() {
+        // python3: t = sha256(b"IPCJUE/signature").digest(); sha256(t + t + b"abc").hexdigest()
+        assert_eq!(
+            hex::encode(tagged_sha256(JOIN_UE_SIGNATURE_TAG, b"abc")),
+            "f8268caa7f0cd000ffa8e1c9ae5d3cb7095b18337a0d5a772828ed25162407c6"
+        );
     }
 
     #[test]

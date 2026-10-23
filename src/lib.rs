@@ -1,6 +1,7 @@
 use bitcoin::{FeeRate, Network};
 
 pub mod bitcoin_utils;
+pub mod collateral;
 pub mod db;
 pub mod eth_utils;
 pub mod ipc_lib;
