@@ -16,6 +16,8 @@ use thiserror::Error;
 /// Genesis committee configuration number
 const GENESIS_COMMITTEE_CONF_NUM: u64 = 0;
 
+use std::sync::RwLock;
+
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
 const UE_ACTIVATION_HEIGHT_KEY: &str = "monitor:ue_activation_height";
 // subnet_genesis_info:<subnet_id>
@@ -37,6 +39,9 @@ const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
 // ue_collaterals:<subnet_id>:<join_txid>
 const UE_COLLATERALS_KEY: &str = "ue_collaterals:";
+// ue_pending:<subnet_id>:<timeout, 10 digits>:<join_txid>, the records not yet removed,
+// in timeout order
+const UE_PENDING_KEY: &str = "ue_pending:";
 // token_balance:<home_subnet_id>:<home_token_address>:<holder_subnet_id>
 const TOKEN_BALANCE_KEY: &str = "token_balance:";
 
@@ -117,6 +122,17 @@ fn ue_collaterals_prefix(subnet_id: SubnetId) -> String {
 
 fn ue_collateral_key(subnet_id: SubnetId, join_txid: Txid) -> String {
     format!("{UE_COLLATERALS_KEY}:{}:{}", subnet_id, join_txid)
+}
+
+fn ue_pending_prefix(subnet_id: SubnetId) -> String {
+    format!("{UE_PENDING_KEY}:{}:", subnet_id)
+}
+
+fn ue_pending_key(subnet_id: SubnetId, timeout: u32, join_txid: Txid) -> String {
+    format!(
+        "{UE_PENDING_KEY}:{}:{:010}:{}",
+        subnet_id, timeout, join_txid
+    )
 }
 
 // reward_candidates:<snapshot>:<subnet_id>
@@ -891,17 +907,39 @@ pub struct HeedDb {
     token_balances_db: HeedDatabase<Str, SerdeBincode<alloy_primitives::U256>>,
     /// `None` when a database written before UE is opened read-only: empty until the
     /// writer creates the table
-    ue_collaterals_db: Option<HeedDatabase<Str, SerdeBincode<UeCollateral>>>,
+    ue_collaterals_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<UeCollateral>>>>,
     /// Monitor settings that must agree with the processed blocks; `None` as above
-    settings_db: Option<HeedDatabase<Str, SerdeBincode<u64>>>,
+    settings_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<u64>>>>,
 }
 
 impl HeedDb {
     /// The UE table, present in every writable database
-    fn ue_collaterals_db(&self) -> Result<&HeedDatabase<Str, SerdeBincode<UeCollateral>>, DbError> {
-        self.ue_collaterals_db
-            .as_ref()
+    /// A table that may not have existed when a read-only database was opened: looked up
+    /// again on each use until the writer has created it.
+    fn lazy_table<DC: 'static>(
+        &self,
+        slot: &RwLock<Option<HeedDatabase<Str, DC>>>,
+        name: &str,
+    ) -> Result<Option<HeedDatabase<Str, DC>>, DbError> {
+        if let Some(db) = *slot.read().expect("table lock") {
+            return Ok(Some(db));
+        }
+        let rtxn = self.env.read_txn()?;
+        let opened = self.env.open_database::<Str, DC>(&rtxn, Some(name))?;
+        if let Some(db) = opened {
+            *slot.write().expect("table lock") = Some(db);
+        }
+        Ok(opened)
+    }
+
+    fn ue_collaterals_db(&self) -> Result<HeedDatabase<Str, SerdeBincode<UeCollateral>>, DbError> {
+        self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")?
             .ok_or(DbError::DbNotFound("ue_collaterals_db".to_string()))
+    }
+
+    fn settings_db(&self) -> Result<HeedDatabase<Str, SerdeBincode<u64>>, DbError> {
+        self.lazy_table(&self.settings_db, "settings_db")?
+            .ok_or(DbError::DbNotFound("settings_db".to_string()))
     }
 
     pub async fn new(database_path: &str, read_only: bool) -> Result<Self, DbError> {
@@ -983,8 +1021,9 @@ impl HeedDb {
             let token_balances_db = env
                 .open_database(&rtxn, Some("token_balances_db"))?
                 .ok_or(DbError::DbNotFound("token_balances_db".to_string()))?;
-            let ue_collaterals_db = env.open_database(&rtxn, Some("ue_collaterals_db"))?;
-            let settings_db = env.open_database(&rtxn, Some("settings_db"))?;
+            let ue_collaterals_db =
+                RwLock::new(env.open_database(&rtxn, Some("ue_collaterals_db"))?);
+            let settings_db = RwLock::new(env.open_database(&rtxn, Some("settings_db"))?);
             rtxn.commit()?;
 
             Ok(Self {
@@ -1020,8 +1059,11 @@ impl HeedDb {
                 env.create_database(&mut txn, Some("reward_candidates_db"))?;
             let reward_results_db = env.create_database(&mut txn, Some("reward_results_db"))?;
             let token_balances_db = env.create_database(&mut txn, Some("token_balances_db"))?;
-            let ue_collaterals_db = Some(env.create_database(&mut txn, Some("ue_collaterals_db"))?);
-            let settings_db = Some(env.create_database(&mut txn, Some("settings_db"))?);
+            let ue_collaterals_db = RwLock::new(Some(
+                env.create_database(&mut txn, Some("ue_collaterals_db"))?,
+            ));
+            let settings_db =
+                RwLock::new(Some(env.create_database(&mut txn, Some("settings_db"))?));
             txn.commit()?;
 
             Ok(Self {
@@ -1231,6 +1273,14 @@ pub trait DatabaseCore {
     /// All UE collaterals of a subnet, removed or not
     fn get_ue_collaterals(&self, subnet_id: SubnetId) -> Result<Vec<UeCollateral>, DbError>;
 
+    /// The UE collaterals of a subnet not yet removed, with a timeout up to `max_timeout`,
+    /// in timeout order
+    fn get_pending_ue_collaterals(
+        &self,
+        subnet_id: SubnetId,
+        max_timeout: u32,
+    ) -> Result<Vec<UeCollateral>, DbError>;
+
     fn set_ue_collateral_removed(
         &self,
         txn: &mut RwTxn,
@@ -1325,7 +1375,7 @@ impl DatabaseCore for HeedDb {
     }
 
     fn get_ue_activation_height(&self) -> Result<Option<u64>, DbError> {
-        let Some(db) = &self.settings_db else {
+        let Some(db) = self.lazy_table(&self.settings_db, "settings_db")? else {
             return Ok(None);
         };
         let txn = self.env.read_txn()?;
@@ -1333,10 +1383,7 @@ impl DatabaseCore for HeedDb {
     }
 
     fn set_ue_activation_height(&self, height: Option<u64>) -> Result<(), DbError> {
-        let db = self
-            .settings_db
-            .as_ref()
-            .ok_or(DbError::DbNotFound("settings_db".to_string()))?;
+        let db = self.settings_db()?;
         let mut txn = self.env.write_txn()?;
         match height {
             Some(height) => {
@@ -1855,10 +1902,20 @@ impl DatabaseCore for HeedDb {
     }
 
     fn add_ue_collateral(&self, txn: &mut RwTxn, collateral: &UeCollateral) -> Result<(), DbError> {
+        let db = self.ue_collaterals_db()?;
         let key = ue_collateral_key(collateral.subnet_id, collateral.join_txid);
-        self.ue_collaterals_db()?
-            .put(txn, &key, collateral)
-            .map_err(|e| e.into())
+        db.put(txn, &key, collateral)?;
+        let pending = ue_pending_key(
+            collateral.subnet_id,
+            collateral.timeout,
+            collateral.join_txid,
+        );
+        if collateral.removed {
+            db.delete(txn, &pending)?;
+        } else {
+            db.put(txn, &pending, collateral)?;
+        }
+        Ok(())
     }
 
     fn get_ue_collateral(
@@ -1866,7 +1923,7 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         join_txid: Txid,
     ) -> Result<Option<UeCollateral>, DbError> {
-        let Some(db) = &self.ue_collaterals_db else {
+        let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
             return Ok(None);
         };
         let rtxn = self.env.read_txn()?;
@@ -1875,7 +1932,7 @@ impl DatabaseCore for HeedDb {
     }
 
     fn get_ue_collaterals(&self, subnet_id: SubnetId) -> Result<Vec<UeCollateral>, DbError> {
-        let Some(db) = &self.ue_collaterals_db else {
+        let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
             return Ok(Vec::new());
         };
         let rtxn = self.env.read_txn()?;
@@ -1883,6 +1940,29 @@ impl DatabaseCore for HeedDb {
         let mut collaterals = Vec::new();
         for item in db.prefix_iter(&rtxn, &prefix)? {
             let (_key, collateral) = item?;
+            collaterals.push(collateral);
+        }
+        rtxn.commit()?;
+        Ok(collaterals)
+    }
+
+    fn get_pending_ue_collaterals(
+        &self,
+        subnet_id: SubnetId,
+        max_timeout: u32,
+    ) -> Result<Vec<UeCollateral>, DbError> {
+        let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
+            return Ok(Vec::new());
+        };
+        let rtxn = self.env.read_txn()?;
+        let prefix = ue_pending_prefix(subnet_id);
+        let mut collaterals = Vec::new();
+        // The keys sort by timeout
+        for item in db.prefix_iter(&rtxn, &prefix)? {
+            let (_key, collateral) = item?;
+            if collateral.timeout > max_timeout {
+                break;
+            }
             collaterals.push(collateral);
         }
         rtxn.commit()?;
@@ -1901,7 +1981,12 @@ impl DatabaseCore for HeedDb {
             .get(txn, &key)?
             .ok_or_else(|| DbError::KeyValueNotFound(key.clone()))?;
         collateral.removed = true;
-        db.put(txn, &key, &collateral).map_err(|e| e.into())
+        db.put(txn, &key, &collateral)?;
+        db.delete(
+            txn,
+            &ue_pending_key(subnet_id, collateral.timeout, join_txid),
+        )?;
+        Ok(())
     }
 
     fn delete_ue_collateral(
@@ -1910,8 +1995,15 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         join_txid: Txid,
     ) -> Result<(), DbError> {
+        let db = self.ue_collaterals_db()?;
         let key = ue_collateral_key(subnet_id, join_txid);
-        self.ue_collaterals_db()?.delete(txn, &key)?;
+        if let Some(collateral) = db.get(txn, &key)? {
+            db.delete(
+                txn,
+                &ue_pending_key(subnet_id, collateral.timeout, join_txid),
+            )?;
+        }
+        db.delete(txn, &key)?;
         Ok(())
     }
 
@@ -2074,8 +2166,8 @@ pub mod tests {
 
         // A read-only reader sees no UE collaterals and cannot write them
         let reader = open_db(path, true).expect("legacy database opens read-only");
-        assert!(reader.ue_collaterals_db.is_none());
-        assert!(reader.settings_db.is_none());
+        assert!(reader.ue_collaterals_db.read().unwrap().is_none());
+        assert!(reader.settings_db.read().unwrap().is_none());
         assert_eq!(reader.get_ue_activation_height().unwrap(), None);
         assert_eq!(
             reader
@@ -2084,13 +2176,21 @@ pub mod tests {
             None
         );
         assert!(reader.get_ue_collaterals(subnet_id).unwrap().is_empty());
+        assert!(reader
+            .get_pending_ue_collaterals(subnet_id, u32::MAX)
+            .unwrap()
+            .is_empty());
+
         drop(reader);
 
-        // The writer creates the table; a later read-only open sees its records
+        // The writer creates the tables; a reader opened before that finds them on its next
+        // use (a provider restarted before the monitor). One process cannot hold the
+        // environment twice, so the reader's cached handles are cleared instead
         let writer = open_db(path, false).unwrap();
         let mut txn = writer.write_txn().unwrap();
         writer.add_ue_collateral(&mut txn, &collateral).unwrap();
         txn.commit().unwrap();
+        writer.set_ue_activation_height(Some(7)).unwrap();
         assert_eq!(
             writer
                 .get_ue_collateral(subnet_id, collateral.join_txid)
@@ -2099,8 +2199,18 @@ pub mod tests {
         );
         drop(writer);
         let reader = open_db(path, true).unwrap();
+        *reader.ue_collaterals_db.write().unwrap() = None;
+        *reader.settings_db.write().unwrap() = None;
         assert_eq!(
             reader.get_ue_collaterals(subnet_id).unwrap(),
+            vec![collateral.clone()]
+        );
+        assert_eq!(reader.get_ue_activation_height().unwrap(), Some(7));
+        assert!(reader.ue_collaterals_db.read().unwrap().is_some());
+        assert_eq!(
+            reader
+                .get_pending_ue_collaterals(subnet_id, u32::MAX)
+                .unwrap(),
             vec![collateral]
         );
     }
@@ -2134,13 +2244,36 @@ pub mod tests {
             None
         );
 
+        // The pending index lists the open records in timeout order, up to a timeout
+        let mut d = test_ue_collateral(subnet_id);
+        d.timeout = 500;
+        let mut txn = db.write_txn().unwrap();
+        db.add_ue_collateral(&mut txn, &d).unwrap();
+        txn.commit().unwrap();
+        let pending = db.get_pending_ue_collaterals(subnet_id, 1_000).unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0], d);
+        assert_eq!(
+            db.get_pending_ue_collaterals(subnet_id, 999).unwrap(),
+            vec![d.clone()]
+        );
+        assert!(db
+            .get_pending_ue_collaterals(subnet_id, 499)
+            .unwrap()
+            .is_empty());
+
         let mut txn = db.write_txn().unwrap();
         db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid)
             .unwrap();
         assert!(db
             .set_ue_collateral_removed(&mut txn, subnet_id, create_rand_txid())
             .is_err());
+        db.delete_ue_collateral(&mut txn, subnet_id, d.join_txid)
+            .unwrap();
         txn.commit().unwrap();
+        let pending = db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap();
+        assert_eq!(pending, vec![b.clone()]);
+        assert_eq!(db.get_ue_collateral(subnet_id, d.join_txid).unwrap(), None);
         assert!(
             db.get_ue_collateral(subnet_id, a.join_txid)
                 .unwrap()

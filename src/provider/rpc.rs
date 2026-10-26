@@ -1,9 +1,9 @@
 use crate::{
-    bitcoin_utils,
+    bitcoin_utils, collateral,
     db::{self, DatabaseCore, StakingChange},
     ipc_lib::{
         self, validate_erc_batch_data, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg,
-        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcKillSubnetMsg, IpcPrefundSubnetMsg,
+        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcKillSubnetMsg, IpcPrefundSubnetMsg,
         IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, wallet, NETWORK,
@@ -159,6 +159,9 @@ pub struct JoinSubnetRequest {
     pub ip: std::net::SocketAddr,
     pub backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     pub pubkey: bitcoin::XOnlyPublicKey,
+    /// With it, a `join-ue`: the collateral matures `lock_blocks` blocks after the current tip
+    #[serde(default)]
+    pub lock_blocks: Option<u64>,
 }
 
 impl From<JoinSubnetRequest> for IpcJoinSubnetMsg {
@@ -182,8 +185,9 @@ pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
     Params(req): Params<JoinSubnetRequest>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
+    let lock_blocks = req.lock_blocks;
     let msg: IpcJoinSubnetMsg = req.into();
-    info!("joinsubnet: {:?}", msg);
+    info!("joinsubnet: {:?} lock_blocks={:?}", msg, lock_blocks);
 
     if let Err(err) = msg.validate() {
         error!("Invalid join message={msg:?}: {err}");
@@ -213,6 +217,11 @@ pub async fn join_subnet(
             RpcError::InvalidParams(e.to_string())
         })?;
 
+    if let Some(lock_blocks) = lock_blocks {
+        let join_txid = join_subnet_ue(&data, msg, lock_blocks)?;
+        return Ok(JoinSubnetResponse { join_txid });
+    }
+
     // TODO this check should be done in the Db
     let multisig_address = &genesis_info.multisig_address();
 
@@ -221,6 +230,177 @@ pub async fn join_subnet(
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     Ok(JoinSubnetResponse { join_txid })
+}
+
+/// The join-ue path of `joinsubnet`: the collateral is locked under the validator's own
+/// unilateral-exit script, maturing at `T = tip + lock_blocks`. Only this provider's
+/// validator can join this way, since the message carries its signature.
+fn join_subnet_ue(
+    data: &ServerData,
+    join: IpcJoinSubnetMsg,
+    lock_blocks: u64,
+) -> Result<bitcoin::Txid, JsonRpcError> {
+    let invalid = |m: String| -> JsonRpcError {
+        error!("joinsubnet (join-ue) rejected: {m}");
+        RpcError::InvalidParams(m).into()
+    };
+    let tip = data
+        .btc_rpc
+        .get_block_count()
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
+    check_ue_active(collateral::ue_activation_height(), tip).map_err(invalid)?;
+    let Some((validator_xpk, validator_sk)) = data.validator else {
+        return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
+    };
+    if join.pubkey != validator_xpk {
+        return Err(invalid(format!(
+            "join-ue signs with this provider's validator key {validator_xpk}, not {}",
+            join.pubkey
+        )));
+    }
+    // The reveal lands in block tip + 1 at the earliest and the monitor requires T > that + 1
+    if lock_blocks < 3 {
+        return Err(invalid(format!(
+            "lock_blocks must be at least 3, got {lock_blocks}"
+        )));
+    }
+    let timeout = tip
+        .checked_add(lock_blocks)
+        .and_then(|t| u32::try_from(t).ok())
+        .ok_or_else(|| invalid(format!("tip {tip} + lock_blocks {lock_blocks} overflows")))?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk);
+    msg.validate().map_err(|e| invalid(e.to_string()))?;
+
+    info!("joinsubnet (join-ue): timeout {timeout} = tip {tip} + {lock_blocks}");
+    msg.submit_to_bitcoin(&data.btc_rpc)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))
+}
+
+/// The switch of C37: `join-ue` and `unstakeue` are refused while `UE_ACTIVATION_HEIGHT` is
+/// unset or above the tip.
+fn check_ue_active(activation: Option<u64>, tip: u64) -> Result<(), String> {
+    match activation {
+        Some(activation) if activation <= tip => Ok(()),
+        Some(activation) => Err(format!(
+            "unilateral exit is active from block {activation}, the tip is {tip}"
+        )),
+        None => Err(format!(
+            "unilateral exit is off: {} is not set",
+            collateral::UE_ACTIVATION_HEIGHT_VAR
+        )),
+    }
+}
+
+/// The members of `committee` that joined with `join-ue`: their collateral is outside the
+/// multisig, so no checkpoint output pays it.
+fn ue_members(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    committee: &db::SubnetCommittee,
+) -> Result<std::collections::HashSet<bitcoin::XOnlyPublicKey>, RpcError> {
+    let mut members = std::collections::HashSet::new();
+    for v in &committee.validators {
+        if collateral::is_ue_validator(db, subnet_id, v.join_txid, &v.pubkey)? {
+            members.insert(v.pubkey);
+        }
+    }
+    Ok(members)
+}
+
+/// The kill checkpoint's payouts: the collateral of every member but the UE ones.
+fn kill_unstakes(
+    committee: &db::SubnetCommittee,
+    ue_members: &std::collections::HashSet<bitcoin::XOnlyPublicKey>,
+) -> Vec<ipc_lib::IpcUnstake> {
+    committee
+        .validators
+        .iter()
+        .filter(|v| !ue_members.contains(&v.pubkey))
+        .map(|v| ipc_lib::IpcUnstake {
+            amount: v.collateral,
+            address: v.backup_address.clone(),
+            pubkey: v.pubkey,
+        })
+        .collect()
+}
+
+/// The unstake outputs of a rotation: one per Withdraw stake change of a member of
+/// `committee`, none for a UE member (its removal withdraws nothing from the multisig).
+fn rotation_unstakes(
+    stake_changes: &[db::StakeChangeRequest],
+    committee: &db::SubnetCommittee,
+    ue_members: &std::collections::HashSet<bitcoin::XOnlyPublicKey>,
+) -> Vec<ipc_lib::IpcUnstake> {
+    stake_changes
+        .iter()
+        .filter_map(|sc| {
+            let StakingChange::Withdraw { amount } = sc.change else {
+                return None;
+            };
+            let Some(v) = committee
+                .validators
+                .iter()
+                .find(|v| v.pubkey == sc.validator_xpk)
+            else {
+                error!(
+                    "Validator {} not found in committee for a stake change, skipping",
+                    sc.validator_xpk
+                );
+                return None;
+            };
+            if ue_members.contains(&v.pubkey) {
+                info!(
+                    "Validator {} is a UE validator, no unstake output for its stake change",
+                    sc.validator_xpk
+                );
+                return None;
+            }
+            Some(ipc_lib::IpcUnstake {
+                amount,
+                address: v.backup_address.clone(),
+                pubkey: sc.validator_xpk,
+            })
+        })
+        .collect()
+}
+
+/// Whether `pubkey` is a member of `committee` that joined with `join-ue`.
+fn is_ue_member(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    committee: &db::SubnetCommittee,
+    pubkey: &bitcoin::XOnlyPublicKey,
+) -> Result<bool, RpcError> {
+    match committee.validators.iter().find(|v| v.pubkey == *pubkey) {
+        Some(v) => Ok(collateral::is_ue_validator(
+            db,
+            subnet_id,
+            v.join_txid,
+            pubkey,
+        )?),
+        None => Ok(false),
+    }
+}
+
+/// The error of `stakecollateral` and `unstakecollateral` for a UE validator: its
+/// collateral is in its own output, not in the multisig, and leaves it only by `unstakeue`.
+fn refuse_ue_member(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    committee: &db::SubnetCommittee,
+    pubkey: &bitcoin::XOnlyPublicKey,
+) -> Result<(), RpcError> {
+    if is_ue_member(db, subnet_id, committee, pubkey)? {
+        let m = format!(
+            "Validator {pubkey} joined subnet {subnet_id} with join-ue; its collateral is \
+             not in the multisig and is returned by unstakeue after it matures."
+        );
+        error!("{m}");
+        return Err(RpcError::InvalidParams(m));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -908,6 +1088,8 @@ pub async fn gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
+    let ue_members = ue_members(&data.db, msg.subnet_id, &subnet.committee)?;
+
     // assume no change in the committee
     let mut next_committee = subnet.committee.clone();
     let current_committee_configuration = subnet.committee.configuration_number;
@@ -923,6 +1105,7 @@ pub async fn gen_checkpoint_psbt(
             .committee
             .validators
             .iter()
+            .filter(|v| !ue_members.contains(&v.pubkey))
             .map(|v| v.collateral)
             .sum::<bitcoin::Amount>();
 
@@ -949,16 +1132,7 @@ pub async fn gen_checkpoint_psbt(
         );
 
         // Process all validators in the committee for unstaking
-        msg.unstakes = subnet
-            .committee
-            .validators
-            .iter()
-            .map(|v| ipc_lib::IpcUnstake {
-                amount: v.collateral,
-                address: v.backup_address.clone(),
-                pubkey: v.pubkey,
-            })
-            .collect::<Vec<_>>();
+        msg.unstakes = kill_unstakes(&subnet.committee, &ue_members);
 
         info!(
             "Killing subnet {}, processing {} unstakes.",
@@ -989,38 +1163,8 @@ pub async fn gen_checkpoint_psbt(
                 error!("Error getting unconfirmed stake changes from Db: {}", e);
                 RpcError::DbError(e)
             })?;
-        let unstakes = unconfirmed_stake_changes
-            .iter()
-            .filter_map(|sc| {
-                let validator = subnet
-                    .committee
-                    .validators
-                    .iter()
-                    .find(|v| v.pubkey == sc.validator_xpk);
-
-                let address = match validator {
-                    Some(v) => v.backup_address.clone(),
-                    None => {
-                        error!(
-                            "Validator {} not found in committee for a stake change, skipping",
-                            sc.validator_xpk
-                        );
-                        return None;
-                    }
-                };
-
-                match sc.change {
-                    StakingChange::Withdraw { amount } => Some(ipc_lib::IpcUnstake {
-                        amount,
-                        address,
-                        pubkey: sc.validator_xpk,
-                    }),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        msg.unstakes = unstakes;
+        msg.unstakes =
+            rotation_unstakes(&unconfirmed_stake_changes, &subnet.committee, &ue_members);
 
         info!(
             "Rotating committee to configuration number {} multisig address {}",
@@ -1711,6 +1855,12 @@ pub async fn stake_collateral(
         );
         RpcError::InvalidParams(e.to_string())
     })?;
+    refuse_ue_member(
+        &data.db,
+        msg.subnet_id,
+        subnet_state.latest_committee(),
+        &msg.pubkey,
+    )?;
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -1783,6 +1933,12 @@ pub async fn unstake_collateral(
             );
             RpcError::InvalidParams(e.to_string())
         })?;
+    refuse_ue_member(
+        &data.db,
+        msg.subnet_id,
+        subnet_state.latest_committee(),
+        &validator_xpk,
+    )?;
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -1791,6 +1947,138 @@ pub async fn unstake_collateral(
         .map_err(|e| JsonRpcError::internal(e.to_string()))?;
 
     Ok(UnstakeCollateralResponse { txid })
+}
+
+// Unstake UE collateral
+
+#[derive(Serialize, Deserialize)]
+pub struct UnstakeUeParams {
+    pub subnet_id: SubnetId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UnstakeUeResponse {
+    txid: bitcoin::Txid,
+    /// The collateral spent, before the fee
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    amount: bitcoin::Amount,
+    /// The address paid
+    address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+}
+
+/// Spends this validator's matured join-ue collaterals in `subnet_id` to its backup address
+/// in one transaction that no other validator takes part in. A collateral is matured when its
+/// timeout `T` is at most the tip; the transaction is accepted from tip `T` and mined from block
+/// `T + 1`. One call spends the matured collaterals of one backup address, that of the latest
+/// matured record; a further call spends the rest, if any.
+pub async fn unstake_ue(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<UnstakeUeParams>,
+) -> Result<UnstakeUeResponse, JsonRpcError> {
+    info!("unstakeue: {}", params.subnet_id);
+
+    let Some((validator_xpk, validator_sk)) = data.validator else {
+        error!("No validator keypair configured.");
+        return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
+    };
+    let invalid = |m: String| -> JsonRpcError {
+        error!("unstakeue rejected: {m}");
+        RpcError::InvalidParams(m).into()
+    };
+    let internal = |e: &dyn std::fmt::Display| -> JsonRpcError {
+        error!("unstakeue failed: {e}");
+        RpcError::InternalError(e.to_string()).into()
+    };
+
+    let records = data
+        .db
+        .get_ue_collaterals(params.subnet_id)
+        .map_err(RpcError::DbError)?
+        .into_iter()
+        .filter(|r| r.pubkey == validator_xpk)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(invalid(format!(
+            "Validator {validator_xpk} has no join-ue collateral in subnet {}",
+            params.subnet_id
+        )));
+    }
+
+    let tip = data.btc_rpc.get_block_count().map_err(|e| internal(&e))?;
+    check_ue_active(collateral::ue_activation_height(), tip).map_err(invalid)?;
+    let mut unspent = Vec::new();
+    let mut pending = 0;
+    for r in records {
+        let tx_out = |mempool| {
+            data.btc_rpc
+                .get_tx_out(&r.outpoint.txid, r.outpoint.vout, Some(mempool))
+                .map_err(|e| internal(&e))
+        };
+        if tx_out(true)?.is_some() {
+            unspent.push(r);
+        } else if tx_out(false)?.is_some() {
+            // Spent by a transaction still in the mempool: an exit waiting to be mined
+            pending += 1;
+        }
+    }
+    if unspent.is_empty() {
+        return Err(invalid(format!(
+            "Every join-ue collateral of validator {validator_xpk} in subnet {} is spent \
+             ({pending} by an exit still in the mempool)",
+            params.subnet_id
+        )));
+    }
+    // The matured records paying the backup address of the latest matured one
+    let Some(latest) = unspent
+        .iter()
+        .filter(|r| u64::from(r.timeout) <= tip)
+        .max_by_key(|r| r.timeout)
+        .cloned()
+    else {
+        let earliest = unspent.iter().map(|r| r.timeout).min().expect("non-empty");
+        return Err(invalid(format!(
+            "No matured join-ue collateral: the earliest matures at block {earliest}, the tip is {tip}"
+        )));
+    };
+    let matured = unspent
+        .iter()
+        .filter(|r| u64::from(r.timeout) <= tip && r.backup_address == latest.backup_address)
+        .collect::<Vec<_>>();
+
+    let to = latest
+        .backup_address
+        .clone()
+        .require_network(NETWORK)
+        .map_err(|e| invalid(format!("backup address: {e}")))?;
+    let inputs = matured
+        .iter()
+        .map(|r| collateral::UeExitInput {
+            outpoint: r.outpoint,
+            value: r.value,
+            timeout: r.timeout,
+        })
+        .collect::<Vec<_>>();
+    let amount = inputs.iter().map(|i| i.value).sum::<bitcoin::Amount>();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = validator_sk.keypair(&secp);
+    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_rpc, None, None);
+    let tx = collateral::build_ue_exit_tx(&secp, &inputs, &keypair, &to, fee_rate)
+        .map_err(|e| internal(&e))?;
+    let txid = data
+        .btc_rpc
+        .send_raw_transaction(&tx)
+        .map_err(|e| internal(&e))?;
+    info!(
+        "unstakeue: spent {} collateral outputs ({amount}) of validator {validator_xpk} in subnet {} to {to}, txid={txid}",
+        inputs.len(),
+        params.subnet_id
+    );
+
+    Ok(UnstakeUeResponse {
+        txid,
+        amount,
+        address: latest.backup_address,
+    })
 }
 
 // Stake changes
@@ -2161,6 +2449,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         // stake changes
         .with_method("stakecollateral", stake_collateral)
         .with_method("unstakecollateral", unstake_collateral)
+        .with_method("unstakeue", unstake_ue)
         .with_method("getstakechanges", get_stake_changes)
         // kill requests
         .with_method("getkillrequests", get_kill_requests);
@@ -2176,4 +2465,156 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("dev_gencheckpointpsbt", dev_gen_checkpoint_psbt);
 
     server.finish()
+}
+
+#[cfg(test)]
+mod ue_tests {
+    use super::*;
+    use crate::db::{SubnetValidator, SubnetValidators, UeCollateral};
+    use crate::test_utils::{
+        create_rand_eth_addr, create_rand_txid, create_test_db, generate_subnet_id,
+        generate_xonly_pubkeys,
+    };
+    use std::str::FromStr;
+
+    fn validator(pubkey: bitcoin::XOnlyPublicKey) -> SubnetValidator {
+        SubnetValidator {
+            pubkey,
+            subnet_address: create_rand_eth_addr(),
+            power: 10,
+            collateral: bitcoin::Amount::from_sat(1_000_000),
+            backup_address: bitcoin::Address::from_str(
+                "bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd",
+            )
+            .unwrap(),
+            ip: "127.0.0.1:8000".parse().unwrap(),
+            join_txid: create_rand_txid(),
+        }
+    }
+
+    /// `stakecollateral` and `unstakecollateral` are refused for a member whose join
+    /// has a UE record under its key, and only for it.
+    #[test]
+    fn refuses_ue_members_only() {
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+        let keys = generate_xonly_pubkeys(3);
+        let (ue, ordinary, outsider) = (keys[0], keys[1], keys[2]);
+        let members = vec![validator(ue), validator(ordinary)];
+        // A reveal carrying both joins: the ordinary member's join_txid has the UE record too
+        let shared_txid = members[0].join_txid;
+        let mut members = members;
+        members[1].join_txid = shared_txid;
+        let committee = members.to_committee(&subnet_id, 0);
+
+        let record = UeCollateral {
+            subnet_id,
+            pubkey: ue,
+            outpoint: bitcoin::OutPoint::new(create_rand_txid(), 1),
+            value: bitcoin::Amount::from_sat(1_000_000),
+            timeout: 1_000,
+            backup_address: members[0].backup_address.clone(),
+            join_txid: shared_txid,
+            removed: false,
+        };
+        let mut txn = db.write_txn().unwrap();
+        db.add_ue_collateral(&mut txn, &record).unwrap();
+        txn.commit().unwrap();
+
+        assert!(is_ue_member(&db, subnet_id, &committee, &ue).unwrap());
+        assert!(!is_ue_member(&db, subnet_id, &committee, &ordinary).unwrap());
+        assert!(!is_ue_member(&db, subnet_id, &committee, &outsider).unwrap());
+
+        let err = refuse_ue_member(&db, subnet_id, &committee, &ue).unwrap_err();
+        assert!(matches!(err, RpcError::InvalidParams(m) if m.contains("unstakeue")));
+        refuse_ue_member(&db, subnet_id, &committee, &ordinary).unwrap();
+        refuse_ue_member(&db, subnet_id, &committee, &outsider).unwrap();
+    }
+
+    /// A rotation pays a Withdraw of an ordinary member, none of a UE member, none of a
+    /// key outside the committee; a kill pays every ordinary member and no UE member.
+    #[test]
+    fn checkpoint_outputs_skip_ue_members() {
+        use crate::db::{StakeChangeRequest, StakingChange};
+        use crate::test_utils::{create_rand_blockhash, generate_subnet_id};
+        let subnet_id = generate_subnet_id();
+        let keys = generate_xonly_pubkeys(3);
+        let (ue, ordinary, outsider) = (keys[0], keys[1], keys[2]);
+        let committee = vec![validator(ue), validator(ordinary)].to_committee(&subnet_id, 0);
+        let ue_members = std::collections::HashSet::from([ue]);
+        let withdraw = |pubkey: bitcoin::XOnlyPublicKey, sats: u64| StakeChangeRequest {
+            change: StakingChange::Withdraw {
+                amount: bitcoin::Amount::from_sat(sats),
+            },
+            validator_xpk: pubkey,
+            validator_subnet_address: create_rand_eth_addr(),
+            configuration_number: 1,
+            committee_after_change: committee.clone(),
+            block_height: 100,
+            block_hash: create_rand_blockhash(),
+            checkpoint_block_height: None,
+            checkpoint_block_hash: None,
+            txid: create_rand_txid(),
+        };
+        let changes = vec![
+            withdraw(ue, 1_000_000),
+            withdraw(ordinary, 300_000),
+            withdraw(outsider, 5),
+            StakeChangeRequest {
+                change: StakingChange::Deposit {
+                    amount: bitcoin::Amount::from_sat(7),
+                },
+                ..withdraw(ordinary, 0)
+            },
+        ];
+
+        let unstakes = rotation_unstakes(&changes, &committee, &ue_members);
+        assert_eq!(unstakes.len(), 1);
+        assert_eq!(unstakes[0].pubkey, ordinary);
+        assert_eq!(unstakes[0].amount.to_sat(), 300_000);
+        assert_eq!(unstakes[0].address, committee.validators[1].backup_address);
+
+        let unstakes = kill_unstakes(&committee, &ue_members);
+        assert_eq!(unstakes.len(), 1);
+        assert_eq!(unstakes[0].pubkey, ordinary);
+        assert_eq!(unstakes[0].amount.to_sat(), 1_000_000);
+
+        // Without UE members both paths pay everyone, as before
+        let none = std::collections::HashSet::new();
+        assert_eq!(rotation_unstakes(&changes, &committee, &none).len(), 2);
+        assert_eq!(kill_unstakes(&committee, &none).len(), 2);
+    }
+
+    /// The switch refuses while unset or above the tip.
+    #[test]
+    fn switch_gates_join_ue_and_unstakeue() {
+        assert!(check_ue_active(None, 1_000)
+            .unwrap_err()
+            .contains("not set"));
+        assert!(check_ue_active(Some(500), 499)
+            .unwrap_err()
+            .contains("active from block 500"));
+        check_ue_active(Some(500), 500).unwrap();
+        check_ue_active(Some(500), 501).unwrap();
+    }
+
+    /// `lock_blocks` is optional in the request and absent in the join message.
+    #[test]
+    fn join_request_lock_blocks_is_optional() {
+        let json = serde_json::json!({
+            "subnet_id": generate_subnet_id(),
+            "collateral": 100_000,
+            "ip": "127.0.0.1:8000",
+            "backup_address": "bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd",
+            "pubkey": generate_xonly_pubkeys(1)[0],
+        });
+        let req: JoinSubnetRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(req.lock_blocks, None);
+        let mut with_lock = json;
+        with_lock["lock_blocks"] = serde_json::json!(20);
+        let req: JoinSubnetRequest = serde_json::from_value(with_lock).unwrap();
+        assert_eq!(req.lock_blocks, Some(20));
+        let msg: IpcJoinSubnetMsg = req.into();
+        assert_eq!(msg.collateral.to_sat(), 100_000);
+    }
 }
