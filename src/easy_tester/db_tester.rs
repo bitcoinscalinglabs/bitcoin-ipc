@@ -1,25 +1,27 @@
 use std::collections::HashMap;
 
-use bitcoin::{hashes::sha256, Amount, BlockHash};
-use log::{error, info};
+use bitcoin::{hashes::sha256, key::Secp256k1, Amount, BlockHash};
+use log::{error, info, warn};
 use rand::RngCore;
 use tempfile::TempDir;
 
 use crate::{
+    collateral,
     db::{DatabaseCore, DatabaseRewardExtensions, HeedDb, SubnetCheckpoint},
     easy_tester::{
         error::EasyTesterError,
         model::{
-            build_create_subnet_msg, create_rand_blockhash, create_rand_txid,
-            OutputDb, OutputExpectTarget, SetupSpec, ValidatorSpec,
+            build_create_subnet_msg, create_rand_blockhash, create_rand_txid, OutputDb,
+            OutputExpectTarget, SetupSpec, ValidatorSpec,
         },
         tester::Tester,
+        ue_reads::{self, Names, UeRead},
     },
     eth_utils,
     ipc_lib::{
         IpcBatchTransferMsg, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer,
-        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcStakeCollateralMsg,
-        IpcUnstakeCollateralMsg, IpcValidate,
+        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg,
+        IpcLibError, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
     },
     rewards::{RewardConfig, RewardTracker},
     SubnetId,
@@ -49,6 +51,10 @@ pub struct DbTester {
     // Reward fields
     reward_tracker: Option<RewardTracker>,
     last_reward_results: Option<LastRewardResults>,
+    // Unilateral exit: on from this height, as the monitor's switch
+    ue_activation_height: Option<u64>,
+    last_ue: Option<UeRead>,
+    removal_pass_height: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -69,6 +75,7 @@ impl DbTester {
         setup: SetupSpec,
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        ue_activation_height: Option<u64>,
     ) -> Result<Self, EasyTesterError> {
         eth_utils::set_fvm_network();
         let temp_dir = tempfile::tempdir()
@@ -105,7 +112,106 @@ impl DbTester {
             last_token_balance: None,
             reward_tracker,
             last_reward_results: None,
+            ue_activation_height,
+            last_ue: None,
+            removal_pass_height: None,
         })
+    }
+
+    fn ue_active(&self, height: u64) -> bool {
+        self.ue_activation_height
+            .is_some_and(|activation| height >= activation)
+    }
+
+    /// The monitor's removal pass for block `height`, once: before the first command of
+    /// that block, as the monitor runs it before the block's transactions, or when the
+    /// block is mined without commands
+    fn run_removal_pass(&mut self, height: u64) -> Result<(), EasyTesterError> {
+        if self.removal_pass_height >= Some(height) || !self.ue_active(height) {
+            return Ok(());
+        }
+        self.removal_pass_height = Some(height);
+        let block_hash = self.block_hash(height);
+        let removals = collateral::remove_matured_ue_validators(&self.db, height, block_hash)
+            .map_err(|e| EasyTesterError::runtime(format!("removal pass at {height}: {e}")))?;
+        let names = self.validator_names();
+        for r in removals {
+            info!(
+                "Block {}: UE validator '{}' matured: {}",
+                height,
+                names
+                    .get(&r.pubkey)
+                    .cloned()
+                    .unwrap_or_else(|| r.pubkey.to_string()),
+                r.outcome
+            );
+        }
+        Ok(())
+    }
+
+    fn validator_names(&self) -> Names {
+        self.setup
+            .validators
+            .values()
+            .map(|v| (v.pubkey, v.name.clone()))
+            .collect()
+    }
+
+    /// `join-ue`: the monitor's handling on synthetic transactions, with the validator's key.
+    /// A rejected join is logged, as the monitor does, so that the scenario can check it.
+    fn join_ue(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        collateral_sats: u64,
+        timeout: u64,
+    ) -> Result<(), EasyTesterError> {
+        if !self.ue_active(height) {
+            info!("join-ue ignored: unilateral exit is not active at block {height}");
+            return Ok(());
+        }
+        let subnet_id = self.resolve_subnet_id(subnet_name)?;
+        let validator = self.resolve_validator(validator_name)?;
+        let timeout = u32::try_from(timeout)
+            .map_err(|_| EasyTesterError::runtime(format!("timeout {timeout} does not fit u32")))?;
+        let collateral = Amount::from_sat(collateral_sats);
+        let join = IpcJoinSubnetMsg {
+            subnet_id,
+            collateral,
+            ip: validator.default_ip,
+            backup_address: validator.default_backup_address.clone(),
+            pubkey: validator.pubkey,
+        };
+        let secp = Secp256k1::new();
+        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator.secret_key);
+        let (commit, reveal, data) = collateral::unsigned_join_ue_txs(&secp, &msg, collateral)
+            .map_err(|e| EasyTesterError::runtime(format!("join-ue transactions: {e}")))?;
+        let checked = match collateral::check_join_ue(&secp, &reveal, &commit, &data, height) {
+            Ok(checked) => checked,
+            Err(e) => {
+                warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
+                return Ok(());
+            }
+        };
+        let block_hash = self.block_hash(height);
+        match collateral::process_join_ue(
+            &self.db,
+            &checked,
+            reveal.compute_txid(),
+            height,
+            block_hash,
+        ) {
+            Ok(_) => info!(
+                "JoinUe: validator '{}' joined subnet '{}' with {} sats, timeout {}",
+                validator_name, subnet_name, collateral_sats, timeout
+            ),
+            Err(IpcLibError::IpcValidateError(e)) => {
+                warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
+            }
+            Err(e) => return Err(EasyTesterError::runtime(format!("join-ue failed: {e}"))),
+        }
+        Ok(())
     }
 
     fn block_hash(&mut self, height: u64) -> BlockHash {
@@ -509,8 +615,9 @@ impl DbTester {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let delta = alloy_primitives::I256::try_from(amount)
-            .map_err(|e| EasyTesterError::runtime(format!("mint amount too large for I256: {e}")))?;
+        let delta = alloy_primitives::I256::try_from(amount).map_err(|e| {
+            EasyTesterError::runtime(format!("mint amount too large for I256: {e}"))
+        })?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -521,7 +628,10 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!("Queued mint for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
+        info!(
+            "Queued mint for token '{}' on subnet '{}', amount={}",
+            token_name, subnet_name, amount
+        );
         Ok(())
     }
 
@@ -537,10 +647,12 @@ impl DbTester {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let pos = alloy_primitives::I256::try_from(amount)
-            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
-        let delta = pos.checked_neg()
-            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
+        let pos = alloy_primitives::I256::try_from(amount).map_err(|e| {
+            EasyTesterError::runtime(format!("burn amount too large for I256: {e}"))
+        })?;
+        let delta = pos.checked_neg().ok_or_else(|| {
+            EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string())
+        })?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -551,7 +663,10 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!("Queued burn for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
+        info!(
+            "Queued burn for token '{}' on subnet '{}', amount={}",
+            token_name, subnet_name, amount
+        );
         Ok(())
     }
 
@@ -627,6 +742,7 @@ fn validator_ordinal(name: &str) -> Option<u64> {
 
 impl Tester for DbTester {
     fn exec_mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.mine_block(height)?;
 
         if let Some(rt) = &mut self.reward_tracker {
@@ -652,6 +768,7 @@ impl Tester for DbTester {
         height: u64,
         subnet_name: &str,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.create_subnet(height, subnet_name)
     }
 
@@ -662,7 +779,26 @@ impl Tester for DbTester {
         validator_name: &str,
         collateral_sats: u64,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.join_subnet(height, subnet_name, validator_name, collateral_sats)
+    }
+
+    fn exec_join_ue(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        collateral_sats: u64,
+        timeout: u64,
+    ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
+        self.join_ue(
+            height,
+            subnet_name,
+            validator_name,
+            collateral_sats,
+            timeout,
+        )
     }
 
     fn exec_stake_subnet(
@@ -672,6 +808,7 @@ impl Tester for DbTester {
         validator_name: &str,
         amount_sats: u64,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.stake_subnet(height, subnet_name, validator_name, amount_sats)
     }
 
@@ -682,16 +819,18 @@ impl Tester for DbTester {
         validator_name: &str,
         amount_sats: u64,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.unstake_subnet(height, subnet_name, validator_name, amount_sats)
     }
 
     fn exec_deposit(
         &mut self,
-        _height: u64,
+        height: u64,
         subnet_name: &str,
         address_name: &str,
         amount_sats: u64,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         // The db tester has no real Bitcoin UTXOs, so deposit is a no-op.
         // We still resolve the subnet to catch typos early.
         self.resolve_subnet_id(subnet_name)?;
@@ -707,6 +846,7 @@ impl Tester for DbTester {
         height: u64,
         subnet_name: &str,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         let token_registrations = self
             .pending_registrations
             .remove(subnet_name)
@@ -749,6 +889,7 @@ impl Tester for DbTester {
         symbol: &str,
         initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.queue_token_registration(height, subnet_name, name, symbol, initial_supply)
     }
 
@@ -759,6 +900,7 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.queue_mint(height, subnet_name, token_name, amount)
     }
 
@@ -769,6 +911,7 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.queue_burn(height, subnet_name, token_name, amount)
     }
 
@@ -780,6 +923,7 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
+        self.run_removal_pass(height)?;
         self.queue_erc_transfer(height, src_subnet, dst_subnet, token_name, amount)
     }
 
@@ -793,8 +937,29 @@ impl Tester for DbTester {
         self.last_rootnet_msgs = None;
         self.last_token_balance = None;
         self.last_reward_results = None;
+        self.last_ue = None;
 
         match db {
+            OutputDb::Validators | OutputDb::UeCollaterals | OutputDb::Withdrawals => {
+                let subnet_name = &args[0];
+                let subnet_id = self.resolve_subnet_id(subnet_name)?;
+                let names = self.validator_names();
+                let read = match db {
+                    OutputDb::Validators => ue_reads::read_validators(
+                        &self.db,
+                        subnet_id,
+                        subnet_name,
+                        &names,
+                        args.len() == 2,
+                    )?,
+                    OutputDb::UeCollaterals => {
+                        ue_reads::read_ue_collaterals(&self.db, subnet_id, subnet_name, &names, None)?
+                    }
+                    _ => ue_reads::read_withdrawals(&self.db, subnet_id, subnet_name, &names)?,
+                };
+                self.last_ue = Some(read);
+            }
+
             OutputDb::RootnetMsgs => {
                 let subnet_name = &args[0];
                 let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -1027,14 +1192,19 @@ impl Tester for DbTester {
         target: OutputExpectTarget,
         expected_value: &str,
     ) -> Result<String, EasyTesterError> {
+        if let Some(last) = &self.last_ue {
+            return ue_reads::expect_ue(last, &target, expected_value);
+        }
+
         // token_balance expect
         if let Some(balance) = self.last_token_balance {
             let parts: Vec<&str> = target.path.split('.').collect();
             match parts.as_slice() {
                 ["balance"] => {
                     use crate::easy_tester::model::parse_u256_allow_underscores;
-                    let expected = parse_u256_allow_underscores(expected_value)
-                        .map_err(|e| EasyTesterError::runtime(format!("balance must be numeric: {e}")))?;
+                    let expected = parse_u256_allow_underscores(expected_value).map_err(|e| {
+                        EasyTesterError::runtime(format!("balance must be numeric: {e}"))
+                    })?;
                     if balance != expected {
                         return Err(EasyTesterError::runtime(format!(
                             "EXPECT failed (line {}): result.balance expected {}, got {}",

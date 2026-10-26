@@ -9,23 +9,27 @@ use std::{
 };
 
 use bitcoin::hashes::sha256;
-use log::info;
+use bitcoincore_rpc::{Auth, Client};
+use log::{info, warn};
 use tempfile::TempDir;
 
 use crate::{
+    collateral,
+    db::HeedDb,
     easy_tester::{
         error::EasyTesterError,
         model::{
-            build_create_subnet_msg, OutputDb, OutputExpectTarget,
-            parse_u256_allow_underscores, SetupSpec, ValidatorSpec,
+            build_create_subnet_msg, parse_u256_allow_underscores, OutputDb, OutputExpectTarget,
+            SetupSpec, ValidatorSpec,
         },
         provider_client::ProviderClient,
         tester::Tester,
+        ue_reads::{self, Names, UeRead},
     },
     eth_utils::eth_addr_from_x_only_pubkey,
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcSupplyAdjustment,
-        IpcErcTokenRegistration,
+        IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg,
     },
     provider::rpc::{DevMultisignPsbtParams, DevMultisignPsbtResponse},
     SubnetId,
@@ -150,6 +154,7 @@ fn write_env(
     sk_path: &str,
     activation_height: Option<u64>,
     snapshot_length: Option<u64>,
+    ue_activation_height: Option<u64>,
     log_level: Option<&str>,
 ) -> Result<(), EasyTesterError> {
     let rust_log = log_level.unwrap_or("info");
@@ -170,6 +175,9 @@ fn write_env(
     }
     if let Some(sl) = snapshot_length {
         content.push_str(&format!("SNAPSHOT_LENGTH={sl}\n"));
+    }
+    if let Some(h) = ue_activation_height {
+        content.push_str(&format!("UE_ACTIVATION_HEIGHT={h}\n"));
     }
     std::fs::write(path, content)
         .map_err(|e| EasyTesterError::runtime(format!("failed to write .env: {e}")))?;
@@ -246,14 +254,20 @@ struct JoinSubnetLocalRequest {
 struct FinalizeBootstrapHandoverLocalParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    signatures: Vec<(bitcoin::XOnlyPublicKey, Vec<bitcoin::secp256k1::schnorr::Signature>)>,
+    signatures: Vec<(
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    )>,
 }
 
 #[derive(serde::Serialize)]
 struct FinalizeCheckpointLocalParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    signatures: Vec<(bitcoin::XOnlyPublicKey, Vec<bitcoin::secp256k1::schnorr::Signature>)>,
+    signatures: Vec<(
+        bitcoin::XOnlyPublicKey,
+        Vec<bitcoin::secp256k1::schnorr::Signature>,
+    )>,
     batch_transfer_tx_hex: Option<String>,
 }
 
@@ -375,6 +389,11 @@ pub struct MonitorTester {
     done_handovers: std::collections::HashSet<String>,
     /// Directory where log files are written.
     log_dir: PathBuf,
+    /// The monitor's LMDB directory, opened read-only for the unilateral-exit reads.
+    db_url: String,
+    last_ue: Option<UeRead>,
+    /// Subnets that received an ordinary `join`, whose whitelist multisig holds funds.
+    subnets_with_joins: std::collections::HashSet<String>,
 }
 
 impl MonitorTester {
@@ -382,6 +401,7 @@ impl MonitorTester {
         setup: SetupSpec,
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        ue_activation_height: Option<u64>,
         monitor_log_level: Option<String>,
         provider_log_level: Option<String>,
     ) -> Result<Self, EasyTesterError> {
@@ -393,6 +413,7 @@ impl MonitorTester {
             /// One (validator_name, pid, port) per validator.
             providers: Vec<(String, u32, u16)>,
             all_sk_hex: HashMap<String, String>,
+            db_url: String,
         }
 
         // Set FVM network to match NETWORK (Regtest → Testnet prefix for addresses).
@@ -443,8 +464,9 @@ impl MonitorTester {
                 "ulimit -n 65536 2>/dev/null; exec bitcoind -datadir={} -daemon=0",
                 datadir.display()
             );
-            let bitcoind_log_stderr = bitcoind_log.try_clone()
-                .map_err(|e| EasyTesterError::runtime(format!("failed to clone bitcoind log fd: {e}")))?;
+            let bitcoind_log_stderr = bitcoind_log.try_clone().map_err(|e| {
+                EasyTesterError::runtime(format!("failed to clone bitcoind log fd: {e}"))
+            })?;
             let bitcoind = Command::new("sh")
                 .args(["-c", &bitcoind_cmd])
                 .stdout(Stdio::from(bitcoind_log))
@@ -503,13 +525,18 @@ impl MonitorTester {
                 primary_sk_path.to_str().unwrap_or("/tmp/validator1.sk"),
                 activation_height,
                 snapshot_length,
+                ue_activation_height,
                 monitor_log_level.as_deref(),
             )?;
 
             // 9. Start monitor
             let monitor_log = open_log("monitor.log")?;
+            // dotenv keeps variables already in the environment: the scenario config must win
             let monitor = Command::new(&monitor_bin)
                 .args(["--env", monitor_env_path.to_str().unwrap()])
+                .env_remove("UE_ACTIVATION_HEIGHT")
+                .env_remove("ACTIVATION_HEIGHT")
+                .env_remove("SNAPSHOT_LENGTH")
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(monitor_log))
                 .spawn()
@@ -548,11 +575,15 @@ impl MonitorTester {
                     sk_path.to_str().unwrap_or("/tmp/validator.sk"),
                     activation_height,
                     snapshot_length,
+                    ue_activation_height,
                     provider_log_level.as_deref(),
                 )?;
                 let prov_log = open_log(&format!("provider-{name}.log"))?;
                 let child = Command::new(&provider_bin)
                     .args(["--env", env_path.to_str().unwrap()])
+                    .env_remove("UE_ACTIVATION_HEIGHT")
+                    .env_remove("ACTIVATION_HEIGHT")
+                    .env_remove("SNAPSHOT_LENGTH")
                     .stdout(Stdio::null())
                     .stderr(Stdio::from(prov_log))
                     .spawn()
@@ -569,12 +600,13 @@ impl MonitorTester {
 
             // 11. Poll until every provider responds to HTTP.
             for (name, _pid, port) in &providers {
-                wait_for_provider_http(*port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS)
-                    .map_err(|e| {
+                wait_for_provider_http(*port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS).map_err(
+                    |e| {
                         EasyTesterError::runtime(format!(
                             "provider for {name} (port {port}) failed to start: {e}"
                         ))
-                    })?;
+                    },
+                )?;
             }
 
             // Success — disarm the guard so processes survive past this scope.
@@ -586,14 +618,14 @@ impl MonitorTester {
                 monitor_pid,
                 providers,
                 all_sk_hex,
+                db_url: db_url_str.to_string(),
             })
         })?;
 
         let mut validator_provider_urls = HashMap::new();
         let mut provider_pids = Vec::new();
         for (name, pid, port) in &started.providers {
-            validator_provider_urls
-                .insert(name.clone(), format!("http://127.0.0.1:{port}/api"));
+            validator_provider_urls.insert(name.clone(), format!("http://127.0.0.1:{port}/api"));
             provider_pids.push(*pid);
         }
         let default_provider_url = validator_provider_urls
@@ -634,10 +666,38 @@ impl MonitorTester {
             all_sk_hex: started.all_sk_hex,
             done_handovers: std::collections::HashSet::new(),
             log_dir,
+            db_url: started.db_url,
+            last_ue: None,
+            subnets_with_joins: std::collections::HashSet::new(),
         })
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// An RPC client on the tester's bitcoind wallet, which funds the join-ue transactions.
+    fn wallet_client(&self) -> Result<Client, EasyTesterError> {
+        Client::new(
+            &format!("http://127.0.0.1:{BITCOIND_RPC_PORT}/wallet/{WALLET_NAME}"),
+            Auth::UserPass(RPC_USER.to_string(), RPC_PASS.to_string()),
+        )
+        .map_err(|e| EasyTesterError::runtime(format!("bitcoind rpc client: {e}")))
+    }
+
+    /// The monitor's database, read-only.
+    fn open_db(&self) -> Result<HeedDb, EasyTesterError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(HeedDb::new(&self.db_url, true))
+        })
+        .map_err(|e| EasyTesterError::runtime(format!("open monitor db read-only: {e}")))
+    }
+
+    fn validator_names(&self) -> Names {
+        self.setup
+            .validators
+            .values()
+            .map(|v| (v.pubkey, v.name.clone()))
+            .collect()
+    }
 
     /// Returns the secret keys (hex) for validators in a subnet's whitelist.
     fn sk_hex_for_subnet(&self, subnet_name: &str) -> Vec<String> {
@@ -678,7 +738,12 @@ impl MonitorTester {
         committee: &crate::db::SubnetCommittee,
     ) -> Result<String, EasyTesterError> {
         for cv in &committee.validators {
-            if let Some(v) = self.setup.validators.values().find(|v| v.pubkey == cv.pubkey) {
+            if let Some(v) = self
+                .setup
+                .validators
+                .values()
+                .find(|v| v.pubkey == cv.pubkey)
+            {
                 if self.validator_provider_urls.contains_key(&v.name) {
                     return Ok(v.name.clone());
                 }
@@ -724,11 +789,12 @@ impl MonitorTester {
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        let url = self.validator_provider_urls.get(validator_name).ok_or_else(|| {
-            EasyTesterError::runtime(format!(
-                "no provider for validator '{validator_name}'"
-            ))
-        })?;
+        let url = self
+            .validator_provider_urls
+            .get(validator_name)
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!("no provider for validator '{validator_name}'"))
+            })?;
         self.rpc_call_to(url, method, params)
     }
 
@@ -758,9 +824,12 @@ impl MonitorTester {
         }
         // Suppress logging for high-frequency polling calls to keep rpc_client.log readable.
         let silent = matches!(method, "getconfirmedcount");
-        let log_file = if silent { None } else { Some(self.log_dir.join("rpc_client.log")) };
-        ProviderClient::new(url.to_string(), AUTH_TOKEN.to_string(), log_file)
-            .call(method, params)
+        let log_file = if silent {
+            None
+        } else {
+            Some(self.log_dir.join("rpc_client.log"))
+        };
+        ProviderClient::new(url.to_string(), AUTH_TOKEN.to_string(), log_file).call(method, params)
     }
 
     /// Poll provider's `getconfirmedcount` until it reaches `target_height`.
@@ -821,7 +890,23 @@ impl MonitorTester {
         eprintln!("[easy_tester] bootstrap handover for subnet '{subnet_name}'");
 
         let gen_resp: GenBootstrapHandoverResult =
-            self.rpc_call("genbootstraphandover", SubnetIdParam { subnet_id })?;
+            match self.rpc_call("genbootstraphandover", SubnetIdParam { subnet_id }) {
+                Ok(resp) => resp,
+                // A subnet whose validators all joined with join-ue holds nothing in the
+                // whitelist multisig: there is nothing to hand over. With an ordinary join
+                // the funds exist, and this error is a real failure
+                Err(e)
+                    if e.to_string().contains("No unspent outputs")
+                        && !self.subnets_with_joins.contains(subnet_name) =>
+                {
+                    warn!(
+                        "No whitelist funds to hand over for subnet '{}' (join-ue only), skipping",
+                        subnet_name
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
 
         let sign_params = DevMultisignPsbtParams {
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
@@ -897,7 +982,8 @@ impl MonitorTester {
 
         // Route checkpoint RPCs to a provider whose validator is still in the
         // committee (the default provider's validator may have left).
-        let committee_validator_name = self.find_committee_validator_name(&subnet_state.committee)?;
+        let committee_validator_name =
+            self.find_committee_validator_name(&subnet_state.committee)?;
 
         let msg = IpcCheckpointSubnetMsg {
             subnet_id,
@@ -930,8 +1016,11 @@ impl MonitorTester {
             signatures: sign_resp.signatures,
             batch_transfer_tx_hex: gen_resp.batch_transfer_tx_hex,
         };
-        let _: serde_json::Value =
-            self.rpc_call_as(&committee_validator_name, "finalizecheckpointpsbt", finalize_params)?;
+        let _: serde_json::Value = self.rpc_call_as(
+            &committee_validator_name,
+            "finalizecheckpointpsbt",
+            finalize_params,
+        )?;
 
         info!(
             "Checkpoint #{} for subnet '{}' finalized",
@@ -1162,10 +1251,65 @@ impl Tester for MonitorTester {
         };
 
         let _: serde_json::Value = self.rpc_call_as(validator_name, "joinsubnet", req)?;
+        self.subnets_with_joins.insert(subnet_name.to_string());
 
         info!(
             "Joined validator '{}' to subnet '{}'",
             validator_name, subnet_name
+        );
+        Ok(())
+    }
+
+    /// `join-ue`: the transactions are built as the provider builds them, with the
+    /// validator's key and the tester's wallet, but without the provider's own check, so
+    /// that every rejection in a scenario is the monitor's. A failed submission is a
+    /// failure of the tester, not a scenario outcome.
+    fn exec_join_ue(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+        collateral_sats: u64,
+        timeout: u64,
+    ) -> Result<(), EasyTesterError> {
+        let subnet_id = self.resolve_subnet_id(subnet_name)?;
+        let v = self.resolve_validator(validator_name)?.clone();
+        let timeout = u32::try_from(timeout)
+            .map_err(|_| EasyTesterError::runtime(format!("timeout {timeout} does not fit u32")))?;
+        let collateral = bitcoin::Amount::from_sat(collateral_sats);
+        let join = IpcJoinSubnetMsg {
+            subnet_id,
+            collateral,
+            ip: v.default_ip,
+            backup_address: v.default_backup_address.clone(),
+            pubkey: v.pubkey,
+        };
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &v.secret_key);
+        let err = |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("join-ue: {e}"));
+        let data = msg.to_bytes().map_err(|e| err(&e))?;
+        let rpc = self.wallet_client()?;
+        let return_address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
+        let collateral_output = bitcoin::TxOut {
+            value: collateral,
+            script_pubkey: collateral::ue_script_pubkey(&secp, &v.pubkey, timeout)
+                .map_err(|e| err(&e))?,
+        };
+        let (commit_tx, reveal_tx) = crate::bitcoin_utils::create_commit_reveal_txs(
+            &rpc,
+            &secp,
+            &return_address,
+            &data,
+            None,
+            Some(collateral_output),
+        )
+        .map_err(|e| err(&e))?;
+        let join_txid = reveal_tx.compute_txid();
+        crate::bitcoin_utils::submit_to_mempool(&rpc, vec![commit_tx, reveal_tx])
+            .map_err(|e| err(&e))?;
+        info!(
+            "JoinUe: validator '{}' submitted to subnet '{}' with {} sats, timeout {}, join_txid={}",
+            validator_name, subnet_name, collateral_sats, timeout, join_txid
         );
         Ok(())
     }
@@ -1242,6 +1386,29 @@ impl Tester for MonitorTester {
             "Unstaked {} sats for '{}' from subnet '{}'",
             amount_sats, validator_name, subnet_name
         );
+        Ok(())
+    }
+
+    /// `unstake-ue`: the validator's provider spends its matured collaterals. A refusal
+    /// (nothing matured, nothing left) is logged, not fatal, so the scenario can check it.
+    fn exec_unstake_ue(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        validator_name: &str,
+    ) -> Result<(), EasyTesterError> {
+        let subnet_id = self.resolve_subnet_id(subnet_name)?;
+        let params = serde_json::json!({ "subnet_id": subnet_id });
+        match self.rpc_call_as::<_, serde_json::Value>(validator_name, "unstakeue", params) {
+            Ok(resp) => info!(
+                "UnstakeUe: validator '{}' spent its collateral in subnet '{}': {}",
+                validator_name, subnet_name, resp
+            ),
+            Err(e) => warn!(
+                "UnstakeUe: validator '{}' refused in subnet '{}': {}",
+                validator_name, subnet_name, e
+            ),
+        }
         Ok(())
     }
 
@@ -1334,8 +1501,9 @@ impl Tester for MonitorTester {
         })?;
         let addr = *addr;
 
-        let delta = alloy_primitives::I256::try_from(amount)
-            .map_err(|e| EasyTesterError::runtime(format!("mint amount too large for I256: {e}")))?;
+        let delta = alloy_primitives::I256::try_from(amount).map_err(|e| {
+            EasyTesterError::runtime(format!("mint amount too large for I256: {e}"))
+        })?;
 
         self.pending_supply_adjustments
             .entry(subnet_name.to_string())
@@ -1360,10 +1528,12 @@ impl Tester for MonitorTester {
         })?;
         let addr = *addr;
 
-        let pos = alloy_primitives::I256::try_from(amount)
-            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
-        let delta = pos.checked_neg()
-            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
+        let pos = alloy_primitives::I256::try_from(amount).map_err(|e| {
+            EasyTesterError::runtime(format!("burn amount too large for I256: {e}"))
+        })?;
+        let delta = pos.checked_neg().ok_or_else(|| {
+            EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string())
+        })?;
 
         self.pending_supply_adjustments
             .entry(subnet_name.to_string())
@@ -1415,8 +1585,44 @@ impl Tester for MonitorTester {
         self.last_rootnet_msgs = None;
         self.last_token_balance = None;
         self.last_reward_results = None;
+        self.last_ue = None;
 
         match db {
+            OutputDb::Validators | OutputDb::UeCollaterals | OutputDb::Withdrawals => {
+                let subnet_name = &args[0];
+                let subnet_id = self.resolve_subnet_id(subnet_name)?;
+                let names = self.validator_names();
+                let monitor_db = self.open_db()?;
+                let read = match db {
+                    OutputDb::Validators => ue_reads::read_validators(
+                        &monitor_db,
+                        subnet_id,
+                        subnet_name,
+                        &names,
+                        args.len() == 2,
+                    )?,
+                    OutputDb::UeCollaterals => {
+                        // A collateral output is spent once the exit transaction is mined
+                        let rpc = self.wallet_client()?;
+                        let spent = |outpoint: &bitcoin::OutPoint| {
+                            use bitcoincore_rpc::RpcApi;
+                            rpc.get_tx_out(&outpoint.txid, outpoint.vout, Some(false))
+                                .map(|o| o.is_none())
+                                .map_err(|e| EasyTesterError::runtime(format!("gettxout: {e}")))
+                        };
+                        ue_reads::read_ue_collaterals(
+                            &monitor_db,
+                            subnet_id,
+                            subnet_name,
+                            &names,
+                            Some(&spent),
+                        )?
+                    }
+                    _ => ue_reads::read_withdrawals(&monitor_db, subnet_id, subnet_name, &names)?,
+                };
+                self.last_ue = Some(read);
+            }
+
             OutputDb::RootnetMsgs => {
                 let subnet_name = &args[0];
                 let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -1427,7 +1633,10 @@ impl Tester for MonitorTester {
                 for h in 1..=self.current_block {
                     let batch: Vec<RootnetMsgValue> = self.rpc_call(
                         "getrootnetmessages",
-                        SubnetBlockParam { subnet_id, block_height: h },
+                        SubnetBlockParam {
+                            subnet_id,
+                            block_height: h,
+                        },
                     )?;
                     msgs.extend(batch);
                 }
@@ -1585,6 +1794,10 @@ impl Tester for MonitorTester {
         target: OutputExpectTarget,
         expected_value: &str,
     ) -> Result<String, EasyTesterError> {
+        if let Some(last) = &self.last_ue {
+            return ue_reads::expect_ue(last, &target, expected_value);
+        }
+
         // token_balance
         if let Some(balance) = self.last_token_balance {
             match target.path.as_str() {
@@ -1726,10 +1939,14 @@ fn rootnet_msg_field(msg: &RootnetMsgValue, field: &str) -> Result<String, EasyT
         "nonce" => Ok(msg.nonce.to_string()),
         "tokenName" => json_nested_field(msg.registration.as_ref(), "name", "tokenName"),
         "tokenSymbol" => json_nested_field(msg.registration.as_ref(), "symbol", "tokenSymbol"),
-        "tokenDecimals" => json_nested_field(msg.registration.as_ref(), "decimals", "tokenDecimals"),
+        "tokenDecimals" => {
+            json_nested_field(msg.registration.as_ref(), "decimals", "tokenDecimals")
+        }
         "token" => json_nested_field(msg.registration.as_ref(), "home_token_address", "token"),
         "amount" => json_nested_field(msg.msg.as_ref(), "amount", "amount"),
-        other => Err(EasyTesterError::runtime(format!("unknown rootnet_msg field '{other}'"))),
+        other => Err(EasyTesterError::runtime(format!(
+            "unknown rootnet_msg field '{other}'"
+        ))),
     }
 }
 
@@ -1739,11 +1956,11 @@ fn json_nested_field(
     key: &str,
     display_field: &str,
 ) -> Result<String, EasyTesterError> {
-    let val = obj
-        .and_then(|v| v.get(key))
-        .ok_or_else(|| {
-            EasyTesterError::runtime(format!("field '{display_field}' not present in this message"))
-        })?;
+    let val = obj.and_then(|v| v.get(key)).ok_or_else(|| {
+        EasyTesterError::runtime(format!(
+            "field '{display_field}' not present in this message"
+        ))
+    })?;
     Ok(match val {
         serde_json::Value::String(s) => {
             // U256 and similar types serialize as "0x..." hex strings; convert to decimal.

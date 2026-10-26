@@ -1,0 +1,141 @@
+# Unilateral-exit joins only (join-ue). A timeout T is a block height: the validator
+# leaves the next committee at block T - 1 and can spend its collateral from block T + 1.
+#
+# Run with testers/db-ue.txt or testers/monitor-ue.txt (unilateral exit active from 102).
+# `block N` means what follows goes into block N, so a removal at T - 1 is visible at `block T`.
+# No checkpoint after a removal here: the provider must first learn to skip UE payouts.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 130
+join-ue subnet1 validator2 200_000 140
+join-ue subnet1 validator3 100_000 150
+join-ue subnet1 validator4 100_000 160
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+expect result.waiting = false
+expect result.validator1.ue = true
+expect result.validator1.collateral = 100_000
+expect result.validator2.collateral = 200_000
+read ue_collaterals subnet1
+expect result.count = 4
+expect result.removed_count = 0
+expect result.validator1.timeout = 130
+expect result.validator1.value = 100_000
+expect result.validator1.removed = false
+expect result.validator2.timeout = 140
+
+# a fifth key joins after bootstrap and waits for the next checkpoint
+join-ue subnet1 validator5 150_000 170
+
+block 114
+read validators subnet1
+expect result.count = 5
+expect result.names = validator1,validator2,validator3,validator4,validator5
+expect result.waiting = true
+read validators subnet1 current
+expect result.count = 4
+
+# the multisig needs funds before a checkpoint can be built
+deposit subnet1 validator1 500_000_000
+
+block 116
+checkpoint subnet1
+
+block 119
+read validators subnet1 current
+expect result.count = 5
+expect result.waiting = false
+
+# state after block 128: two blocks before validator1 matures, nothing happens
+block 129
+read validators subnet1
+expect result.count = 5
+read withdrawals subnet1
+expect result.count = 0
+
+# state after block 129 = T - 1: validator1 left the next committee, whole collateral
+block 130
+read validators subnet1
+expect result.count = 4
+expect result.names = validator2,validator3,validator4,validator5
+expect result.waiting = true
+read validators subnet1 current
+expect result.count = 5
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator1 = 100_000
+read ue_collaterals subnet1
+expect result.removed_count = 1
+expect result.validator1.removed = true
+expect result.validator2.removed = false
+
+# state after block 130 = T: nothing more happens
+block 131
+read validators subnet1
+expect result.count = 4
+read withdrawals subnet1
+expect result.count = 1
+
+block 140
+read validators subnet1
+expect result.names = validator3,validator4,validator5
+read withdrawals subnet1
+expect result.count = 2
+expect result.validator2 = 200_000
+
+block 150
+read validators subnet1
+expect result.names = validator4,validator5
+
+block 160
+read validators subnet1
+expect result.names = validator5
+read withdrawals subnet1
+expect result.count = 4
+
+# state after block 168: validator5's record is still open
+block 169
+read ue_collaterals subnet1
+expect result.removed_count = 4
+expect result.validator5.removed = false
+
+# validator5 is the only member left: it is kept, its record is marked removed
+block 170
+read validators subnet1
+expect result.names = validator5
+read ue_collaterals subnet1
+expect result.removed_count = 5
+read withdrawals subnet1
+expect result.count = 4
+
+# a key that left stays in the current committee until a checkpoint rotates it out,
+# so it cannot join again before that (the checkpoint comes after step 3)
+block 175
+join-ue subnet1 validator1 100_000 300
+
+block 177
+read validators subnet1
+expect result.names = validator5
+read ue_collaterals subnet1
+expect result.count = 5
+expect result.validator1.count = 1

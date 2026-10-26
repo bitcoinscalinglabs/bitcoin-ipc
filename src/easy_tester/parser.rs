@@ -1,10 +1,14 @@
-use std::{collections::{HashMap, HashSet}, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+};
 
 use crate::easy_tester::{
     error::EasyTesterError,
     model::{
         generate_validator, normalize_numeric_literal, parse_u16_allow_underscores,
-        parse_u64_allow_underscores, parse_u256_allow_underscores, FendermintIssuer,
+        parse_u256_allow_underscores, parse_u64_allow_underscores, FendermintIssuer,
         FendermintSetup, FendermintSubnet, OutputDb, OutputExpectTarget, ParsedFendermintTest,
         ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TesterConfig,
     },
@@ -379,6 +383,32 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         },
                     });
                 }
+                "join-ue" => {
+                    if tokens.len() != 5 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "join-ue syntax: join-ue <subnetName> <validatorName> <collateralSats> <timeoutHeight>",
+                            original_line,
+                        ));
+                    }
+                    let collateral_sats = parse_u64_allow_underscores(tokens[3]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    let timeout = parse_u64_allow_underscores(tokens[4]).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::JoinUe {
+                            subnet_name: tokens[1].to_string(),
+                            validator_name: tokens[2].to_string(),
+                            collateral_sats,
+                            timeout,
+                        },
+                    });
+                }
                 "stake" => {
                     if tokens.len() != 4 {
                         return Err(EasyTesterError::parse(
@@ -420,6 +450,24 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             subnet_name: tokens[1].to_string(),
                             validator_name: tokens[2].to_string(),
                             amount_sats,
+                        },
+                    });
+                }
+                "unstake-ue" => {
+                    if tokens.len() != 3 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "unstake-ue syntax: unstake-ue <subnetName> <validatorName>",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::UnstakeUe {
+                            subnet_name: tokens[1].to_string(),
+                            validator_name: tokens[2].to_string(),
                         },
                     });
                 }
@@ -521,7 +569,12 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         ));
                     }
                     let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
-                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                        EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            format!("invalid amount: {e}"),
+                            original_line,
+                        )
                     })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
@@ -544,7 +597,12 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         ));
                     }
                     let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
-                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                        EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            format!("invalid amount: {e}"),
+                            original_line,
+                        )
                     })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
@@ -567,7 +625,12 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         ));
                     }
                     let amount = parse_u256_allow_underscores(tokens[4]).map_err(|e| {
-                        EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                        EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            format!("invalid amount: {e}"),
+                            original_line,
+                        )
                     })?;
                     scenario_entries.push(ScenarioEntry {
                         line_no,
@@ -772,6 +835,61 @@ fn validate_scenario(
                     ));
                 }
             }
+            ScenarioCommand::JoinUe {
+                subnet_name,
+                validator_name,
+                collateral_sats,
+                timeout,
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !setup.validators.contains_key(validator_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("validator '{validator_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before join-ue"),
+                        &entry.text,
+                    ));
+                }
+                if *collateral_sats == 0 {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "collateral must be greater than 0",
+                        &entry.text,
+                    ));
+                }
+                if *timeout == 0 {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "timeout must be a block height greater than 0",
+                        &entry.text,
+                    ));
+                }
+            }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
@@ -860,6 +978,43 @@ fn validate_scenario(
                         path.clone(),
                         entry.line_no,
                         "amount must be greater than 0",
+                        &entry.text,
+                    ));
+                }
+            }
+            ScenarioCommand::UnstakeUe {
+                subnet_name,
+                validator_name,
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !setup.validators.contains_key(validator_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("validator '{validator_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before unstake-ue"),
                         &entry.text,
                     ));
                 }
@@ -984,6 +1139,9 @@ fn validate_scenario(
                     | OutputDb::StakeChanges
                     | OutputDb::KillRequests
                     | OutputDb::Committee
+                    | OutputDb::Validators
+                    | OutputDb::UeCollaterals
+                    | OutputDb::Withdrawals
                     | OutputDb::RewardCandidates => {
                         let subnet_arg_index = if *db == OutputDb::RewardCandidates {
                             1
@@ -1061,6 +1219,9 @@ fn validate_scenario(
                         | Some(OutputDb::RootnetMsgs)
                         | Some(OutputDb::TokenBalance)
                         | Some(OutputDb::TokenMetadata)
+                        | Some(OutputDb::Validators)
+                        | Some(OutputDb::UeCollaterals)
+                        | Some(OutputDb::Withdrawals)
                 );
                 if !valid_precursor {
                     return Err(EasyTesterError::parse(
@@ -1178,6 +1339,9 @@ fn parse_output_db(s: &str) -> Result<OutputDb, String> {
         "rootnet_msgs" => Ok(OutputDb::RootnetMsgs),
         "token_balance" => Ok(OutputDb::TokenBalance),
         "token_metadata" => Ok(OutputDb::TokenMetadata),
+        "validators" => Ok(OutputDb::Validators),
+        "ue_collaterals" => Ok(OutputDb::UeCollaterals),
+        "withdrawals" => Ok(OutputDb::Withdrawals),
         _ => Err(format!("unknown output db '{s}'")),
     }
 }
@@ -1252,7 +1416,19 @@ fn validate_output_args(
         }
         OutputDb::TokenMetadata => {
             if args.len() != 2 {
-                return Err(err("expected: read token_metadata <subnetName> <tokenName>"));
+                return Err(err(
+                    "expected: read token_metadata <subnetName> <tokenName>",
+                ));
+            }
+        }
+        OutputDb::Validators => {
+            if args.is_empty() || args.len() > 2 || (args.len() == 2 && args[1] != "current") {
+                return Err(err("expected: read validators <subnetName> [current]"));
+            }
+        }
+        OutputDb::UeCollaterals | OutputDb::Withdrawals => {
+            if args.len() != 1 {
+                return Err(err("expected: read <db> <subnetName>"));
             }
         }
     }
@@ -1278,6 +1454,7 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
     let mut tester_type: Option<String> = None;
     let mut activation_height: Option<u64> = None;
     let mut snapshot_length: Option<u64> = None;
+    let mut ue_activation_height: Option<u64> = None;
     let mut monitor_log_level: Option<String> = None;
     let mut provider_log_level: Option<String> = None;
 
@@ -1306,33 +1483,45 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
             "tester" => {
                 if tokens.len() != 2 {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no, "tester requires exactly one argument", original_line,
+                        path.clone(),
+                        line_no,
+                        "tester requires exactly one argument",
+                        original_line,
                     ));
                 }
                 tester_type = Some(tokens[1].to_string());
             }
-            "activation_height" | "snapshot_length" | "monitor_log_level" | "provider_log_level" => {
+            "activation_height"
+            | "snapshot_length"
+            | "ue_activation_height"
+            | "monitor_log_level"
+            | "provider_log_level" => {
                 if tokens.len() != 2 {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no,
+                        path.clone(),
+                        line_no,
                         format!("{} requires exactly one argument", tokens[0]),
                         original_line,
                     ));
                 }
                 match tokens[0] {
                     "activation_height" => {
-                        activation_height = Some(
-                            parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                        activation_height =
+                            Some(parse_u64_allow_underscores(tokens[1]).map_err(|e| {
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                            })?,
-                        );
+                            })?);
                     }
                     "snapshot_length" => {
-                        snapshot_length = Some(
-                            parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                        snapshot_length =
+                            Some(parse_u64_allow_underscores(tokens[1]).map_err(|e| {
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
-                            })?,
-                        );
+                            })?);
+                    }
+                    "ue_activation_height" => {
+                        ue_activation_height =
+                            Some(parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?);
                     }
                     "monitor_log_level" => monitor_log_level = Some(tokens[1].to_string()),
                     "provider_log_level" => provider_log_level = Some(tokens[1].to_string()),
@@ -1342,8 +1531,10 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
             "docker_container" => {
                 if tokens.len() != 2 {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no,
-                        "docker_container requires exactly one argument", original_line,
+                        path.clone(),
+                        line_no,
+                        "docker_container requires exactly one argument",
+                        original_line,
                     ));
                 }
                 fm_docker_container = tokens[1].to_string();
@@ -1351,8 +1542,10 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
             "print_ipc_queries" => {
                 if tokens.len() != 2 {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no,
-                        "print_ipc_queries requires exactly one argument (on|off)", original_line,
+                        path.clone(),
+                        line_no,
+                        "print_ipc_queries requires exactly one argument (on|off)",
+                        original_line,
                     ));
                 }
                 fm_print_queries = match tokens[1] {
@@ -1360,7 +1553,8 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
                     "off" => false,
                     other => {
                         return Err(EasyTesterError::parse(
-                            path.clone(), line_no,
+                            path.clone(),
+                            line_no,
                             format!("print_ipc_queries value must be 'on' or 'off', got '{other}'"),
                             original_line,
                         ));
@@ -1371,7 +1565,8 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
                 // subnet1 <subnet_id> <eth_rpc_url> <provider_url>
                 if tokens.len() != 4 {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no,
+                        path.clone(),
+                        line_no,
                         "subnet syntax: <name> <subnet_id> <eth_rpc_url> <provider_url>",
                         original_line,
                     ));
@@ -1379,17 +1574,22 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
                 let sname = tokens[0].to_string();
                 if fm_subnets.contains_key(&sname) {
                     return Err(EasyTesterError::parse(
-                        path.clone(), line_no,
-                        format!("duplicate subnet '{sname}'"), original_line,
+                        path.clone(),
+                        line_no,
+                        format!("duplicate subnet '{sname}'"),
+                        original_line,
                     ));
                 }
                 fm_subnet_order.push(sname.clone());
-                fm_subnets.insert(sname.clone(), FendermintSubnet {
-                    name: sname,
-                    subnet_id: tokens[1].to_string(),
-                    eth_rpc_url: tokens[2].to_string(),
-                    provider_url: tokens[3].to_string(),
-                });
+                fm_subnets.insert(
+                    sname.clone(),
+                    FendermintSubnet {
+                        name: sname,
+                        subnet_id: tokens[1].to_string(),
+                        eth_rpc_url: tokens[2].to_string(),
+                        provider_url: tokens[3].to_string(),
+                    },
+                );
             }
             other => {
                 return Err(EasyTesterError::parse(
@@ -1412,10 +1612,12 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
         "db" => Ok(TesterConfig::Db {
             activation_height,
             snapshot_length,
+            ue_activation_height,
         }),
         "monitor" => Ok(TesterConfig::Monitor {
             activation_height,
             snapshot_length,
+            ue_activation_height,
             monitor_log_level,
             provider_log_level,
         }),
@@ -1610,15 +1812,15 @@ fn parse_fendermint_scenario_command(
     tokens: &[&str],
     setup: &FendermintSetup,
 ) -> Result<ScenarioCommand, EasyTesterError> {
-    let err =
-        |msg: &str| EasyTesterError::parse(path.clone(), line_no, msg, original_line);
+    let err = |msg: &str| EasyTesterError::parse(path.clone(), line_no, msg, original_line);
 
     match tokens[0] {
         // NOPs: block, checkpoint, create, join, stake, unstake
         "block" | "checkpoint" => Ok(ScenarioCommand::Block { height: 0 }),
-        "create" | "join" | "stake" | "unstake" => Err(err(
-            &format!("'{}' is not supported by FendermintTester", tokens[0]),
-        )),
+        "create" | "join" | "join-ue" | "stake" | "unstake" | "unstake-ue" => Err(err(&format!(
+            "'{}' is not supported by FendermintTester",
+            tokens[0]
+        ))),
 
         // register_token <subnet> <issuer> <name> <symbol> <initial_supply>
         "register_token" => {
@@ -1659,7 +1861,9 @@ fn parse_fendermint_scenario_command(
         // mint_token <subnet> <token_name> <amount>
         "mint_token" => {
             if tokens.len() != 4 {
-                return Err(err("mint_token syntax: mint_token <subnet> <token_name> <amount>"));
+                return Err(err(
+                    "mint_token syntax: mint_token <subnet> <token_name> <amount>",
+                ));
             }
             let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
                 EasyTesterError::parse(
@@ -1679,7 +1883,9 @@ fn parse_fendermint_scenario_command(
         // burn_token <subnet> <token_name> <amount>
         "burn_token" => {
             if tokens.len() != 4 {
-                return Err(err("burn_token syntax: burn_token <subnet> <token_name> <amount>"));
+                return Err(err(
+                    "burn_token syntax: burn_token <subnet> <token_name> <amount>",
+                ));
             }
             let amount = parse_u256_allow_underscores(tokens[3]).map_err(|e| {
                 EasyTesterError::parse(
@@ -1702,7 +1908,12 @@ fn parse_fendermint_scenario_command(
                 return Err(err("wait syntax: wait <seconds>"));
             }
             let seconds = parse_u64_allow_underscores(tokens[1]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, format!("invalid seconds: {e}"), original_line)
+                EasyTesterError::parse(
+                    path.clone(),
+                    line_no,
+                    format!("invalid seconds: {e}"),
+                    original_line,
+                )
             })?;
             Ok(ScenarioCommand::Wait { seconds })
         }
@@ -1710,18 +1921,29 @@ fn parse_fendermint_scenario_command(
         // deposit <subnet> <address_name> <amount_sats>
         "deposit" => {
             if tokens.len() != 4 {
-                return Err(err("deposit syntax: deposit <subnet> <address_name> <amount_sats>"));
+                return Err(err(
+                    "deposit syntax: deposit <subnet> <address_name> <amount_sats>",
+                ));
             }
             let subnet_name = tokens[1].to_string();
             if !setup.subnets.contains_key(&subnet_name) {
-                return Err(err(&format!("subnet '{subnet_name}' not declared in setup")));
+                return Err(err(&format!(
+                    "subnet '{subnet_name}' not declared in setup"
+                )));
             }
             let address_name = tokens[2].to_string();
             if !setup.issuers.contains_key(&address_name) {
-                return Err(err(&format!("address '{address_name}' not declared as issuer in setup")));
+                return Err(err(&format!(
+                    "address '{address_name}' not declared as issuer in setup"
+                )));
             }
             let amount_sats = parse_u64_allow_underscores(tokens[3]).map_err(|e| {
-                EasyTesterError::parse(path.clone(), line_no, format!("invalid amount: {e}"), original_line)
+                EasyTesterError::parse(
+                    path.clone(),
+                    line_no,
+                    format!("invalid amount: {e}"),
+                    original_line,
+                )
             })?;
             Ok(ScenarioCommand::Deposit {
                 subnet_name,
@@ -1748,10 +1970,14 @@ fn parse_fendermint_scenario_command(
             let src_actor = tokens[2].to_string();
             let dst_actor = tokens[4].to_string();
             if !setup.issuers.contains_key(&src_actor) {
-                return Err(err(&format!("actor '{src_actor}' not declared as issuer in setup")));
+                return Err(err(&format!(
+                    "actor '{src_actor}' not declared as issuer in setup"
+                )));
             }
             if !setup.issuers.contains_key(&dst_actor) {
-                return Err(err(&format!("actor '{dst_actor}' not declared as issuer in setup")));
+                return Err(err(&format!(
+                    "actor '{dst_actor}' not declared as issuer in setup"
+                )));
             }
             let amount = parse_u256_allow_underscores(tokens[6]).map_err(|e| {
                 EasyTesterError::parse(
@@ -1791,7 +2017,9 @@ fn parse_fendermint_scenario_command(
                     }
                     let actor = tokens[3].to_string();
                     if !setup.issuers.contains_key(&actor) {
-                        return Err(err(&format!("actor '{actor}' not declared as issuer in setup")));
+                        return Err(err(&format!(
+                            "actor '{actor}' not declared as issuer in setup"
+                        )));
                     }
                     Ok(ScenarioCommand::OutputRead {
                         db: OutputDb::TokenBalance,

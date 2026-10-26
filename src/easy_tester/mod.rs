@@ -6,6 +6,7 @@ pub mod model;
 pub mod parser;
 pub mod provider_client;
 pub mod tester;
+pub mod ue_reads;
 
 pub use db_tester::DbTester;
 pub use error::EasyTesterError;

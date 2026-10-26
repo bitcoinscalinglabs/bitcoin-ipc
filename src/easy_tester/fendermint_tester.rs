@@ -171,8 +171,10 @@ impl FendermintTester {
                 }
                 ScenarioCommand::Create { .. }
                 | ScenarioCommand::Join { .. }
+                | ScenarioCommand::JoinUe { .. }
                 | ScenarioCommand::Stake { .. }
-                | ScenarioCommand::Unstake { .. } => {
+                | ScenarioCommand::Unstake { .. }
+                | ScenarioCommand::UnstakeUe { .. } => {
                     return Err(annotate(EasyTesterError::runtime(
                         "create/join/stake/unstake not supported by FendermintTester",
                     )));

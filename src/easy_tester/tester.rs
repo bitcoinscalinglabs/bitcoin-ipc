@@ -20,6 +20,19 @@ pub trait Tester {
         collateral_sats: u64,
     ) -> Result<(), EasyTesterError>;
 
+    fn exec_join_ue(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _validator_name: &str,
+        _collateral_sats: u64,
+        _timeout: u64,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "join-ue is not supported by this tester",
+        ))
+    }
+
     fn exec_stake_subnet(
         &mut self,
         height: u64,
@@ -35,6 +48,17 @@ pub trait Tester {
         validator_name: &str,
         amount_sats: u64,
     ) -> Result<(), EasyTesterError>;
+
+    fn exec_unstake_ue(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _validator_name: &str,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "unstake-ue is not supported by this tester",
+        ))
+    }
 
     fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError>;
 

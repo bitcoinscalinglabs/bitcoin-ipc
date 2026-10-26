@@ -1,0 +1,86 @@
+# join-ue requests the monitor must reject, and the ones it must accept right after.
+# Run with testers/db-ue.txt or testers/monitor-ue.txt. The minimum collateral of a subnet is
+# 100_000 sats; a join in block N needs a timeout above N + 1. Every rejection here is the
+# monitor's: the monitor tester submits the transactions without the provider's own check.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator5
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+# not whitelisted before bootstrap
+block 106
+join-ue subnet1 validator4 100_000 200
+
+block 108
+read ue_collaterals subnet1
+expect result.count = 0
+
+# below the minimum collateral, and a timeout that is not after the join
+block 110
+join-ue subnet1 validator1 99_999 200
+join-ue subnet1 validator2 100_000 111
+
+block 112
+read ue_collaterals subnet1
+expect result.count = 0
+
+# exactly the minimum collateral is accepted; the subnet bootstraps
+block 113
+join-ue subnet1 validator1 100_000 200
+join-ue subnet1 validator2 100_000 200
+join-ue subnet1 validator3 100_000 200
+join-ue subnet1 validator5 100_000 200
+
+block 115
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator5
+# the same key again, with another timeout: rejected, the first record stays
+join-ue subnet1 validator1 100_000 300
+
+block 117
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 4
+expect result.validator1.count = 1
+expect result.validator1.timeout = 200
+
+# after bootstrap anyone can join: a timeout at the join's block or the next one is
+# rejected (T = 118 and T = 119 for a join in block 118), the next is accepted
+block 118
+join-ue subnet1 validator4 100_000 118
+join-ue subnet1 validator4 100_000 119
+join-ue subnet1 validator4 100_000 125
+
+block 120
+read validators subnet1
+expect result.count = 5
+expect result.waiting = true
+read ue_collaterals subnet1
+expect result.validator4.count = 1
+expect result.validator4.timeout = 125
+
+# validator4 matures while still waiting for its first checkpoint: removed from the
+# waiting committee at T - 1 = 124, visible at the line `block 125`
+block 125
+read validators subnet1
+expect result.names = validator1,validator2,validator3,validator5
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator4 = 100_000
+read ue_collaterals subnet1
+expect result.validator4.removed = true

@@ -1,0 +1,89 @@
+# Unilateral exit end to end: a checkpoint after a removal, the key joining again after
+# that checkpoint, and `unstake-ue` spending the matured collateral.
+#
+# Monitor tester only (testers/monitor-ue.txt): the exit spends real outputs and
+# `spent_count` reads the chain. `block N` means what follows goes into block N.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 130
+join-ue subnet1 validator2 100_000 160
+join-ue subnet1 validator3 100_000 170
+join-ue subnet1 validator4 100_000 180
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.waiting = false
+# the multisig needs funds before a checkpoint can be built
+deposit subnet1 validator1 500_000_000
+
+# before maturity the provider refuses: nothing to spend
+block 120
+unstake-ue subnet1 validator1
+
+block 122
+read ue_collaterals subnet1
+expect result.validator1.spent_count = 0
+
+# state after block 129 = T - 1: validator1 left the next committee
+block 130
+read validators subnet1
+expect result.names = validator2,validator3,validator4
+expect result.waiting = true
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator1 = 100_000
+
+# at tip 130 = T the exit is accepted; block 131 mines it
+block 131
+unstake-ue subnet1 validator1
+
+block 132
+read ue_collaterals subnet1
+expect result.validator1.spent_count = 1
+expect result.validator1.removed = true
+# the checkpoint after the removal rotates validator1 out; nothing is paid from the multisig
+checkpoint subnet1
+
+block 135
+read validators subnet1 current
+expect result.names = validator2,validator3,validator4
+expect result.waiting = false
+read withdrawals subnet1
+expect result.count = 0
+
+# the key joins again once the checkpoint rotated it out
+join-ue subnet1 validator1 120_000 200
+
+block 137
+read validators subnet1
+expect result.names = validator1,validator2,validator3,validator4
+expect result.waiting = true
+read ue_collaterals subnet1
+expect result.validator1.count = 2
+expect result.validator1.timeout = 200
+expect result.validator1.removed = false
+expect result.validator1.spent_count = 1
+
+# a further call spends nothing: the new collateral is not matured
+unstake-ue subnet1 validator1
+
+block 139
+read ue_collaterals subnet1
+expect result.validator1.spent_count = 1

@@ -1,0 +1,29 @@
+# Without ue_activation_height in the tester config (UE_ACTIVATION_HEIGHT unset for the
+# monitor) every join-ue is ignored and the subnet never bootstraps.
+# Run with testers/db.txt or testers/monitor.txt.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 106
+join-ue subnet1 validator1 100_000 300
+join-ue subnet1 validator2 100_000 300
+join-ue subnet1 validator3 100_000 300
+join-ue subnet1 validator4 100_000 300
+
+block 110
+read ue_collaterals subnet1
+expect result.count = 0

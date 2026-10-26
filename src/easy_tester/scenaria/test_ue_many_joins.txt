@@ -1,0 +1,134 @@
+# Seven validators joining with join-ue and staggered timeouts: some mature while others
+# hold, two in the same block, one tries to join again after leaving.
+# Run with testers/db-ue.txt or testers/monitor-ue.txt. A removal at T - 1 is visible at `block T`.
+# No checkpoint after a removal here: the provider must first learn to skip UE payouts.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+validator7
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 140
+join-ue subnet1 validator2 150_000 160
+join-ue subnet1 validator3 200_000 160
+join-ue subnet1 validator4 300_000 200
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+expect result.validator4.collateral = 300_000
+read ue_collaterals subnet1
+expect result.count = 4
+join-ue subnet1 validator5 100_000 150
+
+block 113
+join-ue subnet1 validator6 100_000 170
+
+block 114
+join-ue subnet1 validator7 100_000 400
+
+block 116
+read validators subnet1
+expect result.count = 7
+expect result.waiting = true
+read validators subnet1 current
+expect result.count = 4
+deposit subnet1 validator1 500_000_000
+
+block 118
+checkpoint subnet1
+
+block 121
+read validators subnet1 current
+expect result.count = 7
+expect result.waiting = false
+
+# validator1 leaves at T - 1 = 139
+block 140
+read validators subnet1
+expect result.count = 6
+expect result.names = validator2,validator3,validator4,validator5,validator6,validator7
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator1 = 100_000
+
+block 141
+read withdrawals subnet1
+expect result.count = 1
+
+# validator5 leaves at 149
+block 150
+read validators subnet1
+expect result.names = validator2,validator3,validator4,validator6,validator7
+read withdrawals subnet1
+expect result.count = 2
+
+# nothing happens between: state after block 158
+block 159
+read validators subnet1
+expect result.names = validator2,validator3,validator4,validator6,validator7
+read withdrawals subnet1
+expect result.count = 2
+read ue_collaterals subnet1
+expect result.validator2.removed = false
+expect result.validator3.removed = false
+
+# validator2 and validator3 leave in the same block, 159
+block 160
+read validators subnet1
+expect result.names = validator4,validator6,validator7
+read withdrawals subnet1
+expect result.count = 4
+expect result.validator2 = 150_000
+expect result.validator3 = 200_000
+read ue_collaterals subnet1
+expect result.removed_count = 4
+expect result.validator4.removed = false
+
+# validator6 leaves at 169
+block 170
+read validators subnet1
+expect result.names = validator4,validator7
+
+# validator1 cannot join again while the current committee still holds it: only the
+# checkpoint that rotates it out frees its key (that checkpoint comes after step 3)
+block 180
+join-ue subnet1 validator1 100_000 400
+
+block 182
+read validators subnet1
+expect result.names = validator4,validator7
+read ue_collaterals subnet1
+expect result.count = 7
+expect result.validator1.count = 1
+
+# validator4 leaves at 199; validator7 holds until 400
+block 200
+read validators subnet1
+expect result.names = validator7
+read withdrawals subnet1
+expect result.count = 6
+read ue_collaterals subnet1
+expect result.removed_count = 6
+
+block 250
+read validators subnet1
+expect result.names = validator7
+read ue_collaterals subnet1
+expect result.removed_count = 6

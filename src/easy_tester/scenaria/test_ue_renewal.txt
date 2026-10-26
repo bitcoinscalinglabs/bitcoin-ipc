@@ -1,0 +1,63 @@
+# A waiting validator renews its key in the very block its collateral matures: the monitor
+# removes the old membership before the block's transactions, so the new join-ue is accepted.
+# Run with testers/db-ue.txt or testers/monitor-ue.txt.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 400
+join-ue subnet1 validator2 100_000 400
+join-ue subnet1 validator3 100_000 400
+join-ue subnet1 validator4 100_000 400
+
+block 112
+join-ue subnet1 validator5 100_000 130
+
+block 114
+read validators subnet1
+expect result.count = 5
+expect result.waiting = true
+
+# block 129 = T - 1 of validator5: it leaves the waiting committee, then joins again
+block 129
+join-ue subnet1 validator5 100_000 300
+
+block 130
+read validators subnet1
+expect result.count = 5
+expect result.names = validator1,validator2,validator3,validator4,validator5
+read ue_collaterals subnet1
+expect result.validator5.count = 2
+expect result.validator5.timeout = 300
+expect result.validator5.removed = false
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator5 = 100_000
+
+# the old record is marked removed, the new one acts at its own timeout
+block 299
+read ue_collaterals subnet1
+expect result.removed_count = 1
+
+block 300
+read validators subnet1
+expect result.names = validator1,validator2,validator3,validator4
+read ue_collaterals subnet1
+expect result.removed_count = 2
+read withdrawals subnet1
+expect result.count = 2

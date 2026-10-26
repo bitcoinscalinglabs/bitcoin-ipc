@@ -95,14 +95,21 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 TesterConfig::Db {
                     activation_height,
                     snapshot_length,
+                    ue_activation_height,
                 } => {
-                    let mut tester =
-                        DbTester::new(parsed.setup, activation_height, snapshot_length).await?;
+                    let mut tester = DbTester::new(
+                        parsed.setup,
+                        activation_height,
+                        snapshot_length,
+                        ue_activation_height,
+                    )
+                    .await?;
                     run_scenario(&mut tester, scenario, 1)?;
                 }
                 TesterConfig::Monitor {
                     activation_height,
                     snapshot_length,
+                    ue_activation_height,
                     monitor_log_level,
                     provider_log_level,
                 } => {
@@ -110,6 +117,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                         parsed.setup,
                         activation_height,
                         snapshot_length,
+                        ue_activation_height,
                         monitor_log_level,
                         provider_log_level,
                     )
@@ -163,6 +171,22 @@ fn run_scenario<T: Tester>(
                     collateral_sats,
                 ).map_err(annotate)?;
             }
+            ScenarioCommand::JoinUe {
+                subnet_name,
+                validator_name,
+                collateral_sats,
+                timeout,
+            } => {
+                tester
+                    .exec_join_ue(
+                        working_height,
+                        &subnet_name,
+                        &validator_name,
+                        collateral_sats,
+                        timeout,
+                    )
+                    .map_err(annotate)?;
+            }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
@@ -186,6 +210,14 @@ fn run_scenario<T: Tester>(
                     &validator_name,
                     amount_sats,
                 ).map_err(annotate)?;
+            }
+            ScenarioCommand::UnstakeUe {
+                subnet_name,
+                validator_name,
+            } => {
+                tester
+                    .exec_unstake_ue(working_height, &subnet_name, &validator_name)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::Checkpoint { subnet_name } => {
                 tester.exec_checkpoint_subnet(working_height, &subnet_name).map_err(annotate)?;

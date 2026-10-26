@@ -1,0 +1,54 @@
+# The activation switch: join-ue in blocks below UE_ACTIVATION_HEIGHT (110 here) is ignored,
+# from block 110 on it is processed.
+# Run with testers/db-ue-activation-110.txt or testers/monitor-ue-activation-110.txt.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+# block 106: ignored
+block 106
+join-ue subnet1 validator1 100_000 300
+join-ue subnet1 validator2 100_000 300
+
+block 108
+read ue_collaterals subnet1
+expect result.count = 0
+
+# block 109, the last one below the switch: ignored
+block 109
+join-ue subnet1 validator3 100_000 300
+join-ue subnet1 validator4 100_000 300
+
+# block 110, the switch itself: processed
+block 110
+join-ue subnet1 validator1 100_000 300
+join-ue subnet1 validator2 100_000 300
+
+block 112
+read ue_collaterals subnet1
+expect result.count = 2
+expect result.validator1.count = 1
+expect result.validator2.count = 1
+
+block 113
+join-ue subnet1 validator3 100_000 300
+join-ue subnet1 validator4 100_000 300
+
+block 115
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 4

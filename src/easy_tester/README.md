@@ -19,6 +19,7 @@ Space-separated `key value` lines (no `=`). Stored in `src/easy_tester/testers/`
 | `tester` | `db` \| `monitor` | required |
 | `activation_height` | integer | required for reward commands |
 | `snapshot_length` | integer | required for reward commands |
+| `ue_activation_height` | integer | unilateral exit (`join-ue`) active from this height; omitted = off |
 | `monitor_log_level` | e.g. `debug`, `info` | monitor tester only; defaults to `info` |
 | `provider_log_level` | e.g. `debug`, `info` | monitor tester only; defaults to `info` |
 
@@ -66,12 +67,14 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 
 | Command | Description |
 |---------|-------------|
-| `block <n>` | Advance to block height `n`. Mines all intermediate blocks. |
+| `block <n>` | What follows goes into block `n`; all earlier blocks are mined. |
 | `create <subnet>` | Create a subnet (uses setup whitelist). |
 | `checkpoint <subnet>` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). |
 | `join <subnet> <validator> <collateral_sats>` | Queue a join command. |
+| `join-ue <subnet> <validator> <collateral_sats> <timeout_height>` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. |
 | `stake <subnet> <validator> <amount_sats>` | Queue a stake-increase command. |
 | `unstake <subnet> <validator> <amount_sats>` | Queue a stake-decrease command. |
+| `unstake-ue <subnet> <validator>` | The validator's provider spends its matured unilateral-exit collaterals to its backup address (`unstakeue`). A refusal is logged, not fatal. Monitor tester only. |
 | `register_token <subnet> <name> <symbol> <initial_supply>` | Queue an ERC20 token registration (ETR). Decimals are fixed at 18. |
 | `mint_token <subnet> <token> <amount>` | Queue a supply increase (ETS). |
 | `burn_token <subnet> <token> <amount>` | Queue a supply decrease (ETS). |
@@ -80,7 +83,12 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | `read rootnet_msgs <subnet>` | Read rootnet messages for the subnet (from all Bitcoin blocks). |
 | `read token_balance <subnet> <token>` | Read and cache the token balance on the subnet. |
 | `read reward_results <snapshot>` | Read reward results for the given snapshot. |
+| `read validators <subnet> [current]` | The latest committee (the waiting one if any), or the current one. Fields: `count`, `names` (sorted, comma-separated), `waiting`, `<validator>.collateral`, `<validator>.ue`. |
+| `read ue_collaterals <subnet>` | The unilateral-exit collateral records. Fields: `count`, `removed_count`, `<validator>.count`, and for the validator's record with the greatest timeout `<validator>.value`, `<validator>.timeout`, `<validator>.removed`; monitor tester only: `<validator>.spent_count`, the validator's collateral outputs spent on the chain. |
+| `read withdrawals <subnet>` | The Withdraw stake changes not yet confirmed by a checkpoint. Fields: `count`, `<validator>` (amount). |
 | `expect result.<path> = <value>` | Assert a field in the **last** `read` result. |
+
+The monitor tester reads `validators`, `ue_collaterals` and `withdrawals` straight from the monitor's database (read-only), the other reads through the provider. `block N` means "what follows goes into block N": all earlier blocks are mined, and a `read` at `N` sees the state after block `N - 1`. Unilateral-exit scenarios: `scenaria/test_ue_*.txt` with `testers/db-ue.txt` or `testers/monitor-ue.txt` (`test_ue_activation.txt` uses the `*-activation-110.txt` configs; `test_ue_exit.txt` runs on the monitor tester only).
 
 ---
 

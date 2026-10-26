@@ -45,18 +45,19 @@ pub enum TesterConfig {
     Db {
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        /// Unilateral exit is on from this height; `None` = off
+        ue_activation_height: Option<u64>,
     },
     Monitor {
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        ue_activation_height: Option<u64>,
         monitor_log_level: Option<String>,
         provider_log_level: Option<String>,
     },
     /// Fendermint tester — subnets come from the config file, issuers from
     /// the scenario file.
-    Fendermint {
-        setup: FendermintSetup,
-    },
+    Fendermint { setup: FendermintSetup },
 }
 
 // ── Fendermint-specific setup types ────────────────────────────────────
@@ -98,6 +99,12 @@ pub enum OutputDb {
     TokenBalance,
     /// FendermintTester only: `read token_metadata <subnet> <token_name>`
     TokenMetadata,
+    /// `read validators <subnet> [current]`: the latest (or the current) committee
+    Validators,
+    /// `read ue_collaterals <subnet>`: the unilateral-exit collateral records
+    UeCollaterals,
+    /// `read withdrawals <subnet>`: the Withdraw stake changes not yet in a checkpoint
+    Withdrawals,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +120,13 @@ pub enum ScenarioCommand {
         validator_name: String,
         collateral_sats: u64,
     },
+    /// Join with the collateral under the unilateral-exit script, maturing at `timeout`
+    JoinUe {
+        subnet_name: String,
+        validator_name: String,
+        collateral_sats: u64,
+        timeout: u64,
+    },
     Stake {
         subnet_name: String,
         validator_name: String,
@@ -122,6 +136,11 @@ pub enum ScenarioCommand {
         subnet_name: String,
         validator_name: String,
         amount_sats: u64,
+    },
+    /// Spend the validator's matured unilateral-exit collaterals to its backup address
+    UnstakeUe {
+        subnet_name: String,
+        validator_name: String,
     },
     Checkpoint {
         subnet_name: String,
