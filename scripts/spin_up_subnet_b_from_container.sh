@@ -130,11 +130,14 @@ BEARER_TOKEN_3="validator3_auth_token"
 BEARER_TOKEN_4="validator4_auth_token"
 BEARER_TOKEN_5="validator5_auth_token"
 
-API_URL_1="http://host.docker.internal:${PORT_1}/api"
-API_URL_2="http://host.docker.internal:${PORT_2}/api"
-API_URL_3="http://host.docker.internal:${PORT_3}/api"
-API_URL_4="http://host.docker.internal:${PORT_4}/api"
-API_URL_5="http://host.docker.internal:${PORT_5}/api"
+# Address at which containers reach services published on the host: host.docker.internal on
+# Docker Desktop, the host's interface address under rootless Docker (HOST_ADDR=10.0.0.4).
+HOST_ADDR="${HOST_ADDR:-host.docker.internal}"
+API_URL_1="http://${HOST_ADDR}:${PORT_1}/api"
+API_URL_2="http://${HOST_ADDR}:${PORT_2}/api"
+API_URL_3="http://${HOST_ADDR}:${PORT_3}/api"
+API_URL_4="http://${HOST_ADDR}:${PORT_4}/api"
+API_URL_5="http://${HOST_ADDR}:${PORT_5}/api"
 
 # Validator 5 fendermint ports (Subnet B: 28056, 28057, 9945, 28055)
 CMT_P2P_5="28056"

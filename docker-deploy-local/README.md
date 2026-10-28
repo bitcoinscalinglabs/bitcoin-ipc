@@ -65,6 +65,21 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 - **3030–3035** – Provider (validator1–6)
 - **3040–3041** – Provider (user1–2)
 
+### How containers reach these ports
+
+The subnet containers (fendermint, CometBFT, ETH API) call the providers, and `ipc-cli` inside
+`bitcoin-ipc` calls the subnet ETH API, through ports published on the host. The host name used
+for that is `HOST_ADDR`, default `host.docker.internal`, which Docker Desktop resolves to the host.
+Where that name does not reach published ports (rootless Docker on Linux, for example), set it to
+the host's own interface address, for the whole stack or for one command:
+
+```bash
+HOST_ADDR=10.0.0.4 make local-up
+docker exec -e HOST_ADDR=10.0.0.4 bitcoin-ipc spin_up_subnet_a_from_container.sh <subnet id>
+```
+
+The published ports then also answer on that interface; keep them closed to other machines with
+the host firewall.
 
 
 

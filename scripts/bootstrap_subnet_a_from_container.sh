@@ -319,7 +319,7 @@ id = "${SUBNET_ID}"
 
 [subnets.config]
 network_type = "fevm"
-provider_http = "http://host.docker.internal:${PORT}/"
+provider_http = "http://${HOST_ADDR:-host.docker.internal}:${PORT}/"
 gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
 registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
 EOF
