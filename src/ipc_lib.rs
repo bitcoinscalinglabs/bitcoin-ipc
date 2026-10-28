@@ -2001,10 +2001,12 @@ impl IpcCheckpointSubnetMsg {
         let reveal_witness =
             bitcoin::Witness::from_slice(&[commit_script.to_bytes(), control_block.serialize()]);
 
+        // The reveal output must clear Core's dust limit at its default relay fee too
         let reveal_tx_out = bitcoin::TxOut {
             value: return_address
                 .script_pubkey()
-                .minimal_non_dust_custom(fee_rate),
+                .minimal_non_dust_custom(fee_rate)
+                .max(return_address.script_pubkey().minimal_non_dust()),
             script_pubkey: return_address.script_pubkey(),
         };
 
@@ -4312,6 +4314,15 @@ impl IpcUnstakeCollateralMsg {
         let mut next_committee = subnet_state.latest_committee().clone();
 
         if new_power == 0 || !sufficient_to_participate {
+            // A committee is never emptied: the only member keeps its collateral (the same rule
+            // as the unilateral-exit removal pass); an empty committee has no multisig
+            if next_committee.validators.len() <= 1 {
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "Validator {pubkey} is the only member of subnet {} and cannot withdraw all its collateral",
+                    self.subnet_id
+                ))
+                .into());
+            }
             // Remove the validator from the committee if power is zero
             next_committee.remove_validator(&self.subnet_id, &pubkey)?;
             info!(

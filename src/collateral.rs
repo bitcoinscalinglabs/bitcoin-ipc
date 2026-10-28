@@ -107,13 +107,17 @@ fn ue_control_block(
         .ok_or(CollateralError::TaprootBuilderNotFinalizable)
 }
 
-/// The UE activation height from the environment, `None` if the feature is off.
+/// The UE activation height from the environment, `None` if the feature is off: the
+/// variable unset or empty (docker compose passes an empty value for an unset variable).
 pub fn ue_activation_height() -> Option<u64> {
-    std::env::var(UE_ACTIVATION_HEIGHT_VAR).ok().map(|v| {
-        v.trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("{UE_ACTIVATION_HEIGHT_VAR} must be a valid u64"))
-    })
+    std::env::var(UE_ACTIVATION_HEIGHT_VAR)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("{UE_ACTIVATION_HEIGHT_VAR} must be a valid u64"))
+        })
 }
 
 /// An accepted `join-ue`: the message, with `join.collateral` filled from the commit
@@ -584,6 +588,40 @@ pub fn is_ue_validator<D: DatabaseCore>(
     Ok(db
         .get_ue_collateral(subnet_id, join_txid)?
         .is_some_and(|r| r.pubkey == *pubkey))
+}
+
+/// Whether `pubkey` is a member of `committee` that joined with `join-ue`.
+pub fn is_ue_member<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    committee: &db::SubnetCommittee,
+    pubkey: &XOnlyPublicKey,
+) -> Result<bool, db::DbError> {
+    match committee.validators.iter().find(|v| v.pubkey == *pubkey) {
+        Some(v) => is_ue_validator(db, subnet_id, v.join_txid, pubkey),
+        None => Ok(false),
+    }
+}
+
+/// Refuses a stake or unstake through the multisig (`IPCSTK`, `IPCUST`) for a join-ue member
+/// of the subnet's latest committee, as the provider does: its collateral is in its own
+/// output and leaves it only by `unstakeue`.
+pub fn refuse_ue_member<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    pubkey: &XOnlyPublicKey,
+) -> Result<(), IpcLibError> {
+    let Some(state) = db.get_subnet_state(subnet_id)? else {
+        return Ok(());
+    };
+    if is_ue_member(db, subnet_id, state.latest_committee(), pubkey)? {
+        return Err(IpcValidateError::InvalidMsg(format!(
+            "Validator {pubkey} joined subnet {subnet_id} with join-ue; its collateral is \
+             not in the multisig and is returned by unstakeue after it matures."
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Reconciles the configured switch with the one the database recorded, at startup. The
@@ -1204,6 +1242,35 @@ mod tests {
     }
 
     #[test]
+    fn only_member_cannot_unstake_everything_on_chain() {
+        let secp = setup();
+        let db = create_test_db();
+        let keys = generate_keypairs(1);
+        let pk = keys[0].x_only_public_key().0;
+        let subnet_id = subnet_with_whitelist(&db, vec![pk], 1);
+        let block_hash = BlockHash::all_zeros();
+        let (checked, join_txid) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
+        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let before = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(before.latest_committee().pubkeys(), vec![pk]);
+
+        // A hand-built full unstake of the only member is refused instead of emptying the
+        // committee (an empty committee has no multisig address)
+        let unstake = IpcUnstakeCollateralMsg {
+            subnet_id,
+            amount: COLLATERAL,
+            pubkey: Some(pk),
+        };
+        let err = unstake
+            .save_to_db(&db, BLOCK + 1, block_hash, join_txid)
+            .unwrap_err();
+        assert!(matches!(err, IpcLibError::IpcValidateError(_)), "{err}");
+        let after = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(after.latest_committee().pubkeys(), vec![pk]);
+        assert!(withdrawals(&db, subnet_id).is_empty());
+    }
+
+    #[test]
     fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
         let secp = setup();
         let db = create_test_db();
@@ -1693,58 +1760,46 @@ mod tests {
     }
 
     #[test]
-    fn unstakes_of_a_ue_validator_before_maturity() {
+    fn stake_and_unstake_of_a_ue_member_are_refused() {
         let secp = setup();
         let db = create_test_db();
         let keys = generate_keypairs(2);
         let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
         let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
         let block_hash = BlockHash::all_zeros();
-        let late = TIMEOUT + 1000;
         let (a, txid_a) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
         process_join_ue(&db, &a, txid_a, BLOCK, block_hash).unwrap();
-        let (b, txid_b) = checked_join(&secp, &keys[1], subnet_id, late);
+        let (b, txid_b) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT + 1000);
         process_join_ue(&db, &b, txid_b, BLOCK, block_hash).unwrap();
+        let ordinary = generate_keypairs(1)[0].x_only_public_key().0;
+        let mut plain = test_join_msg(ordinary);
+        plain.subnet_id = subnet_id;
+        plain.collateral = COLLATERAL;
+        plain
+            .save_to_db(
+                &db,
+                BLOCK + 1,
+                block_hash,
+                Txid::from_slice(&[3u8; 32]).unwrap(),
+            )
+            .unwrap();
+        let outsider = generate_keypairs(1)[0].x_only_public_key().0;
 
-        // A full unstake, built by hand, removes A before its maturity: at T - 1 there is
-        // nothing left to do and no second withdrawal
-        IpcUnstakeCollateralMsg {
-            subnet_id,
-            amount: COLLATERAL,
-            pubkey: Some(pks[0]),
-        }
-        .save_to_db(
-            &db,
-            BLOCK + 10,
-            block_hash,
-            Txid::from_slice(&[3u8; 32]).unwrap(),
-        )
-        .unwrap();
+        let err = refuse_ue_member(&db, subnet_id, &pks[0]).unwrap_err();
+        assert!(
+            matches!(&err, IpcLibError::IpcValidateError(e) if e.to_string().contains("unstakeue")),
+            "{err}"
+        );
+        refuse_ue_member(&db, subnet_id, &ordinary).unwrap();
+        refuse_ue_member(&db, subnet_id, &outsider).unwrap();
+
+        // The removal pass is not affected: at T - 1 A's whole collateral is withdrawn, once
         let removals =
             remove_matured_ue_validators(&db, u64::from(TIMEOUT) - 1, block_hash).unwrap();
-        assert_eq!(removals[0].outcome, "not in the committee, nothing to do");
+        assert_eq!(removals[0].outcome, "removed from the next committee");
         assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], COLLATERAL)]);
-
-        // A partial unstake of B: at T - 1 the remainder is withdrawn, once
-        IpcUnstakeCollateralMsg {
-            subnet_id,
-            amount: Amount::from_sat(30_000),
-            pubkey: Some(pks[1]),
-        }
-        .save_to_db(
-            &db,
-            BLOCK + 20,
-            block_hash,
-            Txid::from_slice(&[4u8; 32]).unwrap(),
-        )
-        .unwrap();
-        let removals = remove_matured_ue_validators(&db, u64::from(late) - 1, block_hash).unwrap();
-        assert_eq!(removals[0].outcome, "only member of the committee, kept");
-        let mut all = withdrawals(&db, subnet_id);
-        all.sort();
-        let mut expected = vec![(pks[0], COLLATERAL), (pks[1], Amount::from_sat(30_000))];
-        expected.sort();
-        assert_eq!(all, expected);
+        // A is no longer a member, so the rule leaves its key to the usual checks
+        refuse_ue_member(&db, subnet_id, &pks[0]).unwrap();
     }
 
     #[test]
@@ -1975,6 +2030,8 @@ mod tests {
         assert_eq!(ue_activation_height(), None);
         std::env::set_var(UE_ACTIVATION_HEIGHT_VAR, " 42 ");
         assert_eq!(ue_activation_height(), Some(42));
+        std::env::set_var(UE_ACTIVATION_HEIGHT_VAR, "");
+        assert_eq!(ue_activation_height(), None);
         std::env::remove_var(UE_ACTIVATION_HEIGHT_VAR);
     }
 }

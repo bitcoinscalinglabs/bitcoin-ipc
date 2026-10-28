@@ -323,12 +323,13 @@ pub fn create_commit_reveal_txs(
         commit_spend_info.merkle_root(),
     );
 
-    // TODO: should there be a min_non_dust for the reveal tx?
-    let commit_output_value = std::cmp::max(
-        // Provide at least the minimal value for the output
-        commit_script_pubkey.minimal_non_dust_custom(fee_rate),
-        amount_to_send,
-    );
+    // The reveal forwards this value to final_address, so both outputs must clear Bitcoin Core's
+    // dust limit at its default dust relay fee, whatever the current fee rate
+    let commit_output_value = commit_script_pubkey
+        .minimal_non_dust_custom(fee_rate)
+        .max(commit_script_pubkey.minimal_non_dust())
+        .max(final_address.script_pubkey().minimal_non_dust())
+        .max(amount_to_send);
 
     let mut commit_tx = Transaction {
         version: transaction::Version::TWO,

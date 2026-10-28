@@ -354,6 +354,8 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("stake msg invalid: {e}")))?;
+        collateral::refuse_ue_member(&self.db, subnet_id, &msg.pubkey)
+            .map_err(|e| EasyTesterError::runtime(format!("stake rejected: {e}")))?;
         let subnet_state = self
             .db
             .get_subnet_state(subnet_id)
@@ -393,6 +395,8 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("unstake msg invalid: {e}")))?;
+        collateral::refuse_ue_member(&self.db, subnet_id, &validator.pubkey)
+            .map_err(|e| EasyTesterError::runtime(format!("unstake rejected: {e}")))?;
         let genesis_info = self
             .db
             .get_subnet_genesis_info(subnet_id)

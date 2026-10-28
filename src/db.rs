@@ -16,7 +16,7 @@ use thiserror::Error;
 /// Genesis committee configuration number
 const GENESIS_COMMITTEE_CONF_NUM: u64 = 0;
 
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 const LAST_PROCESSED_BLOCK_KEY: &str = "monitor:last_processed_block";
 const UE_ACTIVATION_HEIGHT_KEY: &str = "monitor:ue_activation_height";
@@ -910,6 +910,9 @@ pub struct HeedDb {
     ue_collaterals_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<UeCollateral>>>>,
     /// Monitor settings that must agree with the processed blocks; `None` as above
     settings_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<u64>>>>,
+    /// LMDB opens one database per transaction at a time in a process: the lazy lookups of the
+    /// two tables above take this lock
+    lazy_open: Mutex<()>,
 }
 
 impl HeedDb {
@@ -924,8 +927,14 @@ impl HeedDb {
         if let Some(db) = *slot.read().expect("table lock") {
             return Ok(Some(db));
         }
+        let _opening = self.lazy_open.lock().expect("lazy open lock");
+        if let Some(db) = *slot.read().expect("table lock") {
+            return Ok(Some(db));
+        }
         let rtxn = self.env.read_txn()?;
         let opened = self.env.open_database::<Str, DC>(&rtxn, Some(name))?;
+        // heed: the transaction that opened a database must be committed, or the handle is invalid
+        rtxn.commit()?;
         if let Some(db) = opened {
             *slot.write().expect("table lock") = Some(db);
         }
@@ -1042,6 +1051,7 @@ impl HeedDb {
                 token_balances_db,
                 ue_collaterals_db,
                 settings_db,
+                lazy_open: Mutex::new(()),
             })
         } else {
             // In write mode, we can create the databases if they don't exist
@@ -1082,6 +1092,7 @@ impl HeedDb {
                 token_balances_db,
                 ue_collaterals_db,
                 settings_db,
+                lazy_open: Mutex::new(()),
             })
         }
     }

@@ -914,6 +914,7 @@ where
             IpcMessage::StakeCollateral(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
+                collateral::refuse_ue_member(&self.db, msg.subnet_id, &msg.pubkey)?;
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
                 info!(
                     "Processed StakeCollateral for Subnet ID: {} Validator XPK: {} Amount: {}",
@@ -925,6 +926,9 @@ where
             IpcMessage::UnstakeCollateral(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
+                if let Some(pubkey) = &msg.pubkey {
+                    collateral::refuse_ue_member(&self.db, msg.subnet_id, pubkey)?;
+                }
                 msg.save_to_db(&self.db, block_height, block_hash, txid)?;
                 info!(
                     "Processed UnstakeCollateral for Subnet ID: {} Validator XPK: {:?} Amount: {}",
@@ -941,7 +945,12 @@ where
                 let data = collateral::join_ue_leaf_data(tx)
                     .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
                 let commit_txid = tx.input[0].previous_output.txid;
-                let commit = self.rpc.get_raw_transaction(&commit_txid, None)?;
+                // The commit is usually in the same block (submitted as a package); an older
+                // one needs bitcoind's -txindex
+                let commit = self
+                    .rpc
+                    .get_raw_transaction(&commit_txid, Some(&block_hash))
+                    .or_else(|_| self.rpc.get_raw_transaction(&commit_txid, None))?;
                 let secp = bitcoin::secp256k1::Secp256k1::new();
                 let checked = collateral::check_join_ue(&secp, tx, &commit, &data, block_height)
                     .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;

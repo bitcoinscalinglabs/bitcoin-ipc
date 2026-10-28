@@ -189,6 +189,22 @@ pub async fn join_subnet(
     let msg: IpcJoinSubnetMsg = req.into();
     info!("joinsubnet: {:?} lock_blocks={:?}", msg, lock_blocks);
 
+    // A join-ue is refused by the activation switch before anything else is validated
+    let tip = match lock_blocks {
+        Some(_) => {
+            let tip = data
+                .btc_rpc
+                .get_block_count()
+                .map_err(|e| RpcError::InternalError(e.to_string()))?;
+            check_ue_active(collateral::ue_activation_height(), tip).map_err(|m| {
+                error!("joinsubnet (join-ue) rejected: {m}");
+                JsonRpcError::from(RpcError::InvalidParams(m))
+            })?;
+            Some(tip)
+        }
+        None => None,
+    };
+
     if let Err(err) = msg.validate() {
         error!("Invalid join message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
@@ -217,8 +233,8 @@ pub async fn join_subnet(
             RpcError::InvalidParams(e.to_string())
         })?;
 
-    if let Some(lock_blocks) = lock_blocks {
-        let join_txid = join_subnet_ue(&data, msg, lock_blocks)?;
+    if let (Some(lock_blocks), Some(tip)) = (lock_blocks, tip) {
+        let join_txid = join_subnet_ue(&data, msg, lock_blocks, tip)?;
         return Ok(JoinSubnetResponse { join_txid });
     }
 
@@ -234,21 +250,18 @@ pub async fn join_subnet(
 
 /// The join-ue path of `joinsubnet`: the collateral is locked under the validator's own
 /// unilateral-exit script, maturing at `T = tip + lock_blocks`. Only this provider's
-/// validator can join this way, since the message carries its signature.
+/// validator can join this way, since the message carries its signature. The caller has
+/// checked the activation switch at `tip`.
 fn join_subnet_ue(
     data: &ServerData,
     join: IpcJoinSubnetMsg,
     lock_blocks: u64,
+    tip: u64,
 ) -> Result<bitcoin::Txid, JsonRpcError> {
     let invalid = |m: String| -> JsonRpcError {
         error!("joinsubnet (join-ue) rejected: {m}");
         RpcError::InvalidParams(m).into()
     };
-    let tip = data
-        .btc_rpc
-        .get_block_count()
-        .map_err(|e| RpcError::InternalError(e.to_string()))?;
-    check_ue_active(collateral::ue_activation_height(), tip).map_err(invalid)?;
     let Some((validator_xpk, validator_sk)) = data.validator else {
         return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
     };
@@ -366,24 +379,6 @@ fn rotation_unstakes(
         .collect()
 }
 
-/// Whether `pubkey` is a member of `committee` that joined with `join-ue`.
-fn is_ue_member(
-    db: &db::HeedDb,
-    subnet_id: SubnetId,
-    committee: &db::SubnetCommittee,
-    pubkey: &bitcoin::XOnlyPublicKey,
-) -> Result<bool, RpcError> {
-    match committee.validators.iter().find(|v| v.pubkey == *pubkey) {
-        Some(v) => Ok(collateral::is_ue_validator(
-            db,
-            subnet_id,
-            v.join_txid,
-            pubkey,
-        )?),
-        None => Ok(false),
-    }
-}
-
 /// The error of `stakecollateral` and `unstakecollateral` for a UE validator: its
 /// collateral is in its own output, not in the multisig, and leaves it only by `unstakeue`.
 fn refuse_ue_member(
@@ -392,7 +387,7 @@ fn refuse_ue_member(
     committee: &db::SubnetCommittee,
     pubkey: &bitcoin::XOnlyPublicKey,
 ) -> Result<(), RpcError> {
-    if is_ue_member(db, subnet_id, committee, pubkey)? {
+    if collateral::is_ue_member(db, subnet_id, committee, pubkey)? {
         let m = format!(
             "Validator {pubkey} joined subnet {subnet_id} with join-ue; its collateral is \
              not in the multisig and is returned by unstakeue after it matures."
@@ -1848,6 +1843,12 @@ pub async fn stake_collateral(
             msg.subnet_id
         )))?;
 
+    refuse_ue_member(
+        &data.db,
+        msg.subnet_id,
+        subnet_state.latest_committee(),
+        &msg.pubkey,
+    )?;
     msg.validate_for_subnet(&subnet_state).map_err(|e| {
         error!(
             "Error validating stake collateral msg for subnet info: {}",
@@ -1855,12 +1856,6 @@ pub async fn stake_collateral(
         );
         RpcError::InvalidParams(e.to_string())
     })?;
-    refuse_ue_member(
-        &data.db,
-        msg.subnet_id,
-        subnet_state.latest_committee(),
-        &msg.pubkey,
-    )?;
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -1925,6 +1920,12 @@ pub async fn unstake_collateral(
             msg.subnet_id
         )))?;
 
+    refuse_ue_member(
+        &data.db,
+        msg.subnet_id,
+        subnet_state.latest_committee(),
+        &validator_xpk,
+    )?;
     msg.validate_for_subnet(&genesis_info, &subnet_state)
         .map_err(|e| {
             error!(
@@ -1933,12 +1934,6 @@ pub async fn unstake_collateral(
             );
             RpcError::InvalidParams(e.to_string())
         })?;
-    refuse_ue_member(
-        &data.db,
-        msg.subnet_id,
-        subnet_state.latest_committee(),
-        &validator_xpk,
-    )?;
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -2050,8 +2045,18 @@ pub async fn unstake_ue(
         .clone()
         .require_network(NETWORK)
         .map_err(|e| invalid(format!("backup address: {e}")))?;
+    // Bitcoin Core relays transactions up to 400,000 weight units; each exit input weighs about
+    // 305, so this many fit with room to spare and the rest are spent by the next call
+    const MAX_EXIT_INPUTS: usize = 1000;
+    if matured.len() > MAX_EXIT_INPUTS {
+        info!(
+            "unstakeue: {} matured outputs, spending {MAX_EXIT_INPUTS} now and the rest on the next call",
+            matured.len()
+        );
+    }
     let inputs = matured
         .iter()
+        .take(MAX_EXIT_INPUTS)
         .map(|r| collateral::UeExitInput {
             outpoint: r.outpoint,
             value: r.value,
@@ -2521,9 +2526,9 @@ mod ue_tests {
         db.add_ue_collateral(&mut txn, &record).unwrap();
         txn.commit().unwrap();
 
-        assert!(is_ue_member(&db, subnet_id, &committee, &ue).unwrap());
-        assert!(!is_ue_member(&db, subnet_id, &committee, &ordinary).unwrap());
-        assert!(!is_ue_member(&db, subnet_id, &committee, &outsider).unwrap());
+        assert!(collateral::is_ue_member(&db, subnet_id, &committee, &ue).unwrap());
+        assert!(!collateral::is_ue_member(&db, subnet_id, &committee, &ordinary).unwrap());
+        assert!(!collateral::is_ue_member(&db, subnet_id, &committee, &outsider).unwrap());
 
         let err = refuse_ue_member(&db, subnet_id, &committee, &ue).unwrap_err();
         assert!(matches!(err, RpcError::InvalidParams(m) if m.contains("unstakeue")));
