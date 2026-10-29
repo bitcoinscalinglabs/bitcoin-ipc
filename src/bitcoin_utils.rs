@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::vec;
 
 use log::{debug, error, trace};
@@ -16,8 +15,8 @@ use bitcoin::{
     hashes::Hash,
     key::UntweakedPublicKey,
     opcodes::{
-        all::{OP_CSV, OP_DROP},
-        OP_TRUE,
+        all::{OP_CSV, OP_DROP, OP_PUSHNUM_1, OP_PUSHNUM_NEG1},
+        Class, ClassifyContext, Opcode, OP_TRUE,
     },
     script::{Instruction, PushBytes},
     secp256k1::Secp256k1,
@@ -245,24 +244,23 @@ pub fn submit_to_mempool(
     Ok(())
 }
 
-/// Pushes arbitrary data in chuns, dropping all of them,
-/// and then pushes a OP_TRUE at the end to allow spending.
+/// The data leaf script of `data`: each 520-byte chunk as a minimal push followed by
+/// `OP_DROP`, then `OP_TRUE`.
 pub fn make_push_data_script(data: &[u8]) -> ScriptBuf {
     let mut builder = Builder::new();
-    let mut offset = 0;
-    let chunk_size = 520;
-
-    while offset < data.len() {
-        let end = min(offset + chunk_size, data.len());
-        builder = builder.push_slice(convert_bytes_to_push_bytes(&data[offset..end]));
-        offset += chunk_size;
+    for chunk in data.chunks(DATA_CHUNK_SIZE) {
+        builder = match chunk {
+            [b @ 1..=16] => builder.push_opcode(Opcode::from(OP_PUSHNUM_1.to_u8() + b - 1)),
+            [0x81] => builder.push_opcode(OP_PUSHNUM_NEG1),
+            _ => builder.push_slice(convert_bytes_to_push_bytes(chunk)),
+        };
         builder = builder.push_opcode(OP_DROP);
     }
-
-    builder = builder.push_opcode(OP_TRUE);
-
-    builder.into_script()
+    builder.push_opcode(OP_TRUE).into_script()
 }
+
+/// The largest push Bitcoin script allows
+const DATA_CHUNK_SIZE: usize = 520;
 
 /// Makes a simple OP_RETURN script
 pub fn make_op_return_script<T: AsRef<PushBytes>>(data: T) -> ScriptBuf {
@@ -559,33 +557,241 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
     unsafe { &*(data as *const [u8] as *const PushBytes) }
 }
 
-pub fn concatenate_op_push_data(witness: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
-    // TODO instantiate with_capacity
-    let mut concatenated_data = Vec::new();
+/// A reveal input: the data leaf it executes, its control block and the data the leaf pushes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevealInput<'a> {
+    pub leaf: &'a [u8],
+    pub control_block: &'a [u8],
+    pub data: Vec<u8>,
+}
 
-    let script = ScriptBuf::from(witness.to_vec());
+/// The leaf script and control block of a script-path spend (BIP341: the last two witness
+/// elements, after an optional annex). `None` for a key-path spend or an empty witness.
+pub fn script_path_leaf(input: &TxIn) -> Option<(&[u8], &[u8])> {
+    let witness: Vec<&[u8]> = input.witness.iter().collect();
+    let annex = witness.len() >= 2 && witness[witness.len() - 1].first() == Some(&0x50);
+    match &witness[..witness.len() - usize::from(annex)] {
+        [.., leaf, control_block] => Some((leaf, control_block)),
+        _ => None,
+    }
+}
 
-    for instruction in script.instructions() {
-        match instruction {
-            Ok(Instruction::PushBytes(bytes)) => {
-                concatenated_data.extend_from_slice(bytes.as_bytes());
+impl RevealInput<'_> {
+    /// Checks the input is exactly as specified: a 33-byte control block (a single-leaf
+    /// commitment) and a leaf that is the data leaf script of its data.
+    pub fn check_exact(&self) -> Result<(), BitcoinUtilsError> {
+        if self.control_block.len() != 33 {
+            return Err(BitcoinUtilsError::NotASingleLeaf);
+        }
+        if self.leaf != make_push_data_script(&self.data).as_bytes() {
+            return Err(BitcoinUtilsError::NotTheDataScript);
+        }
+        Ok(())
+    }
+}
+
+/// The message data of a reveal input: the pushes of the leaf it executes. `None` when the
+/// input is not a script-path spend or its leaf is not a data script.
+pub fn reveal_input(input: &TxIn) -> Option<RevealInput<'_>> {
+    let (leaf, control_block) = script_path_leaf(input)?;
+    let data = concatenate_op_push_data(leaf).ok()?;
+    Some(RevealInput {
+        leaf,
+        control_block,
+        data,
+    })
+}
+
+/// An unsigned commit and reveal pair for `data`: the commit spends a dummy outpoint and
+/// carries `extra_outputs` after the commitment output. For tests and the db tester, which
+/// have no wallet.
+pub fn unsigned_commit_reveal(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    data: &[u8],
+    extra_outputs: Vec<TxOut>,
+) -> Result<(Transaction, Transaction), BitcoinUtilsError> {
+    let commit_script = make_push_data_script(data);
+    let info = TaprootBuilder::new()
+        .add_leaf(0, commit_script.clone())?
+        .finalize(secp, unspenable_internal_key())
+        .map_err(|_| BitcoinUtilsError::TaprootBuilderNotFinalizable)?;
+    let mut output = vec![TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::new_p2tr(secp, info.internal_key(), info.merkle_root()),
+    }];
+    output.extend(extra_outputs);
+    let commit = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(
+                bitcoin::Txid::from_byte_array(rand::random::<[u8; 32]>()),
+                0,
+            ),
+            ..Default::default()
+        }],
+        output,
+    };
+    let control_block = info
+        .control_block(&(commit_script.clone(), LeafVersion::TapScript))
+        .ok_or(BitcoinUtilsError::CannotConstructControlBlock)?;
+    let reveal = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(commit.compute_txid(), 0),
+            witness: Witness::from_slice(&[commit_script.to_bytes(), control_block.serialize()]),
+            ..Default::default()
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: ScriptBuf::new_op_return([2]),
+        }],
+    };
+    Ok((commit, reveal))
+}
+
+/// One reveal with the inputs and the outputs of `reveals`, in order.
+pub fn merge_reveals(reveals: impl IntoIterator<Item = Transaction>) -> Transaction {
+    let mut merged = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    for reveal in reveals {
+        merged.input.extend(reveal.input);
+        merged.output.extend(reveal.output);
+    }
+    merged
+}
+
+/// A rebuilding of a reveal: other inputs, another input order or other outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealShape {
+    AsBuilt,
+    /// A reveal that carries no message merged before it
+    InputBefore,
+    /// A reveal that carries no message merged after it
+    InputAfter,
+    /// One before and one after
+    InputsAround,
+    /// The inputs in reverse order
+    Reversed,
+    /// Every output paying another script
+    OtherOutput,
+    /// Output 0 split in two, the second paying another script
+    ExtraOutput,
+}
+
+impl RevealShape {
+    pub const NAMES: [&'static str; 7] = [
+        "as-built",
+        "input-before",
+        "input-after",
+        "inputs-around",
+        "reversed",
+        "other-output",
+        "extra-output",
+    ];
+}
+
+impl std::str::FromStr for RevealShape {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s {
+            "as-built" => Self::AsBuilt,
+            "input-before" => Self::InputBefore,
+            "input-after" => Self::InputAfter,
+            "inputs-around" => Self::InputsAround,
+            "reversed" => Self::Reversed,
+            "other-output" => Self::OtherOutput,
+            "extra-output" => Self::ExtraOutput,
+            _ => {
+                return Err(format!(
+                    "unknown reveal shape '{s}', expected one of {}",
+                    Self::NAMES.join(", ")
+                ))
             }
-            Ok(Instruction::Op(op))
-                if op == bitcoin::opcodes::all::OP_DROP || op == bitcoin::opcodes::OP_TRUE =>
-            {
-                // Do nothing, ignore these opcodes
+        })
+    }
+}
+
+impl std::fmt::Display for RevealShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::NAMES[*self as usize])
+    }
+}
+
+/// `reveal` rebuilt in `shape`. `filler()` gives a reveal that carries no message (an
+/// empty-data commit-reveal pair), `other_output` the script every output pays instead.
+pub fn reshape_reveal<E>(
+    reveal: Transaction,
+    shape: RevealShape,
+    mut filler: impl FnMut() -> Result<Transaction, E>,
+    other_output: &ScriptBuf,
+) -> Result<Transaction, E> {
+    Ok(match shape {
+        RevealShape::AsBuilt => reveal,
+        RevealShape::InputBefore => merge_reveals([filler()?, reveal]),
+        RevealShape::InputAfter => merge_reveals([reveal, filler()?]),
+        RevealShape::InputsAround => {
+            let before = filler()?;
+            let after = filler()?;
+            merge_reveals([before, reveal, after])
+        }
+        RevealShape::Reversed => {
+            let mut reveal = reveal;
+            reveal.input.reverse();
+            reveal
+        }
+        RevealShape::OtherOutput => {
+            let mut reveal = reveal;
+            for output in &mut reveal.output {
+                output.script_pubkey = other_output.clone();
             }
-            // Return an error if any other instruction is encountered
-            Ok(_) => {
-                return Err(BitcoinUtilsError::UnsuportedOpCode);
-            }
-            Err(_) => {
-                return Err(BitcoinUtilsError::ErrorParsingWitnessScript);
-            }
+            reveal
+        }
+        RevealShape::ExtraOutput => {
+            let mut reveal = reveal;
+            let half = reveal.output[0].value / 2;
+            reveal.output[0].value -= half;
+            reveal.output.push(TxOut {
+                value: half,
+                script_pubkey: other_output.clone(),
+            });
+            reveal
+        }
+    })
+}
+
+/// The data of a data leaf script: the concatenation of the chunks that the pushes followed
+/// by `OP_DROP` push, `OP_1`…`OP_16` and `OP_1NEGATE` included. The final `OP_TRUE` is not
+/// data. Any non-minimal push or other instruction makes the script not a data leaf.
+pub fn concatenate_op_push_data(leaf: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
+    let script = ScriptBuf::from(leaf.to_vec());
+    let mut data = Vec::with_capacity(leaf.len());
+    let mut pending: Option<Vec<u8>> = None;
+    for instruction in script.instructions_minimal() {
+        let push = match instruction {
+            Ok(Instruction::PushBytes(bytes)) => bytes.as_bytes().to_vec(),
+            Ok(Instruction::Op(op)) => match op.classify(ClassifyContext::TapScript) {
+                Class::PushNum(n) => vec![if n < 0 { 0x81 } else { n as u8 }],
+                _ if op == OP_DROP => {
+                    data.extend(pending.take().ok_or(BitcoinUtilsError::UnsuportedOpCode)?);
+                    continue;
+                }
+                _ => return Err(BitcoinUtilsError::UnsuportedOpCode),
+            },
+            Err(_) => return Err(BitcoinUtilsError::ErrorParsingWitnessScript),
+        };
+        // Two pushes in a row: the first is not followed by OP_DROP
+        if pending.replace(push).is_some() {
+            return Err(BitcoinUtilsError::UnsuportedOpCode);
         }
     }
-
-    Ok(concatenated_data)
+    Ok(data)
 }
 
 pub fn create_send_with_timelock_release_tx_script(
@@ -668,6 +874,12 @@ pub enum BitcoinUtilsError {
 
     #[error("cannot construct control block for the given script")]
     CannotConstructControlBlock,
+
+    #[error("commitment output is not a single leaf")]
+    NotASingleLeaf,
+
+    #[error("witness leaf is not the data script of the message")]
+    NotTheDataScript,
 }
 
 #[cfg(test)]
@@ -682,5 +894,145 @@ mod tests {
             format!("{key}"),
             "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81799"
         );
+    }
+
+    fn input_with_witness(elements: &[Vec<u8>]) -> TxIn {
+        TxIn {
+            witness: Witness::from_slice(elements),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reveal_input_reads_the_data_of_the_executed_leaf() {
+        let data = b"IPCXYZ some message bytes".to_vec();
+        let leaf = make_push_data_script(&data).to_bytes();
+        let control_block = vec![0xc0u8; 33];
+
+        let input = input_with_witness(&[leaf.clone(), control_block.clone()]);
+        let found = reveal_input(&input).unwrap();
+        assert_eq!(found.data, data);
+        assert_eq!(found.leaf, leaf.as_slice());
+        assert_eq!(found.control_block, control_block.as_slice());
+
+        // An annex after the control block, and stack elements below the leaf, are skipped
+        let annexed = input_with_witness(&[leaf.clone(), control_block.clone(), vec![0x50, 1, 2]]);
+        assert_eq!(reveal_input(&annexed).unwrap().data, data);
+        let with_stack = input_with_witness(&[vec![7u8; 3], leaf.clone(), control_block.clone()]);
+        assert_eq!(reveal_input(&with_stack).unwrap().data, data);
+
+        // Data of more than one chunk
+        let long = vec![0x42u8; 1_300];
+        let input = input_with_witness(&[make_push_data_script(&long).to_bytes(), control_block]);
+        assert_eq!(reveal_input(&input).unwrap().data, long);
+    }
+
+    #[test]
+    fn data_leaf_pushes_are_minimal_at_the_chunk_boundary() {
+        // 521 bytes: a full chunk, then a one-byte chunk whose minimal push depends on its value
+        let full = vec![0x42u8; 520];
+        let mut full_push = vec![0x4d, 0x08, 0x02];
+        full_push.extend(&full);
+        for (last, push) in [
+            (0x01u8, vec![0x51]),
+            (0x10, vec![0x60]),
+            (0x81, vec![0x4f]),
+            (0x11, vec![0x01, 0x11]),
+            (0x00, vec![0x01, 0x00]),
+        ] {
+            let mut data = full.clone();
+            data.push(last);
+            let mut expected = full_push.clone();
+            expected.push(0x75);
+            expected.extend(&push);
+            expected.extend([0x75, 0x51]);
+            let leaf = make_push_data_script(&data).to_bytes();
+            assert_eq!(leaf, expected, "last byte {last:#04x}");
+            assert!(
+                ScriptBuf::from(leaf.clone())
+                    .instructions_minimal()
+                    .all(|i| i.is_ok()),
+                "last byte {last:#04x}: a non-minimal push"
+            );
+            assert_eq!(concatenate_op_push_data(&leaf).unwrap(), data);
+            let input = input_with_witness(&[leaf, vec![0xc0u8; 33]]);
+            assert_eq!(reveal_input(&input).unwrap().data, data);
+        }
+
+        // A single byte of data
+        assert_eq!(
+            make_push_data_script(&[0x05]).to_bytes(),
+            vec![0x55, 0x75, 0x51]
+        );
+        assert_eq!(
+            concatenate_op_push_data(&[0x55, 0x75, 0x51]).unwrap(),
+            vec![0x05]
+        );
+        assert_eq!(make_push_data_script(&[]).to_bytes(), vec![0x51]);
+        assert_eq!(concatenate_op_push_data(&[0x51]).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn data_leaf_decoder_rejects_other_scripts() {
+        // A non-minimal push of a one-byte chunk, as rust-bitcoin's push_slice writes it
+        assert!(concatenate_op_push_data(&[0x01, 0x05, 0x75, 0x51]).is_err());
+        // A push without OP_DROP before another push, and OP_DROP without a push
+        assert!(concatenate_op_push_data(&[0x55, 0x56, 0x75, 0x51]).is_err());
+        assert!(concatenate_op_push_data(&[0x75, 0x51]).is_err());
+        // Another opcode
+        assert!(concatenate_op_push_data(&[0x55, 0x75, 0xb2, 0x51]).is_err());
+        // A truncated push
+        assert!(concatenate_op_push_data(&[0x02, 0x05]).is_err());
+    }
+
+    #[test]
+    fn reveal_input_ignores_inputs_without_a_data_leaf() {
+        let data = b"IPCXYZ some message bytes".to_vec();
+        let leaf = make_push_data_script(&data).to_bytes();
+
+        // A key-path spend, with and without an annex, and an empty witness
+        assert!(reveal_input(&input_with_witness(&[vec![0u8; 64]])).is_none());
+        assert!(reveal_input(&input_with_witness(&[vec![0u8; 64], vec![0x50]])).is_none());
+        assert!(reveal_input(&input_with_witness(&[])).is_none());
+
+        // The data script as a stack element under another leaf
+        let other_leaf = Builder::new()
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP)
+            .into_script()
+            .to_bytes();
+        assert!(reveal_input(&input_with_witness(&[leaf, other_leaf, vec![0xc0u8; 33]])).is_none());
+    }
+
+    #[test]
+    fn check_exact_requires_the_data_script_and_a_single_leaf() {
+        let data = b"IPCXYZ some message bytes".to_vec();
+        let leaf = make_push_data_script(&data).to_bytes();
+        let checked = |elements: &[Vec<u8>]| {
+            reveal_input(&input_with_witness(elements))
+                .unwrap()
+                .check_exact()
+        };
+        assert!(checked(&[leaf.clone(), vec![0xc0u8; 33]]).is_ok());
+
+        // A two-leaf control block
+        assert!(matches!(
+            checked(&[leaf.clone(), vec![0xc0u8; 65]]),
+            Err(BitcoinUtilsError::NotASingleLeaf)
+        ));
+
+        // An extra empty push: the leaf decodes to the same data but is not its data script
+        let mut extra = leaf.clone();
+        extra.pop();
+        extra.extend([
+            bitcoin::opcodes::all::OP_PUSHBYTES_0.to_u8(),
+            OP_DROP.to_u8(),
+            OP_TRUE.to_u8(),
+        ]);
+        assert_eq!(concatenate_op_push_data(&extra).unwrap(), data);
+        assert!(matches!(
+            checked(&[extra, vec![0xc0u8; 33]]),
+            Err(BitcoinUtilsError::NotTheDataScript)
+        ));
     }
 }

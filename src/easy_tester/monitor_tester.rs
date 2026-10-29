@@ -8,19 +8,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::hashes::sha256;
+use bitcoin::{hashes::sha256, key::Secp256k1, Transaction};
 use bitcoincore_rpc::{Auth, Client};
 use log::{info, warn};
 use tempfile::TempDir;
 
 use crate::{
+    bitcoin_utils::{
+        create_commit_reveal_txs, merge_reveals, reshape_reveal, submit_to_mempool, RevealShape,
+    },
     collateral,
     db::HeedDb,
     easy_tester::{
         error::EasyTesterError,
         model::{
-            build_create_subnet_msg, parse_u256_allow_underscores, OutputDb, OutputExpectTarget,
-            SetupSpec, ValidatorSpec,
+            build_create_subnet_msg, parse_u256_allow_underscores, JoinUeSpec, OutputDb,
+            OutputExpectTarget, SetupSpec, ValidatorSpec,
         },
         provider_client::ProviderClient,
         tester::Tester,
@@ -29,11 +32,47 @@ use crate::{
     eth_utils::eth_addr_from_x_only_pubkey,
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcSupplyAdjustment,
-        IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg,
+        IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcStakeCollateralMsg,
+        IpcUnstakeCollateralMsg,
     },
     provider::rpc::{DevMultisignPsbtParams, DevMultisignPsbtResponse},
-    SubnetId,
+    SubnetId, NETWORK,
 };
+
+/// A reveal that carries no message, its commit submitted: for the rebuilt reveals
+fn empty_reveal(
+    rpc: &Client,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Result<Transaction, EasyTesterError> {
+    let err = |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("filler reveal: {e}"));
+    let address = crate::wallet::get_new_address(rpc).map_err(|e| err(&e))?;
+    let (commit, reveal) =
+        create_commit_reveal_txs(rpc, secp, &address, &[], None, None).map_err(|e| err(&e))?;
+    submit_to_mempool(rpc, vec![commit]).map_err(|e| err(&e))?;
+    Ok(reveal)
+}
+
+/// Rebuilds `reveal` in `shape` with the tester's wallet and submits it
+fn submit_reshaped(
+    rpc: &Client,
+    reveal: Transaction,
+    shape: RevealShape,
+) -> Result<Transaction, EasyTesterError> {
+    let err = |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("reveal: {e}"));
+    let secp = Secp256k1::new();
+    let other = crate::wallet::get_new_address(rpc)
+        .map_err(|e| err(&e))?
+        .script_pubkey();
+    let reveal = reshape_reveal(reveal, shape, || empty_reveal(rpc, &secp), &other)?;
+    submit_to_mempool(rpc, vec![reveal.clone()]).map_err(|e| err(&e))?;
+    info!(
+        "Submitted a reveal with {} inputs and {} outputs ({shape}): {}",
+        reveal.input.len(),
+        reveal.output.len(),
+        reveal.compute_txid()
+    );
+    Ok(reveal)
+}
 
 // ── constants / defaults ──────────────────────────────────────────────────────
 
@@ -892,9 +931,7 @@ impl MonitorTester {
         let gen_resp: GenBootstrapHandoverResult =
             match self.rpc_call("genbootstraphandover", SubnetIdParam { subnet_id }) {
                 Ok(resp) => resp,
-                // A subnet whose validators all joined with join-ue holds nothing in the
-                // whitelist multisig: there is nothing to hand over. With an ordinary join
-                // the funds exist, and this error is a real failure
+                // A join-ue-only subnet has no whitelist funds: nothing to hand over
                 Err(e)
                     if e.to_string().contains("No unspent outputs")
                         && !self.subnets_with_joins.contains(subnet_name) =>
@@ -953,6 +990,8 @@ impl MonitorTester {
         Ok(())
     }
 
+    /// With `submit_batch` the provider submits the checkpoint and its batch transfer reveal
+    /// together; without it the reveal is returned and the caller submits it.
     fn do_checkpoint_malicious(
         &mut self,
         subnet_name: &str,
@@ -960,7 +999,8 @@ impl MonitorTester {
         token_registrations: Vec<IpcErcTokenRegistration>,
         supply_adjustments: Vec<IpcErcSupplyAdjustment>,
         erc_transfers: Vec<IpcCrossSubnetErcTransfer>,
-    ) -> Result<(), EasyTesterError> {
+        submit_batch: bool,
+    ) -> Result<Option<Transaction>, EasyTesterError> {
         let checkpoint_height = self
             .checkpoint_heights
             .entry(subnet_name.to_string())
@@ -1010,11 +1050,27 @@ impl MonitorTester {
         let sign_resp: DevMultisignPsbtResponse =
             self.rpc_call_as(&committee_validator_name, "dev_multisignpsbt", sign_params)?;
 
+        let reveal = match &gen_resp.batch_transfer_tx_hex {
+            Some(hex) if !submit_batch && !hex.is_empty() => {
+                let bytes = hex::decode(hex)
+                    .map_err(|e| EasyTesterError::runtime(format!("batch reveal hex: {e}")))?;
+                Some(
+                    bitcoin::consensus::deserialize::<Transaction>(&bytes).map_err(|e| {
+                        EasyTesterError::runtime(format!("batch reveal transaction: {e}"))
+                    })?,
+                )
+            }
+            _ => None,
+        };
         let finalize_params = FinalizeCheckpointLocalParams {
             subnet_id,
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64,
             signatures: sign_resp.signatures,
-            batch_transfer_tx_hex: gen_resp.batch_transfer_tx_hex,
+            batch_transfer_tx_hex: if submit_batch {
+                gen_resp.batch_transfer_tx_hex
+            } else {
+                None
+            },
         };
         let _: serde_json::Value = self.rpc_call_as(
             &committee_validator_name,
@@ -1026,7 +1082,18 @@ impl MonitorTester {
             "Checkpoint #{} for subnet '{}' finalized",
             checkpoint_height, subnet_name
         );
-        Ok(())
+        Ok(reveal)
+    }
+
+    /// The multisig address of the subnet's current committee, from the provider
+    fn multisig_address(&self, subnet_id: SubnetId) -> Result<bitcoin::Address, EasyTesterError> {
+        let state: crate::db::SubnetState =
+            self.rpc_call("getsubnet", SubnetIdParam { subnet_id })?;
+        state
+            .committee
+            .multisig_address
+            .require_network(NETWORK)
+            .map_err(|e| EasyTesterError::runtime(format!("multisig address: {e}")))
     }
 }
 
@@ -1209,10 +1276,13 @@ impl Tester for MonitorTester {
         self.do_handovers_if_needed()
     }
 
+    /// `create`: through the provider as built; a rebuilt reveal is made with the tester's
+    /// wallet from the same message. The subnet id is the reveal's txid either way.
     fn exec_create_subnet(
         &mut self,
         _height: u64,
         subnet_name: &str,
+        shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
         let spec = self
             .setup
@@ -1224,11 +1294,35 @@ impl Tester for MonitorTester {
             .clone();
         let msg = build_create_subnet_msg(&spec);
 
-        let resp: CreateSubnetLocalResponse = self.rpc_call("createsubnet", msg)?;
+        let subnet_id = if shape == RevealShape::AsBuilt {
+            let resp: CreateSubnetLocalResponse = self.rpc_call("createsubnet", msg)?;
+            resp.subnet_id
+        } else {
+            let err = |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("create: {e}"));
+            let data = msg.to_bytes().map_err(|e| err(&e))?;
+            let rpc = self.wallet_client()?;
+            let secp = Secp256k1::new();
+            let address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
+            let (commit, reveal) = create_commit_reveal_txs(
+                &rpc,
+                &secp,
+                &address,
+                &data,
+                Some(bitcoin::Amount::from_sat(2_000)),
+                None,
+            )
+            .map_err(|e| err(&e))?;
+            submit_to_mempool(&rpc, vec![commit]).map_err(|e| err(&e))?;
+            let reveal = submit_reshaped(&rpc, reveal, shape)?;
+            SubnetId::from_txid(&reveal.compute_txid())
+        };
 
         self.created_subnets
-            .insert(subnet_name.to_string(), resp.subnet_id);
-        info!("Created subnet '{}' => {}", subnet_name, resp.subnet_id);
+            .insert(subnet_name.to_string(), subnet_id);
+        info!(
+            "Created subnet '{}' => {} ({shape})",
+            subnet_name, subnet_id
+        );
         Ok(())
     }
 
@@ -1260,57 +1354,62 @@ impl Tester for MonitorTester {
         Ok(())
     }
 
-    /// `join-ue`: the transactions are built as the provider builds them, with the
-    /// validator's key and the tester's wallet, but without the provider's own check, so
-    /// that every rejection in a scenario is the monitor's. A failed submission is a
-    /// failure of the tester, not a scenario outcome.
+    /// `join-ue`: one funded commit per join, each submitted as built, then one reveal for all
+    /// of them, without the provider's own check so that every rejection is the monitor's.
     fn exec_join_ue(
         &mut self,
         _height: u64,
         subnet_name: &str,
-        validator_name: &str,
-        collateral_sats: u64,
-        timeout: u64,
+        joins: &[JoinUeSpec],
+        shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
-        let subnet_id = self.resolve_subnet_id(subnet_name)?;
-        let v = self.resolve_validator(validator_name)?.clone();
-        let timeout = u32::try_from(timeout)
-            .map_err(|_| EasyTesterError::runtime(format!("timeout {timeout} does not fit u32")))?;
-        let collateral = bitcoin::Amount::from_sat(collateral_sats);
-        let join = IpcJoinSubnetMsg {
-            subnet_id,
-            collateral,
-            ip: v.default_ip,
-            backup_address: v.default_backup_address.clone(),
-            pubkey: v.pubkey,
-        };
         let secp = bitcoin::secp256k1::Secp256k1::new();
-        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &v.secret_key);
         let err = |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("join-ue: {e}"));
-        let data = msg.to_bytes().map_err(|e| err(&e))?;
         let rpc = self.wallet_client()?;
-        let return_address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
-        let collateral_output = bitcoin::TxOut {
-            value: collateral,
-            script_pubkey: collateral::ue_script_pubkey(&secp, &v.pubkey, timeout)
-                .map_err(|e| err(&e))?,
-        };
-        let (commit_tx, reveal_tx) = crate::bitcoin_utils::create_commit_reveal_txs(
-            &rpc,
-            &secp,
-            &return_address,
-            &data,
-            None,
-            Some(collateral_output),
-        )
-        .map_err(|e| err(&e))?;
-        let join_txid = reveal_tx.compute_txid();
-        crate::bitcoin_utils::submit_to_mempool(&rpc, vec![commit_tx, reveal_tx])
+        let mut reveals = Vec::new();
+        for spec in joins {
+            let subnet_id =
+                self.resolve_subnet_id(spec.subnet_name.as_deref().unwrap_or(subnet_name))?;
+            let v = self.resolve_validator(&spec.validator_name)?.clone();
+            let timeout = u32::try_from(spec.timeout).map_err(|_| {
+                EasyTesterError::runtime(format!("timeout {} does not fit u32", spec.timeout))
+            })?;
+            let collateral = bitcoin::Amount::from_sat(spec.collateral_sats);
+            let join = IpcJoinSubnetMsg {
+                subnet_id,
+                collateral,
+                ip: v.default_ip,
+                backup_address: v.default_backup_address.clone(),
+                pubkey: v.pubkey,
+            };
+            let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &v.secret_key);
+            let data = msg.to_bytes().map_err(|e| err(&e))?;
+            let return_address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
+            let collateral_output = bitcoin::TxOut {
+                value: collateral,
+                script_pubkey: collateral::ue_script_pubkey(&secp, &v.pubkey, timeout)
+                    .map_err(|e| err(&e))?,
+            };
+            let (commit_tx, reveal_tx) = crate::bitcoin_utils::create_commit_reveal_txs(
+                &rpc,
+                &secp,
+                &return_address,
+                &data,
+                None,
+                Some(collateral_output),
+            )
             .map_err(|e| err(&e))?;
-        info!(
-            "JoinUe: validator '{}' submitted to subnet '{}' with {} sats, timeout {}, join_txid={}",
-            validator_name, subnet_name, collateral_sats, timeout, join_txid
-        );
+            crate::bitcoin_utils::submit_to_mempool(&rpc, vec![commit_tx]).map_err(|e| err(&e))?;
+            reveals.push(reveal_tx);
+        }
+        let reveal_tx = submit_reshaped(&rpc, merge_reveals(reveals), shape)?;
+        let join_txid = reveal_tx.compute_txid();
+        for spec in joins {
+            info!(
+                "JoinUe: validator '{}' submitted to subnet '{}' with {} sats, timeout {}, join_txid={}",
+                spec.validator_name, subnet_name, spec.collateral_sats, spec.timeout, join_txid
+            );
+        }
         Ok(())
     }
 
@@ -1339,15 +1438,36 @@ impl Tester for MonitorTester {
         Ok(())
     }
 
+    /// `raw`: the stake transaction is built with the library and the tester's wallet, so
+    /// that the monitor's own rules are what refuses or accepts it
     fn exec_stake_subnet(
         &mut self,
         _height: u64,
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
         let v = self.resolve_validator(validator_name)?.clone();
+
+        if raw {
+            let rpc = self.wallet_client()?;
+            let multisig = self.multisig_address(subnet_id)?;
+            let msg = IpcStakeCollateralMsg {
+                subnet_id,
+                amount: bitcoin::Amount::from_sat(amount_sats),
+                pubkey: v.pubkey,
+            };
+            let txid = msg
+                .submit_to_bitcoin(&rpc, &multisig)
+                .map_err(|e| EasyTesterError::runtime(format!("raw stake: {e}")))?;
+            info!(
+                "Submitted a hand-built stake of {} sats for '{}' on subnet '{}': {}",
+                amount_sats, validator_name, subnet_name, txid
+            );
+            return Ok(());
+        }
 
         let params = StakeCollateralLocalParams {
             subnet_id,
@@ -1370,9 +1490,28 @@ impl Tester for MonitorTester {
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
         let v = self.resolve_validator(validator_name)?.clone();
+
+        if raw {
+            let rpc = self.wallet_client()?;
+            let multisig = self.multisig_address(subnet_id)?;
+            let msg = IpcUnstakeCollateralMsg {
+                subnet_id,
+                amount: bitcoin::Amount::from_sat(amount_sats),
+                pubkey: Some(v.pubkey),
+            };
+            let txid = msg
+                .submit_to_bitcoin(&rpc, &multisig, v.secret_key)
+                .map_err(|e| EasyTesterError::runtime(format!("raw unstake: {e}")))?;
+            info!(
+                "Submitted a hand-built unstake of {} sats for '{}' from subnet '{}': {}",
+                amount_sats, validator_name, subnet_name, txid
+            );
+            return Ok(());
+        }
 
         let params = UnstakeCollateralLocalParams {
             subnet_id,
@@ -1389,8 +1528,8 @@ impl Tester for MonitorTester {
         Ok(())
     }
 
-    /// `unstake-ue`: the validator's provider spends its matured collaterals. A refusal
-    /// (nothing matured, nothing left) is logged, not fatal, so the scenario can check it.
+    /// `unstake-ue`: the validator's provider spends its matured collaterals; a refusal is
+    /// logged, not fatal.
     fn exec_unstake_ue(
         &mut self,
         _height: u64,
@@ -1412,32 +1551,45 @@ impl Tester for MonitorTester {
         Ok(())
     }
 
-    fn exec_checkpoint_subnet(
+    /// One subnet as built: the provider submits the checkpoint and its reveal. Otherwise the
+    /// reveals of all the subnets go in one reveal, rebuilt in `shape`, submitted by the tester.
+    fn exec_checkpoint(
         &mut self,
         _height: u64,
-        subnet_name: &str,
+        subnets: &[String],
+        shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
-        let subnet_id = self.resolve_subnet_id(subnet_name)?;
-        let registrations = self
-            .pending_registrations
-            .remove(subnet_name)
-            .unwrap_or_default();
-        let adjustments = self
-            .pending_supply_adjustments
-            .remove(subnet_name)
-            .unwrap_or_default();
-        let transfers = self
-            .pending_erc_transfers
-            .remove(subnet_name)
-            .unwrap_or_default();
+        let via_provider = subnets.len() == 1 && shape == RevealShape::AsBuilt;
+        let mut reveals = Vec::new();
+        for subnet_name in subnets {
+            let subnet_id = self.resolve_subnet_id(subnet_name)?;
+            let registrations = self
+                .pending_registrations
+                .remove(subnet_name)
+                .unwrap_or_default();
+            let adjustments = self
+                .pending_supply_adjustments
+                .remove(subnet_name)
+                .unwrap_or_default();
+            let transfers = self
+                .pending_erc_transfers
+                .remove(subnet_name)
+                .unwrap_or_default();
 
-        self.do_checkpoint_malicious(
-            subnet_name,
-            subnet_id,
-            registrations,
-            adjustments,
-            transfers,
-        )
+            reveals.extend(self.do_checkpoint_malicious(
+                subnet_name,
+                subnet_id,
+                registrations,
+                adjustments,
+                transfers,
+                via_provider,
+            )?);
+        }
+        if !reveals.is_empty() {
+            let rpc = self.wallet_client()?;
+            submit_reshaped(&rpc, merge_reveals(reveals), shape)?;
+        }
+        Ok(())
     }
 
     fn exec_register_token(
@@ -1697,9 +1849,12 @@ impl Tester for MonitorTester {
             OutputDb::SubnetGenesis => {
                 let subnet_name = &args[0];
                 let subnet_id = self.resolve_subnet_id(subnet_name)?;
-                let resp: serde_json::Value =
-                    self.rpc_call("getgenesisinfo", SubnetIdParam { subnet_id })?;
-                println!("OUTPUT read SubnetGenesis '{}' => {:#}", subnet_name, resp);
+                let monitor_db = self.open_db()?;
+                self.last_ue = Some(ue_reads::read_subnet_genesis(
+                    &monitor_db,
+                    subnet_id,
+                    subnet_name,
+                )?);
             }
 
             OutputDb::StakeChanges => {

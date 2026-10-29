@@ -14,6 +14,8 @@ pub mod rewards;
 pub mod wallet;
 
 #[cfg(test)]
+mod proptests;
+#[cfg(test)]
 mod test_sizes;
 #[cfg(test)]
 mod test_utils;

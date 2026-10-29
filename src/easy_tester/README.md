@@ -68,12 +68,12 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | Command | Description |
 |---------|-------------|
 | `block <n>` | What follows goes into block `n`; all earlier blocks are mined. |
-| `create <subnet>` | Create a subnet (uses setup whitelist). |
-| `checkpoint <subnet>` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). |
+| `create <subnet> [@<shape>]` | Create a subnet (uses setup whitelist). With a shape the reveal is rebuilt (see "Reveal shapes"); the name still resolves to the subnet id the reveal names, so `read subnet_genesis` can check whether the monitor accepted it. |
+| `checkpoint <subnet> [<subnet>...] [@<shape>]` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). Several subnets: one checkpoint each, their batch transfers in one reveal transaction; a shape rebuilds that reveal. |
 | `join <subnet> <validator> <collateral_sats>` | Queue a join command. |
-| `join-ue <subnet> <validator> <collateral_sats> <timeout_height>` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. |
-| `stake <subnet> <validator> <amount_sats>` | Queue a stake-increase command. |
-| `unstake <subnet> <validator> <amount_sats>` | Queue a stake-decrease command. |
+| `join-ue <subnet> <[subnet:]validator> <collateral_sats> <timeout_height> [<[subnet:]validator> <collateral_sats> <timeout_height>]... [@<shape>]` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`. Several triples: all the joins in one reveal transaction, in that order, each read from its own input; a triple's `subnet:validator` targets another subnet than the line's. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. |
+| `stake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-increase command. `@raw` (monitor tester): the transaction is built with the library and the tester's wallet, not by the provider, so that the monitor's own rules decide; a refusal is logged, not fatal. The db tester's stakes are always hand-built. |
+| `unstake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-decrease command; `@raw` as for `stake`. |
 | `unstake-ue <subnet> <validator>` | The validator's provider spends its matured unilateral-exit collaterals to its backup address (`unstakeue`). A refusal is logged, not fatal. Monitor tester only. |
 | `register_token <subnet> <name> <symbol> <initial_supply>` | Queue an ERC20 token registration (ETR). Decimals are fixed at 18. |
 | `mint_token <subnet> <token> <amount>` | Queue a supply increase (ETS). |
@@ -83,12 +83,17 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | `read rootnet_msgs <subnet>` | Read rootnet messages for the subnet (from all Bitcoin blocks). |
 | `read token_balance <subnet> <token>` | Read and cache the token balance on the subnet. |
 | `read reward_results <snapshot>` | Read reward results for the given snapshot. |
+| `read subnet_genesis <subnet>` | Fields: `exists`, and when it exists `bootstrapped`, `min_validators`, `genesis_validators`. |
 | `read validators <subnet> [current]` | The latest committee (the waiting one if any), or the current one. Fields: `count`, `names` (sorted, comma-separated), `waiting`, `<validator>.collateral`, `<validator>.ue`. |
 | `read ue_collaterals <subnet>` | The unilateral-exit collateral records. Fields: `count`, `removed_count`, `<validator>.count`, and for the validator's record with the greatest timeout `<validator>.value`, `<validator>.timeout`, `<validator>.removed`; monitor tester only: `<validator>.spent_count`, the validator's collateral outputs spent on the chain. |
 | `read withdrawals <subnet>` | The Withdraw stake changes not yet confirmed by a checkpoint. Fields: `count`, `<validator>` (amount). |
 | `expect result.<path> = <value>` | Assert a field in the **last** `read` result. |
 
-The monitor tester reads `validators`, `ue_collaterals` and `withdrawals` straight from the monitor's database (read-only), the other reads through the provider. `block N` means "what follows goes into block N": all earlier blocks are mined, and a `read` at `N` sees the state after block `N - 1`. Unilateral-exit scenarios: `scenaria/test_ue_*.txt` with `testers/db-ue.txt` or `testers/monitor-ue.txt` (`test_ue_activation.txt` uses the `*-activation-110.txt` configs; `test_ue_exit.txt` runs on the monitor tester only).
+### Reveal shapes
+
+A reveal transaction carries no signature, so the monitor reads a message from any input that spends a commitment output. A trailing `@<shape>` on `create`, `join-ue` or `checkpoint` rebuilds the reveal before it is submitted (`bitcoin_utils::reshape_reveal`, the same function the unit tests use): `as-built` (default), `input-before` (a reveal that carries no message merged before it: the data input is the last), `input-after` (merged after it: the data input is the first), `inputs-around` (one before and one after: the data inputs are in the middle), `reversed` (the inputs in reverse order), `other-output` (every output pays another script), `extra-output` (output 0 split in two). The filler reveals spend an empty-data commitment, which the db tester fabricates and the monitor tester funds with its wallet.
+
+The monitor tester reads `validators`, `ue_collaterals`, `withdrawals` and `subnet_genesis` straight from the monitor's database (read-only), the other reads through the provider. `block N` means "what follows goes into block N": all earlier blocks are mined, and a `read` at `N` sees the state after block `N - 1`. Unilateral-exit scenarios: `scenaria/test_ue_*.txt` with `testers/db-ue.txt` or `testers/monitor-ue.txt` (`test_ue_activation.txt` uses the `*-activation-110.txt` configs; `test_ue_exit.txt` runs on the monitor tester only).
 
 ---
 

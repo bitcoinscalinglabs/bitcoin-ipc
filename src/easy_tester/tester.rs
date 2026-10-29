@@ -1,4 +1,8 @@
-use crate::easy_tester::{model::OutputExpectTarget, EasyTesterError, OutputDb};
+use crate::bitcoin_utils::RevealShape;
+use crate::easy_tester::{
+    model::{JoinUeSpec, OutputExpectTarget},
+    EasyTesterError, OutputDb,
+};
 
 pub trait Tester {
     /// The number of blocks already mined before the scenario starts.
@@ -10,7 +14,13 @@ pub trait Tester {
 
     fn exec_mine_block(&mut self, height: u64) -> Result<(), EasyTesterError>;
 
-    fn exec_create_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError>;
+    /// `shape` rebuilds the create reveal; a rebuilt reveal still names the subnet
+    fn exec_create_subnet(
+        &mut self,
+        height: u64,
+        subnet_name: &str,
+        shape: RevealShape,
+    ) -> Result<(), EasyTesterError>;
 
     fn exec_join_subnet(
         &mut self,
@@ -20,25 +30,27 @@ pub trait Tester {
         collateral_sats: u64,
     ) -> Result<(), EasyTesterError>;
 
+    /// The joins of one `join-ue` line go in one reveal transaction, in order, rebuilt in `shape`
     fn exec_join_ue(
         &mut self,
         _height: u64,
         _subnet_name: &str,
-        _validator_name: &str,
-        _collateral_sats: u64,
-        _timeout: u64,
+        _joins: &[JoinUeSpec],
+        _shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
         Err(EasyTesterError::runtime(
             "join-ue is not supported by this tester",
         ))
     }
 
+    /// `raw`: hand-built and submitted without the provider
     fn exec_stake_subnet(
         &mut self,
         height: u64,
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError>;
 
     fn exec_unstake_subnet(
@@ -47,6 +59,7 @@ pub trait Tester {
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError>;
 
     fn exec_unstake_ue(
@@ -60,7 +73,13 @@ pub trait Tester {
         ))
     }
 
-    fn exec_checkpoint_subnet(&mut self, height: u64, subnet_name: &str) -> Result<(), EasyTesterError>;
+    /// One checkpoint per subnet; their batch transfers go in one reveal, rebuilt in `shape`
+    fn exec_checkpoint(
+        &mut self,
+        height: u64,
+        subnets: &[String],
+        shape: RevealShape,
+    ) -> Result<(), EasyTesterError>;
 
     fn exec_register_token(
         &mut self,

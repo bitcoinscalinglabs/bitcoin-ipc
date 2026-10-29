@@ -37,10 +37,10 @@ const STAKE_CHANGES_KEY: &str = "stake_changes:";
 // kill_requests:<subnet_id>:<block_height>:<txid>
 const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
-// ue_collaterals:<subnet_id>:<join_txid>
+// ue_collaterals:<subnet_id>:<join_txid>:<pubkey>
 const UE_COLLATERALS_KEY: &str = "ue_collaterals:";
-// ue_pending:<subnet_id>:<timeout, 10 digits>:<join_txid>, the records not yet removed,
-// in timeout order
+// ue_pending:<subnet_id>:<timeout, 10 digits>:<join_txid>:<pubkey>, the records not yet
+// removed, in timeout order
 const UE_PENDING_KEY: &str = "ue_pending:";
 // token_balance:<home_subnet_id>:<home_token_address>:<holder_subnet_id>
 const TOKEN_BALANCE_KEY: &str = "token_balance:";
@@ -120,18 +120,26 @@ fn ue_collaterals_prefix(subnet_id: SubnetId) -> String {
     format!("{UE_COLLATERALS_KEY}:{}:", subnet_id)
 }
 
-fn ue_collateral_key(subnet_id: SubnetId, join_txid: Txid) -> String {
-    format!("{UE_COLLATERALS_KEY}:{}:{}", subnet_id, join_txid)
+fn ue_collateral_key(subnet_id: SubnetId, join_txid: Txid, pubkey: &XOnlyPublicKey) -> String {
+    format!(
+        "{UE_COLLATERALS_KEY}:{}:{}:{}",
+        subnet_id, join_txid, pubkey
+    )
 }
 
 fn ue_pending_prefix(subnet_id: SubnetId) -> String {
     format!("{UE_PENDING_KEY}:{}:", subnet_id)
 }
 
-fn ue_pending_key(subnet_id: SubnetId, timeout: u32, join_txid: Txid) -> String {
+fn ue_pending_key(
+    subnet_id: SubnetId,
+    timeout: u32,
+    join_txid: Txid,
+    pubkey: &XOnlyPublicKey,
+) -> String {
     format!(
-        "{UE_PENDING_KEY}:{}:{:010}:{}",
-        subnet_id, timeout, join_txid
+        "{UE_PENDING_KEY}:{}:{:010}:{}:{}",
+        subnet_id, timeout, join_txid, pubkey
     )
 }
 
@@ -806,12 +814,12 @@ pub struct UeCollateral {
     pub outpoint: bitcoin::OutPoint,
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub value: bitcoin::Amount,
-    /// Maturity height: the validator alone spends the output from block `timeout + 1`
+    /// Maturity height
     pub timeout: u32,
     pub backup_address: Address<NetworkUnchecked>,
     /// The reveal txid, the validator's `join_txid` in the committee
     pub join_txid: Txid,
-    /// Set once the monitor has removed the validator at block `timeout - 1`
+    /// Set once the removal pass has handled the record
     pub removed: bool,
 }
 
@@ -1275,10 +1283,12 @@ pub trait DatabaseCore {
 
     fn add_ue_collateral(&self, txn: &mut RwTxn, collateral: &UeCollateral) -> Result<(), DbError>;
 
+    /// The record of the join of `pubkey` in the reveal `join_txid`
     fn get_ue_collateral(
         &self,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<Option<UeCollateral>, DbError>;
 
     /// All UE collaterals of a subnet, removed or not
@@ -1297,6 +1307,7 @@ pub trait DatabaseCore {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<(), DbError>;
 
     fn delete_ue_collateral(
@@ -1304,6 +1315,7 @@ pub trait DatabaseCore {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<(), DbError>;
 
     // Token balances
@@ -1914,12 +1926,17 @@ impl DatabaseCore for HeedDb {
 
     fn add_ue_collateral(&self, txn: &mut RwTxn, collateral: &UeCollateral) -> Result<(), DbError> {
         let db = self.ue_collaterals_db()?;
-        let key = ue_collateral_key(collateral.subnet_id, collateral.join_txid);
+        let key = ue_collateral_key(
+            collateral.subnet_id,
+            collateral.join_txid,
+            &collateral.pubkey,
+        );
         db.put(txn, &key, collateral)?;
         let pending = ue_pending_key(
             collateral.subnet_id,
             collateral.timeout,
             collateral.join_txid,
+            &collateral.pubkey,
         );
         if collateral.removed {
             db.delete(txn, &pending)?;
@@ -1933,12 +1950,13 @@ impl DatabaseCore for HeedDb {
         &self,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<Option<UeCollateral>, DbError> {
         let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
             return Ok(None);
         };
         let rtxn = self.env.read_txn()?;
-        let key = ue_collateral_key(subnet_id, join_txid);
+        let key = ue_collateral_key(subnet_id, join_txid, pubkey);
         Ok(db.get(&rtxn, &key)?)
     }
 
@@ -1985,9 +2003,10 @@ impl DatabaseCore for HeedDb {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<(), DbError> {
         let db = self.ue_collaterals_db()?;
-        let key = ue_collateral_key(subnet_id, join_txid);
+        let key = ue_collateral_key(subnet_id, join_txid, pubkey);
         let mut collateral = db
             .get(txn, &key)?
             .ok_or_else(|| DbError::KeyValueNotFound(key.clone()))?;
@@ -1995,7 +2014,7 @@ impl DatabaseCore for HeedDb {
         db.put(txn, &key, &collateral)?;
         db.delete(
             txn,
-            &ue_pending_key(subnet_id, collateral.timeout, join_txid),
+            &ue_pending_key(subnet_id, collateral.timeout, join_txid, pubkey),
         )?;
         Ok(())
     }
@@ -2005,13 +2024,14 @@ impl DatabaseCore for HeedDb {
         txn: &mut RwTxn,
         subnet_id: SubnetId,
         join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
     ) -> Result<(), DbError> {
         let db = self.ue_collaterals_db()?;
-        let key = ue_collateral_key(subnet_id, join_txid);
+        let key = ue_collateral_key(subnet_id, join_txid, pubkey);
         if let Some(collateral) = db.get(txn, &key)? {
             db.delete(
                 txn,
-                &ue_pending_key(subnet_id, collateral.timeout, join_txid),
+                &ue_pending_key(subnet_id, collateral.timeout, join_txid, pubkey),
             )?;
         }
         db.delete(txn, &key)?;
@@ -2182,7 +2202,7 @@ pub mod tests {
         assert_eq!(reader.get_ue_activation_height().unwrap(), None);
         assert_eq!(
             reader
-                .get_ue_collateral(subnet_id, collateral.join_txid)
+                .get_ue_collateral(subnet_id, collateral.join_txid, &collateral.pubkey)
                 .unwrap(),
             None
         );
@@ -2194,9 +2214,7 @@ pub mod tests {
 
         drop(reader);
 
-        // The writer creates the tables; a reader opened before that finds them on its next
-        // use (a provider restarted before the monitor). One process cannot hold the
-        // environment twice, so the reader's cached handles are cleared instead
+        // A reader opened before the writer created the tables finds them on its next use
         let writer = open_db(path, false).unwrap();
         let mut txn = writer.write_txn().unwrap();
         writer.add_ue_collateral(&mut txn, &collateral).unwrap();
@@ -2204,7 +2222,7 @@ pub mod tests {
         writer.set_ue_activation_height(Some(7)).unwrap();
         assert_eq!(
             writer
-                .get_ue_collateral(subnet_id, collateral.join_txid)
+                .get_ue_collateral(subnet_id, collateral.join_txid, &collateral.pubkey)
                 .unwrap(),
             Some(collateral.clone())
         );
@@ -2251,7 +2269,8 @@ pub mod tests {
             vec![c.clone()]
         );
         assert_eq!(
-            db.get_ue_collateral(other_subnet, a.join_txid).unwrap(),
+            db.get_ue_collateral(other_subnet, a.join_txid, &a.pubkey)
+                .unwrap(),
             None
         );
 
@@ -2274,29 +2293,83 @@ pub mod tests {
             .is_empty());
 
         let mut txn = db.write_txn().unwrap();
-        db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid)
+        db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid, &a.pubkey)
             .unwrap();
         assert!(db
-            .set_ue_collateral_removed(&mut txn, subnet_id, create_rand_txid())
+            .set_ue_collateral_removed(&mut txn, subnet_id, create_rand_txid(), &a.pubkey)
             .is_err());
-        db.delete_ue_collateral(&mut txn, subnet_id, d.join_txid)
+        db.delete_ue_collateral(&mut txn, subnet_id, d.join_txid, &d.pubkey)
             .unwrap();
         txn.commit().unwrap();
         let pending = db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap();
         assert_eq!(pending, vec![b.clone()]);
-        assert_eq!(db.get_ue_collateral(subnet_id, d.join_txid).unwrap(), None);
+        assert_eq!(
+            db.get_ue_collateral(subnet_id, d.join_txid, &d.pubkey)
+                .unwrap(),
+            None
+        );
         assert!(
-            db.get_ue_collateral(subnet_id, a.join_txid)
+            db.get_ue_collateral(subnet_id, a.join_txid, &a.pubkey)
                 .unwrap()
                 .unwrap()
                 .removed
         );
         assert!(
-            !db.get_ue_collateral(subnet_id, b.join_txid)
+            !db.get_ue_collateral(subnet_id, b.join_txid, &b.pubkey)
                 .unwrap()
                 .unwrap()
                 .removed
         );
+    }
+
+    #[test]
+    fn test_ue_collaterals_of_one_reveal_are_kept_apart_by_key() {
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+        let a = test_ue_collateral(subnet_id);
+        let mut b = test_ue_collateral(subnet_id);
+        b.join_txid = a.join_txid;
+        b.timeout = a.timeout;
+
+        let mut txn = db.write_txn().unwrap();
+        db.add_ue_collateral(&mut txn, &a).unwrap();
+        db.add_ue_collateral(&mut txn, &b).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            db.get_ue_collateral(subnet_id, a.join_txid, &a.pubkey)
+                .unwrap(),
+            Some(a.clone())
+        );
+        assert_eq!(
+            db.get_ue_collateral(subnet_id, a.join_txid, &b.pubkey)
+                .unwrap(),
+            Some(b.clone())
+        );
+        assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 2);
+        assert_eq!(
+            db.get_pending_ue_collaterals(subnet_id, u32::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Removing one leaves the other pending; deleting it leaves the other stored
+        let mut txn = db.write_txn().unwrap();
+        db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid, &a.pubkey)
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap(),
+            vec![b.clone()]
+        );
+        let mut txn = db.write_txn().unwrap();
+        db.delete_ue_collateral(&mut txn, subnet_id, b.join_txid, &b.pubkey)
+            .unwrap();
+        txn.commit().unwrap();
+        let stored = db.get_ue_collaterals(subnet_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].pubkey == a.pubkey && stored[0].removed);
     }
 
     #[test]

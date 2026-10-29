@@ -128,8 +128,7 @@ expect result.removed_count = 5
 read withdrawals subnet1
 expect result.count = 4
 
-# a key that left stays in the current committee until a checkpoint rotates it out,
-# so it cannot join again before that (the checkpoint comes after step 3)
+# a key that left cannot join again: a key joins a subnet once
 block 175
 join-ue subnet1 validator1 100_000 300
 

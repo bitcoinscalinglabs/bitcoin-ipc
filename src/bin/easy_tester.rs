@@ -156,8 +156,10 @@ fn run_scenario<T: Tester>(
                 }
                 working_height = height;
             }
-            ScenarioCommand::Create { subnet_name } => {
-                tester.exec_create_subnet(working_height, &subnet_name).map_err(annotate)?;
+            ScenarioCommand::Create { subnet_name, shape } => {
+                tester
+                    .exec_create_subnet(working_height, &subnet_name, shape)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::Join {
                 subnet_name,
@@ -173,42 +175,39 @@ fn run_scenario<T: Tester>(
             }
             ScenarioCommand::JoinUe {
                 subnet_name,
-                validator_name,
-                collateral_sats,
-                timeout,
+                joins,
+                shape,
             } => {
                 tester
-                    .exec_join_ue(
-                        working_height,
-                        &subnet_name,
-                        &validator_name,
-                        collateral_sats,
-                        timeout,
-                    )
+                    .exec_join_ue(working_height, &subnet_name, &joins, shape)
                     .map_err(annotate)?;
             }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
                 amount_sats,
+                raw,
             } => {
                 tester.exec_stake_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     amount_sats,
+                    raw,
                 ).map_err(annotate)?;
             }
             ScenarioCommand::Unstake {
                 subnet_name,
                 validator_name,
                 amount_sats,
+                raw,
             } => {
                 tester.exec_unstake_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     amount_sats,
+                    raw,
                 ).map_err(annotate)?;
             }
             ScenarioCommand::UnstakeUe {
@@ -219,8 +218,10 @@ fn run_scenario<T: Tester>(
                     .exec_unstake_ue(working_height, &subnet_name, &validator_name)
                     .map_err(annotate)?;
             }
-            ScenarioCommand::Checkpoint { subnet_name } => {
-                tester.exec_checkpoint_subnet(working_height, &subnet_name).map_err(annotate)?;
+            ScenarioCommand::Checkpoint { subnets, shape } => {
+                tester
+                    .exec_checkpoint(working_height, &subnets, shape)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::RegisterToken {
                 subnet_name,

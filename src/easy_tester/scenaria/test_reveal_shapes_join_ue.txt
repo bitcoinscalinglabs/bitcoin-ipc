@@ -1,0 +1,87 @@
+# The monitor reads a join-ue from any input of a reveal: the data input first, last, in the
+# middle, with inputs that carry no message before and after, several joins in one reveal for
+# one subnet and for two, a duplicate key inside one reveal, and a reveal with other outputs.
+# Run with testers/db-ue.txt or testers/monitor-ue.txt.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+validator7
+validator8
+validator9
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+create subnet2
+
+# Four joins in one reveal, with an input before and one after: data inputs 1 to 4 of 6
+block 110
+join-ue subnet1 validator1 100_000 400 validator2 100_000 400 validator3 100_000 400 validator4 100_000 400 @inputs-around
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+read ue_collaterals subnet1
+expect result.count = 4
+read subnet_genesis subnet1
+expect result.bootstrapped = true
+# The data input last
+join-ue subnet1 validator5 100_000 400 @input-before
+
+block 113
+read validators subnet1
+expect result.count = 5
+# The data input first, with an input after it
+join-ue subnet1 validator6 100_000 400 @input-after
+
+block 114
+read validators subnet1
+expect result.count = 6
+# A rebuilt reveal with other outputs
+join-ue subnet1 validator7 100_000 400 @other-output
+
+block 115
+read validators subnet1
+expect result.count = 7
+# The same key twice in one reveal, inputs reversed: one join accepted
+join-ue subnet1 validator8 100_000 400 validator8 100_000 400 @reversed
+
+block 116
+read validators subnet1
+expect result.count = 8
+expect result.names = validator1,validator2,validator3,validator4,validator5,validator6,validator7,validator8
+read ue_collaterals subnet1
+expect result.count = 8
+expect result.validator8.count = 1
+# One reveal for two subnets: subnet2 bootstraps and validator9 joins subnet1
+join-ue subnet2 validator1 100_000 400 validator2 100_000 400 subnet1:validator9 100_000 400 validator3 100_000 400 validator4 100_000 400 @inputs-around
+
+block 118
+read validators subnet2
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+read ue_collaterals subnet2
+expect result.count = 4
+read validators subnet1
+expect result.count = 9
+read ue_collaterals subnet1
+expect result.count = 9
+expect result.validator9.count = 1
+read subnet_genesis subnet2
+expect result.bootstrapped = true

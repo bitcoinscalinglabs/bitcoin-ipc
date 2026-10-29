@@ -77,6 +77,37 @@ pub fn read_validators<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
+/// `read subnet_genesis <subnet>`. Fields: `exists`, and when the subnet exists
+/// `bootstrapped`, `min_validators` and `genesis_validators` (the joins accepted before
+/// bootstrap).
+pub fn read_subnet_genesis<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    subnet_name: &str,
+) -> Result<UeRead, EasyTesterError> {
+    let mut fields = BTreeMap::new();
+    match db.get_subnet_genesis_info(subnet_id).map_err(db_err)? {
+        Some(info) => {
+            fields.insert("exists".to_string(), "true".to_string());
+            fields.insert("bootstrapped".to_string(), info.bootstrapped.to_string());
+            fields.insert(
+                "min_validators".to_string(),
+                info.create_subnet_msg.min_validators.to_string(),
+            );
+            fields.insert(
+                "genesis_validators".to_string(),
+                info.genesis_validators.len().to_string(),
+            );
+        }
+        None => {
+            fields.insert("exists".to_string(), "false".to_string());
+        }
+    }
+    let what = format!("subnet_genesis {subnet_name}");
+    print_read(&what, &fields);
+    Ok(UeRead { what, fields })
+}
+
 /// `read ue_collaterals <subnet>`. Fields: `count`, `removed_count`, and per validator
 /// `<name>.count` (records of that key) and, for its record with the largest timeout,
 /// `<name>.value`, `<name>.timeout`, `<name>.removed`.

@@ -5,7 +5,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::{ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
+use crate::{bitcoin_utils::RevealShape, ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
 
 #[derive(Debug, Clone)]
 pub struct ValidatorSpec {
@@ -107,6 +107,16 @@ pub enum OutputDb {
     Withdrawals,
 }
 
+/// One join of a `join-ue` line: the collateral matures at `timeout`. `subnet_name` is set
+/// when the join targets another subnet than the line's (`<subnet>:<validator>`)
+#[derive(Debug, Clone)]
+pub struct JoinUeSpec {
+    pub subnet_name: Option<String>,
+    pub validator_name: String,
+    pub collateral_sats: u64,
+    pub timeout: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum ScenarioCommand {
     Block {
@@ -114,36 +124,41 @@ pub enum ScenarioCommand {
     },
     Create {
         subnet_name: String,
+        shape: RevealShape,
     },
     Join {
         subnet_name: String,
         validator_name: String,
         collateral_sats: u64,
     },
-    /// Join with the collateral under the unilateral-exit script, maturing at `timeout`
+    /// Join under the unilateral-exit script; several joins go in one reveal, in order
     JoinUe {
         subnet_name: String,
-        validator_name: String,
-        collateral_sats: u64,
-        timeout: u64,
+        joins: Vec<JoinUeSpec>,
+        shape: RevealShape,
     },
+    /// `raw`: the transaction is hand-built and submitted without the provider
     Stake {
         subnet_name: String,
         validator_name: String,
         amount_sats: u64,
+        raw: bool,
     },
     Unstake {
         subnet_name: String,
         validator_name: String,
         amount_sats: u64,
+        raw: bool,
     },
     /// Spend the validator's matured unilateral-exit collaterals to its backup address
     UnstakeUe {
         subnet_name: String,
         validator_name: String,
     },
+    /// One checkpoint per subnet; their batch transfers go in one reveal, in `shape`
     Checkpoint {
-        subnet_name: String,
+        subnets: Vec<String>,
+        shape: RevealShape,
     },
     /// Register an ERC20 token on a subnet (queues ETR for next checkpoint).
     /// `issuer` is only set for FendermintTester scenarios.

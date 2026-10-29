@@ -1,5 +1,5 @@
-# Unilateral exit end to end: a checkpoint after a removal, the key joining again after
-# that checkpoint, and `unstake-ue` spending the matured collateral.
+# Unilateral exit end to end: a checkpoint after a removal, the key refused when it joins
+# again after that checkpoint, and `unstake-ue` spending the matured collateral.
 #
 # Monitor tester only (testers/monitor-ue.txt): the exit spends real outputs and
 # `spent_count` reads the chain. `block N` means what follows goes into block N.
@@ -68,20 +68,19 @@ expect result.waiting = false
 read withdrawals subnet1
 expect result.count = 0
 
-# the key joins again once the checkpoint rotated it out
+# a key joins a subnet once: the second join-ue is refused even after the rotation
 join-ue subnet1 validator1 120_000 200
 
 block 137
 read validators subnet1
-expect result.names = validator1,validator2,validator3,validator4
-expect result.waiting = true
+expect result.names = validator2,validator3,validator4
+expect result.waiting = false
 read ue_collaterals subnet1
-expect result.validator1.count = 2
-expect result.validator1.timeout = 200
-expect result.validator1.removed = false
+expect result.validator1.count = 1
+expect result.validator1.removed = true
 expect result.validator1.spent_count = 1
 
-# a further call spends nothing: the new collateral is not matured
+# a further call spends nothing: the only collateral is already spent
 unstake-ue subnet1 validator1
 
 block 139

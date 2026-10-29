@@ -19,7 +19,7 @@ set -euo pipefail
 #   6 traffic      a withdrawal and a deposit go through a checkpoint; unstake and unstake-ue refused
 #   7 removal      at block T5 - 1 the monitor removes validator 5; the next checkpoint rotates it out
 #   8 exit         at tip T5 unstake-ue pays the backup address
-#   9 rejoin       validator 5 joins again and is rotated in
+#   9 rejoin       validator 5 is refused when it joins again (a key joins a subnet once)
 #  10 steady       two more checkpoints and a deposit
 # Durations: about 30 minutes, dominated by LOCK_V5.
 
@@ -301,13 +301,13 @@ step_exit() {
 }
 
 step_rejoin() {
-  say "9. validator 5 joins again after the rotation"
-  local cfg_before; cfg_before=$(config_number)
-  join_ue 5 "$LOCK_V5"
+  say "9. validator 5 cannot join again after the rotation: a key joins a subnet once"
+  expect_fail "second join-ue of validator5 refused by the provider" cli 5 subnet join-ue --from "$(evm 5)" \
+    --subnet "$SUBNET" --collateral "$COLLATERAL" --ip "${IP_PREFIX}4" --backup-address "${BACKUP[5]}" \
+    --lock-blocks "$LOCK_V5"
   wait_blocks 1
-  wait_rotation "$cfg_before"
-  list_validators
-  check "committee of 5 again" [ "$(committee_size)" -eq 5 ]
+  check "committee still of 4" [ "$(committee_size)" -eq 4 ]
+  check "no waiting committee" [ "$(waiting_size)" -eq 0 ]
 }
 
 step_steady() {

@@ -687,6 +687,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "postcard",
+ "proptest",
  "rand 0.8.5",
  "reqwest",
  "serde",

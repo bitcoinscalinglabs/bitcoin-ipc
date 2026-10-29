@@ -189,7 +189,7 @@ pub async fn join_subnet(
     let msg: IpcJoinSubnetMsg = req.into();
     info!("joinsubnet: {:?} lock_blocks={:?}", msg, lock_blocks);
 
-    // A join-ue is refused by the activation switch before anything else is validated
+    // The activation switch is checked before any validation
     let tip = match lock_blocks {
         Some(_) => {
             let tip = data
@@ -248,10 +248,9 @@ pub async fn join_subnet(
     Ok(JoinSubnetResponse { join_txid })
 }
 
-/// The join-ue path of `joinsubnet`: the collateral is locked under the validator's own
-/// unilateral-exit script, maturing at `T = tip + lock_blocks`. Only this provider's
-/// validator can join this way, since the message carries its signature. The caller has
-/// checked the activation switch at `tip`.
+/// The join-ue path of `joinsubnet`: the join signed by this provider's validator key, with
+/// `T = tip + lock_blocks` and `lock_blocks` at least 3. The caller has checked the
+/// activation switch at `tip`.
 fn join_subnet_ue(
     data: &ServerData,
     join: IpcJoinSubnetMsg,
@@ -282,6 +281,9 @@ fn join_subnet_ue(
         .and_then(|t| u32::try_from(t).ok())
         .ok_or_else(|| invalid(format!("tip {tip} + lock_blocks {lock_blocks} overflows")))?;
 
+    collateral::refuse_earlier_join(&*data.db, join.subnet_id, &join.pubkey, None)
+        .map_err(|e| invalid(e.to_string()))?;
+
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk);
     msg.validate().map_err(|e| invalid(e.to_string()))?;
@@ -291,8 +293,8 @@ fn join_subnet_ue(
         .map_err(|e| JsonRpcError::internal(e.to_string()))
 }
 
-/// The switch of C37: `join-ue` and `unstakeue` are refused while `UE_ACTIVATION_HEIGHT` is
-/// unset or above the tip.
+/// The activation switch: `join-ue` and `unstakeue` are refused while `UE_ACTIVATION_HEIGHT`
+/// is unset or above the tip.
 fn check_ue_active(activation: Option<u64>, tip: u64) -> Result<(), String> {
     match activation {
         Some(activation) if activation <= tip => Ok(()),
@@ -306,8 +308,8 @@ fn check_ue_active(activation: Option<u64>, tip: u64) -> Result<(), String> {
     }
 }
 
-/// The members of `committee` that joined with `join-ue`: their collateral is outside the
-/// multisig, so no checkpoint output pays it.
+/// The members of `committee` that joined with `join-ue`: the rotation and kill checkpoints
+/// pay them nothing.
 fn ue_members(
     db: &db::HeedDb,
     subnet_id: SubnetId,
@@ -340,7 +342,7 @@ fn kill_unstakes(
 }
 
 /// The unstake outputs of a rotation: one per Withdraw stake change of a member of
-/// `committee`, none for a UE member (its removal withdraws nothing from the multisig).
+/// `committee`, none for a UE member.
 fn rotation_unstakes(
     stake_changes: &[db::StakeChangeRequest],
     committee: &db::SubnetCommittee,
@@ -379,8 +381,7 @@ fn rotation_unstakes(
         .collect()
 }
 
-/// The error of `stakecollateral` and `unstakecollateral` for a UE validator: its
-/// collateral is in its own output, not in the multisig, and leaves it only by `unstakeue`.
+/// The error of `stakecollateral` and `unstakecollateral`, which are refused for a UE validator.
 fn refuse_ue_member(
     db: &db::HeedDb,
     subnet_id: SubnetId,
@@ -1962,10 +1963,8 @@ pub struct UnstakeUeResponse {
 }
 
 /// Spends this validator's matured join-ue collaterals in `subnet_id` to its backup address
-/// in one transaction that no other validator takes part in. A collateral is matured when its
-/// timeout `T` is at most the tip; the transaction is accepted from tip `T` and mined from block
-/// `T + 1`. One call spends the matured collaterals of one backup address, that of the latest
-/// matured record; a further call spends the rest, if any.
+/// in one transaction: those paying the backup address of the latest matured record; a
+/// further call spends the rest, if any.
 pub async fn unstake_ue(
     data: Data<Arc<ServerData>>,
     Params(params): Params<UnstakeUeParams>,
@@ -2497,8 +2496,7 @@ mod ue_tests {
         }
     }
 
-    /// `stakecollateral` and `unstakecollateral` are refused for a member whose join
-    /// has a UE record under its key, and only for it.
+    /// `stakecollateral` and `unstakecollateral` are refused for a UE member, and only for it.
     #[test]
     fn refuses_ue_members_only() {
         let db = create_test_db();
@@ -2536,8 +2534,7 @@ mod ue_tests {
         refuse_ue_member(&db, subnet_id, &committee, &outsider).unwrap();
     }
 
-    /// A rotation pays a Withdraw of an ordinary member, none of a UE member, none of a
-    /// key outside the committee; a kill pays every ordinary member and no UE member.
+    /// A rotation pays only ordinary members' withdrawals; a kill pays only ordinary members.
     #[test]
     fn checkpoint_outputs_skip_ue_members() {
         use crate::db::{StakeChangeRequest, StakingChange};

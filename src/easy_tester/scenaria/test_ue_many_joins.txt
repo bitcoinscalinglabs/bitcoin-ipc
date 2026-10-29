@@ -1,5 +1,5 @@
 # Seven validators joining with join-ue and staggered timeouts: some mature while others
-# hold, two in the same block, one tries to join again after leaving.
+# hold, two in the same block, one is refused when it tries to join again after leaving.
 # Run with testers/db-ue.txt or testers/monitor-ue.txt. A removal at T - 1 is visible at `block T`.
 # No checkpoint after a removal here: the provider must first learn to skip UE payouts.
 
@@ -106,8 +106,7 @@ block 170
 read validators subnet1
 expect result.names = validator4,validator7
 
-# validator1 cannot join again while the current committee still holds it: only the
-# checkpoint that rotates it out frees its key (that checkpoint comes after step 3)
+# validator1 cannot join again: a key joins a subnet once
 block 180
 join-ue subnet1 validator1 100_000 400
 

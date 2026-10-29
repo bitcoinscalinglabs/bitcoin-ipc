@@ -559,9 +559,8 @@ where
         block_hash: BlockHash,
         block: Block,
     ) -> Result<(), MonitorError> {
-        // UE validators leave the committee one block before their collateral matures. The
-        // pass runs before the block's transactions, on the state the previous block left,
-        // so that a block replayed after a crash gives the same result.
+        // Join-ue validators leave the next committee one block before their collateral
+        // matures: the pass runs before the block's transactions, on the previous block's state
         if self.ue_active(block_height) {
             for removal in
                 collateral::remove_matured_ue_validators(&self.db, block_height, block_hash)?
@@ -591,43 +590,21 @@ where
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
 
-        // Process inputs
+        // Inputs: one message per input that executes a data leaf, in input order
 
-        for input in &tx.input {
-            // TODO check more efficiently if witness has IPC tag
-            for witness in input.witness.iter().filter(|w| !w.is_empty()) {
-                // Reconstruct the witness data
-                let witness_data = match bitcoin_utils::concatenate_op_push_data(witness) {
-                    Ok(data) => data,
-                    Err(_) => {
-                        continue;
-                    }
-                };
+        for (_, ipc_message) in IpcMessage::from_reveal_inputs(tx) {
+            // join-ue is ignored while unilateral exit is not active
+            if matches!(ipc_message, IpcMessage::JoinUe { .. }) && !self.ue_active(block_height) {
+                trace!("Skipping join-ue: unilateral exit is not active at this height");
+                continue;
+            }
 
-                // join-ue is not parsed at all while unilateral exit is not active
-                if witness_data.starts_with(ipc_lib::IPC_JOIN_UE_TAG.as_bytes())
-                    && !self.ue_active(block_height)
-                {
-                    trace!("Skipping join-ue: unilateral exit is not active at this height");
-                    continue;
-                }
-
-                let ipc_message = IpcMessage::from_witness(witness_data);
-                let ipc_message = match ipc_message {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        trace!("Error deserializing IPC message: {:?}", e);
-                        continue;
-                    }
-                };
-
-                match self
-                    .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => self.handle_ipc_msg_error(e)?,
-                }
+            match self
+                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(e)?,
             }
         }
 
@@ -658,16 +635,6 @@ where
             ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, tx)
         {
             let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
-
-            match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
-            }
-        } else if let Ok(msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx) {
-            let ipc_message = IpcMessage::BatchTransfer(msg);
 
             match self
                 .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
@@ -871,43 +838,11 @@ where
 
             IpcMessage::BatchTransfer(mut msg) => {
                 debug!("Found IPC message: {:#?}", msg);
-
-                msg.validate()?;
-
-                // Get checkpoint tx and parse as msg
-
-                let checkpoint_tx = self.db.get_transaction(&msg.checkpoint_txid)
-                    .map_err(MonitorError::DbError)?
-                    .ok_or_else(|| {
-                        MonitorError::IpcTxInvalid(format!(
-                            "Can't get Checkpoint Txid {} for BatchTransferMsg: not found in database",
-                            msg.checkpoint_txid
-                        ))
-                    })?;
-
-                let checkpoint_msg =
-                    ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, &checkpoint_tx)
-                        .map_err(|e| {
-                        MonitorError::IpcTxInvalid(format!(
-                            "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
-                        ))
-                    })?;
-
-                trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
-
-                checkpoint_msg.validate()?;
-                msg.validate_for_checkpoint(&checkpoint_tx)?;
-                msg.subnet_id = checkpoint_msg.subnet_id;
-
-                // Save to DB
-
-                msg.save_to_db(&self.db, block_height, block_hash, txid)?;
-
+                msg.process(&self.db, block_height, block_hash, txid)?;
                 info!(
                     "Processed BatchTransfer for Subnet ID: {} Checkpoint Txid: {}",
                     msg.subnet_id, msg.checkpoint_txid,
                 );
-
                 Ok(())
             }
 
@@ -937,27 +872,18 @@ where
                 Ok(())
             }
 
-            IpcMessage::JoinUe(msg) => {
-                debug!("Found IPC message: {:?}", msg);
+            IpcMessage::JoinUe { input, msg } => {
+                debug!("Found IPC message in input {}: {:?}", input, msg);
 
-                // The join-ue of a transaction is the one in the leaf of input 0; the scan
-                // finds messages in every witness element, so a copy elsewhere is not processed
-                let data = collateral::join_ue_leaf_data(tx)
-                    .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
-                let commit_txid = tx.input[0].previous_output.txid;
-                // The commit is usually in the same block (submitted as a package); an older
-                // one needs bitcoind's -txindex
+                // A commit in an older block needs bitcoind's -txindex
+                let commit_txid = tx.input[input].previous_output.txid;
                 let commit = self
                     .rpc
                     .get_raw_transaction(&commit_txid, Some(&block_hash))
                     .or_else(|_| self.rpc.get_raw_transaction(&commit_txid, None))?;
                 let secp = bitcoin::secp256k1::Secp256k1::new();
-                let checked = collateral::check_join_ue(&secp, tx, &commit, &data, block_height)
+                let checked = collateral::check_join_ue(&secp, tx, input, &commit, block_height)
                     .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
-                if checked.msg.signature != msg.signature {
-                    debug!("Ignoring a join-ue message outside the leaf of input 0");
-                    return Ok(());
-                }
 
                 if let Some(subnet) =
                     collateral::process_join_ue(&self.db, &checked, txid, block_height, block_hash)?
