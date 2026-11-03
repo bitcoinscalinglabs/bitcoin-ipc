@@ -39,8 +39,8 @@ const TOKEN_BALANCE_KEY: &str = "token_balance:";
 // Number of LMDB databases (`heed::Database`) we open/create in this environment.
 const MAX_DBS: u32 = 14;
 
-// LMDB map size: maximum virtual address space for the environment (1 GiB).
-const MAP_SIZE: usize = 1_073_741_824;
+// LMDB map size: maximum virtual address space for the environment (10 GiB).
+const MAP_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
 // Kill request validity duration in blocks
 #[cfg(feature = "dev")]
