@@ -2425,19 +2425,6 @@ impl IpcCheckpointSubnetMsg {
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<db::SubnetCheckpoint, IpcLibError> {
-        // Replay of a block interrupted after this checkpoint was saved: return the existing
-        // record instead of saving it again under the next number.
-        let last_number = db
-            .get_subnet_state(self.subnet_id)?
-            .and_then(|state| state.last_checkpoint_number);
-        if let Some(n) = last_number {
-            if let Some(last) = db.get_checkpoint(self.subnet_id, n)? {
-                if last.txid == txid {
-                    return Ok(last);
-                }
-            }
-        }
-
         // Get the current subnet state
         let mut subnet_state = db.get_subnet_state(self.subnet_id)?.ok_or_else(|| {
             IpcValidateError::InvalidMsg(format!("Subnet ID {} does not exist", self.subnet_id))
@@ -5702,40 +5689,6 @@ mod checkpoint_msg_tests {
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
         }
-    }
-
-    #[test]
-    fn test_checkpoint_save_to_db_replay_keeps_number() {
-        use crate::db::DatabaseCore;
-
-        let db = test_utils::create_test_db();
-        let subnet = test_utils::generate_subnet(3);
-        let mut wtxn = db.write_txn().unwrap();
-        db.save_subnet_state(&mut wtxn, subnet.id, &subnet).unwrap();
-        wtxn.commit().unwrap();
-
-        let mut msg = create_test_checkpoint_msg();
-        msg.subnet_id = subnet.id;
-        msg.next_committee_configuration_number = 0; // no rotation
-        let block_hash = test_utils::create_rand_blockhash();
-        let txid = test_utils::create_rand_txid();
-
-        let first = msg.save_to_db(&db, 100, block_hash, txid).unwrap();
-
-        // The monitor replays a block that crashed after this checkpoint was saved.
-        let replay = msg.save_to_db(&db, 100, block_hash, txid).unwrap();
-        assert_eq!(replay.checkpoint_number, first.checkpoint_number);
-        let state = db.get_subnet_state(subnet.id).unwrap().unwrap();
-        assert_eq!(state.last_checkpoint_number, Some(first.checkpoint_number));
-        assert!(db
-            .get_checkpoint(subnet.id, first.checkpoint_number + 1)
-            .unwrap()
-            .is_none());
-
-        // A new checkpoint transaction still takes the next number.
-        let next_txid = test_utils::create_rand_txid();
-        let next = msg.save_to_db(&db, 101, block_hash, next_txid).unwrap();
-        assert_eq!(next.checkpoint_number, first.checkpoint_number + 1);
     }
 
     fn create_test_checkpoint_msg_multiple_transfers(n_transfers: usize) -> IpcCheckpointSubnetMsg {
