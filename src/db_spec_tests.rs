@@ -659,6 +659,11 @@ mod epoch_state {
 mod epoch_zero {
     use super::*;
     use crate::ipc_lib::{CheckpointSigner, IpcCheckpointSubnetMsg, IpcFundSubnetMsg, IpcMessage};
+    use crate::provider::rpc::{self, ServerData};
+    use base64::Engine;
+    use bitcoincore_rpc::{json::ListUnspentResultEntry, jsonrpc};
+    use jsonrpc_v2::{Data, Params};
+    use std::sync::{Arc, Mutex};
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -811,6 +816,179 @@ mod epoch_zero {
         }
     }
 
+    // Only Bitcoin Core is stubbed: the provider chooses the rotation flag, signing
+    // configuration, change address, sweep policy and deposit destination itself.
+    #[derive(Default)]
+    struct WalletState {
+        funds: Vec<ListUnspentResultEntry>,
+        submitted: Vec<bitcoin::Transaction>,
+    }
+
+    #[derive(Clone, Default)]
+    struct WalletRpc(Arc<Mutex<WalletState>>);
+
+    impl jsonrpc::client::Transport for WalletRpc {
+        fn send_request(
+            &self,
+            request: jsonrpc::Request,
+        ) -> Result<jsonrpc::Response, jsonrpc::Error> {
+            let args: Vec<serde_json::Value> = request
+                .params
+                .map(|p| serde_json::from_str(p.get()).unwrap())
+                .unwrap_or_default();
+            let result = match request.method {
+                "estimatesmartfee" => serde_json::json!({"feerate": 0.0001, "blocks": 6}),
+                "listunspent" => {
+                    let addresses: Vec<String> = serde_json::from_value(args[2].clone()).unwrap();
+                    let state = self.0.lock().unwrap();
+                    serde_json::to_value(
+                        state
+                            .funds
+                            .iter()
+                            .filter(|fund| {
+                                addresses.contains(
+                                    &fund
+                                        .address
+                                        .as_ref()
+                                        .unwrap()
+                                        .clone()
+                                        .assume_checked()
+                                        .to_string(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                }
+                "fundrawtransaction" => {
+                    // Wallet templates have no inputs and use legacy serialization. Decode
+                    // their fields separately, then provide a synthetic wallet input.
+                    use bitcoin::consensus::Decodable;
+                    let bytes = hex::decode(args[0].as_str().unwrap()).unwrap();
+                    let mut cursor = bitcoin::io::Cursor::new(bytes);
+                    let mut tx = bitcoin::Transaction {
+                        version: Decodable::consensus_decode(&mut cursor).unwrap(),
+                        input: Decodable::consensus_decode(&mut cursor).unwrap(),
+                        output: Decodable::consensus_decode(&mut cursor).unwrap(),
+                        lock_time: Decodable::consensus_decode(&mut cursor).unwrap(),
+                    };
+                    assert!(tx.input.is_empty());
+                    tx.input.push(bitcoin::TxIn {
+                        previous_output: OutPoint::new(Txid::from_byte_array([0xfd; 32]), 0),
+                        ..Default::default()
+                    });
+                    serde_json::json!({
+                        "hex": bitcoin::consensus::encode::serialize_hex(&tx),
+                        "fee": 0.00001,
+                        "changepos": -1
+                    })
+                }
+                "signrawtransactionwithwallet" => {
+                    serde_json::json!({"hex": args[0], "complete": true})
+                }
+                "testmempoolaccept" => {
+                    let hexes: Vec<String> = serde_json::from_value(args[0].clone()).unwrap();
+                    serde_json::json!(hexes
+                        .iter()
+                        .map(|raw| {
+                            let tx: bitcoin::Transaction =
+                                bitcoin::consensus::deserialize(&hex::decode(raw).unwrap())
+                                    .unwrap();
+                            serde_json::json!({"txid": tx.compute_txid(), "allowed": true})
+                        })
+                        .collect::<Vec<_>>())
+                }
+                "sendrawtransaction" => {
+                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
+                        &hex::decode(args[0].as_str().unwrap()).unwrap(),
+                    )
+                    .unwrap();
+                    let txid = tx.compute_txid();
+                    self.0.lock().unwrap().submitted.push(tx);
+                    serde_json::json!(txid)
+                }
+                method => panic!("unexpected Bitcoin RPC method: {method}"),
+            };
+            Ok(jsonrpc::Response {
+                result: Some(jsonrpc::arg(result)),
+                error: None,
+                id: request.id,
+                jsonrpc: Some("2.0".into()),
+            })
+        }
+
+        fn send_batch(
+            &self,
+            requests: &[jsonrpc::Request],
+        ) -> Result<Vec<jsonrpc::Response>, jsonrpc::Error> {
+            requests
+                .iter()
+                .cloned()
+                .map(|r| self.send_request(r))
+                .collect()
+        }
+
+        fn fmt_target(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("spec-test wallet")
+        }
+    }
+
+    fn fund_utxos(address: &Address, count: u8) -> Vec<ListUnspentResultEntry> {
+        (0..count)
+            .map(|n| ListUnspentResultEntry {
+                txid: Txid::from_byte_array([n; 32]),
+                vout: 1,
+                address: Some(address.clone().into_unchecked()),
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: address.script_pubkey(),
+                amount: Amount::from_sat(10_000_000),
+                confirmations: 10,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            })
+            .collect()
+    }
+
+    fn provider(f: Fixture, wallet: &WalletRpc) -> (tempfile::TempDir, Arc<ServerData>) {
+        let client = Arc::new(bitcoincore_rpc::Client::from_jsonrpc(
+            jsonrpc::Client::with_transport(wallet.clone()),
+        ));
+        (
+            f._dir,
+            Arc::new(ServerData {
+                db: Arc::new(f.db),
+                btc_rpc: client.clone(),
+                btc_watchonly_rpc: client,
+                validator: Some((pubkey(1), secret(1))),
+                eots: None,
+                eots_signer: None,
+            }),
+        )
+    }
+
+    async fn provider_checkpoint(
+        data: &Arc<ServerData>,
+        msg: IpcCheckpointSubnetMsg,
+    ) -> bitcoin::Psbt {
+        let response = rpc::gen_checkpoint_psbt(Data::new(data.clone()), Params(msg))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "checkpoint RPC failed: {}",
+                    serde_json::to_string(&e).unwrap()
+                )
+            });
+        let response = serde_json::to_value(response).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response["unsigned_psbt_base64"].as_str().unwrap())
+            .unwrap();
+        bitcoin::Psbt::deserialize(&bytes).unwrap()
+    }
+
     // lifecycle.md, Epoch 0 / checkpoint.md, Before activation: a checkpoint of epoch 0 is a regular checkpoint of C_wlist and activates nothing.
     #[tokio::test]
     async fn an_epoch_zero_checkpoint_is_recorded_as_a_regular_checkpoint_of_c_wlist() {
@@ -876,6 +1054,208 @@ mod epoch_zero {
         assert_eq!(state.committee.validators.len(), 4);
         assert!(state.committee.validators.iter().all(|v| v.power == 1));
         assert!(f.db.get_all_stake_changes(f.id).unwrap().is_empty());
+    }
+
+    // lifecycle.md:118,146,156 / checkpoint.md:35,66-67 / deposit.md:12,25:
+    // C_1 == C_gen still requires epoch 1's flagged sweep from C_wlist, while a
+    // deposit after H_0 already pays C_1, before that rotation is recorded.
+    #[tokio::test]
+    async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_gen() {
+        let f = Fixture::new([135; 4]).await;
+        let first = f.message(&[1, 2, 3, 4]);
+        let (tx, reveal) = f.transactions(&first);
+        f.accept(&first, &tx, 110);
+        f.reveal(&reveal, 111).unwrap();
+        f.cutoff(111);
+
+        let id = f.id;
+        let state = f.state();
+        assert_eq!(state.h_0, Some(111));
+        assert_eq!(state.epoch, 1);
+        assert_eq!(state.last_rotation_epoch, 0);
+        let g = f.db.get_subnet_genesis_info(id).unwrap().unwrap();
+        let c_gen = g.to_subnet().committee;
+        let c_one = state.latest_committee().clone();
+        assert_eq!(
+            c_one.validator_weighted_keys(),
+            c_gen.validator_weighted_keys()
+        );
+        assert_eq!(c_one.threshold, c_gen.threshold);
+        assert_eq!(c_one.multisig_address, c_gen.multisig_address);
+        assert_eq!(c_one.configuration_number, 0);
+        assert!(f.db.get_all_stake_changes(id).unwrap().is_empty());
+        let whitelist = f.signer().address;
+        let destination = c_one.address_checked();
+        assert_ne!(whitelist, destination);
+        let funds = fund_utxos(&whitelist, 3);
+        let wallet = WalletRpc::default();
+        wallet.0.lock().unwrap().funds = funds.clone();
+        let mut request = f.message(&[]);
+        request.checkpoint_height = 60;
+        request.change_address = None;
+        let (_dir, data) = provider(f, &wallet);
+
+        rpc::fund_subnet(
+            Data::new(data.clone()),
+            Params(IpcFundSubnetMsg {
+                subnet_id: id,
+                amount: Amount::from_sat(555_000),
+                address: alloy_primitives::Address::from([7; 20]),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("deposit RPC failed: {}", serde_json::to_string(&e).unwrap()));
+        {
+            let state = wallet.0.lock().unwrap();
+            assert_eq!(state.submitted.len(), 1);
+            assert_eq!(
+                state.submitted[0].output[1].value,
+                Amount::from_sat(555_000)
+            );
+            assert_eq!(
+                state.submitted[0].output[1].script_pubkey,
+                destination.script_pubkey()
+            );
+        }
+
+        let psbt = provider_checkpoint(&data, request).await;
+        let tx = &psbt.unsigned_tx;
+        assert_eq!(
+            tx.output[0].script_pubkey.as_bytes().last().copied(),
+            Some(0x04)
+        );
+        let actual: std::collections::BTreeSet<_> =
+            tx.input.iter().map(|i| i.previous_output).collect();
+        let expected: std::collections::BTreeSet<_> = funds
+            .iter()
+            .map(|u| OutPoint::new(u.txid, u.vout))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(tx.input.len(), funds.len());
+        assert!(psbt.inputs.iter().all(|i| {
+            i.witness_utxo.as_ref().unwrap().script_pubkey == whitelist.script_pubkey()
+        }));
+        assert_eq!(
+            tx.output.last().unwrap().script_pubkey,
+            destination.script_pubkey()
+        );
+        // Parse the supported wire format without asserting the unimplemented 77-byte layout.
+        let msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, tx).unwrap();
+        assert!(msg.is_rotation_checkpoint);
+        assert_eq!(msg.next_committee_configuration_number, 0);
+        let cp = msg
+            .save_to_db(
+                &*data.db,
+                113,
+                BlockHash::from_byte_array([113; 32]),
+                tx.compute_txid(),
+            )
+            .unwrap();
+        assert!(cp.is_rotation_checkpoint);
+        assert_eq!(cp.epoch, 1);
+        assert_eq!(
+            data.db
+                .get_subnet_state(id)
+                .unwrap()
+                .unwrap()
+                .last_rotation_epoch,
+            1
+        );
+        assert!(data.db.get_all_stake_changes(id).unwrap().is_empty());
+    }
+
+    // lifecycle.md:156,170 / checkpoint.md:35,66-67,102:
+    // unchanged C_2 gets a flagged rotation with the same change number, no new
+    // updates and no compulsory sweep of its unchanged multisig's fund UTXOs.
+    #[tokio::test]
+    async fn unchanged_epoch_has_a_flagged_rotation_without_updates_or_a_fund_sweep() {
+        let f = Fixture::new([1000; 4]).await;
+        let first = f.message(&[1, 2, 3, 4]);
+        let (tx, reveal) = f.transactions(&first);
+        f.accept(&first, &tx, 110);
+        f.reveal(&reveal, 111).unwrap();
+        f.cutoff(111);
+        rotation(&f, 4)
+            .save_to_db(
+                &f.db,
+                112,
+                BlockHash::from_byte_array([112; 32]),
+                Txid::from_byte_array([0x97; 32]),
+            )
+            .unwrap();
+        let changes = serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap();
+        let previous = f.state().committee;
+        f.cutoff(121);
+        let state = f.state();
+        assert_eq!(state.epoch, 2);
+        assert_eq!(state.last_rotation_epoch, 1);
+        assert_eq!(
+            state.latest_committee().multisig_address,
+            previous.multisig_address
+        );
+        assert_eq!(state.latest_committee().configuration_number, 4);
+        assert!(state.waiting_committee.is_none());
+        assert_eq!(
+            serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap(),
+            changes
+        );
+
+        let id = f.id;
+        let address = previous.address_checked();
+        let funds = fund_utxos(&address, 128);
+        let wallet = WalletRpc::default();
+        wallet.0.lock().unwrap().funds = funds.clone();
+        let mut request = f.message(&[]);
+        request.checkpoint_height = 90;
+        request.next_committee_configuration_number = 4;
+        request.change_address = None;
+        let (_dir, data) = provider(f, &wallet);
+        let psbt = provider_checkpoint(&data, request).await;
+        let tx = &psbt.unsigned_tx;
+        assert_eq!(
+            tx.output[0].script_pubkey.as_bytes().last().copied(),
+            Some(0x04)
+        );
+        assert!(!tx.input.is_empty());
+        // There are no payments here; fees fit comfortably in one fund UTXO.
+        // Leave room for routine consolidation without prescribing its limit or
+        // which UTXOs it chooses; the unchanged multisig must not force all of them.
+        assert!(
+            tx.input.len() < funds.len(),
+            "an unchanged multisig must not force a sweep"
+        );
+        assert!(tx.input.iter().all(|i| funds
+            .iter()
+            .any(|u| { i.previous_output == OutPoint::new(u.txid, u.vout) })));
+        assert_eq!(
+            tx.output.last().unwrap().script_pubkey,
+            address.script_pubkey()
+        );
+        let msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, tx).unwrap();
+        assert!(msg.is_rotation_checkpoint);
+        assert_eq!(msg.next_committee_configuration_number, 4);
+        let cp = msg
+            .save_to_db(
+                &*data.db,
+                122,
+                BlockHash::from_byte_array([122; 32]),
+                tx.compute_txid(),
+            )
+            .unwrap();
+        assert!(cp.is_rotation_checkpoint);
+        assert_eq!(cp.epoch, 2);
+        let state = data.db.get_subnet_state(id).unwrap().unwrap();
+        assert_eq!(state.last_rotation_epoch, 2);
+        assert_eq!(state.committee.configuration_number, 4);
+        assert_eq!(
+            serde_json::to_value(data.db.get_all_stake_changes(id).unwrap()).unwrap(),
+            changes
+        );
+        assert!(data
+            .db
+            .get_unconfirmed_stake_changes(id)
+            .unwrap()
+            .is_empty());
     }
 
     // deposit.md, Verifying 4 / user decision: epoch-0 deposits are recorded immediately at
@@ -1028,14 +1408,25 @@ mod epoch_zero {
         f.accept(&first, &tx, 110);
         f.reveal(&reveal, 111).unwrap();
         f.cutoff(111);
+        // Record epoch 1's rotation before H_1; its four updates are already applied
+        // when the epoch-2 checkpoint below carries the previous change number.
+        let epoch_one = rotation(&f, 4);
+        epoch_one
+            .save_to_db(
+                &f.db,
+                112,
+                BlockHash::from_byte_array([112; 32]),
+                Txid::from_byte_array([0x97; 32]),
+            )
+            .unwrap();
         let mut join = checked(f.id, 5, 25, 15);
         join.committee_number = f.state().committee_number;
         process_join_ue(
             &f.db,
             &join,
             Txid::from_byte_array([35; 32]),
-            112,
-            BlockHash::from_byte_array([112; 32]),
+            113,
+            BlockHash::from_byte_array([113; 32]),
         )
         .unwrap();
         let record =
@@ -1060,35 +1451,110 @@ mod epoch_zero {
     fn rotation(f: &Fixture, number: u64) -> IpcCheckpointSubnetMsg {
         let mut msg = f.message(&[]);
         msg.is_rotation_checkpoint = true;
-        msg.checkpoint_height = 60;
+        let last =
+            f.db.get_checkpoint(f.id, f.state().last_checkpoint_number.unwrap())
+                .unwrap()
+                .unwrap();
+        msg.checkpoint_height = last.checkpoint_height + 30;
+        msg.checkpoint_hash =
+            bitcoin::hashes::sha256::Hash::hash(&msg.checkpoint_height.to_le_bytes());
         msg.next_committee_configuration_number = number;
-        msg.change_address = Some(f.state().waiting_committee.unwrap().multisig_address);
+        msg.change_address = Some(f.state().latest_committee().multisig_address.clone());
         msg
     }
 
-    // checkpoint.md, Verifying 5-6: a rotation cannot adopt a waiting configuration with a stale last change number.
+    // checkpoint.md:66,102-104 / lifecycle.md:179: the flag records rotation independently
+    // of applied updates; a later regular checkpoint can confirm the new updates.
     #[tokio::test]
-    async fn rotation_rejects_a_stale_last_change_number_without_adopting_any_changes() {
-        let f = waiting_rotation().await;
-        let msg = rotation(&f, 5);
-        assert!(msg
-            .save_to_db(
-                &f.db,
-                122,
-                BlockHash::from_byte_array([122; 32]),
-                Txid::from_byte_array([0x96; 32])
-            )
-            .is_err());
-        let state = f.state();
-        assert_eq!(state.last_rotation_epoch, 0);
-        assert_eq!(state.committee.validators.len(), 4);
-        assert_eq!(state.waiting_committee.unwrap().validators.len(), 5);
-        assert_eq!(state.last_checkpoint_number, Some(0));
+    async fn rotation_with_zero_or_an_older_change_number_precedes_regular_update_confirmation() {
+        for applied in [0, 4, 5] {
+            let f = waiting_rotation().await;
+            let msg = rotation(&f, applied);
+            let cp = msg
+                .save_to_db(
+                    &f.db,
+                    122,
+                    BlockHash::from_byte_array([122; 32]),
+                    Txid::from_byte_array([0x96; 32]),
+                )
+                .unwrap();
+            assert!(cp.is_rotation_checkpoint);
+            assert_eq!(cp.epoch, 2);
+            assert_eq!(cp.checkpoint_number, 2);
+            let recorded = f.db.get_checkpoint(f.id, 2).unwrap().unwrap();
+            assert!(recorded.is_rotation_checkpoint);
+            assert_eq!(recorded.epoch, 2);
+            assert_eq!(recorded.txid, cp.txid);
+            let state = f.state();
+            assert_eq!(state.last_rotation_epoch, 2);
+            assert_eq!(state.committee.configuration_number, 6);
+            assert_eq!(state.committee.validators.len(), 5);
+            assert!(state.waiting_committee.is_none());
+            let pending = f.db.get_unconfirmed_stake_changes(f.id).unwrap();
+            let expected_pending = if applied == 5 { vec![6] } else { vec![5, 6] };
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|c| c.configuration_number)
+                    .collect::<Vec<_>>(),
+                expected_pending
+            );
+
+            // Applying the new change number cannot make another rotation in epoch 2.
+            let mut regular = msg.clone();
+            regular.next_committee_configuration_number = 6;
+            regular.checkpoint_height += 30;
+            regular.checkpoint_hash =
+                bitcoin::hashes::sha256::Hash::hash(&regular.checkpoint_height.to_le_bytes());
+            let before = serde_json::to_value(f.state()).unwrap();
+            assert!(regular
+                .save_to_db(
+                    &f.db,
+                    123,
+                    BlockHash::from_byte_array([123; 32]),
+                    Txid::from_byte_array([0x98; 32]),
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(f.state()).unwrap(), before);
+            assert_eq!(
+                f.db.get_unconfirmed_stake_changes(f.id).unwrap().len(),
+                expected_pending.len()
+            );
+
+            regular.is_rotation_checkpoint = false;
+            let cp = regular
+                .save_to_db(
+                    &f.db,
+                    123,
+                    BlockHash::from_byte_array([123; 32]),
+                    Txid::from_byte_array([0x98; 32]),
+                )
+                .unwrap();
+            assert!(!cp.is_rotation_checkpoint);
+            assert_eq!(cp.epoch, 2);
+            assert_eq!(cp.checkpoint_number, 3);
+            assert_eq!(f.state().last_rotation_epoch, 2);
+            assert!(f.db.get_unconfirmed_stake_changes(f.id).unwrap().is_empty());
+            for change in f.db.get_all_stake_changes(f.id).unwrap() {
+                let height = if change.configuration_number <= 4 {
+                    112
+                } else if change.configuration_number <= applied {
+                    122
+                } else {
+                    123
+                };
+                assert_eq!(change.checkpoint_block_height, Some(height));
+                assert_eq!(
+                    change.checkpoint_block_hash,
+                    Some(BlockHash::from_byte_array([height as u8; 32]))
+                );
+            }
+        }
     }
 
-    // lifecycle.md, Adopting a new configuration / checkpoint.md, Verifying 7: the exact last number adopts all waiting changes.
+    // checkpoint.md:102-104: a flagged checkpoint may also confirm all released updates.
     #[tokio::test]
-    async fn rotation_adopts_the_waiting_configuration_and_records_its_last_change_number() {
+    async fn rotation_with_the_latest_change_number_confirms_all_released_updates() {
         let f = waiting_rotation().await;
         let msg = rotation(&f, 6);
         let cp = msg
@@ -1108,5 +1574,29 @@ mod epoch_zero {
         assert!(state.waiting_committee.is_none());
         assert_eq!(state.committee.validators.len(), 5);
         assert!(f.db.get_unconfirmed_stake_changes(f.id).unwrap().is_empty());
+    }
+
+    // checkpoint.md:100,103: a non-zero number must name a released update; rejection is atomic.
+    #[tokio::test]
+    async fn rotation_with_an_unreleased_change_number_is_rejected_atomically() {
+        let f = waiting_rotation().await;
+        let before_state = serde_json::to_value(f.state()).unwrap();
+        let before_changes =
+            serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap();
+        let msg = rotation(&f, 7);
+        assert!(msg
+            .save_to_db(
+                &f.db,
+                122,
+                BlockHash::from_byte_array([122; 32]),
+                Txid::from_byte_array([0x96; 32]),
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(f.state()).unwrap(), before_state);
+        assert_eq!(
+            serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap(),
+            before_changes
+        );
+        assert!(f.db.get_checkpoint(f.id, 2).unwrap().is_none());
     }
 }

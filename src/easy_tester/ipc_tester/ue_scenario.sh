@@ -207,22 +207,23 @@ wait_checkpoints() {
   done
   echo "   checkpoint $target recorded at tip $(tip)"
 }
-# wait_rotation <cfg_before> <cp_before> <deadline>: wait for a recorded adoption checkpoint.
+# checkpoint.md:102: identify a rotation by its flag and epoch, independently of change numbers.
+# wait_rotation <epoch> <cp_before> <deadline>: wait for that epoch's flagged checkpoint.
 wait_rotation() {
-  wait_for "rotation past configuration $1" "$3" rotation_recorded "$1" "$2"
+  wait_for "rotation of epoch $1" "$3" rotation_recorded "$1" "$2"
 }
-# rotation_cp_after <cp_before> <cfg_before>: checkpoint evidence survives the waiting state.
+# rotation_cp_after <cp_before> <epoch>: checkpoint evidence survives the waiting state.
 rotation_cp_after() {
   local n
   for n in $(seq $(( $1 + 1 )) "$(cp_number)"); do
     if rpc getsubnetcheckpoint "{\"subnet_id\":\"$SUBNET\",\"number\":$n}" \
-        | jq -e --argjson cfg "$2" '.result.next_configuration_number > $cfg' >/dev/null; then
+        | jq -e --argjson epoch "$2" '.result.is_rotation_checkpoint and .result.epoch == $epoch' >/dev/null; then
       echo "$n"; return
     fi
   done
 }
 rotation_recorded() {
-  [ "$(config_number)" -gt "$1" ] && [ -n "$(rotation_cp_after "$2" "$1")" ]
+  [ -n "$(rotation_cp_after "$2" "$1")" ]
 }
 
 evm() { local v="IPC_ADDRESS_OF_VALIDATOR_$1"; echo "${!v}"; }
@@ -949,7 +950,9 @@ step_join_v5() {
   wait_for "validator5's join recorded with its exact EOTS commitment" "$V5_REMOVAL" check_commitment_query 5
   # join.md, Verifying 5-6 / slashing.md, After activation: a reveal alone gives no seat.
   wait_for "validator5's collateral made slashable on L1" "$V5_REMOVAL" v5_is_slashable
-  wait_rotation "$cfg_before" "$cp_before" "$V5_REMOVAL"
+  wait_for "committee contains validators 1-5" "$V5_REMOVAL" committee_is 1 2 3 4 5
+  local entry_epoch; entry_epoch=$(getsubnet | jq -er '.result.last_rotation_epoch')
+  wait_rotation "$entry_epoch" "$cp_before" "$V5_REMOVAL"
   list_validators
   check "committee rotated (configuration $cfg_before -> $(config_number))" [ "$(config_number)" -gt "$cfg_before" ]
   check "committee contains validators 1-5" committee_is 1 2 3 4 5
@@ -974,7 +977,9 @@ step_removal() {
   say "7. validator 5's removal precedes maturity; check its later adoption checkpoint"
   # lifecycle.md, Maturity of a collateral: a collateral stops seating its owner before maturity.
   # lifecycle.md, Maturity of a collateral: the first cutoff with T<=cutoff+3K removes the collateral.
-  local changes key; key=$(xonly 5)
+  local changes key h_zero removal_epoch; key=$(xonly 5)
+  h_zero=$(getsubnet | jq -er '.result.h_0')
+  removal_epoch=$(((V5_REMOVAL - h_zero) / EPOCH_LENGTH + 1))
   wait_block "$V5_REMOVAL"
   # lifecycle.md, Maturity of a collateral: the preceding block cannot record the departure.
   changes=$(rpc getstakechanges "{\"subnet_id\":\"$SUBNET\",\"block_height\":$((V5_REMOVAL - 1))}")
@@ -989,11 +994,11 @@ step_removal() {
         and .block_height == $removal and .block_height < $timeout and .configuration_number > $cfg
         and ([.committee_after_change.validators[].pubkey] | index($key)) == null)' <<< "$changes"
   # Use the entry snapshot: a departure during traffic must not require another rotation.
-  wait_rotation "$V5_CONFIG" "$V5_CP" 0
+  wait_rotation "$removal_epoch" "$V5_CP" 0
   wait_for "committee contains validators 1-4 after departure" 0 committee_is 1 2 3 4
   list_validators
   check "committee of 4 after the rotation" [ "$(committee_size)" -eq 4 ]
-  local cp txid; cp=$(rotation_cp_after "$V5_CP" "$V5_CONFIG")
+  local cp txid; cp=$(rotation_cp_after "$V5_CP" "$removal_epoch")
   [ -n "$cp" ] || fail "no departure checkpoint after checkpoint $V5_CP"
   txid=$(cp_txid "$cp")
   echo "   rotation checkpoint $txid outputs:"
@@ -1300,7 +1305,8 @@ def spends_whitelist(vin):
 tx = json.loads(subprocess.check_output(["bitcoin-cli", "getrawtransaction", rotation["txid"], "1"], text=True))
 assert tx.get("confirmations", 0) > 0, "epoch 1's rotation is not on Bitcoin L1"
 assert tx["vin"] and all(spends_whitelist(v) for v in tx["vin"]), "epoch 1's rotation must spend this subnet's C_wlist fund UTXOs"
-assert rotation["next_configuration_number"] == c_one["configuration_number"], "rotation did not adopt C_1"
+# checkpoint.md:66,102: the flag decides rotation even before L2 applies C_1's updates.
+assert rotation["epoch"] == 1 and rotation["is_rotation_checkpoint"], "checkpoint is not epoch 1's flagged rotation"
 assert tx["vout"][-1]["scriptPubKey"].get("address") == c_one["multisig_address"], "rotation change must pay MS(C_1)"
 print(f"epoch 1 rotation {rotation['txid']} is mined, spends C_wlist funds and pays its change to MS(C_1)")
 PY

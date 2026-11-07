@@ -355,7 +355,8 @@ fn mixed_changes_follow_key_order_even_with_reversed_input_vectors() {
     );
 }
 
-// lifecycle.md, Change numbers: an unchanged epoch consumes no number and the next change continues the sequence.
+// lifecycle.md:162-170: an unchanged epoch releases no update, keeps its multisig and
+// consumes no change number; the next actual change continues the sequence.
 #[test]
 fn an_unchanged_epoch_does_not_break_change_number_continuity() {
     let base = committee();
@@ -367,10 +368,19 @@ fn an_unchanged_epoch_does_not_break_change_number_continuity() {
     let (c3, unchanged) = configuration_changes(id(), &c2, &target, 10, 120, hash()).unwrap();
     assert!(unchanged.is_empty());
     assert_eq!(c3.configuration_number, 9);
+    assert_eq!(c3.multisig_address, c2.multisig_address);
     let (c4, last) = configuration_changes(id(), &c3, &base.validators, 10, 130, hash()).unwrap();
     assert_eq!(last.len(), 1);
     assert_eq!(last[0].configuration_number, 10);
     assert_eq!(c4.configuration_number, 10);
+    assert_eq!(
+        first
+            .iter()
+            .chain(&last)
+            .map(|c| c.configuration_number)
+            .collect::<Vec<_>>(),
+        [8, 9, 10]
+    );
 }
 
 // lifecycle.md, C_e conditions 2-3: T==boundary is excluded, T==boundary+1 is included.

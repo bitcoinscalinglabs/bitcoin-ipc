@@ -1,4 +1,6 @@
-# checkpoint.md, Verifying 6: equal last-change numbers select the earliest still-unadopted epoch.
+# lifecycle.md:156,170 / checkpoint.md:102: every epoch has a flagged rotation,
+# including unchanged epochs, which release no updates and keep their multisig.
+# The companion db_spec_tests provider test checks the wire flag, change number and no sweep.
 # Run with testers/db-ue.txt or testers/monitor-ue.txt. All collaterals outlive every boundary here.
 setup
 validator1
@@ -33,28 +35,55 @@ checkpoint subnet_a
 block 107
 read subnet_state subnet_a
 expect result.last_rotation_epoch = 1
-block 137
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+expect result.validator1.collateral = 100000
+expect result.validator2.collateral = 120000
+# H_1=115: create and include epoch 2's rotation before H_2.
+block 116
 read subnet_state subnet_a
-expect result.epoch = 4
+expect result.epoch = 2
 expect result.last_rotation_epoch = 1
+checkpoint subnet_a
+block 117
+read subnet_state subnet_a
+expect result.epoch = 2
+expect result.last_rotation_epoch = 2
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+expect result.names = validator1,validator2
 read withdrawals subnet_a
 expect result.count = 0
-checkpoint subnet_a
-block 138
+# H_2=125: the same configuration still gets epoch 3's rotation.
+block 126
 read subnet_state subnet_a
-expect result.epoch = 4
+expect result.epoch = 3
 expect result.last_rotation_epoch = 2
 checkpoint subnet_a
-block 139
+block 127
+read subnet_state subnet_a
+expect result.epoch = 3
+expect result.last_rotation_epoch = 3
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+# H_3=135: epoch 4's rotation is made in epoch 4, without backfilling skipped epochs.
+block 136
 read subnet_state subnet_a
 expect result.epoch = 4
 expect result.last_rotation_epoch = 3
 checkpoint subnet_a
-block 140
+block 137
 read subnet_state subnet_a
 expect result.epoch = 4
 expect result.last_rotation_epoch = 4
+expect result.committee_number = 2
 read validators subnet_a current
 expect result.names = validator1,validator2
+expect result.waiting = false
+expect result.validator1.collateral = 100000
+expect result.validator2.collateral = 120000
 read withdrawals subnet_a
 expect result.count = 0

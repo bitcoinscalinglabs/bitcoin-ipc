@@ -32,8 +32,8 @@
 
 tester fendermint
 
-subnet1 /b4/t410fd3f45qroksu3csdg56phwbukfl7rpmnmh5cf2xy http://10.0.0.4:8545 http://10.0.0.4:3030
+subnet1 /b4/t410fqx7fln6liqpu64kn4p6wbrtybm4tjf2olpabzna http://10.0.0.4:8545 http://10.0.0.4:3030
 
-subnet2 /b4/t410fh2mbafkayr7fmwyamgiqc3buombxgnrrctpfwaa http://10.0.0.4:9545 http://10.0.0.4:3130
+subnet2 /b4/t410f4ga2ctk4knpr4xusyurtqjnbou7jygwji2kvt5y http://10.0.0.4:9545 http://10.0.0.4:3130
 
 print_ipc_queries on
