@@ -147,7 +147,7 @@ From the cutoff on, `C_e` is the current configuration: new deposit and join tra
 
 ### Checkpoints
 
-Every `bottomup_check_period` subnet blocks, the subnet creates a [checkpoint](transactions/checkpoint.md). It also creates one at a subnet block in which a cross-subnet message finds the batch of the next checkpoint full, with `MAX_MSGS_PER_BATCH` (10) messages: the checkpoint of that subnet block carries the full batch. A *checkpoint height* is the height of a subnet block at which the subnet creates a checkpoint.
+Every `bottomup_check_period` subnet blocks, the subnet creates a [checkpoint](transactions/checkpoint.md). A *checkpoint height* is the height of a subnet block at which the subnet creates a checkpoint.
 
 A checkpoint pays, from the subnet's fund UTXOs, the withdrawals and outgoing transfers that the subnet has recorded up to its subnet block, and carries slash pre-signatures. It also carries the configuration updates of join and stake transactions that the monitor has released up to that point. The monitor knows the last Bitcoin block that it has parsed. When that Bitcoin block is a cutoff `H_{e−1}`, which puts the monitor in epoch `e`, and only then, the monitor releases the configuration updates of the join and stake transactions that it has accepted: the [configuration updates](#configuration-updates) of `C_e`.
 
@@ -235,7 +235,7 @@ The monitor keeps the following state for every subnet. Names in parentheses are
 - **Subnet state** (`SubnetState`), from bootstrap on: the current epoch `e`, the epoch of the latest rotation checkpoint, the configuration that it adopted (`committee`, `C_gen` before the first rotation checkpoint) and its last change number, the number of the last checkpoint, the fee reserve ([fund UTXOs](transactions/checkpoint.md#fund-utxos), fee reserve **unimplemented**), the status, `H_0` once known, and the checkpoint number at which the monitor marked the subnet to be killed.
 - **Configurations** (`committee::<subnet>:<n>`): the configuration of every epoch, by epoch.
 - **Configuration updates** (`StakeChangeRequest`): for every configuration from `C_1` on, its configuration updates, each with its kind, validator key and subnet address, amount, change number and the Bitcoin block at which the monitor released it.
-- **Checkpoints** (`SubnetCheckpoint`): checkpoint number, subnet block hash and height, Bitcoin height and txid, the txid and height of its batch-transfer transaction, the configuration whose multisig its change pays, `last_change_number`, and the flags.
+- **Checkpoints** (`SubnetCheckpoint`): checkpoint number, subnet block hash and height, Bitcoin height and txid, the txid and height of its batch-transfer transaction, the configuration whose multisig its change pays and its last change number, and the flags.
 - **Fund UTXOs**: for every configuration, the outputs locked under its multisig that the monitor accepted.
 - **Rootnet messages** (`RootnetMessage`): the top-down messages for the subnet, numbered by a per-subnet message nonce from 0: funds (deposit transactions and incoming transfers), ERC20 registrations and ERC20 transfers, each with the Bitcoin block that produced it.
 - **Validators**: for every accepted join transaction, the validator key, its EOTS key, its backup address and its subnet address.

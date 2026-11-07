@@ -53,7 +53,7 @@ Each area is one unit of work with its own checks.
 
 **B. bitcoin-ipc provider** (`bitcoin-ipc/src/provider/`, `src/bin/provider.rs`)
 - `rpc.rs`: every JSON-RPC method, `ServerData` (db, Bitcoin RPC, validator key). Checkpoint
-  planning: `signing_configuration`, `plan_checkpoint` (fund UTXOs, fee), `counted_slash_entries`
+  planning: `signing_configuration`, `plan_checkpoint` (fund UTXOs, fee), `carried_slash_entries`
   (the reveal takes slash pre-signatures from the first `N` entries); `get_unslashable_outputs`,
   `latest_checkpoint_at`.
 - `eots_signer.rs`: EOTS signing and the sign record; the nonce trees are rebuilt from the seed
@@ -76,7 +76,7 @@ Each area is one unit of work with its own checks.
   pre-signatures, `setSubnetFinalHeight` (system actor, keeps the maximum). `GatewayGetterFacet.sol`: subnet final
   height getter. `structs/Quorum.sol`, `lib/LibQuorum.sol`: `quorumSignerWeights`
   (`getBitcoinCheckpointSignatures` returns the PSBT whose signers carry the most weight).
-  `lib/LibGateway.sol`: `commitBottomUpMsg` (a full batch of cross-subnet messages makes the current subnet block a checkpoint height).
+  `lib/LibGateway.sol`: `commitBottomUpMsg`.
 - `lib/LibGatewayActorStorage.sol`: gateway storage. `structs/Bitcoin.sol`, `structs/CrossNet.sol`: structs (`BottomUpCheckpoint.slashPreSignatureCount`).
 - Checks: `make gen`, then `cargo check -p fendermint_app`.
 
@@ -94,11 +94,11 @@ Each area is one unit of work with its own checks.
 - `vm/interpreter/src/fvm/exec.rs` (`end`): calls the checkpoint creation, signing and slash pre-signature functions at the end of a subnet block.
 - `vm/interpreter/src/fvm/checkpoint.rs`: checkpoint creation (`maybe_create_checkpoint`,
   `should_create_checkpoint`: the checkpoint of `H` at the end of subnet block `H`); first signing
-  (`newly_final_checkpoints`, `newly_final_heights`); re-signing at checkpoint heights
+  (`newly_final_checkpoints`, `newly_final_heights`); re-signing at multiples of the period
   (`checkpoints_to_resign`, `resign_plan`, `final_heights_above`, `unsigned_checkpoints`);
   signature broadcast to the gateway (`broadcast_signatures`, `broadcast_checkpoint_signatures`,
   `broadcast_signature`, `broadcast_bitcoin_signature`); slash pre-signatures
-  (`post_slash_pre_signatures`, `outputs_to_presign` via `getunslashableoutputs`).
+  (`post_slash_pre_signatures`, `outputs_to_presign` via `getunslashableoutputs`, then `signslash` and the gateway's `addSlashPreSignature`).
 - `vm/interpreter/src/fvm/state/ipc.rs`: `GatewayCaller` (`subnet_final_height`,
   `set_subnet_final_height`, `has_bitcoin_checkpoint_signature`, `slash_pre_signature_count`,
   `slash_pre_signatures`, `add_slash_pre_signature_calldata`, `last_applied_change_number`, `last_power_table`).
