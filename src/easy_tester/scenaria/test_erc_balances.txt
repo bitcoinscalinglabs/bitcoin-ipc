@@ -8,6 +8,7 @@
 # 5. Multi-token isolation (token A balance doesn't affect token B)
 # 6. Burn exactly equal to balance succeeds
 # 7. Non-home subnet forwards tokens
+# Run with testers/db.txt or testers/monitor.txt.
 setup
 validator1
 validator2
@@ -40,6 +41,11 @@ join subnet2 validator1 100_000_000
 join subnet2 validator2 100_000_000
 join subnet2 validator3 100_000_000
 join subnet2 validator4 100_000_000
+
+# the first checkpoint of subnet2 activates it: a subnet receives transfers from its
+# activation on
+block 104
+checkpoint subnet2
 
 # ──────────────────────────────────────────────────
 # Test 1: Registration seeds balance

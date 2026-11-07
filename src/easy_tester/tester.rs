@@ -74,6 +74,17 @@ pub trait Tester {
     }
 
     /// One checkpoint per subnet; their batch transfers go in one reveal, rebuilt in `shape`
+    fn exec_presign(
+        &mut self,
+        _height: u64,
+        _subnet_name: &str,
+        _spec: super::model::PresignSpec,
+    ) -> Result<(), EasyTesterError> {
+        Err(EasyTesterError::runtime(
+            "presign is not supported by this tester",
+        ))
+    }
+
     fn exec_checkpoint(
         &mut self,
         height: u64,

@@ -7,8 +7,9 @@ curl -X POST http://localhost:3040/api \
     "method": "createsubnet",
     "params": {
 	    "min_validator_stake": 100000000,
+	    "power_unit_exponent": 7,
 	    "min_validators": 4,
-	    "bottomup_check_period": 5,
+	    "bottomup_check_period": 10,
 	    "active_validators_limit": 4,
 	    "min_cross_msg_fee": 200,
 	    "whitelist": [
@@ -16,7 +17,13 @@ curl -X POST http://localhost:3040/api \
 		    "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
 		    "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
 				"b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
-	    ]
+	    ],
+	    "epoch_length": 30,
+	    "min_timeout": 1,
+	    "max_timeout": 2000,
+	    "min_deposit": 330,
+	    "kill_vote_period": 36,
+	    "kill_delay_period": 5
     },
     "id": 1
 }' | jq
@@ -319,32 +326,6 @@ curl -X POST http://localhost:3030/api \
     },
     "id": 1
 }' | jq
-
-curl -X POST http://localhost:3040/api \
--H "Content-Type: application/json" \
--H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
--d '{
-    "jsonrpc": "2.0",
-    "method": "genbootstraphandover",
-    "params": {
-			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
-    },
-    "id": 1
-}' | jq
-
-curl -X POST http://localhost:3030/api \
--H "Content-Type: application/json" \
--H "Authorization: Bearer validator1_auth_token" \
--d '{
-    "jsonrpc": "2.0",
-    "method": "genbootstraphandover",
-    "params": {
-			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
-    },
-    "id": 1
-}' | jq
-
-# checkpoint with withdrawals and transfers
 
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \

@@ -163,6 +163,7 @@ fn calc_checkpoint_size(
         transfers,
         token_registrations: vec![],
         token_supply_adjustments: vec![],
+        slash_signatures: vec![],
         token_transfers: vec![],
         change_address: Some(subnet.committee.multisig_address.clone()),
         // Static values below, not relevant for size testing
@@ -173,6 +174,8 @@ fn calc_checkpoint_size(
         checkpoint_height: 50,
         next_committee_configuration_number: 30, // arbitrary test number
         is_kill_checkpoint: false,
+        slash_pre_signature_count: None,
+        is_rotation_checkpoint: false,
     };
 
     // Sanity check that the message is valid

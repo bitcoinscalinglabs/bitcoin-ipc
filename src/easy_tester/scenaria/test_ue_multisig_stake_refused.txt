@@ -1,6 +1,15 @@
 # A hand-built multisig stake (IPCSTK) or unstake (IPCUST) for a join-ue validator is refused
-# by the monitor; the same for an ordinary validator is accepted.
+# by the monitor; the same for an ordinary validator is accepted and takes effect at the next
+# cutoff. The joins here carry no collateral, so no C_gen collateral is unspent and H_0 is the
+# bootstrap Bitcoin block; C_1 is current from the first read, and an ordinary genesis
+# validator has the value of its join.
 # Run with testers/db-ue.txt or testers/monitor-ue.txt.
+# A collateral with timeout T seats its validator in every configuration computed with a
+# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
+# Epochs are K = 10 blocks here.
+# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
+# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
+# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
 
 setup
 
@@ -28,39 +37,70 @@ join subnet1 validator4 100_000_000
 block 112
 read validators subnet1
 expect result.count = 4
+deposit subnet1 validator1 500_000_000
+
+read validators subnet1
+expect result.validator1.collateral = 100_000_000
+
+# the first checkpoint is the rotation checkpoint of epoch 1; C_1 is the genesis validators
+# with their join values
+block 114
+checkpoint subnet1
+
+block 115
+read subnet_state subnet1
+expect result.activated = true
+read validators subnet1 current
+expect result.count = 4
+expect result.validator1.collateral = 100_000_000
 join-ue subnet1 validator5 100_000_000 400
 
-block 114
+block 116
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 1
+presign subnet1 validator5 by validator1 validator2 validator3
+
+block 117
+checkpoint subnet1
+
+block 118
+read ue_collaterals subnet1
+expect result.validator5.slashable = true
+
+# the cutoff at 120 = H_1 seats validator5
+block 124
 read validators subnet1
 expect result.count = 5
 expect result.validator5.ue = true
-deposit subnet1 validator1 500_000_000
-
-block 116
+expect result.validator5.collateral = 100_000_000
+expect result.waiting = true
 checkpoint subnet1
 
-block 119
+block 125
 read validators subnet1 current
 expect result.count = 5
 expect result.validator5.ue = true
-
+expect result.waiting = false
 # Refused for the join-ue validator
 stake subnet1 validator5 50_000_000 @raw
 unstake subnet1 validator5 10_000_000 @raw
+# Accepted for ordinary validators: pending until the cutoff at 130
+stake subnet1 validator1 50_000_000 @raw
+unstake subnet1 validator2 10_000_000 @raw
 
-block 121
+block 127
 read validators subnet1
 expect result.count = 5
 expect result.waiting = false
 expect result.validator5.collateral = 100_000_000
+read subnet_state subnet1
+expect result.pending_multisig_changes = 2
 read withdrawals subnet1
 expect result.count = 0
 
-# Accepted for ordinary validators
-stake subnet1 validator1 50_000_000 @raw
-unstake subnet1 validator2 10_000_000 @raw
-
-block 123
+block 134
 read validators subnet1
 expect result.waiting = true
 expect result.validator1.collateral = 150_000_000

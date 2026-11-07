@@ -1,0 +1,20 @@
+# ipc-cli.md, Transfer an ERC20 token to another subnet: balances after registration and each transfer.
+setup
+tester fendermint
+
+user1 0x005e05dd763dd125473f8889726f7c305e50fcae
+user2 0xa78bc5d61e0da3c2d96e29a495f4e358d8d2218d
+
+scenario
+register_token subnet2 user1 ONE_MORE OM1 10_000_000_000
+
+read token_balance subnet2 user1 ONE_MORE
+expect result.balance = 10_000_000_000
+
+erc_transfer subnet2 user1 subnet1 user2 ONE_MORE 5_000_000_000
+
+read token_balance subnet2 user1 ONE_MORE
+expect result.balance = 5_000_000_000
+
+read token_balance subnet1 user2 ONE_MORE
+expect result.balance = 5_000_000_000

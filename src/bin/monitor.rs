@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use bitcoin::{Block, BlockHash};
 use bitcoin_ipc::collateral;
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
+use bitcoin_ipc::epochs;
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
@@ -559,22 +560,26 @@ where
         block_hash: BlockHash,
         block: Block,
     ) -> Result<(), MonitorError> {
-        // Join-ue validators leave the next committee one block before their collateral
-        // matures: the pass runs before the block's transactions, on the previous block's state
-        if self.ue_active(block_height) {
-            for removal in
-                collateral::remove_matured_ue_validators(&self.db, block_height, block_hash)?
-            {
-                info!(
-                    "Subnet {} UE validator {} matured at block {}: {}",
-                    removal.subnet_id, removal.pubkey, block_height, removal.outcome
-                );
-            }
-        }
-
         for tx in block.txdata {
             self.process_transaction(&tx, block_height, block_hash, block.header.time)
                 .await?;
+        }
+
+        // After its transactions, a block that activates a subnet or is a cutoff computes the
+        // next configuration
+        for outcome in epochs::process_cutoffs(&self.db, block_height, block_hash)? {
+            info!(
+                "Subnet {} begins epoch {} at block {}",
+                outcome.subnet_id, outcome.epoch, block_height
+            );
+            if let Some((number, committee)) = outcome.new_committee {
+                let label = format!("{}-{}", outcome.subnet_id, number);
+                self.import_watchonly_address(
+                    committee.address_checked(),
+                    label,
+                    block.header.time,
+                );
+            }
         }
 
         Ok(())
@@ -589,6 +594,13 @@ where
     ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
+
+        for record in collateral::record_collateral_spends(&self.db, tx)? {
+            info!(
+                "Collateral {} of validator {} in subnet {} spent by {} at block {}",
+                record.outpoint, record.pubkey, record.subnet_id, txid, block_height
+            );
+        }
 
         // Inputs: one message per input that executes a data leaf, in input order
 
@@ -790,30 +802,13 @@ where
                     wtxn.commit().map_err(db::DbError::from)?;
                 }
 
-                // import new address if the committee changed
-                if checkpoint.signed_committee_number != checkpoint.next_committee_number {
-                    // get the update subnet state from the database
-                    let subnet = self
-                        .db
-                        .get_subnet_state(msg.subnet_id)
-                        .map_err(MonitorError::DbError)?
-                        // Should never happen
-                        .ok_or(IpcValidateError::InvalidMsg(
-                            "Could not fetch subnet id after a checkpoint".to_string(),
-                        ))?;
-
-                    info!(
-                        "Committee changed for Subnet ID: {}, importing address.",
-                        msg.subnet_id
-                    );
-
-                    let (new_committee_addr, new_label) = subnet.committee_address_label();
-                    self.import_watchonly_address(new_committee_addr, new_label, block_time);
-                }
-
                 info!(
-                    "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {}",
-                    msg.subnet_id, msg.checkpoint_height, checkpoint.checkpoint_number
+                    "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {} Epoch: {} Rotation: {}",
+                    msg.subnet_id,
+                    msg.checkpoint_height,
+                    checkpoint.checkpoint_number,
+                    checkpoint.epoch,
+                    checkpoint.is_rotation_checkpoint
                 );
 
                 // Reward bookkeeping hooks after a checkpoint.
@@ -882,8 +877,10 @@ where
                     .get_raw_transaction(&commit_txid, Some(&block_hash))
                     .or_else(|_| self.rpc.get_raw_transaction(&commit_txid, None))?;
                 let secp = bitcoin::secp256k1::Secp256k1::new();
-                let checked = collateral::check_join_ue(&secp, tx, input, &commit, block_height)
-                    .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
+                let context = collateral::join_context(&self.db, msg.join.subnet_id)?;
+                let checked =
+                    collateral::check_join_ue(&secp, tx, input, &commit, block_height, &context)
+                        .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
 
                 if let Some(subnet) =
                     collateral::process_join_ue(&self.db, &checked, txid, block_height, block_hash)?

@@ -10,12 +10,14 @@ use log::error;
 use log::trace;
 use log::warn;
 use log::{debug, info};
-use num_traits::Zero;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
+use crate::eots::{signature_from_bytes, signature_to_bytes, EotsNonceCommitment, Signature64};
+use crate::slash::SlashSignatureEntry;
 use crate::bitcoin_utils::get_fee_rate;
 use crate::bitcoin_utils::{self, submit_to_mempool};
 use crate::db;
@@ -287,64 +289,132 @@ pub trait IpcValidate {
 
 // IPC Messages
 
+/// The largest `power_unit_exponent`.
+pub const MAX_POWER_UNIT_EXPONENT: u8 = 15;
+/// The most whitelisted keys and the largest `active_validators_limit`: every slash
+/// transaction stays within the 10,000 vB of TRUC.
+pub const MAX_WHITELIST_SIZE: usize = 350;
+/// The most genesis validators: the reveal transaction of the first checkpoint holds the
+/// slash pre-signatures of every member of `C_gen` within a standard transaction.
+pub const MAX_BOOT_VALIDATORS: u16 = 90;
+/// The largest relative timelock in blocks (the unbonding script uses `3K`).
+pub const MAX_RELATIVE_TIMELOCK: u64 = 65_535;
+/// The dust limit of a P2TR output.
+pub const P2TR_DUST_LIMIT: Amount = Amount::from_sat(330);
+
+/// The subnet parameters, in the postcard order of the create transaction.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IpcCreateSubnetMsg {
-    /// The minimum number of collateral required for validators in Satoshis
+    /// The minimum collateral of a join, in satoshis
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub min_validator_stake: Amount,
-    /// Minimum number of validators required to bootstrap the subnet
+    /// `p`: one unit of power is `10^p` satoshis
+    pub power_unit_exponent: u8,
+    /// Number of accepted joins that bootstraps the subnet (`boot_validators` in the spec)
     pub min_validators: u16,
-    /// The bottom up checkpoint period in number of blocks
+    /// The bottom up checkpoint period in number of subnet blocks
     pub bottomup_check_period: u64,
     /// The max number of active validators in subnet
     pub active_validators_limit: u16,
     /// Minimum fee for cross-net messages in subnet (in Satoshis)
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub min_cross_msg_fee: Amount,
-    /// The addresses of whitelisted validators
+    /// The keys of `C_wlist`
     pub whitelist: Vec<XOnlyPublicKey>,
+    /// `K`: the length of an epoch in Bitcoin blocks
+    pub epoch_length: u64,
+    /// The fewest epochs for which a collateral seats its owner
+    pub min_timeout: u32,
+    /// The most epochs for which a collateral seats its owner
+    pub max_timeout: u32,
+    /// The smallest deposit the monitor credits, in satoshis
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
+    pub min_deposit: Amount,
+    /// Subnet blocks for which a kill proposal stays open (the kill procedure is not implemented)
+    pub kill_vote_period: u64,
+    /// Epochs a subnet marked to be killed stays operational (the kill procedure is not implemented)
+    pub kill_delay_period: u64,
 }
 
 impl IpcValidate for IpcCreateSubnetMsg {
     fn validate(&self) -> Result<(), IpcValidateError> {
+        let field = |name, what: &str| IpcValidateError::InvalidField(name, what.to_string());
+
+        if self.power_unit_exponent > MAX_POWER_UNIT_EXPONENT {
+            return Err(field("power_unit_exponent", "Must be at most 15"));
+        }
+        if self.min_validator_stake < self.power_unit() {
+            return Err(field("min_validator_stake", "Must be at least one power unit"));
+        }
         if self.min_validators == 0 {
-            return Err(IpcValidateError::InvalidField(
-                "min_validators",
-                "The minimum number of validators must be greater than 0".to_string(),
-            ));
+            return Err(field("min_validators", "Must be greater than 0"));
         }
-
+        if self.min_validators > MAX_BOOT_VALIDATORS {
+            return Err(field("min_validators", "Must be at most 90"));
+        }
+        let mut keys = self.whitelist.clone();
+        keys.sort();
+        keys.dedup();
+        if keys.len() != self.whitelist.len() {
+            return Err(field("whitelist", "Keys must be distinct"));
+        }
         if self.whitelist.len() < self.min_validators as usize {
-            return Err(IpcValidateError::InvalidField(
-                "whitelist",
-                "Number of whitelisted validators is less than the minimum required validators"
-                    .to_string(),
-            ));
+            return Err(field("whitelist", "Must hold at least min_validators keys"));
         }
-
+        if self.whitelist.len() > MAX_WHITELIST_SIZE {
+            return Err(field("whitelist", "Must hold at most 350 keys"));
+        }
         if self.bottomup_check_period == 0 {
-            return Err(IpcValidateError::InvalidField(
-                "bottomup_check_period",
-                "Must be greater than 0".to_string(),
-            ));
+            return Err(field("bottomup_check_period", "Must be greater than 0"));
         }
-
         if self.active_validators_limit < self.min_validators {
-            return Err(IpcValidateError::InvalidField(
-                "active_validators_limit",
-                "Must be greater than or equal to min_validators".to_string(),
-            ));
+            return Err(field("active_validators_limit", "Must be at least min_validators"));
         }
-
+        if usize::from(self.active_validators_limit) > MAX_WHITELIST_SIZE {
+            return Err(field("active_validators_limit", "Must be at most 350"));
+        }
         if self.min_cross_msg_fee == Amount::ZERO {
-            return Err(IpcValidateError::InvalidField(
-                "min_cross_msg_fee",
-                "Must be greater than 0".to_string(),
-            ));
+            return Err(field("min_cross_msg_fee", "Must be greater than 0"));
+        }
+        if self.epoch_length == 0 {
+            return Err(field("epoch_length", "Must be greater than 0"));
+        }
+        if self.epoch_length.saturating_mul(3) > MAX_RELATIVE_TIMELOCK {
+            return Err(field("epoch_length", "3K must be at most 65535"));
+        }
+        if self.min_timeout == 0 {
+            return Err(field("min_timeout", "Must be greater than 0"));
+        }
+        if self.max_timeout < self.min_timeout {
+            return Err(field("max_timeout", "Must be at least min_timeout"));
+        }
+        if self.min_deposit < P2TR_DUST_LIMIT {
+            return Err(field("min_deposit", "Must be at least the 330 sat dust limit"));
+        }
+        if self.kill_vote_period == 0 {
+            return Err(field("kill_vote_period", "Must be greater than 0"));
         }
 
         Ok(())
     }
+}
+
+/// Decodes `bytes` as the exact postcard encoding of a `T`: no byte is left over and the
+/// decoded value re-encodes to the same bytes, which rejects non-minimal varints.
+fn decode_exact<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, IpcSerializeError> {
+    let err = IpcSerializeError::DeserializationError;
+    let (value, rest): (T, &[u8]) =
+        postcard::take_from_bytes(bytes).map_err(|e| err(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(err(format!("{} bytes left after the message", rest.len())));
+    }
+    let encoded = postcard::to_stdvec(&value).map_err(|e| err(e.to_string()))?;
+    if encoded != bytes {
+        return Err(err(
+            "Message is not the exact encoding of its fields".to_string()
+        ));
+    }
+    Ok(value)
 }
 
 impl IpcCreateSubnetMsg {
@@ -363,8 +433,7 @@ impl IpcCreateSubnetMsg {
             ));
         }
 
-        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
-            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+        decode_exact(&data[IPC_TAG_LENGTH..])
     }
 
     /// Submits the create subnet message to the Bitcoin network
@@ -455,24 +524,44 @@ impl IpcCreateSubnetMsg {
         subnet_id: &SubnetId,
     ) -> Result<bitcoin::Address, IpcLibError> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
-
-        let whitelist_weighted_keys = self
-            .whitelist
-            .clone()
-            .into_iter()
-            // Each key has the same weight
-            .map(|xpk| (xpk, 1))
-            .collect::<Vec<_>>();
-
-        let multisig_address = create_subnet_multisig_address(
+        let configuration = self.whitelist_configuration();
+        Ok(create_subnet_multisig_address(
             &secp,
             subnet_id,
-            &whitelist_weighted_keys,
-            self.min_validators.into(),
+            &configuration.keys,
+            configuration.threshold,
             NETWORK,
-        )?;
+        )?)
+    }
 
-        Ok(multisig_address)
+    /// One unit of power, `10^p` satoshis.
+    pub fn power_unit(&self) -> Amount {
+        Amount::from_sat(10u64.pow(u32::from(self.power_unit_exponent)))
+    }
+
+    /// The power of a collateral of at least `min_validator_stake`.
+    pub fn power_of(&self, collateral: &Amount) -> Result<multisig::Power, multisig::MultisigError> {
+        multisig::collateral_to_power(collateral, &self.min_validator_stake, &self.power_unit())
+    }
+
+    /// The cutoff height `H_e` for a first cutoff `h_0`.
+    pub fn cutoff_height(&self, h_0: u64, epoch: u64) -> u64 {
+        h_0 + epoch * self.epoch_length
+    }
+
+    /// The epoch that contains `height`, for a first cutoff `h_0`: epoch `e` spans
+    /// `(H_{e-1}, H_e]`. Heights at or below `h_0` are in epoch 0.
+    pub fn epoch_of(&self, h_0: u64, height: u64) -> u64 {
+        height.saturating_sub(h_0).div_ceil(self.epoch_length)
+    }
+
+    /// The whitelist configuration `C_0`: every whitelisted key with power 1, threshold
+    /// `⌊2 · min_validators / 3⌋ + 1`.
+    pub fn whitelist_configuration(&self) -> multisig::Configuration {
+        multisig::Configuration {
+            keys: self.whitelist.iter().map(|xpk| (*xpk, 1)).collect(),
+            threshold: multisig::multisig_threshold(self.min_validators.into()),
+        }
     }
 }
 
@@ -510,8 +599,7 @@ impl IpcJoinSubnetMsg {
             ));
         }
 
-        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
-            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+        decode_exact(&data[IPC_TAG_LENGTH..])
     }
 
     /// Validates the join subnet message, for the given genesis info
@@ -573,6 +661,12 @@ impl IpcJoinSubnetMsg {
                 self.subnet_id
             )));
         }
+        if !subnet.is_activated() {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Subnet {} is in epoch 0: it accepts no join until its activation.",
+                self.subnet_id
+            )));
+        }
 
         // Check if the collateral is at least the minimum validator stake
         if self.collateral < genesis_info.create_subnet_msg.min_validator_stake {
@@ -606,16 +700,33 @@ impl IpcJoinSubnetMsg {
                 self.pubkey
             )));
         }
+        if subnet
+            .pending_multisig_changes
+            .iter()
+            .any(|c| matches!(c, db::PendingMultisigChange::Join(v) if v.pubkey == self.pubkey))
+        {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator with public key '{}' already joined subnet {}, waiting for the next cutoff",
+                self.pubkey, self.subnet_id
+            )));
+        }
 
         Ok(())
     }
 
-    /// Validates the join subnet message, for the given genesis info
+    /// Validates the join subnet message, for the given genesis info. The collateral is
+    /// output 1's value, not a payload field, so its checks are here and not in `validate`.
     pub fn validate_for_subnet(
         &self,
         genesis_info: &db::SubnetGenesisInfo,
         subnet: &Option<db::SubnetState>,
     ) -> Result<(), IpcValidateError> {
+        if self.collateral == Amount::ZERO {
+            return Err(IpcValidateError::InvalidField(
+                "collateral",
+                "Collateral amount must be greater than zero".to_string(),
+            ));
+        }
         if let Some(subnet) = subnet {
             if subnet.id != self.subnet_id {
                 return Err(IpcValidateError::InvalidField(
@@ -691,7 +802,7 @@ impl IpcJoinSubnetMsg {
         &self,
         db: &D,
         block_height: u64,
-        block_hash: bitcoin::BlockHash,
+        _block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<Option<db::SubnetState>, IpcLibError> {
         let mut genesis_info =
@@ -710,10 +821,7 @@ impl IpcJoinSubnetMsg {
 
         let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
-        let power = multisig::collateral_to_power(
-            &self.collateral,
-            &genesis_info.create_subnet_msg.min_validator_stake,
-        )?;
+        let power = genesis_info.create_subnet_msg.power_of(&self.collateral)?;
 
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
@@ -741,67 +849,12 @@ impl IpcJoinSubnetMsg {
                 .into());
             }
 
-            let mut next_committee = subnet
-                .waiting_committee
-                .unwrap_or_else(|| subnet.committee.clone());
-
-            if next_committee.is_validator(&self.pubkey) {
-                return Err(IpcValidateError::InvalidField(
-                    "pubkey",
-                    format!(
-						"Validator with public key '{}' already registered in subnet, waiting in next committee.",
-						self.pubkey
-					),
-                )
-                .into());
-            }
-
-            next_committee.join_new_validator(&subnet.id, &new_validator)?;
-            subnet.waiting_committee = Some(next_committee.clone());
-
-            let stake_change_configuration_number =
-                db.get_next_stake_change_configuration_number(self.subnet_id)?;
-
-            let validator_subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
-
-            // Join
-            let stake_change_join = db::StakeChangeRequest {
-                change: db::StakingChange::Join {
-                    pubkey: self.pubkey.public_key(bitcoin::secp256k1::Parity::Even),
-                },
-                validator_xpk: self.pubkey,
-                validator_subnet_address,
-                configuration_number: stake_change_configuration_number,
-                committee_after_change: next_committee.clone(),
-
-                block_height,
-                block_hash,
-                checkpoint_block_height: None,
-                checkpoint_block_hash: None,
-                txid,
-            };
-            // Deposit
-            let stake_change = db::StakeChangeRequest {
-                change: db::StakingChange::Deposit {
-                    amount: self.collateral,
-                },
-                validator_xpk: self.pubkey,
-                validator_subnet_address,
-                configuration_number: stake_change_configuration_number + 1,
-                committee_after_change: next_committee.clone(),
-
-                block_height,
-                block_hash,
-                checkpoint_block_height: None,
-                checkpoint_block_hash: None,
-                txid,
-            };
-
-            // Write to DB
+            // The join takes effect at the next cutoff
+            subnet
+                .pending_multisig_changes
+                .push(db::PendingMultisigChange::Join(new_validator));
             let mut wtxn = db.write_txn()?;
             db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet)?;
-            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change_join)?;
-            db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
             wtxn.commit()?;
 
             Ok(None)
@@ -854,14 +907,6 @@ impl IpcValidate for IpcJoinSubnetMsg {
             ));
         }
 
-        // Check collateral is not zero
-        if self.collateral == Amount::ZERO {
-            return Err(IpcValidateError::InvalidField(
-                "collateral",
-                "Collateral amount must be greater than zero".to_string(),
-            ));
-        }
-
         // Check backup address
         if !self.backup_address.is_valid_for_network(NETWORK) {
             return Err(IpcValidateError::InvalidField(
@@ -874,7 +919,7 @@ impl IpcValidate for IpcJoinSubnetMsg {
     }
 }
 
-/// A join whose collateral is locked under the unilateral-exit script (see `collateral`)
+/// A join whose collateral is locked under the collateral script (see `collateral`)
 /// instead of the subnet multisig.
 #[derive(Debug, Clone)]
 pub struct IpcJoinUeMsg {
@@ -882,12 +927,21 @@ pub struct IpcJoinUeMsg {
     pub join: IpcJoinSubnetMsg,
     /// Maturity height
     pub timeout: u32,
+    /// The EOTS key used for slashing
+    pub pk_eots: bitcoin::XOnlyPublicKey,
+    /// The EOTS nonce commitment of `pk_eots`
+    pub nonce_commitment: EotsNonceCommitment,
+    /// Signature of `pk_eots` on the bytes that precede it
+    pub nonce_commitment_signature: Signature64,
     /// Signature of the validator key on the bytes that precede it
     pub signature: bitcoin::secp256k1::schnorr::Signature,
 }
 
 /// Tag of the join-ue signature digest
 pub const JOIN_UE_SIGNATURE_TAG: &[u8] = b"IPCJUE/signature";
+
+/// Tag of the join-ue EOTS nonce commitment digest
+pub const JOIN_UE_NONCE_COMMITMENT_TAG: &[u8] = b"IPCJUE/nonce_commitment";
 
 /// A BIP340-style tagged hash
 pub fn tagged_sha256(tag: &[u8], data: &[u8]) -> [u8; 32] {
@@ -900,81 +954,180 @@ pub fn tagged_sha256(tag: &[u8], data: &[u8]) -> [u8; 32] {
     sha256::Hash::from_engine(engine).to_byte_array()
 }
 
+/// Verifies a 64-byte BIP340 signature on `digest` under `key`.
+pub fn verify_schnorr_bytes(
+    signature: &[u8; 64],
+    digest: [u8; 32],
+    key: &bitcoin::XOnlyPublicKey,
+) -> Result<(), String> {
+    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(signature)
+        .map_err(|e| e.to_string())?;
+    bitcoin::secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(
+            &signature,
+            &bitcoin::secp256k1::Message::from_digest(digest),
+            key,
+        )
+        .map_err(|e| e.to_string())
+}
+
 impl IpcJoinUeMsg {
     const TAG: &str = IPC_JOIN_UE_TAG;
 
-    /// Builds the message and signs it with the validator's secret key
+    /// Builds the message: the commitment signed with the EOTS secret key, then everything
+    /// signed with the validator's secret key
     pub fn new_signed(
         secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
         join: IpcJoinSubnetMsg,
         timeout: u32,
         secret_key: &bitcoin::secp256k1::SecretKey,
+        eots_secret_key: &bitcoin::secp256k1::SecretKey,
+        nonce_commitment: EotsNonceCommitment,
     ) -> Self {
-        let msg = Self::signing_message(&join, timeout);
-        let signature = secp.sign_schnorr(&msg, &secret_key.keypair(secp));
+        let pk_eots = eots_secret_key.x_only_public_key(secp).0;
+        let committed = Self::committed_bytes(&join, timeout, &pk_eots, &nonce_commitment);
+        let nonce_commitment_signature = signature_from_bytes(
+            &secp
+                .sign_schnorr(
+                    &Self::digest_of(JOIN_UE_NONCE_COMMITMENT_TAG, &committed),
+                    &eots_secret_key.keypair(secp),
+                )
+                .serialize(),
+        );
+        let unsigned = Self::unsigned_bytes_of(&committed, &nonce_commitment_signature);
+        let signature = secp.sign_schnorr(
+            &Self::digest_of(JOIN_UE_SIGNATURE_TAG, &unsigned),
+            &secret_key.keypair(secp),
+        );
         Self {
             join,
             timeout,
+            pk_eots,
+            nonce_commitment,
+            nonce_commitment_signature,
             signature,
         }
     }
 
-    /// The bytes that precede the signature: the tag, the join fields and the timeout
-    fn unsigned_bytes(join: &IpcJoinSubnetMsg, timeout: u32) -> Vec<u8> {
-        let body = postcard::to_stdvec(&(join, timeout))
+    /// The bytes that precede the EOTS nonce commitment signature: the tag, the join fields,
+    /// the timeout, the EOTS key and the commitment
+    fn committed_bytes(
+        join: &IpcJoinSubnetMsg,
+        timeout: u32,
+        pk_eots: &bitcoin::XOnlyPublicKey,
+        nonce_commitment: &EotsNonceCommitment,
+    ) -> Vec<u8> {
+        let body = postcard::to_stdvec(&(join, timeout, pk_eots.serialize(), nonce_commitment))
             .expect("join message fields serialize without error");
         [Self::TAG.as_bytes(), &body].concat()
     }
 
-    fn signing_message(join: &IpcJoinSubnetMsg, timeout: u32) -> bitcoin::secp256k1::Message {
-        Self::signing_message_of(&Self::unsigned_bytes(join, timeout))
+    /// The bytes that precede the validator signature
+    fn unsigned_bytes_of(committed: &[u8], nonce_commitment_signature: &Signature64) -> Vec<u8> {
+        [
+            committed,
+            &signature_to_bytes(nonce_commitment_signature),
+        ]
+        .concat()
     }
 
-    /// The signed digest of the bytes that precede the signature
-    fn signing_message_of(unsigned: &[u8]) -> bitcoin::secp256k1::Message {
-        bitcoin::secp256k1::Message::from_digest(tagged_sha256(JOIN_UE_SIGNATURE_TAG, unsigned))
+    fn unsigned_bytes(&self) -> Vec<u8> {
+        Self::unsigned_bytes_of(
+            &Self::committed_bytes(
+                &self.join,
+                self.timeout,
+                &self.pk_eots,
+                &self.nonce_commitment,
+            ),
+            &self.nonce_commitment_signature,
+        )
+    }
+
+    fn digest_of(tag: &[u8], data: &[u8]) -> bitcoin::secp256k1::Message {
+        bitcoin::secp256k1::Message::from_digest(tagged_sha256(tag, data))
+    }
+
+    /// The collateral script of this join, naming `configuration`
+    pub fn collateral_script(
+        &self,
+        configuration: crate::multisig::Configuration,
+    ) -> crate::collateral::CollateralScript {
+        crate::collateral::CollateralScript::new(
+            self.join.pubkey,
+            self.pk_eots,
+            self.timeout,
+            configuration,
+        )
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpcSerializeError> {
-        let mut bytes = Self::unsigned_bytes(&self.join, self.timeout);
+        let mut bytes = self.unsigned_bytes();
         bytes.extend_from_slice(&self.signature.serialize());
         Ok(bytes)
     }
 
-    /// Parses the message and verifies its signature on the bytes that precede it.
+    /// Parses the message and verifies both signatures on the bytes that precede them.
     pub fn from_bytes(data: &[u8]) -> Result<Self, IpcSerializeError> {
         let err = IpcSerializeError::DeserializationError;
         if data.len() < IPC_TAG_LENGTH || &data[..IPC_TAG_LENGTH] != Self::TAG.as_bytes() {
             return Err(err("Invalid message tag".to_string()));
         }
-        let ((join, timeout), rest): ((IpcJoinSubnetMsg, u32), &[u8]) =
-            postcard::take_from_bytes(&data[IPC_TAG_LENGTH..]).map_err(|e| err(e.to_string()))?;
-        if rest.len() != SCHNORR_SIGNATURE_SIZE {
+        let ((join, timeout, pk_eots, nonce_commitment), rest): (
+            (IpcJoinSubnetMsg, u32, [u8; 32], EotsNonceCommitment),
+            &[u8],
+        ) = postcard::take_from_bytes(&data[IPC_TAG_LENGTH..]).map_err(|e| err(e.to_string()))?;
+        if rest.len() != 2 * SCHNORR_SIGNATURE_SIZE {
             return Err(err(format!(
-                "Expected a {SCHNORR_SIGNATURE_SIZE}-byte signature after the message, found {} bytes",
+                "Expected two {SCHNORR_SIGNATURE_SIZE}-byte signatures after the message, found {} bytes",
                 rest.len()
             )));
         }
-        let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(rest)
-            .map_err(|e| err(e.to_string()))?;
+        let pk_eots = bitcoin::XOnlyPublicKey::from_slice(&pk_eots)
+            .map_err(|e| err(format!("Invalid EOTS key: {e}")))?;
+        let committed = &data[..data.len() - 2 * SCHNORR_SIGNATURE_SIZE];
+        if Self::committed_bytes(&join, timeout, &pk_eots, &nonce_commitment) != committed {
+            return Err(err(
+                "Message is not the exact encoding of its fields".to_string()
+            ));
+        }
         let unsigned = &data[..data.len() - SCHNORR_SIGNATURE_SIZE];
-        bitcoin::secp256k1::Secp256k1::verification_only()
-            .verify_schnorr(
-                &signature,
-                &Self::signing_message_of(unsigned),
-                &join.pubkey,
-            )
-            .map_err(|e| err(format!("Invalid signature: {e}")))?;
+        let nonce_commitment_signature: [u8; 64] = rest[..SCHNORR_SIGNATURE_SIZE]
+            .try_into()
+            .expect("checked length");
+        verify_schnorr_bytes(
+            &nonce_commitment_signature,
+            tagged_sha256(JOIN_UE_NONCE_COMMITMENT_TAG, committed),
+            &pk_eots,
+        )
+        .map_err(|e| err(format!("Invalid nonce commitment signature: {e}")))?;
+        let signature: [u8; 64] = rest[SCHNORR_SIGNATURE_SIZE..]
+            .try_into()
+            .expect("checked length");
+        verify_schnorr_bytes(
+            &signature,
+            tagged_sha256(JOIN_UE_SIGNATURE_TAG, unsigned),
+            &join.pubkey,
+        )
+        .map_err(|e| err(format!("Invalid signature: {e}")))?;
         Ok(Self {
             join,
             timeout,
-            signature,
+            pk_eots,
+            nonce_commitment,
+            nonce_commitment_signature: signature_from_bytes(&nonce_commitment_signature),
+            signature: bitcoin::secp256k1::schnorr::Signature::from_slice(&signature)
+                .expect("a verified signature parses"),
         })
     }
 
-    /// Builds the commit and reveal transactions, checks them as the monitor will, and
-    /// submits them. Returns the reveal txid, the join txid of the validator.
-    pub fn submit_to_bitcoin(&self, rpc: &bitcoincore_rpc::Client) -> Result<Txid, IpcLibError> {
+    /// Builds the commit and reveal transactions with the collateral naming the first
+    /// configuration of `context`, checks them as the monitor will, and submits them. Returns
+    /// the reveal txid, the join txid of the validator.
+    pub fn submit_to_bitcoin(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        context: &crate::collateral::JoinContext,
+    ) -> Result<Txid, IpcLibError> {
         use bitcoincore_rpc::RpcApi;
 
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -982,13 +1135,15 @@ impl IpcJoinUeMsg {
             error!("Could not serialize join-ue msg: {}", e);
             IpcValidateError::InvalidMsg("Could not serialize message".to_string())
         })?;
+        let (_, configuration) = context
+            .named
+            .first()
+            .ok_or_else(|| IpcValidateError::InvalidMsg("No configuration to name".to_string()))?;
         let collateral = bitcoin::TxOut {
             value: self.join.collateral,
-            script_pubkey: crate::collateral::ue_script_pubkey(
-                &secp,
-                &self.join.pubkey,
-                self.timeout,
-            )?,
+            script_pubkey: self
+                .collateral_script(configuration.clone())
+                .script_pubkey(&secp)?,
         };
         // The reveal only carries the data; its dust goes back to the wallet
         let return_address = wallet::get_new_address(rpc)?;
@@ -1009,7 +1164,7 @@ impl IpcJoinUeMsg {
             .get_block_count()
             .map_err(bitcoin_utils::BitcoinUtilsError::from)?
             + 1;
-        crate::collateral::check_join_ue(&secp, &reveal_tx, 0, &commit_tx, next_height)?;
+        crate::collateral::check_join_ue(&secp, &reveal_tx, 0, &commit_tx, next_height, context)?;
 
         let reveal_txid = reveal_tx.compute_txid();
         debug!(
@@ -1037,6 +1192,18 @@ impl IpcValidate for IpcJoinUeMsg {
                     "Timeout must be a block height below {}",
                     crate::collateral::LOCKTIME_THRESHOLD
                 ),
+            ));
+        }
+        if self.pk_eots == self.join.pubkey {
+            return Err(IpcValidateError::InvalidField(
+                "pk_eots",
+                "The EOTS key must differ from the validator key".to_string(),
+            ));
+        }
+        if self.nonce_commitment.start < 1 || self.nonce_commitment.count < 1 {
+            return Err(IpcValidateError::InvalidField(
+                "nonce_commitment",
+                "The EOTS nonce commitment needs start >= 1 and count >= 1".to_string(),
             ));
         }
         Ok(())
@@ -1316,13 +1483,28 @@ impl IpcFundSubnetMsg {
     // The total length of the op_return data - helper
     const DATA_LEN: usize = Self::FUND_TAG_LEN + SubnetId::INNER_LEN + ETH_ADDR_LEN;
 
-    /// Validates the fund msg for the given subnet
-    pub fn validate_for_subnet(&self, subnet: &db::SubnetState) -> Result<(), IpcValidateError> {
+    /// Validates the fund msg for the given subnet: it must be in epoch 0 or active, and the
+    /// amount at least `min_deposit`
+    pub fn validate_for_subnet(
+        &self,
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<(), IpcValidateError> {
         if subnet.is_killed_or_pending() {
             return Err(IpcValidateError::InvalidMsg(format!(
                 "Subnet {} is killed or marked for killing, cannot fund.",
                 self.subnet_id
             )));
+        }
+        let min_deposit = genesis_info.create_subnet_msg.min_deposit;
+        if self.amount < min_deposit {
+            return Err(IpcValidateError::InvalidField(
+                "amount",
+                format!(
+                    "Deposit must be at least {min_deposit}, supplied {}",
+                    self.amount
+                ),
+            ));
         }
 
         Ok(())
@@ -1345,7 +1527,8 @@ impl IpcFundSubnetMsg {
         }
     }
 
-    /// Modifies the database to account for the join subnet message
+    /// Modifies the database to account for the fund subnet message: a rootnet message, or
+    /// in epoch 0 an entry of the queue that activation credits
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
@@ -1353,14 +1536,20 @@ impl IpcFundSubnetMsg {
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
-        let subnet_state =
-            db.get_subnet_state(self.subnet_id)?
+        let genesis_info =
+            db.get_subnet_genesis_info(self.subnet_id)?
                 .ok_or(IpcValidateError::InvalidMsg(format!(
                     "subnet id={} does not exist",
                     self.subnet_id
                 )))?;
+        let subnet_state =
+            db.get_subnet_state(self.subnet_id)?
+                .ok_or(IpcValidateError::InvalidMsg(format!(
+                    "subnet id={} is not bootstrapped",
+                    self.subnet_id
+                )))?;
 
-        self.validate_for_subnet(&subnet_state)?;
+        self.validate_for_subnet(&genesis_info, &subnet_state)?;
 
         trace!("Processing {self:?}, adding new rootnet message");
 
@@ -1648,6 +1837,8 @@ pub(crate) struct BatchTransferWireData {
     token_supply_adjustments: Vec<IpcErcSupplyAdjustment>,
     /// ERC20 cross-subnet transfers grouped by destination subnet (IPC:ETX)
     token_transfers: BTreeMap<Txid20, Vec<IpcCrossSubnetErcTransferWire>>,
+    /// Slash pre-signatures, one entry per output, in ascending outpoint order
+    slash_signatures: Vec<SlashSignatureEntry>,
 }
 
 /// The transfer batches of `transfers`: one per destination subnet, in ascending `txid20`
@@ -1661,6 +1852,44 @@ pub(crate) fn transfer_batches(transfers: &[IpcCrossSubnetTransfer]) -> BTreeMap
             .or_insert(Amount::ZERO) += transfer.amount;
     }
     batches
+}
+
+/// The configuration that signs a checkpoint's fund inputs: its keys, threshold and address.
+#[derive(Debug, Clone)]
+pub struct CheckpointSigner {
+    pub keys: Vec<multisig::WeightedKey>,
+    pub threshold: multisig::Power,
+    pub address: bitcoin::Address,
+}
+
+impl CheckpointSigner {
+    pub fn of_committee(committee: &db::SubnetCommittee) -> Self {
+        Self {
+            keys: committee.validator_weighted_keys(),
+            threshold: committee.threshold,
+            address: committee.address_checked(),
+        }
+    }
+
+    /// A configuration given by its keys, such as `C_wlist`
+    pub fn of_configuration(
+        subnet_id: &SubnetId,
+        configuration: &multisig::Configuration,
+    ) -> Result<Self, IpcLibError> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let address = create_subnet_multisig_address(
+            &secp,
+            subnet_id,
+            &configuration.keys,
+            configuration.threshold,
+            NETWORK,
+        )?;
+        Ok(Self {
+            keys: configuration.keys.clone(),
+            threshold: configuration.threshold,
+            address,
+        })
+    }
 }
 
 /// Checkpoint message for a subnet
@@ -1690,6 +1919,9 @@ pub struct IpcCheckpointSubnetMsg {
     /// ERC20 cross-subnet transfers (IPC:ETX)
     #[serde(default)]
     pub token_transfers: Vec<IpcCrossSubnetErcTransfer>,
+    /// Slash pre-signatures of collateral outputs, one entry per output
+    #[serde(default)]
+    pub slash_signatures: Vec<SlashSignatureEntry>,
     /// Unstakes for validators leaving the subnet
     #[serde(default, skip_deserializing)]
     pub unstakes: Vec<IpcUnstake>,
@@ -1699,6 +1931,14 @@ pub struct IpcCheckpointSubnetMsg {
     /// The flag marking the subnet killed, ie. the last checkpoint
     #[serde(default, skip_deserializing)]
     pub is_kill_checkpoint: bool,
+    /// The flag marking the rotation checkpoint of an epoch, the first after its cutoff
+    #[serde(default, skip_deserializing)]
+    pub is_rotation_checkpoint: bool,
+    /// The length of the subnet's slash pre-signature list at the end of the checkpoint
+    /// height: the reveal takes entries from the first that many of `slash_signatures` only,
+    /// from all of them when absent
+    #[serde(default)]
+    pub slash_pre_signature_count: Option<u64>,
 }
 
 impl IpcValidate for IpcCheckpointSubnetMsg {
@@ -1824,8 +2064,12 @@ impl IpcCheckpointSubnetMsg {
     const HEIGHT_LEN: usize = std::mem::size_of::<u64>();
     // u64 length
     const COMMITTEE_CONF_LEN: usize = std::mem::size_of::<u64>();
-    // bool length
-    const KILLED_LEN: usize = std::mem::size_of::<u8>();
+    // The flags byte
+    const FLAGS_LEN: usize = std::mem::size_of::<u8>();
+    /// Flag bit of the kill checkpoint
+    pub const FLAG_KILL: u8 = 0x01;
+    /// Flag bit of the rotation checkpoint of an epoch
+    pub const FLAG_ROTATION: u8 = 0x04;
     // The total length of the op_return data - helper
     const DATA_LEN: usize = IPC_TAG_LENGTH
         + SubnetId::INNER_LEN
@@ -1833,7 +2077,7 @@ impl IpcCheckpointSubnetMsg {
         + Self::MARKERS_LEN
         + Self::HEIGHT_LEN
         + Self::COMMITTEE_CONF_LEN
-        + Self::KILLED_LEN;
+        + Self::FLAGS_LEN;
 
     const TAG_OFFSET: usize = 0;
     const TXID_OFFSET: usize = Self::TAG_OFFSET + IPC_TAG_LENGTH;
@@ -1841,7 +2085,20 @@ impl IpcCheckpointSubnetMsg {
     const HEIGHT_OFFSET: usize = Self::HASH_OFFSET + bitcoin::hashes::sha256::Hash::LEN;
     const MARKERS_OFFSET: usize = Self::HEIGHT_OFFSET + Self::HEIGHT_LEN;
     const COMMITTEE_CONF_OFFSET: usize = Self::MARKERS_OFFSET + Self::MARKERS_LEN;
-    const KILLED_OFFSET: usize = Self::COMMITTEE_CONF_OFFSET + Self::COMMITTEE_CONF_LEN;
+    const FLAGS_OFFSET: usize = Self::COMMITTEE_CONF_OFFSET + Self::COMMITTEE_CONF_LEN;
+
+    /// The flags byte of the checkpoint's OP_RETURN data
+    fn flags(&self) -> u8 {
+        (if self.is_kill_checkpoint {
+            Self::FLAG_KILL
+        } else {
+            0
+        }) | (if self.is_rotation_checkpoint {
+            Self::FLAG_ROTATION
+        } else {
+            0
+        })
+    }
 
     pub(crate) fn make_metadata_tx_out(&self, fee_rate: bitcoin::FeeRate) -> bitcoin::TxOut {
         let mut op_return_data = [0u8; Self::DATA_LEN];
@@ -1869,11 +2126,10 @@ impl IpcCheckpointSubnetMsg {
                 .expect("validate: at most 255 destination subnets"); // Transfer batch count
         op_return_data[Self::MARKERS_OFFSET + 2] = self.unstakes.len().min(255) as u8; // Unstake count
                                                                                        // Add committee configuration number
-        op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::KILLED_OFFSET]
+        op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::FLAGS_OFFSET]
             .copy_from_slice(&self.next_committee_configuration_number.to_le_bytes());
 
-        // Add killed flag
-        op_return_data[Self::KILLED_OFFSET] = if self.is_kill_checkpoint { 1 } else { 0 };
+        op_return_data[Self::FLAGS_OFFSET] = self.flags();
 
         // Required to do since [u8; 78] for some reason doesn't implement pusbytes
         let push_bytes: &bitcoin::script::PushBytes =
@@ -1924,8 +2180,7 @@ impl IpcCheckpointSubnetMsg {
         let transfer_count = op_return_data[Self::MARKERS_OFFSET + 1];
         let unstake_count = op_return_data[Self::MARKERS_OFFSET + 2];
 
-        // Extract the killed flag
-        let killed = op_return_data[Self::KILLED_OFFSET] != 0;
+        let killed = op_return_data[Self::FLAGS_OFFSET] & Self::FLAG_KILL != 0;
 
         Ok((withdrawal_count, transfer_count, unstake_count, killed))
     }
@@ -1948,6 +2203,7 @@ impl IpcCheckpointSubnetMsg {
             || !self.token_registrations.is_empty()
             || !self.token_supply_adjustments.is_empty()
             || !self.token_transfers.is_empty()
+            || !self.slash_signatures.is_empty()
     }
 
     pub(crate) fn make_batched_transfer_data(&self) -> Result<Vec<u8>, IpcLibError> {
@@ -1978,11 +2234,14 @@ impl IpcCheckpointSubnetMsg {
                 .push(wire);
         }
 
+        let mut slash_signatures = self.slash_signatures.clone();
+        slash_signatures.sort_by_key(|e| (e.txid, e.vout));
         let wire_data = BatchTransferWireData {
             transfers: transfers_by_subnet,
             token_registrations: self.token_registrations.clone(),
             token_supply_adjustments: self.token_supply_adjustments.clone(),
             token_transfers: erc_by_subnet,
+            slash_signatures,
         };
 
         let binary: Vec<u8> = postcard::to_stdvec(&wire_data).map_err(|e| {
@@ -2000,16 +2259,12 @@ impl IpcCheckpointSubnetMsg {
         Ok(complete_data)
     }
 
-    fn make_batched_transfer(
-        &self,
-        fee_rate: bitcoin::FeeRate,
-        return_address: &bitcoin::Address,
-    ) -> Result<(bitcoin::TxOut, bitcoin::Witness, bitcoin::TxOut), IpcLibError> {
-        let batched_transfer_data = self.make_batched_transfer_data()?;
+    /// The commitment scriptPubKey of batch transfer `data` and the witness that reveals it
+    fn batch_transfer_commitment(
+        data: &[u8],
+    ) -> Result<(bitcoin::ScriptBuf, bitcoin::Witness), IpcLibError> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
-
-        // Construct the script that will contain the data
-        let commit_script = bitcoin_utils::make_push_data_script(batched_transfer_data.as_slice());
+        let commit_script = bitcoin_utils::make_push_data_script(data);
 
         let unspendable_pubkey = bitcoin_utils::unspenable_internal_key();
         let builder = bitcoin::taproot::TaprootBuilder::new()
@@ -2025,8 +2280,6 @@ impl IpcCheckpointSubnetMsg {
             commit_spend_info.merkle_root(),
         );
 
-        // Make the reveal transaction to calculate weight
-
         let control_block = commit_spend_info
             .control_block(&(
                 commit_script.clone(),
@@ -2036,6 +2289,44 @@ impl IpcCheckpointSubnetMsg {
 
         let reveal_witness =
             bitcoin::Witness::from_slice(&[commit_script.to_bytes(), control_block.serialize()]);
+        Ok((commit_script_pubkey, reveal_witness))
+    }
+
+    /// The batch transfer reveal with `witness` and its single output; the commitment outpoint
+    /// is filled in once the checkpoint transaction exists
+    fn batch_transfer_reveal(witness: bitcoin::Witness, output: bitcoin::TxOut) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                witness,
+                ..Default::default()
+            }],
+            output: vec![output],
+        }
+    }
+
+    /// The weight of the batch transfer reveal of this checkpoint's data, with its P2TR output
+    pub fn batch_transfer_reveal_weight(&self) -> Result<bitcoin::Weight, IpcLibError> {
+        let (_, witness) = Self::batch_transfer_commitment(&self.make_batched_transfer_data()?)?;
+        let output = bitcoin::TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0; 34]),
+        };
+        Ok(Self::batch_transfer_reveal(witness, output).weight())
+    }
+
+    fn make_batched_transfer(
+        &self,
+        fee_rate: bitcoin::FeeRate,
+        return_address: &bitcoin::Address,
+    ) -> Result<(bitcoin::TxOut, bitcoin::Witness, bitcoin::TxOut), IpcLibError> {
+        let (commit_script_pubkey, reveal_witness) =
+            Self::batch_transfer_commitment(&self.make_batched_transfer_data()?)?;
 
         // The reveal output must clear Core's dust limit at its default relay fee too
         let reveal_tx_out = bitcoin::TxOut {
@@ -2046,21 +2337,7 @@ impl IpcCheckpointSubnetMsg {
             script_pubkey: return_address.script_pubkey(),
         };
 
-        let reveal_tx = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint {
-                    // This will be replaced by the commit txid after
-                    // constructing the checkpoint transaction
-                    txid: bitcoin::Txid::all_zeros(),
-                    vout: 0,
-                },
-                witness: reveal_witness.clone(),
-                ..Default::default()
-            }],
-            output: vec![reveal_tx_out.clone()],
-        };
+        let reveal_tx = Self::batch_transfer_reveal(reveal_witness.clone(), reveal_tx_out.clone());
 
         // Get the weight of the reveal transaction
         let reveal_tx_weight = reveal_tx.weight();
@@ -2175,14 +2452,32 @@ impl IpcCheckpointSubnetMsg {
         fee_rate: bitcoin::FeeRate,
         unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
     ) -> Result<bitcoin::Psbt, IpcLibError> {
+        self.build_checkpoint_psbt(
+            &CheckpointSigner::of_committee(committee),
+            &next_committee.address_checked(),
+            committee != next_committee || self.is_kill_checkpoint,
+            fee_rate,
+            unspent,
+        )
+    }
+
+    /// The checkpoint PSBT: fund inputs from `unspent`, locked under `signer`, change to
+    /// `change_address`, and with `exhaust_unspent` every input of `unspent` (a rotation or
+    /// the kill checkpoint).
+    pub fn build_checkpoint_psbt(
+        &self,
+        signer: &CheckpointSigner,
+        change_address: &bitcoin::Address,
+        exhaust_unspent: bool,
+        fee_rate: bitcoin::FeeRate,
+        unspent: &[bitcoincore_rpc::json::ListUnspentResultEntry],
+    ) -> Result<bitcoin::Psbt, IpcLibError> {
         debug!(
             "Creating checkpoint transactions for subnet_id={}",
             self.subnet_id
         );
 
-        // Check if committee rotation is happening
-        let exhaust_unspent = committee != next_committee || self.is_kill_checkpoint;
-        let committee_change_address = next_committee.address_checked();
+        let committee_change_address = change_address.clone();
 
         let mut tx_outs = vec![];
 
@@ -2218,8 +2513,7 @@ impl IpcCheckpointSubnetMsg {
                 tx_outs.len(),
                 Self::commit_output_index(self.withdrawals.len())
             );
-            let (commit_tx_out, _, _) =
-                self.make_batched_transfer(fee_rate, &committee.address_checked())?;
+            let (commit_tx_out, _, _) = self.make_batched_transfer(fee_rate, &signer.address)?;
             tx_outs.push(commit_tx_out);
 
             for (txid20, total_amount) in transfer_batches(&self.transfers) {
@@ -2263,11 +2557,11 @@ impl IpcCheckpointSubnetMsg {
         // Create the checkpoint unsigned transaction
         //
 
-        let committee_keys = committee.validator_weighted_keys();
+        let committee_keys = signer.keys.clone();
 
         let mut checkpoint_tx = multisig::construct_spend_unsigned_transaction(
             &committee_keys,
-            committee.threshold,
+            signer.threshold,
             &committee_change_address,
             unspent,
             exhaust_unspent,
@@ -2337,7 +2631,7 @@ impl IpcCheckpointSubnetMsg {
                 // Reconstruct the transaction with updated tx_outs
                 checkpoint_tx = multisig::construct_spend_unsigned_transaction(
                     &committee_keys,
-                    committee.threshold,
+                    signer.threshold,
                     &committee_change_address,
                     unspent,
                     exhaust_unspent,
@@ -2353,7 +2647,7 @@ impl IpcCheckpointSubnetMsg {
             &secp,
             &self.subnet_id,
             &committee_keys,
-            committee.threshold,
+            signer.threshold,
             &committee_change_address,
             unspent,
             exhaust_unspent,
@@ -2450,15 +2744,18 @@ impl IpcCheckpointSubnetMsg {
         let unstakes_count = op_return_data[Self::MARKERS_OFFSET + 2] as usize;
 
         // Extract committee configuration number
-        let committee_conf_bytes =
-            &op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::KILLED_OFFSET];
+        let committee_conf_bytes = &op_return_data[Self::COMMITTEE_CONF_OFFSET..Self::FLAGS_OFFSET];
         let next_committee_configuration_number =
             u64::from_le_bytes(committee_conf_bytes.try_into().map_err(|_| {
                 err("Failed to convert committee configuration number bytes to u64".to_string())
             })?);
 
-        // Extract killed flag
-        let kill_checkpoint = op_return_data[Self::KILLED_OFFSET] != 0;
+        let flags = op_return_data[Self::FLAGS_OFFSET];
+        if flags & !(Self::FLAG_KILL | Self::FLAG_ROTATION) != 0 {
+            return Err(err(format!("Unknown flag bits set: {flags:#04x}")));
+        }
+        let kill_checkpoint = flags & Self::FLAG_KILL != 0;
+        let rotation_checkpoint = flags & Self::FLAG_ROTATION != 0;
 
         // Check if we have enough outputs for all the withdrawals, unstakes and transfers
         let expected_outputs = 1 + // metadata
@@ -2591,8 +2888,11 @@ impl IpcCheckpointSubnetMsg {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             change_address,
             is_kill_checkpoint: kill_checkpoint,
+            is_rotation_checkpoint: rotation_checkpoint,
+            slash_pre_signature_count: None,
         })
     }
 
@@ -2615,67 +2915,65 @@ impl IpcCheckpointSubnetMsg {
         })?;
 
         let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
-        let last_committee_configuration_number = subnet_state.committee.configuration_number;
+        let epoch = subnet_state.epoch;
 
-        let stake_change = if
-        // If next_committee_configuration_number is zero, it "could mean" no change
-        self.next_committee_configuration_number.is_zero()
-            || self.next_committee_configuration_number == last_committee_configuration_number
-        {
-            // No committee rotation, no stake change
-            None
-        } else {
-            if self.next_committee_configuration_number < last_committee_configuration_number {
-                return Err(IpcValidateError::InvalidField(
-                    "next_committee_configuration_number",
-                    format!(
-                        "Next committee configuration number {} is less than the last one {}",
-                        self.next_committee_configuration_number,
-                        last_committee_configuration_number
-                    ),
-                )
-                .into());
-            }
-
-            let stake_change =
-                db.get_stake_change(self.subnet_id, self.next_committee_configuration_number)?;
-
-            if stake_change.is_none() {
-                return Err(IpcValidateError::InvalidField(
-                    "next_committee_configuration_number",
-                    format!(
-                        "Stake change for committee configuration number {} does not exist",
-                        self.next_committee_configuration_number
-                    ),
-                )
-                .into());
-            }
-
-            debug!(
-                "Processing stake changes for checkpoint. Up to stake change {:?}",
-                stake_change
-            );
-
-            stake_change
-        };
-
-        let next_committee = stake_change.clone().map(|sc| sc.committee_after_change);
-
-        let (next_committee_number, next_configuration_number) =
-            if let Some(stake_change) = stake_change {
-                // Increment the committee number
-                // And use the new configuration number
+        // The flag decides. The checkpoint's configuration: for a rotation checkpoint, `C_e` of
+        // the monitor's epoch `e`, which it adopts (`Some`); otherwise the configuration of the
+        // last rotation checkpoint, which is `C_wlist` in epoch 0.
+        let (last_change_number, committee_number, checkpoint_epoch, adopted) =
+            if self.is_rotation_checkpoint {
+                if subnet_state.last_rotation_epoch >= epoch {
+                    return Err(IpcValidateError::InvalidField(
+                        "flags",
+                        format!(
+                            "Epoch {epoch} of subnet {} awaits no rotation checkpoint",
+                            self.subnet_id
+                        ),
+                    )
+                    .into());
+                }
+                let number = crate::collateral::epoch_committee_number(db, self.subnet_id, epoch)?
+                    .ok_or_else(|| {
+                        IpcValidateError::InvalidMsg(format!(
+                            "Subnet {} has no configuration of epoch {epoch}",
+                            self.subnet_id
+                        ))
+                    })?;
+                let configuration = subnet_state.latest_committee().clone();
                 (
-                    subnet_state.committee_number + 1,
-                    stake_change.configuration_number,
+                    configuration.configuration_number,
+                    number,
+                    epoch,
+                    Some(configuration),
                 )
+            } else if !subnet_state.is_activated() {
+                (0, crate::collateral::WHITELIST_COMMITTEE_NUMBER, 0, None)
             } else {
-                // No committee rotation, use the current committee number
                 (
-                    subnet_state.committee_number,
                     subnet_state.committee.configuration_number,
+                    subnet_state.committee_number,
+                    subnet_state.last_rotation_epoch,
+                    None,
                 )
             };
+
+        // The change number names the last configuration update the subnet applied, 0 when
+        // it applied none
+        let applied = self.next_committee_configuration_number;
+        if applied != 0 && db.get_stake_change(self.subnet_id, applied)?.is_none() {
+            return Err(IpcValidateError::InvalidField(
+                "next_committee_configuration_number",
+                format!("Stake change for committee configuration number {applied} does not exist"),
+            )
+            .into());
+        }
+        // The configuration that signs the fund inputs: `C_wlist` holds the funds until the
+        // rotation checkpoint of epoch 1
+        let signed_committee_number = if subnet_state.last_rotation_epoch == 0 {
+            crate::collateral::WHITELIST_COMMITTEE_NUMBER
+        } else {
+            subnet_state.committee_number
+        };
 
         // Create a new checkpoint record
         let checkpoint = db::SubnetCheckpoint {
@@ -2687,18 +2985,19 @@ impl IpcCheckpointSubnetMsg {
             // Will be updated when batch transfer is confirmed
             batch_transfer_txid: None,
             batch_transfer_block_height: None,
-            signed_committee_number: subnet_state.committee_number,
-            next_committee_number,
-            next_configuration_number,
+            signed_committee_number,
+            next_committee_number: committee_number,
+            next_configuration_number: last_change_number,
             is_kill_checkpoint: self.is_kill_checkpoint,
+            epoch: checkpoint_epoch,
+            is_rotation_checkpoint: self.is_rotation_checkpoint,
         };
 
         // Update the checkpoint number in subnet state
         subnet_state.last_checkpoint_number = Some(checkpoint_number);
 
-        // Update subnet state with the new committee
-        if let Some(next_committee) = &next_committee {
-            subnet_state.rotate_to_committee(next_committee.clone());
+        if let Some(configuration) = &adopted {
+            subnet_state.adopt_committee(checkpoint_epoch, committee_number, configuration.clone());
         }
 
         // Update subnet state if killed
@@ -2719,23 +3018,8 @@ impl IpcCheckpointSubnetMsg {
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
         // Save the checkpoint record
         db.save_checkpoint(&mut wtxn, self.subnet_id, &checkpoint, checkpoint_number)?;
-        // Save new committee if changed
-        if let Some(next_committee) = &next_committee {
-            db.save_committee(
-                &mut wtxn,
-                self.subnet_id,
-                next_committee_number,
-                next_committee,
-            )?;
-
-            // Update the stake changes
-            db.confirm_stake_changes(
-                &mut wtxn,
-                self.subnet_id,
-                self.next_committee_configuration_number,
-                block_height,
-                block_hash,
-            )?;
+        if applied != 0 {
+            db.confirm_stake_changes(&mut wtxn, self.subnet_id, applied, block_height, block_hash)?;
         }
 
         // Commit the transaction
@@ -2924,6 +3208,8 @@ pub struct IpcBatchTransferMsg {
     pub token_supply_adjustments: Vec<IpcErcSupplyAdjustment>,
     /// ERC20 cross-subnet transfers (IPC:ETX)
     pub token_transfers: Vec<IpcCrossSubnetErcTransfer>,
+    /// Slash pre-signatures, one entry per output
+    pub slash_signatures: Vec<SlashSignatureEntry>,
 }
 
 impl IpcValidate for IpcBatchTransferMsg {
@@ -2940,11 +3226,14 @@ impl IpcValidate for IpcBatchTransferMsg {
             && self.token_registrations.is_empty()
             && self.token_supply_adjustments.is_empty()
             && self.token_transfers.is_empty()
+            && self.slash_signatures.is_empty()
         {
             return Err(IpcValidateError::InvalidMsg(
-                "Batch transfer message must have at least one transfer, token registration, or ERC transfer".to_string(),
+                "Batch transfer message must have at least one transfer, token registration, ERC transfer or slash pre-signature entry".to_string(),
             ));
         }
+        SlashSignatureEntry::check_order(&self.slash_signatures)
+            .map_err(|e| IpcValidateError::InvalidField("slash_signatures", e))?;
 
         // Check if the transfers are valid
         for transfer in &self.transfers {
@@ -3026,13 +3315,19 @@ impl IpcBatchTransferMsg {
             ));
         }
 
-        let wire_data: BatchTransferWireData =
-            postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..]).map_err(|e| {
-                IpcLibError::MsgParseError(
-                    IPC_TRANSFER_TAG,
-                    format!("Failed to deserialize batch transfer data: {}", e),
-                )
-            })?;
+        let body = &witness_data[IPC_TRANSFER_TAG.len()..];
+        let wire_data: BatchTransferWireData = postcard::from_bytes(body).map_err(|e| {
+            IpcLibError::MsgParseError(
+                IPC_TRANSFER_TAG,
+                format!("Failed to deserialize batch transfer data: {}", e),
+            )
+        })?;
+        if postcard::to_stdvec(&wire_data).ok().as_deref() != Some(body) {
+            return Err(IpcLibError::MsgParseError(
+                IPC_TRANSFER_TAG,
+                "Batch transfer data is not the exact encoding of its fields".to_string(),
+            ));
+        }
 
         Ok(wire_data)
     }
@@ -3088,6 +3383,7 @@ impl IpcBatchTransferMsg {
             && wire_data.token_registrations.is_empty()
             && wire_data.token_supply_adjustments.is_empty()
             && erc_transfers.is_empty()
+            && wire_data.slash_signatures.is_empty()
         {
             return Err(err("No valid data found in batch transfer".into()));
         }
@@ -3101,6 +3397,7 @@ impl IpcBatchTransferMsg {
             token_registrations: wire_data.token_registrations,
             token_supply_adjustments: wire_data.token_supply_adjustments,
             token_transfers: erc_transfers,
+            slash_signatures: wire_data.slash_signatures,
         })
     }
 
@@ -3157,6 +3454,52 @@ impl IpcBatchTransferMsg {
 
         self.validate_for_checkpoint(db, &checkpoint_tx)?;
         self.save_to_db(db, checkpoint, block_height, block_hash, txid)
+    }
+
+    /// The collateral outputs that the entries make slashable now: every entry must name a
+    /// recorded collateral of the subnet and carry valid signatures of members of the
+    /// configuration its script names, or the batch transfer fails as a whole. An output
+    /// already slashable, or an entry whose signers do not reach the threshold, changes
+    /// nothing.
+    pub(crate) fn newly_slashable<D: db::DatabaseCore>(
+        &self,
+        db: &D,
+    ) -> Result<Vec<(db::UeCollateral, Vec<(u16, Signature64)>)>, IpcLibError> {
+        Self::entries_made_slashable(db, self.subnet_id, &self.slash_signatures)
+    }
+
+    /// The outputs that `entries` make slashable, with their valid signatures: those not
+    /// slashable yet whose signatures reach the threshold. An invalid signature is an error.
+    fn entries_made_slashable<D: db::DatabaseCore>(
+        db: &D,
+        subnet_id: SubnetId,
+        entries: &[SlashSignatureEntry],
+    ) -> Result<Vec<(db::UeCollateral, Vec<(u16, Signature64)>)>, IpcLibError> {
+        let mut newly = Vec::new();
+        for entry in entries {
+            let checked = check_slash_entry(db, subnet_id, entry)?;
+            if let Some(index) = checked.invalid.first() {
+                return Err(IpcValidateError::InvalidMsg(format!(
+                    "Slash pre-signature entry {}: signature {index} is invalid",
+                    entry.outpoint()
+                ))
+                .into());
+            }
+            if checked.slashable {
+                continue;
+            }
+            if checked.reaches_threshold() {
+                newly.push((checked.record, checked.valid));
+            } else {
+                debug!(
+                    "Slash pre-signatures of {} reach power {} of threshold {}: not slashable yet",
+                    entry.outpoint(),
+                    checked.power,
+                    checked.script.configuration.threshold
+                );
+            }
+        }
+        Ok(newly)
     }
 
     /// The checkpoint-side rules: the reveal input spends the checkpoint's commitment output,
@@ -3267,6 +3610,7 @@ impl IpcBatchTransferMsg {
             &self.token_transfers,
             db,
         )?;
+        let newly_slashable = self.newly_slashable(db)?;
 
         checkpoint.batch_transfer_txid = Some(txid);
         checkpoint.batch_transfer_block_height = Some(block_height);
@@ -3516,6 +3860,23 @@ impl IpcBatchTransferMsg {
             );
         }
 
+        for (record, signatures) in &newly_slashable {
+            db.add_slash_presigs(
+                &mut wtxn,
+                &db::SlashPresigRecord {
+                    subnet_id: source_subnet_id,
+                    outpoint: record.outpoint,
+                    signatures: signatures.clone(),
+                    block_height,
+                    batch_transfer_txid: txid,
+                },
+            )?;
+            info!(
+                "Collateral {} of validator {} in subnet {} is slashable",
+                record.outpoint, record.pubkey, source_subnet_id
+            );
+        }
+
         // Commit all changes
         wtxn.commit()?;
 
@@ -3528,6 +3889,73 @@ impl IpcBatchTransferMsg {
     }
 }
 
+/// A slash pre-signature entry checked against the monitor's state.
+pub struct CheckedSlashEntry {
+    pub record: db::UeCollateral,
+    pub script: crate::collateral::CollateralScript,
+    /// The valid signatures, in ascending index order
+    pub valid: Vec<(u16, Signature64)>,
+    /// The indexes whose signatures do not verify
+    pub invalid: Vec<u16>,
+    /// The power of the valid signers
+    pub power: u64,
+    /// Whether the output is slashable already
+    pub slashable: bool,
+}
+
+impl CheckedSlashEntry {
+    pub fn reaches_threshold(&self) -> bool {
+        self.power >= u64::from(self.script.configuration.threshold)
+    }
+}
+
+/// Checks a slash pre-signature entry: the output must be a recorded collateral of the
+/// subnet; each signature is checked under the key its index names in the configuration the
+/// collateral script names.
+pub fn check_slash_entry<D: db::DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    entry: &SlashSignatureEntry,
+) -> Result<CheckedSlashEntry, IpcLibError> {
+    let outpoint = entry.outpoint();
+    let record = db
+        .get_ue_collaterals(subnet_id)?
+        .into_iter()
+        .find(|r| r.outpoint == outpoint)
+        .ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!(
+                "Slash pre-signature entry names {outpoint}, not a collateral of subnet {subnet_id}"
+            ))
+        })?;
+    let script = crate::collateral::collateral_script_of(db, &record)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for (index, signature) in &entry.signatures {
+        match crate::slash::verify_slash_signature(
+            &secp,
+            &script,
+            outpoint,
+            record.value,
+            *index,
+            signature,
+        ) {
+            Ok(()) => valid.push((*index, *signature)),
+            Err(_) => invalid.push(*index),
+        }
+    }
+    let power = crate::slash::signed_power(&script, &valid);
+    let slashable = db.get_slash_presigs(subnet_id, &outpoint)?.is_some();
+    Ok(CheckedSlashEntry {
+        record,
+        script,
+        valid,
+        invalid,
+        power,
+        slashable,
+    })
+}
+
 /// Whether a batch transfer credits `subnet_id`: it is bootstrapped and not killed
 fn receives_transfers<D: db::DatabaseCore>(
     db: &D,
@@ -3535,7 +3963,7 @@ fn receives_transfers<D: db::DatabaseCore>(
 ) -> Result<bool, IpcLibError> {
     Ok(db
         .get_subnet_state(subnet_id)?
-        .is_some_and(|subnet| !subnet.is_killed()))
+        .is_some_and(|subnet| subnet.is_activated() && !subnet.is_killed()))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3777,7 +4205,7 @@ impl IpcStakeCollateralMsg {
         &self,
         db: &D,
         block_height: u64,
-        block_hash: bitcoin::BlockHash,
+        _block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
         let genesis_info =
@@ -3801,65 +4229,38 @@ impl IpcStakeCollateralMsg {
 
         self.validate_for_subnet(&subnet_state)?;
 
-        // we clone and modify the validator
-        let mut validator = subnet_state
-            .latest_committee()
-            .validators
-            .iter()
-            .find(|v| v.pubkey == self.pubkey)
-            .ok_or(IpcValidateError::InvalidMsg(format!(
-                "Validator with public key {} not part of committee",
-                self.pubkey
-            )))?
-            .clone();
-
-        let new_collateral = self.amount + validator.collateral;
-        let new_power = multisig::collateral_to_power(
-            &new_collateral,
-            &genesis_info.create_subnet_msg.min_validator_stake,
+        // The stake goes to a multisig member, with the pending changes applied, and takes
+        // effect at the next cutoff
+        let members = crate::epochs::multisig_members_after(
+            db,
+            &genesis_info,
+            subnet_state.latest_committee(),
+            &subnet_state.pending_multisig_changes,
         )?;
+        let member = members.get(&self.pubkey).ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!(
+                "Validator with public key {} is not a multisig member of subnet {}",
+                self.pubkey, self.subnet_id
+            ))
+        })?;
+        let new_collateral = member.collateral.checked_add(self.amount).ok_or_else(|| {
+            IpcValidateError::InvalidMsg("collateral value overflow".to_string())
+        })?;
+        genesis_info.create_subnet_msg.power_of(&new_collateral)?;
 
-        validator.collateral = new_collateral;
-        validator.power = new_power;
-
-        // Update the next committee or create one if it doesn't exist
-        let mut next_committee = subnet_state
-            .waiting_committee
-            .unwrap_or_else(|| subnet_state.committee.clone());
-
-        // Modify the validator in the next committee
-        next_committee.modify_validator(&self.subnet_id, &validator)?;
-
-        // Update the subnet state with the modified next committee
-        subnet_state.waiting_committee = Some(next_committee.clone());
-
-        let stake_change_configuration_number =
-            db.get_next_stake_change_configuration_number(self.subnet_id)?;
-
-        // Create a stake change request to track this change
-        let stake_change = db::StakeChangeRequest {
-            change: db::StakingChange::Deposit {
+        subnet_state
+            .pending_multisig_changes
+            .push(db::PendingMultisigChange::Stake {
+                pubkey: self.pubkey,
                 amount: self.amount,
-            },
-            validator_xpk: self.pubkey,
-            validator_subnet_address: validator.subnet_address,
-            configuration_number: stake_change_configuration_number,
-            committee_after_change: next_committee.clone(),
-            block_height,
-            block_hash,
-            checkpoint_block_height: None,
-            checkpoint_block_hash: None,
-            txid,
-        };
-
+            });
         let mut wtxn = db.write_txn()?;
-
-        // Save the updated subnet state to the database
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
-        // Add the stake change to the database
-        db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
-
         wtxn.commit()?;
+        info!(
+            "Subnet {} stake of {} by {} in block {} ({txid}), applied at the next cutoff",
+            self.subnet_id, self.amount, self.pubkey, block_height
+        );
 
         Ok(())
     }
@@ -3982,10 +4383,7 @@ impl IpcUnstakeCollateralMsg {
                     self.amount, validator.collateral
                 )))?;
 
-        let (_, sufficient_to_participate) = match multisig::collateral_to_power(
-            &new_collateral,
-            &genesis_info.create_subnet_msg.min_validator_stake,
-        ) {
+        let (_, sufficient_to_participate) = match genesis_info.create_subnet_msg.power_of(&new_collateral) {
             Ok(power) => (power, true),
             Err(crate::multisig::MultisigError::InsufficientCollateral) => (0, false),
             Err(_) => {
@@ -4317,7 +4715,7 @@ impl IpcUnstakeCollateralMsg {
         &self,
         db: &D,
         block_height: u64,
-        block_hash: bitcoin::BlockHash,
+        _block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
         let genesis_info =
@@ -4344,101 +4742,62 @@ impl IpcUnstakeCollateralMsg {
         // checked before in validate_for_subnet
         let pubkey = self.pubkey.expect("pubkey should be present");
 
-        let committee = subnet_state.latest_committee();
-
-        // we clone and modify the validator
-        let mut validator = committee
-            .validators
-            .iter()
-            .find(|v| v.pubkey == pubkey)
-            .ok_or(IpcValidateError::InvalidMsg(format!(
-                "Validator with public key {} not part of committee",
-                pubkey
-            )))?
-            .clone();
-
-        let new_collateral =
-            validator
-                .collateral
-                .checked_sub(self.amount)
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "Amount {} is greater than current collateral {}",
-                    self.amount, validator.collateral
-                )))?;
-
-        use crate::multisig::MultisigError;
-
-        // The amount user specified to unstake
-        // in case the remaining collateral is too low, we will withdraw all
-        // of the funds
-        let (new_power, sufficient_to_participate) = match multisig::collateral_to_power(
-            &new_collateral,
-            &genesis_info.create_subnet_msg.min_validator_stake,
-        ) {
-            Ok(power) => (power, true),
-            Err(MultisigError::InsufficientCollateral) => (0, false),
+        // The unstake leaves a multisig member, with the pending changes applied, and takes
+        // effect at the next cutoff. A remainder below the minimum stake removes the member.
+        let members = crate::epochs::multisig_members_after(
+            db,
+            &genesis_info,
+            subnet_state.latest_committee(),
+            &subnet_state.pending_multisig_changes,
+        )?;
+        let member = members.get(&pubkey).ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!(
+                "Validator with public key {pubkey} is not a multisig member of subnet {}",
+                self.subnet_id
+            ))
+        })?;
+        let new_collateral = member.collateral.checked_sub(self.amount).ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!(
+                "Amount {} is greater than current collateral {}",
+                self.amount, member.collateral
+            ))
+        })?;
+        let leaves = match genesis_info.create_subnet_msg.power_of(&new_collateral) {
+            Ok(_) => false,
+            Err(crate::multisig::MultisigError::InsufficientCollateral) => true,
             Err(e) => return Err(e.into()),
         };
-
-        // Update the next committee or create one if it doesn't exist
-        let mut next_committee = subnet_state.latest_committee().clone();
-
-        if new_power == 0 || !sufficient_to_participate {
-            // The only member of a committee cannot withdraw all its collateral
-            if next_committee.validators.len() <= 1 {
-                return Err(IpcValidateError::InvalidMsg(format!(
-                    "Validator {pubkey} is the only member of subnet {} and cannot withdraw all its collateral",
-                    self.subnet_id
-                ))
-                .into());
-            }
-            // Remove the validator from the committee if power is zero
-            next_committee.remove_validator(&self.subnet_id, &pubkey)?;
-            info!(
-                "Subnet={} Validator XPK {} left the committee by withdrawing {} collateral",
-                self.subnet_id, pubkey, self.amount
-            );
-        } else {
-            // Modify the validator in the next committee
-            validator.collateral = new_collateral;
-            validator.power = new_power;
-            next_committee.modify_validator(&self.subnet_id, &validator)?;
-            info!(
-                "Subnet={} Validator XPK {} updated collateral to {}",
-                self.subnet_id, pubkey, self.amount
-            );
+        if leaves && self.amount != member.collateral {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator {pubkey} would keep less than the minimum stake after unstaking {}: unstake all {}",
+                self.amount, member.collateral
+            ))
+            .into());
+        }
+        if leaves && subnet_state.latest_committee().validators.len() <= 1 {
+            return Err(IpcValidateError::InvalidMsg(format!(
+                "Validator {pubkey} is the only member of subnet {} and cannot withdraw all its collateral",
+                self.subnet_id
+            ))
+            .into());
         }
 
-        // Update the subnet state with the modified next committee
-        subnet_state.waiting_committee = Some(next_committee.clone());
-
-        let stake_change_configuration_number =
-            db.get_next_stake_change_configuration_number(self.subnet_id)?;
-
-        // Create a stake change request to track this change
-        let stake_change = db::StakeChangeRequest {
-            change: db::StakingChange::Withdraw {
+        subnet_state
+            .pending_multisig_changes
+            .push(db::PendingMultisigChange::Unstake {
+                pubkey,
                 amount: self.amount,
-            },
-            validator_xpk: pubkey,
-            validator_subnet_address: validator.subnet_address,
-            configuration_number: stake_change_configuration_number,
-            committee_after_change: next_committee.clone(),
-            block_height,
-            block_hash,
-            checkpoint_block_height: None,
-            checkpoint_block_hash: None,
-            txid,
-        };
-
+            });
         let mut wtxn = db.write_txn()?;
-
-        // Save the updated subnet state to the database
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
-        // Add the stake change to the database
-        db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
-
         wtxn.commit()?;
+        info!(
+            "Subnet {} unstake of {} by {pubkey} in block {} ({txid}), applied at the next cutoff{}",
+            self.subnet_id,
+            self.amount,
+            block_height,
+            if leaves { ": the validator leaves" } else { "" }
+        );
 
         Ok(())
     }
@@ -4980,8 +5339,12 @@ impl IpcMessage {
                 }
                 match Self::from_reveal_input(tx, index, &found.data) {
                     Ok(msg) => Some((index, msg)),
+                    Err(IpcLibError::MsgParseError("tag", e)) => {
+                        trace!("Input {index}: not an IPC message: {e}");
+                        None
+                    }
                     Err(e) => {
-                        trace!("Input {index}: not an IPC message: {e:?}");
+                        warn!("Input {index}: IPC message ignored: {e}");
                         None
                     }
                 }
@@ -5332,26 +5695,14 @@ mod tests {
         )
         .unwrap();
 
-        let params = IpcCreateSubnetMsg {
-            min_validator_stake: Amount::from_sat(1000),
-            min_validators: 2,
-            bottomup_check_period: 10,
-            active_validators_limit: 20,
-            min_cross_msg_fee: Amount::from_sat(50),
-            whitelist: vec![validator1, validator2],
-        };
+        let params = spec_example_create_msg(validator1, validator2);
 
         let serialized = params.to_bytes().expect("Serialization failed");
-
-        println!("{:?}", serialized);
+        assert_eq!(serialized, spec_example_create_bytes(validator1, validator2));
 
         let params = IpcCreateSubnetMsg::from_bytes(&serialized).unwrap();
-        assert_eq!(params.min_validator_stake, Amount::from_sat(1000));
-        assert_eq!(params.min_validators, 2);
-        assert_eq!(params.bottomup_check_period, 10);
-        assert_eq!(params.active_validators_limit, 20);
-        assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
-        assert_eq!(params.whitelist, vec![validator1, validator2]);
+        assert_spec_example_create_msg(&params, validator1, validator2);
+        params.validate().unwrap();
     }
 
     #[test]
@@ -5361,11 +5712,18 @@ mod tests {
         let db = crate::test_utils::create_test_db();
         let msg = IpcCreateSubnetMsg {
             min_validator_stake: Amount::from_sat(10_000),
+            power_unit_exponent: 4,
             min_validators: 2,
             bottomup_check_period: 10,
             active_validators_limit: 10,
             min_cross_msg_fee: Amount::from_sat(1),
             whitelist: crate::test_utils::generate_xonly_pubkeys(2),
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 1000,
+            min_deposit: Amount::from_sat(330),
+            kill_vote_period: 36,
+            kill_delay_period: 5,
         };
         let txid = crate::test_utils::create_rand_txid();
         let subnet_id = SubnetId::from_txid(&txid);
@@ -5418,9 +5776,12 @@ mod tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(source.committee.multisig_address.clone()),
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         // The reveal spends the commitment output of a transaction the monitor never processed
@@ -5521,9 +5882,12 @@ mod tests {
                 token_registrations: vec![],
                 token_supply_adjustments: vec![],
                 token_transfers: vec![],
+                slash_signatures: vec![],
                 unstakes: vec![],
                 change_address: Some(source.committee.multisig_address.clone()),
                 is_kill_checkpoint: false,
+                slash_pre_signature_count: None,
+                is_rotation_checkpoint: false,
             }
         }
 
@@ -5902,7 +6266,7 @@ mod tests {
         }
 
         #[test]
-        fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_credited() {
+        fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
             set_test_fvm_network();
             let secp = bitcoin::secp256k1::Secp256k1::new();
             let keypair = test_utils::generate_keypairs(1).remove(0);
@@ -5912,11 +6276,18 @@ mod tests {
                 subnet_id: destination_id,
                 create_subnet_msg: IpcCreateSubnetMsg {
                     min_validator_stake: Amount::from_sat(10_000),
+                    power_unit_exponent: 4,
                     min_validators: 1,
                     bottomup_check_period: 10,
                     active_validators_limit: 10,
                     min_cross_msg_fee: Amount::from_sat(1),
                     whitelist: vec![pubkey],
+                    epoch_length: 10,
+                    min_timeout: 1,
+                    max_timeout: 1000,
+                    min_deposit: Amount::from_sat(330),
+                    kill_vote_period: 36,
+                    kill_delay_period: 5,
                 },
                 create_msg_block_height: 100,
                 bootstrapped: false,
@@ -5937,9 +6308,27 @@ mod tests {
                 backup_address: test_utils::create_rand_addr().into_unchecked(),
                 pubkey,
             };
-            let join_ue = IpcJoinUeMsg::new_signed(&secp, join, 1_000, &keypair.secret_key());
+            let eots_sk = bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+            let commitment = crate::eots::EotsNonceCommitment {
+                start: 1,
+                count: 1,
+                root: [2u8; 32],
+            };
+            let context = {
+                let scratch = test_utils::create_test_db();
+                save_genesis(&scratch);
+                collateral::join_context(&scratch, destination_id).unwrap()
+            };
+            let join_ue = IpcJoinUeMsg::new_signed(
+                &secp,
+                join,
+                1_000,
+                &keypair.secret_key(),
+                &eots_sk,
+                commitment,
+            );
             let (join_commit, join_reveal, _) =
-                collateral::unsigned_join_ue_txs(&secp, &join_ue, Amount::from_sat(50_000))
+                collateral::unsigned_join_ue_txs(&secp, &join_ue, Amount::from_sat(50_000), &context.named[0].1)
                     .unwrap();
 
             // The multisig the join creates, learnt from a scratch database
@@ -5947,7 +6336,7 @@ mod tests {
                 let scratch = test_utils::create_test_db();
                 save_genesis(&scratch);
                 let checked =
-                    collateral::check_join_ue(&secp, &join_reveal, 0, &join_commit, REVEAL_BLOCK)
+                    collateral::check_join_ue(&secp, &join_reveal, 0, &join_commit, REVEAL_BLOCK, &collateral::join_context(&scratch, destination_id).unwrap())
                         .unwrap();
                 collateral::process_join_ue(
                     &scratch,
@@ -5984,6 +6373,7 @@ mod tests {
                             input,
                             &join_commit,
                             REVEAL_BLOCK,
+                            &context,
                         )
                         .unwrap();
                         collateral::process_join_ue(
@@ -6005,7 +6395,8 @@ mod tests {
                     other => panic!("unexpected message {other:?}"),
                 }
             }
-            assert_eq!(credited(&db, &destination), vec![1_000]);
+            // The destination is in epoch 0 until its first checkpoint: inactive, not credited
+            assert!(credited(&db, &destination).is_empty());
         }
 
         #[test]
@@ -6079,22 +6470,115 @@ mod tests {
         )
         .unwrap();
 
-        // Postcard binary format from the above serialization test
-        // Works like a snapshot for deserialization
-        let serialized = vec![
-            73, 80, 67, 67, 82, 84, 232, 7, 2, 10, 20, 50, 2, 24, 132, 87, 129, 246, 49, 196, 143,
-            28, 151, 9, 226, 48, 146, 6, 125, 6, 131, 127, 48, 170, 12, 208, 84, 74, 200, 135, 254,
-            145, 221, 209, 102, 106, 101, 56, 249, 58, 26, 230, 106, 43, 104, 170, 216, 55, 219,
-            243, 206, 151, 1, 14, 202, 251, 237, 68, 11, 121, 171, 121, 140, 242, 137, 132, 223,
-        ];
+        // The 86 bytes of the example in docs/specs/transactions/create-subnet.md
+        let serialized = spec_example_create_bytes(validator1, validator2);
+        assert_eq!(serialized.len(), 86);
 
         let params = IpcCreateSubnetMsg::from_bytes(&serialized).unwrap();
+        assert_spec_example_create_msg(&params, validator1, validator2);
+    }
+
+    /// The create message of the example in docs/specs/transactions/create-subnet.md.
+    fn spec_example_create_msg(key1: XOnlyPublicKey, key2: XOnlyPublicKey) -> IpcCreateSubnetMsg {
+        IpcCreateSubnetMsg {
+            min_validator_stake: Amount::from_sat(1000),
+            power_unit_exponent: 3,
+            min_validators: 2,
+            bottomup_check_period: 10,
+            active_validators_limit: 20,
+            min_cross_msg_fee: Amount::from_sat(50),
+            whitelist: vec![key1, key2],
+            epoch_length: 144,
+            min_timeout: 1,
+            max_timeout: 10,
+            min_deposit: Amount::from_sat(330),
+            kill_vote_period: 36,
+            kill_delay_period: 5,
+        }
+    }
+
+    fn spec_example_create_bytes(key1: XOnlyPublicKey, key2: XOnlyPublicKey) -> Vec<u8> {
+        [
+            &[0x49, 0x50, 0x43, 0x43, 0x52, 0x54, 0xe8, 0x07, 0x03, 0x02, 0x0a, 0x14, 0x32, 0x02][..],
+            &key1.serialize(),
+            &key2.serialize(),
+            &[0x90, 0x01, 0x01, 0x0a, 0xca, 0x02, 0x24, 0x05],
+        ]
+        .concat()
+    }
+
+    fn assert_spec_example_create_msg(
+        params: &IpcCreateSubnetMsg,
+        key1: XOnlyPublicKey,
+        key2: XOnlyPublicKey,
+    ) {
         assert_eq!(params.min_validator_stake, Amount::from_sat(1000));
+        assert_eq!(params.power_unit_exponent, 3);
         assert_eq!(params.min_validators, 2);
         assert_eq!(params.bottomup_check_period, 10);
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
-        assert_eq!(params.whitelist, vec![validator1, validator2]);
+        assert_eq!(params.whitelist, vec![key1, key2]);
+        assert_eq!(params.epoch_length, 144);
+        assert_eq!(params.min_timeout, 1);
+        assert_eq!(params.max_timeout, 10);
+        assert_eq!(params.min_deposit, Amount::from_sat(330));
+        assert_eq!(params.kill_vote_period, 36);
+        assert_eq!(params.kill_delay_period, 5);
+    }
+
+    #[test]
+    fn create_msg_validity_conditions() {
+        set_test_fvm_network();
+        let key1 = XOnlyPublicKey::from_str(
+            "18845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
+        )
+        .unwrap();
+        let key2 = XOnlyPublicKey::from_str(
+            "6a6538f93a1ae66a2b68aad837dbf3ce97010ecafbed440b79ab798cf28984df",
+        )
+        .unwrap();
+        let valid = spec_example_create_msg(key1, key2);
+        valid.validate().unwrap();
+        assert_eq!(valid.power_unit(), Amount::from_sat(1000));
+        assert_eq!(valid.power_of(&Amount::from_sat(2500)).unwrap(), 2);
+        assert_eq!(valid.cutoff_height(1000, 3), 1432);
+        assert_eq!(valid.epoch_of(1000, 1000), 0);
+        assert_eq!(valid.epoch_of(1000, 1001), 1);
+        assert_eq!(valid.epoch_of(1000, 1144), 1);
+        assert_eq!(valid.epoch_of(1000, 1145), 2);
+
+        let rejected: Vec<(&str, Box<dyn Fn(&mut IpcCreateSubnetMsg)>)> = vec![
+            ("power_unit_exponent", Box::new(|m| m.power_unit_exponent = 16)),
+            ("min_validator_stake", Box::new(|m| m.power_unit_exponent = 4)),
+            ("min_validators", Box::new(|m| m.min_validators = 0)),
+            ("min_validators", Box::new(|m| m.min_validators = 91)),
+            ("whitelist", Box::new(|m| m.whitelist = vec![key1, key1])),
+            ("whitelist", Box::new(|m| m.whitelist = vec![key1])),
+            ("bottomup_check_period", Box::new(|m| m.bottomup_check_period = 0)),
+            ("active_validators_limit", Box::new(|m| m.active_validators_limit = 1)),
+            ("active_validators_limit", Box::new(|m| m.active_validators_limit = 351)),
+            ("min_cross_msg_fee", Box::new(|m| m.min_cross_msg_fee = Amount::ZERO)),
+            ("epoch_length", Box::new(|m| m.epoch_length = 0)),
+            ("epoch_length", Box::new(|m| m.epoch_length = 21_846)),
+            ("min_timeout", Box::new(|m| m.min_timeout = 0)),
+            ("max_timeout", Box::new(|m| m.max_timeout = 0)),
+            ("min_deposit", Box::new(|m| m.min_deposit = Amount::from_sat(329))),
+            ("kill_vote_period", Box::new(|m| m.kill_vote_period = 0)),
+        ];
+        for (name, mutate) in rejected {
+            let mut msg = valid.clone();
+            mutate(&mut msg);
+            match msg.validate() {
+                Err(IpcValidateError::InvalidField(f, _)) => assert_eq!(f, name),
+                other => panic!("{name}: expected a rejection, got {other:?}"),
+            }
+        }
+
+        let mut largest = valid.clone();
+        largest.epoch_length = 21_845;
+        largest.active_validators_limit = 350;
+        largest.validate().unwrap();
     }
 
     #[test]
@@ -6176,14 +6660,6 @@ mod tests {
             Err(IpcValidateError::InvalidField("subnet_id", _))
         ));
 
-        // Test zero collateral
-        let mut invalid_msg = valid_msg.clone();
-        invalid_msg.collateral = Amount::ZERO;
-        assert!(matches!(
-            invalid_msg.validate(),
-            Err(IpcValidateError::InvalidField("collateral", _))
-        ));
-
         // Test wrong network address
         let mut invalid_msg = valid_msg.clone();
         invalid_msg.backup_address =
@@ -6234,8 +6710,8 @@ mod tests {
         assert_eq!(deserialized.backup_address, msg.backup_address);
         assert_eq!(deserialized.pubkey, msg.pubkey);
 
-        // It should be invalid because it's missing collateral and subnet_id
-        assert!(deserialized.validate().is_err());
+        // The collateral is not a payload field: the message checks pass without it
+        assert!(deserialized.validate().is_ok());
     }
 
     #[test]
@@ -6716,6 +7192,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![unstake],
             withdrawals: vec![withdrawal],
             transfers: vec![transfer],
@@ -6725,6 +7202,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         }
     }
 
@@ -6759,6 +7238,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers,
@@ -6768,6 +7248,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 30, // arbitrary test number
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         }
     }
 
@@ -6834,9 +7316,12 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
         let fee_rate = DEFAULT_BTC_FEE_RATE;
         let build = |msg: &IpcCheckpointSubnetMsg| {
@@ -7008,10 +7493,13 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -7092,10 +7580,13 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -7252,6 +7743,7 @@ mod checkpoint_msg_tests {
             )
             .unwrap(),
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers: vec![IpcCrossSubnetTransfer {
@@ -7269,6 +7761,8 @@ mod checkpoint_msg_tests {
             change_address: Some(source.committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
         let checkpoint_txid = test_utils::create_rand_txid();
         let fee_rate = bitcoin::FeeRate::from_sat_per_vb(10).unwrap();
@@ -7346,11 +7840,18 @@ mod checkpoint_msg_tests {
     fn create_is_read_only_from_a_reveal_with_one_input_and_one_output() {
         let msg = IpcCreateSubnetMsg {
             min_validator_stake: Amount::from_sat(10_000),
+            power_unit_exponent: 4,
             min_validators: 2,
             bottomup_check_period: 10,
             active_validators_limit: 10,
             min_cross_msg_fee: Amount::from_sat(1),
             whitelist: test_utils::generate_xonly_pubkeys(2),
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 1000,
+            min_deposit: Amount::from_sat(330),
+            kill_vote_period: 36,
+            kill_delay_period: 5,
         };
         let leaf = bitcoin_utils::make_push_data_script(&msg.to_bytes().unwrap()).to_bytes();
         let output = bitcoin::TxOut {
@@ -7592,10 +8093,13 @@ mod checkpoint_msg_tests {
             token_supply_adjustments: vec![],
             token_transfers: vec![],
             withdrawals: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -7717,6 +8221,10 @@ mod checkpoint_msg_tests {
             last_checkpoint_number: None,
             killed: db::SubnetKillState::NotKilled,
             marked_for_kill_checkpoint_number: None,
+            epoch: 1,
+            h_0: Some(0),
+            last_rotation_epoch: 1,
+            pending_multisig_changes: Vec::new(),
         };
 
         {
@@ -7973,10 +8481,13 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![unstake1.clone(), unstake2.clone(), unstake3.clone()],
             change_address: None, // Kill checkpoints shouldn't have change address
             next_committee_configuration_number: 1,
             is_kill_checkpoint: true,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         // Create test UTXOs with extra funds that will become change
@@ -8211,6 +8722,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers: vec![transfer],
@@ -8220,6 +8732,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         }
     }
 
@@ -8281,6 +8795,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers: vec![],
@@ -8290,6 +8805,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         checkpoint_msg.validate().unwrap();
@@ -8320,6 +8837,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers: vec![],
@@ -8332,6 +8850,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         checkpoint_msg.validate().unwrap();
@@ -8372,6 +8892,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![etr],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8392,6 +8913,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![etr],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8412,6 +8934,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![etr],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8434,6 +8957,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![etx],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8456,6 +8980,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![etx],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8478,6 +9003,7 @@ mod checkpoint_msg_tests {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![etx],
+            slash_signatures: vec![],
         };
 
         let result = batch_msg.validate();
@@ -8503,6 +9029,7 @@ mod checkpoint_msg_tests {
             subnet_id: subnet_state.id,
             checkpoint_hash,
             checkpoint_height: 50,
+            slash_signatures: vec![],
             unstakes: vec![],
             withdrawals: vec![],
             transfers: vec![],
@@ -8515,6 +9042,8 @@ mod checkpoint_msg_tests {
             change_address: Some(subnet_state.committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         checkpoint_msg.validate().unwrap();
@@ -8599,10 +9128,13 @@ mod checkpoint_msg_tests {
             token_registrations: vec![test_utils::create_rand_erc_token_registration()],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -8667,10 +9199,13 @@ mod checkpoint_msg_tests {
                 subnet.id,
                 destination.id,
             )],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -8724,10 +9259,13 @@ mod checkpoint_msg_tests {
                 subnet.id,
                 destination.id,
             )],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(committee.multisig_address.clone()),
             next_committee_configuration_number: 1,
             is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
 
         let fee_rate = DEFAULT_BTC_FEE_RATE;
@@ -9118,3 +9656,111 @@ mod compact_amount_tests {
         assert!(rt_i256(neg) < I256::ZERO);
     }
 }
+
+#[cfg(test)]
+mod exact_encoding_tests {
+    use super::*;
+    use crate::eots::EotsNonceCommitment;
+    use crate::test_utils;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+    /// The join-ue message with `committed` as its committed bytes, both signatures valid
+    fn signed_join_ue(committed: &[u8], sk: &SecretKey, eots_sk: &SecretKey) -> Vec<u8> {
+        let secp = Secp256k1::new();
+        let nonce_signature = secp
+            .sign_schnorr(
+                &IpcJoinUeMsg::digest_of(JOIN_UE_NONCE_COMMITMENT_TAG, committed),
+                &eots_sk.keypair(&secp),
+            )
+            .serialize();
+        let unsigned = [committed, &nonce_signature].concat();
+        let signature = secp
+            .sign_schnorr(
+                &IpcJoinUeMsg::digest_of(JOIN_UE_SIGNATURE_TAG, &unsigned),
+                &sk.keypair(&secp),
+            )
+            .serialize();
+        [unsigned.as_slice(), &signature].concat()
+    }
+
+    #[test]
+    fn join_ue_rejects_a_message_that_is_not_the_exact_encoding_of_its_fields() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let eots_sk = SecretKey::from_slice(&[8u8; 32]).unwrap();
+        let join = IpcJoinSubnetMsg {
+            subnet_id: test_utils::generate_subnet_id(),
+            collateral: Amount::ZERO,
+            ip: "127.0.0.1:8080".parse().unwrap(),
+            backup_address: test_utils::create_rand_addr().into_unchecked(),
+            pubkey: sk.x_only_public_key(&secp).0,
+        };
+        let commitment = EotsNonceCommitment {
+            start: 1,
+            count: 1,
+            root: [2u8; 32],
+        };
+        let timeout = 400u32;
+        let pk_eots = eots_sk.x_only_public_key(&secp).0;
+        let exact = IpcJoinUeMsg::committed_bytes(&join, timeout, &pk_eots, &commitment);
+        let parsed = IpcJoinUeMsg::from_bytes(&signed_join_ue(&exact, &sk, &eots_sk)).unwrap();
+        assert_eq!(parsed.timeout, timeout);
+
+        // The timeout as a three-byte varint: the same value, not the same bytes
+        let timeout_at = exact.len() - 32 - 34 - 2;
+        assert_eq!(&exact[timeout_at..timeout_at + 2], &[0x90, 0x03]);
+        let mut padded = exact[..timeout_at].to_vec();
+        padded.extend_from_slice(&[0x90, 0x83, 0x00]);
+        padded.extend_from_slice(&exact[timeout_at + 2..]);
+        let err = IpcJoinUeMsg::from_bytes(&signed_join_ue(&padded, &sk, &eots_sk)).unwrap_err();
+        assert!(
+            err.to_string().contains("exact encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_transfer_rejects_data_that_is_not_the_exact_encoding_of_its_fields() {
+        let entry = SlashSignatureEntry {
+            txid: [1u8; 32],
+            vout: 1,
+            signatures: vec![],
+        };
+        let wire = BatchTransferWireData {
+            transfers: BTreeMap::new(),
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: BTreeMap::new(),
+            slash_signatures: vec![entry],
+        };
+        let mut exact = IPC_TRANSFER_TAG.as_bytes().to_vec();
+        exact.extend(postcard::to_stdvec(&wire).unwrap());
+        assert_eq!(
+            IpcBatchTransferMsg::witness_to_wire_data(&exact)
+                .unwrap()
+                .slash_signatures
+                .len(),
+            1
+        );
+        let rejected = |data: &[u8]| {
+            let err = IpcBatchTransferMsg::witness_to_wire_data(data).unwrap_err();
+            assert!(
+                err.to_string().contains("exact encoding"),
+                "unexpected error: {err}"
+            );
+        };
+        // A byte left over
+        let mut longer = exact.clone();
+        longer.push(0);
+        rejected(&longer);
+        // The entry's vout as a two-byte varint
+        let vout_at = exact.len() - 2;
+        assert_eq!(&exact[vout_at..], &[0x01, 0x00]);
+        let mut padded = exact[..vout_at].to_vec();
+        padded.extend_from_slice(&[0x81, 0x00, 0x00]);
+        rejected(&padded);
+    }
+}
+#[cfg(test)]
+#[path = "ipc_lib_spec_tests.rs"]
+mod spec_tests;

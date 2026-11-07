@@ -189,51 +189,70 @@ pub fn unspenable_internal_key() -> XOnlyPublicKey {
         .expect("Should not error creating an unspendable key")
 }
 
-/// This function tests and submits a set of transactions to the Bitcoin network.
-/// The function tests the transactions for mempool acceptance and submits them to the network.
-/// If the transactions are not accepted by the mempool, the function prints an error message.
-/// If the transactions are accepted, the function prints the transaction IDs and the mined block.
-///
-/// # Arguments
-///
-/// * `rpc` - A Bitcoin RPC client of type `bitcoincore_rpc::Client`
-/// * `txs` - A vector of transactions of type `Transaction`
-/// * `miner_address` - The address to which the block reward is sent, of type `Address`
-///
-/// # Returns
-///
-/// * `()` - The function returns a BitcoinUtilsError if the transaction was accepted by the mempool.`
-// TODO(bitcoincore-rpc): when `txs.len() > 1`, Core treats this as a package
-// `testmempoolaccept` call. Bitcoin Core 28 reshaped the package response
-// (per-TX `allowed` is no longer guaranteed) and bitcoincore-rpc 0.19.0 — the
-// last release before the crate was archived — fails to deserialize it.
+/// One entry of the `testmempoolaccept` result. In a package result Bitcoin Core omits
+/// `allowed` for a transaction it did not validate because another one failed first.
+#[derive(Debug, serde::Deserialize)]
+struct MempoolAcceptEntry {
+    txid: String,
+    allowed: Option<bool>,
+    #[serde(rename = "reject-reason")]
+    reject_reason: Option<String>,
+    #[serde(rename = "package-error")]
+    package_error: Option<String>,
+}
+
+/// Why the transactions of `entries` are not accepted, `None` if all of them are.
+fn mempool_rejection(entries: &[MempoolAcceptEntry]) -> Option<String> {
+    if !entries.is_empty() && entries.iter().all(|e| e.allowed == Some(true)) {
+        return None;
+    }
+    let mut reasons: Vec<String> = entries
+        .iter()
+        .find_map(|e| e.package_error.as_ref())
+        .map(|pe| format!("package error {pe}"))
+        .into_iter()
+        .collect();
+    for e in entries {
+        match e.allowed {
+            Some(true) => {}
+            Some(false) => reasons.push(format!(
+                "txid={} {}",
+                e.txid,
+                e.reject_reason
+                    .as_deref()
+                    .unwrap_or("rejected without a reason")
+            )),
+            None => reasons.push(format!("txid={} not validated", e.txid)),
+        }
+    }
+    if reasons.is_empty() {
+        reasons.push("empty testmempoolaccept result".to_string());
+    }
+    Some(reasons.join(", "))
+}
+
+/// Tests `txs` for mempool acceptance, as one package (parents first) when there are several,
+/// and if all are accepted sends them to the mempool in order. The error names Bitcoin Core's
+/// reject reason.
 pub fn submit_to_mempool(
     rpc: &Client,
     txs: Vec<transaction::Transaction>,
 ) -> Result<(), BitcoinUtilsError> {
-    let result = match rpc
-        .test_mempool_accept(&txs.iter().map(|tx| tx.raw_hex()).collect::<Vec<String>>())
-    {
-        Ok(r) => r,
-        Err(e) => {
+    let hexes: Vec<String> = txs.iter().map(|tx| tx.raw_hex()).collect();
+    // A raw call: bitcoincore-rpc 0.19 requires `allowed` in every entry
+    let entries: Vec<MempoolAcceptEntry> = rpc
+        .call("testmempoolaccept", &[serde_json::json!(hexes)])
+        .map_err(|e| {
             error!("Error testing mempool acceptance: {}", e);
-            // Print the transactions that are being rejected
-            for (i, tx) in txs.iter().enumerate() {
-                error!("TX_{}: {}", i, tx.raw_hex());
+            for (i, hex) in hexes.iter().enumerate() {
+                error!("TX_{}: {}", i, hex);
             }
-            return Err(BitcoinUtilsError::MempoolAcceptanceFailed(e.to_string()));
-        }
-    };
+            BitcoinUtilsError::MempoolAcceptanceFailed(e.to_string())
+        })?;
 
-    for r in result.iter() {
-        if !r.allowed {
-            let reason = r
-                .reject_reason
-                .clone()
-                .unwrap_or("Unknown reason".to_string());
-            error!("Txid={} rejected by mempool: {}", r.txid, reason);
-            return Err(BitcoinUtilsError::MempoolAcceptanceFailed(reason));
-        }
+    if let Some(reason) = mempool_rejection(&entries) {
+        error!("Rejected by mempool: {}", reason);
+        return Err(BitcoinUtilsError::MempoolAcceptanceFailed(reason));
     }
 
     for tx in txs {
@@ -885,6 +904,34 @@ pub enum BitcoinUtilsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mempool_rejection_reads_a_package_result_without_allowed() {
+        let parse = |json: &str| -> Vec<MempoolAcceptEntry> { serde_json::from_str(json).unwrap() };
+        // Bitcoin Core 27.2: the parent fails, the child has no `allowed`
+        let failed = parse(
+            r#"[{"txid":"15b6228e5da2c3971d87e21109e74ab871026d42a13aebdb1a2b88e169ff13bf","wtxid":"b24692f2c43a6dd756d51483f3085dc6c42db214d846265299dbe3747e1def14","allowed":false,"reject-reason":"missing-inputs"},{"txid":"bf9a64f0436ab2e313c9797cf3b464d70c65b623bb66f31ac20c410625de6567","wtxid":"f81fde140b190f7e2d4b2c14160e7eb83d0b72d0e06ee4e20f1a36c984205134"}]"#,
+        );
+        assert_eq!(
+            mempool_rejection(&failed).unwrap(),
+            "txid=15b6228e5da2c3971d87e21109e74ab871026d42a13aebdb1a2b88e169ff13bf missing-inputs, \
+             txid=bf9a64f0436ab2e313c9797cf3b464d70c65b623bb66f31ac20c410625de6567 not validated"
+        );
+
+        let package_error = parse(
+            r#"[{"txid":"aa","wtxid":"ab","package-error":"package-not-sorted"},{"txid":"ba","wtxid":"bb","package-error":"package-not-sorted"}]"#,
+        );
+        assert_eq!(
+            mempool_rejection(&package_error).unwrap(),
+            "package error package-not-sorted, txid=aa not validated, txid=ba not validated"
+        );
+
+        let accepted = parse(
+            r#"[{"txid":"aa","wtxid":"ab","allowed":true,"vsize":200,"fees":{"base":0.00001}},{"txid":"ba","wtxid":"bb","allowed":true,"vsize":110,"fees":{"base":0.00001}}]"#,
+        );
+        assert_eq!(mempool_rejection(&accepted), None);
+        assert!(mempool_rejection(&[]).is_some());
+    }
 
     #[test]
     fn test_unspendable_internal_key_does_not_change() {

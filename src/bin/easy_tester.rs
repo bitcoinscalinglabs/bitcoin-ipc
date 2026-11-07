@@ -218,6 +218,24 @@ fn run_scenario<T: Tester>(
                     .exec_unstake_ue(working_height, &subnet_name, &validator_name)
                     .map_err(annotate)?;
             }
+            ScenarioCommand::Presign {
+                subnet_name,
+                owner,
+                signers,
+                bad,
+            } => {
+                tester
+                    .exec_presign(
+                        working_height,
+                        &subnet_name,
+                        bitcoin_ipc::easy_tester::model::PresignSpec {
+                            owner,
+                            signers,
+                            bad,
+                        },
+                    )
+                    .map_err(annotate)?;
+            }
             ScenarioCommand::Checkpoint { subnets, shape } => {
                 tester
                     .exec_checkpoint(working_height, &subnets, shape)

@@ -1,0 +1,58 @@
+# join.md, Verifying 3: a join that completes bootstrap closes admission even for a later input of the same reveal.
+# Run with testers/db-ue.txt or testers/monitor-ue.txt. No existing generic join/cutoff case is repeated.
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 2
+whitelist validator1 validator2 validator3 validator4
+epoch_length 10
+
+scenario
+block 102
+create subnet_a
+block 103
+join-ue subnet_a validator1 100000 2000 validator2 120000 2000 validator3 130000 2000
+block 104
+read subnet_genesis subnet_a
+expect result.genesis_validators = 2
+expect result.bootstrapped = true
+read subnet_state subnet_a
+expect result.activated = false
+expect result.epoch = 0
+expect result.h_0 = none
+read validators subnet_a current
+expect result.names = validator1,validator2
+expect result.validator1.collateral = 10000
+expect result.validator2.collateral = 10000
+read ue_collaterals subnet_a
+expect result.count = 2
+# join.md, Verifying 4: another block in epoch 0 also rejects a whitelisted key without recording it.
+join-ue subnet_a validator4 140000 2000
+# deposit.md, Verifying 4: the monitor records this deposit in its own Bitcoin block;
+# L2 credit follows parent finality, including before H_0 (the db tester's deposit is a no-op).
+deposit subnet_a validator1 1000000
+presign subnet_a validator1 by validator1 validator2
+presign subnet_a validator2 by validator1 validator2
+block 105
+read ue_collaterals subnet_a
+expect result.count = 2
+checkpoint subnet_a
+block 106
+read subnet_state subnet_a
+expect result.activated = true
+expect result.epoch = 1
+# C_1 is computed at activation; its adoption awaits the next, rotation checkpoint.
+read validators subnet_a
+expect result.validator1.collateral = 100000
+expect result.validator2.collateral = 120000
+# join.md, Verifying 4: an epoch-zero refusal consumes neither the validator nor EOTS identity.
+join-ue subnet_a validator3 130000 2000
+block 107
+read ue_collaterals subnet_a
+expect result.count = 3
+expect result.validator3.value = 130000
+read validators subnet_a
+expect result.names = validator1,validator2

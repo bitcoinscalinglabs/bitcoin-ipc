@@ -1,8 +1,11 @@
 use crate::{
+    eots::{EotsNonceCommitment, Signature64},
     ipc_lib::{
         IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcTokenRegistration, IpcFundSubnetMsg,
     },
-    multisig::{create_subnet_multisig_address, multisig_threshold, Power, WeightedKey},
+    multisig::{
+        create_subnet_multisig_address, multisig_threshold, Configuration, Power, WeightedKey,
+    },
     wallet, SubnetId, NETWORK,
 };
 use async_trait::async_trait;
@@ -14,7 +17,7 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 /// Genesis committee configuration number
-const GENESIS_COMMITTEE_CONF_NUM: u64 = 0;
+pub const GENESIS_COMMITTEE_CONF_NUM: u64 = 0;
 
 use std::sync::{Mutex, RwLock};
 
@@ -39,14 +42,17 @@ const KILL_REQUESTS_KEY: &str = "kill_requests:";
 
 // ue_collaterals:<subnet_id>:<join_txid>:<pubkey>
 const UE_COLLATERALS_KEY: &str = "ue_collaterals:";
-// ue_pending:<subnet_id>:<timeout, 10 digits>:<join_txid>:<pubkey>, the records not yet
-// removed, in timeout order
-const UE_PENDING_KEY: &str = "ue_pending:";
+// ue_outpoint:<txid>:<vout>, the same records by their collateral outpoint
+const UE_OUTPOINT_KEY: &str = "ue_outpoint:";
+const EOTS_COMMITMENTS_KEY: &str = "eots_commitments:";
+const SLASH_PRESIGS_KEY: &str = "slash_presigs:";
+// epoch_committee:<subnet_id>:<epoch>, the committee number of the configuration of the epoch
+const EPOCH_COMMITTEES_KEY: &str = "epoch_committee:";
 // token_balance:<home_subnet_id>:<home_token_address>:<holder_subnet_id>
 const TOKEN_BALANCE_KEY: &str = "token_balance:";
 
 // Number of LMDB databases (`heed::Database`) we open/create in this environment.
-const MAX_DBS: u32 = 16;
+const MAX_DBS: u32 = 32;
 
 // LMDB map size: maximum virtual address space for the environment (1 GiB).
 const MAP_SIZE: usize = 1_073_741_824;
@@ -97,6 +103,10 @@ fn committee_key(subnet_id: SubnetId, committee_number: u64) -> String {
     format!("{COMMITTEE_KEY}:{}:{}", subnet_id, committee_number)
 }
 
+fn epoch_committee_key(subnet_id: SubnetId, epoch: u64) -> String {
+    format!("{EPOCH_COMMITTEES_KEY}{}:{}", subnet_id, epoch)
+}
+
 fn stake_changes_prefix(subnet_id: SubnetId) -> String {
     format!("{STAKE_CHANGES_KEY}:{}", subnet_id)
 }
@@ -127,20 +137,24 @@ fn ue_collateral_key(subnet_id: SubnetId, join_txid: Txid, pubkey: &XOnlyPublicK
     )
 }
 
-fn ue_pending_prefix(subnet_id: SubnetId) -> String {
-    format!("{UE_PENDING_KEY}:{}:", subnet_id)
+fn ue_outpoint_key(outpoint: &bitcoin::OutPoint) -> String {
+    format!("{UE_OUTPOINT_KEY}{}", outpoint)
 }
 
-fn ue_pending_key(
-    subnet_id: SubnetId,
-    timeout: u32,
-    join_txid: Txid,
-    pubkey: &XOnlyPublicKey,
-) -> String {
-    format!(
-        "{UE_PENDING_KEY}:{}:{:010}:{}:{}",
-        subnet_id, timeout, join_txid, pubkey
-    )
+fn eots_commitments_prefix(subnet_id: SubnetId, pk_eots: &XOnlyPublicKey) -> String {
+    format!("{EOTS_COMMITMENTS_KEY}:{}:{}:", subnet_id, pk_eots)
+}
+
+fn eots_commitment_key(subnet_id: SubnetId, pk_eots: &XOnlyPublicKey, start: u64) -> String {
+    format!("{EOTS_COMMITMENTS_KEY}:{}:{}:{:020}", subnet_id, pk_eots, start)
+}
+
+fn slash_presigs_prefix(subnet_id: SubnetId) -> String {
+    format!("{SLASH_PRESIGS_KEY}:{}:", subnet_id)
+}
+
+fn slash_presigs_key(subnet_id: SubnetId, outpoint: &bitcoin::OutPoint) -> String {
+    format!("{SLASH_PRESIGS_KEY}:{}:{}", subnet_id, outpoint)
 }
 
 // reward_candidates:<snapshot>:<subnet_id>
@@ -306,6 +320,14 @@ impl SubnetCommittee {
             .collect()
     }
 
+    /// The configuration as a script names it
+    pub fn configuration(&self) -> Configuration {
+        Configuration {
+            keys: self.validator_weighted_keys(),
+            threshold: self.threshold,
+        }
+    }
+
     pub fn address_checked(&self) -> Address {
         self.multisig_address
             .clone()
@@ -426,6 +448,10 @@ pub struct SubnetCheckpoint {
     pub next_configuration_number: u64,
     /// If this is the kill checkpoint
     pub is_kill_checkpoint: bool,
+    /// The epoch the checkpoint belongs to
+    pub epoch: u64,
+    /// If this is the rotation checkpoint of its epoch
+    pub is_rotation_checkpoint: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -470,6 +496,33 @@ pub struct SubnetState {
     /// If killed = ToBeKilled, but marked_for_kill_checkpoint_number is None,
     /// that means the subnet had no checkpoints when it was marked for killing.
     pub marked_for_kill_checkpoint_number: Option<u64>,
+    /// The current epoch: 0 from bootstrap until activation
+    pub epoch: u64,
+    /// The first cutoff height `H_0`, known at activation
+    pub h_0: Option<u64>,
+    /// The epoch of the last rotation checkpoint the monitor processed: below `epoch` while
+    /// the rotation checkpoint of the current epoch is awaited
+    pub last_rotation_epoch: u64,
+    /// The multisig-based joins, stakes and unstakes accepted since the last cutoff, which
+    /// take effect at the next one
+    pub pending_multisig_changes: Vec<PendingMultisigChange>,
+}
+
+/// A multisig-based join, stake or unstake accepted after activation. Like a deposit, it
+/// takes effect at the next cutoff.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum PendingMultisigChange {
+    Join(SubnetValidator),
+    Stake {
+        pubkey: XOnlyPublicKey,
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
+        amount: bitcoin::Amount,
+    },
+    Unstake {
+        pubkey: XOnlyPublicKey,
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
+        amount: bitcoin::Amount,
+    },
 }
 
 impl SubnetState {
@@ -513,40 +566,24 @@ impl SubnetState {
         self.waiting_committee.as_ref().unwrap_or(&self.committee)
     }
 
-    pub fn rotate_to_committee(&mut self, new_committee: SubnetCommittee) {
+    /// Adopts the configuration of epoch `epoch` at its rotation checkpoint
+    pub fn adopt_committee(
+        &mut self,
+        epoch: u64,
+        committee_number: u64,
+        committee: SubnetCommittee,
+    ) {
         trace!(
-            "subnet id {} rotating committees. prev={:?} next={:?}",
+            "subnet id {} rotating to committee {}. prev={:?} next={:?}",
             self.id,
+            committee_number,
             self.committee,
-            new_committee
+            committee
         );
-
-        if self.committee == new_committee {
-            return;
-        }
-
-        if self
-            .waiting_committee
-            .as_ref()
-            .is_some_and(|wc| *wc == new_committee)
-        {
-            self.waiting_committee = None
-        }
-
-        self.committee = new_committee;
-        self.committee_number += 1;
-    }
-
-    pub fn rotate_to_waiting_committee(&mut self) -> Result<(), DbError> {
-        if let Some(next_committee) = self.waiting_committee.take() {
-            self.committee = next_committee;
-            self.committee_number += 1;
-            Ok(())
-        } else {
-            Err(DbError::InvalidChange(
-                "No next committee to rotate to".to_string(),
-            ))
-        }
+        self.committee = committee;
+        self.committee_number = committee_number;
+        self.waiting_committee = None;
+        self.last_rotation_epoch = epoch;
     }
 
     pub fn is_killed(&self) -> bool {
@@ -555,6 +592,11 @@ impl SubnetState {
 
     pub fn is_killed_or_pending(&self) -> bool {
         self.killed != SubnetKillState::NotKilled
+    }
+
+    /// Activated: the monitor has set `H_0`
+    pub fn is_activated(&self) -> bool {
+        self.h_0.is_some()
     }
 
     pub fn should_kill(&self) -> bool {
@@ -625,25 +667,21 @@ impl SubnetGenesisInfo {
         self.genesis_validators.len() as u16 >= self.create_subnet_msg.min_validators
     }
 
+    /// The whitelist configuration `C_0`
+    pub fn whitelist_configuration(&self) -> Configuration {
+        self.create_subnet_msg.whitelist_configuration()
+    }
+
     pub fn multisig_address(&self) -> Address {
         let secp = bitcoin::secp256k1::Secp256k1::new();
-
-        let whitelist_weighted_keys = self
-            .create_subnet_msg
-            .whitelist
-            .clone()
-            .into_iter()
-            .map(|xpk| (xpk, 1))
-            .collect::<Vec<_>>();
-
+        let configuration = self.whitelist_configuration();
         create_subnet_multisig_address(
             &secp,
             &self.subnet_id,
-            &whitelist_weighted_keys,
-            self.create_subnet_msg.min_validators.into(),
+            &configuration.keys,
+            configuration.threshold,
             NETWORK,
         )
-        // TODO think about this expect, maybe return a Result
         .expect("Multisig should be valid for saved subnet genesis info")
     }
 
@@ -654,16 +692,30 @@ impl SubnetGenesisInfo {
     }
 
     pub fn to_subnet(&self) -> SubnetState {
+        // `C_gen`: the genesis validators with one unit of power each, the value the subnet's
+        // genesis gives them
+        let genesis_configuration: Vec<SubnetValidator> = self
+            .genesis_validators
+            .iter()
+            .map(|v| SubnetValidator {
+                power: 1,
+                collateral: self.create_subnet_msg.power_unit(),
+                ..v.clone()
+            })
+            .collect();
         SubnetState {
             id: self.subnet_id,
             committee_number: 1,
             last_checkpoint_number: None,
-            committee: self
-                .genesis_validators
+            committee: genesis_configuration
                 .to_committee(&self.subnet_id, GENESIS_COMMITTEE_CONF_NUM),
             waiting_committee: None,
             killed: SubnetKillState::NotKilled,
             marked_for_kill_checkpoint_number: None,
+            epoch: 0,
+            h_0: None,
+            last_rotation_epoch: 0,
+            pending_multisig_changes: Vec::new(),
         }
     }
 
@@ -816,11 +868,40 @@ pub struct UeCollateral {
     pub value: bitcoin::Amount,
     /// Maturity height
     pub timeout: u32,
+    /// The EOTS key of the validator
+    pub pk_eots: XOnlyPublicKey,
+    /// The committee the collateral script names (0 for the whitelist)
+    pub committee_number: u64,
+    /// The validator's network address, from the join
+    pub ip: std::net::SocketAddr,
     pub backup_address: Address<NetworkUnchecked>,
     /// The reveal txid, the validator's `join_txid` in the committee
     pub join_txid: Txid,
-    /// Set once the removal pass has handled the record
-    pub removed: bool,
+    /// Set once a block includes a transaction that spends the outpoint
+    pub spent: bool,
+}
+
+/// An EOTS nonce commitment of an accepted join-ue or stake transaction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EotsCommitmentRecord {
+    pub subnet_id: SubnetId,
+    pub pk_eots: XOnlyPublicKey,
+    pub commitment: EotsNonceCommitment,
+    /// The Bitcoin block that holds the transaction
+    pub block_height: u64,
+    pub txid: Txid,
+}
+
+/// The slash pre-signatures that made a collateral output slashable.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SlashPresigRecord {
+    pub subnet_id: SubnetId,
+    pub outpoint: bitcoin::OutPoint,
+    /// The signatures by the signer's index in the named configuration
+    pub signatures: Vec<(u16, Signature64)>,
+    /// The Bitcoin block of the batch transfer that carried them
+    pub block_height: u64,
+    pub batch_transfer_txid: Txid,
 }
 
 /// Keeps track of reward-related information for a subnet during a snapshot.
@@ -918,6 +999,10 @@ pub struct HeedDb {
     ue_collaterals_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<UeCollateral>>>>,
     /// Monitor settings that must agree with the processed blocks; `None` as above
     settings_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<u64>>>>,
+    eots_commitments_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<EotsCommitmentRecord>>>>,
+    slash_presigs_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<SlashPresigRecord>>>>,
+    /// The committee number of each epoch's configuration; `None` as above
+    epoch_committees_db: RwLock<Option<HeedDatabase<Str, SerdeBincode<u64>>>>,
     /// LMDB opens one database per transaction at a time in a process: the lazy lookups of the
     /// two tables above take this lock
     lazy_open: Mutex<()>,
@@ -949,6 +1034,21 @@ impl HeedDb {
         Ok(opened)
     }
 
+    /// The UE collateral records whose key starts with `prefix`, none before the table exists
+    fn ue_collaterals_with_prefix(&self, prefix: &str) -> Result<Vec<UeCollateral>, DbError> {
+        let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
+            return Ok(Vec::new());
+        };
+        let rtxn = self.env.read_txn()?;
+        let mut collaterals = Vec::new();
+        for item in db.prefix_iter(&rtxn, prefix)? {
+            let (_key, collateral) = item?;
+            collaterals.push(collateral);
+        }
+        rtxn.commit()?;
+        Ok(collaterals)
+    }
+
     fn ue_collaterals_db(&self) -> Result<HeedDatabase<Str, SerdeBincode<UeCollateral>>, DbError> {
         self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")?
             .ok_or(DbError::DbNotFound("ue_collaterals_db".to_string()))
@@ -957,6 +1057,25 @@ impl HeedDb {
     fn settings_db(&self) -> Result<HeedDatabase<Str, SerdeBincode<u64>>, DbError> {
         self.lazy_table(&self.settings_db, "settings_db")?
             .ok_or(DbError::DbNotFound("settings_db".to_string()))
+    }
+
+    fn eots_commitments_db(
+        &self,
+    ) -> Result<HeedDatabase<Str, SerdeBincode<EotsCommitmentRecord>>, DbError> {
+        self.lazy_table(&self.eots_commitments_db, "eots_commitments_db")?
+            .ok_or(DbError::DbNotFound("eots_commitments_db".to_string()))
+    }
+
+    fn slash_presigs_db(
+        &self,
+    ) -> Result<HeedDatabase<Str, SerdeBincode<SlashPresigRecord>>, DbError> {
+        self.lazy_table(&self.slash_presigs_db, "slash_presigs_db")?
+            .ok_or(DbError::DbNotFound("slash_presigs_db".to_string()))
+    }
+
+    fn epoch_committees_db(&self) -> Result<HeedDatabase<Str, SerdeBincode<u64>>, DbError> {
+        self.lazy_table(&self.epoch_committees_db, "epoch_committees_db")?
+            .ok_or(DbError::DbNotFound("epoch_committees_db".to_string()))
     }
 
     pub async fn new(database_path: &str, read_only: bool) -> Result<Self, DbError> {
@@ -1041,6 +1160,12 @@ impl HeedDb {
             let ue_collaterals_db =
                 RwLock::new(env.open_database(&rtxn, Some("ue_collaterals_db"))?);
             let settings_db = RwLock::new(env.open_database(&rtxn, Some("settings_db"))?);
+            let eots_commitments_db =
+                RwLock::new(env.open_database(&rtxn, Some("eots_commitments_db"))?);
+            let slash_presigs_db =
+                RwLock::new(env.open_database(&rtxn, Some("slash_presigs_db"))?);
+            let epoch_committees_db =
+                RwLock::new(env.open_database(&rtxn, Some("epoch_committees_db"))?);
             rtxn.commit()?;
 
             Ok(Self {
@@ -1059,6 +1184,9 @@ impl HeedDb {
                 token_balances_db,
                 ue_collaterals_db,
                 settings_db,
+                eots_commitments_db,
+                slash_presigs_db,
+                epoch_committees_db,
                 lazy_open: Mutex::new(()),
             })
         } else {
@@ -1082,6 +1210,14 @@ impl HeedDb {
             ));
             let settings_db =
                 RwLock::new(Some(env.create_database(&mut txn, Some("settings_db"))?));
+            let eots_commitments_db = RwLock::new(Some(
+                env.create_database(&mut txn, Some("eots_commitments_db"))?,
+            ));
+            let slash_presigs_db =
+                RwLock::new(Some(env.create_database(&mut txn, Some("slash_presigs_db"))?));
+            let epoch_committees_db = RwLock::new(Some(
+                env.create_database(&mut txn, Some("epoch_committees_db"))?,
+            ));
             txn.commit()?;
 
             Ok(Self {
@@ -1100,6 +1236,9 @@ impl HeedDb {
                 token_balances_db,
                 ue_collaterals_db,
                 settings_db,
+                eots_commitments_db,
+                slash_presigs_db,
+                epoch_committees_db,
                 lazy_open: Mutex::new(()),
             })
         }
@@ -1215,6 +1354,22 @@ pub trait DatabaseCore {
         committee: &SubnetCommittee,
     ) -> Result<(), DbError>;
 
+    /// The committee number of the configuration of `epoch`, `None` until the monitor
+    /// computes it
+    fn get_epoch_committee_number(
+        &self,
+        subnet_id: SubnetId,
+        epoch: u64,
+    ) -> Result<Option<u64>, DbError>;
+
+    fn save_epoch_committee_number(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        epoch: u64,
+        committee_number: u64,
+    ) -> Result<(), DbError>;
+
     // Stake changes
 
     fn get_stake_change(
@@ -1291,23 +1446,23 @@ pub trait DatabaseCore {
         pubkey: &XOnlyPublicKey,
     ) -> Result<Option<UeCollateral>, DbError>;
 
-    /// All UE collaterals of a subnet, removed or not
+    /// All UE collaterals of a subnet, spent or not
     fn get_ue_collaterals(&self, subnet_id: SubnetId) -> Result<Vec<UeCollateral>, DbError>;
 
-    /// The UE collaterals of a subnet not yet removed, with a timeout up to `max_timeout`,
-    /// in timeout order
-    fn get_pending_ue_collaterals(
-        &self,
-        subnet_id: SubnetId,
-        max_timeout: u32,
-    ) -> Result<Vec<UeCollateral>, DbError>;
+    /// The UE collaterals of every subnet, spent or not
+    fn get_all_ue_collaterals(&self) -> Result<Vec<UeCollateral>, DbError>;
 
-    fn set_ue_collateral_removed(
+    /// The UE collateral at `outpoint`, of any subnet
+    fn get_ue_collateral_by_outpoint(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<Option<UeCollateral>, DbError>;
+
+    /// Marks the UE collateral at `outpoint` as spent
+    fn set_ue_collateral_spent(
         &self,
         txn: &mut RwTxn,
-        subnet_id: SubnetId,
-        join_txid: Txid,
-        pubkey: &XOnlyPublicKey,
+        outpoint: &bitcoin::OutPoint,
     ) -> Result<(), DbError>;
 
     fn delete_ue_collateral(
@@ -1317,6 +1472,42 @@ pub trait DatabaseCore {
         join_txid: Txid,
         pubkey: &XOnlyPublicKey,
     ) -> Result<(), DbError>;
+
+    // EOTS nonce commitments
+
+    fn add_eots_commitment(
+        &self,
+        txn: &mut RwTxn,
+        record: &EotsCommitmentRecord,
+    ) -> Result<(), DbError>;
+
+    /// The commitments of `pk_eots` in `subnet_id`, in ascending `start` order
+    fn get_eots_commitments(
+        &self,
+        subnet_id: SubnetId,
+        pk_eots: &XOnlyPublicKey,
+    ) -> Result<Vec<EotsCommitmentRecord>, DbError>;
+
+    /// The commitments of `pk_eots` in every subnet
+    fn get_eots_commitments_of_key(
+        &self,
+        pk_eots: &XOnlyPublicKey,
+    ) -> Result<Vec<EotsCommitmentRecord>, DbError>;
+
+    // Slash pre-signatures
+
+    fn add_slash_presigs(&self, txn: &mut RwTxn, record: &SlashPresigRecord)
+        -> Result<(), DbError>;
+
+    /// The pre-signatures that made the output slashable, `None` while it is not
+    fn get_slash_presigs(
+        &self,
+        subnet_id: SubnetId,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<Option<SlashPresigRecord>, DbError>;
+
+    /// Every slashable output of a subnet
+    fn get_all_slash_presigs(&self, subnet_id: SubnetId) -> Result<Vec<SlashPresigRecord>, DbError>;
 
     // Token balances
 
@@ -1472,52 +1663,25 @@ impl DatabaseCore for HeedDb {
         Ok(subnets)
     }
 
+    /// The subnet whose current or previous configuration has this multisig address. The
+    /// previous one is accepted for a whole epoch, as for a stake transaction's named
+    /// configuration.
     fn get_subnet_by_multisig_address(
         &self,
         multisig_address: &Address<NetworkUnchecked>,
     ) -> Result<Option<SubnetState>, DbError> {
-        let txn = self.env.read_txn()?;
-        let subnets = self.subnet_db.iter(&txn)?;
-
-        for item in subnets {
-            let (_, subnet_state) = item?;
-
+        for subnet_state in self.get_all_subnets()? {
             if &subnet_state.committee.multisig_address == multisig_address {
                 return Ok(Some(subnet_state));
             }
+            let previous = match subnet_state.committee_number.checked_sub(1) {
+                Some(number) => self.get_committee(subnet_state.id, number)?,
+                None => None,
+            };
+            if previous.is_some_and(|c| &c.multisig_address == multisig_address) {
+                return Ok(Some(subnet_state));
+            }
         }
-
-        // TDOO reenable below functionality
-        // we probably want to know if this is an old multisig address and react
-        // appropriately, like ping old committee members to see if they are still
-        // active (if recent) or just ignore the msg
-        //
-        // // If not found in current committees, check old committees
-        // let iter = self.committee_db.iter(&txn)?;
-        // for item in iter {
-        //     let (key_str, committee) = item?;
-
-        //     // Check if this old committee's multisig address matches
-        //     if &committee.multisig_address == multisig_address {
-        //         // Parse the key to extract subnet ID and committee number
-        //         let parts: Vec<&str> = key_str.split(':').collect();
-        //         if parts.len() >= 3 {
-        //             // Format is "{COMMITTEE_KEY}:{subnet_id}:{committee_number}"
-        //             if let Ok(subnet_id) = parts[1].parse::<SubnetId>() {
-        //                 // Get the current subnet state for this subnet
-        //                 if let Some(subnet_state) = self.get_subnet_state(subnet_id)? {
-        //                     trace!(
-        //                            "Found multisig address {:?} in old committee (number unknown) for subnet {}",
-        //                            *multisig_address,
-        //                            subnet_id
-        //                        );
-        //                     return Ok(Some(subnet_state));
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-
         Ok(None)
     }
 
@@ -1715,6 +1879,34 @@ impl DatabaseCore for HeedDb {
     ) -> Result<(), DbError> {
         let key = committee_key(subnet_id, committee_number);
         self.committee_db.put(txn, &key, committee)?;
+        Ok(())
+    }
+
+    fn get_epoch_committee_number(
+        &self,
+        subnet_id: SubnetId,
+        epoch: u64,
+    ) -> Result<Option<u64>, DbError> {
+        let Some(db) = self.lazy_table(&self.epoch_committees_db, "epoch_committees_db")? else {
+            return Ok(None);
+        };
+        let txn = self.env.read_txn()?;
+        Ok(db.get(&txn, &epoch_committee_key(subnet_id, epoch))?)
+    }
+
+    fn save_epoch_committee_number(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        epoch: u64,
+        committee_number: u64,
+    ) -> Result<(), DbError> {
+        let db = self.epoch_committees_db()?;
+        db.put(
+            txn,
+            &epoch_committee_key(subnet_id, epoch),
+            &committee_number,
+        )?;
         Ok(())
     }
 
@@ -1932,17 +2124,7 @@ impl DatabaseCore for HeedDb {
             &collateral.pubkey,
         );
         db.put(txn, &key, collateral)?;
-        let pending = ue_pending_key(
-            collateral.subnet_id,
-            collateral.timeout,
-            collateral.join_txid,
-            &collateral.pubkey,
-        );
-        if collateral.removed {
-            db.delete(txn, &pending)?;
-        } else {
-            db.put(txn, &pending, collateral)?;
-        }
+        db.put(txn, &ue_outpoint_key(&collateral.outpoint), collateral)?;
         Ok(())
     }
 
@@ -1961,60 +2143,44 @@ impl DatabaseCore for HeedDb {
     }
 
     fn get_ue_collaterals(&self, subnet_id: SubnetId) -> Result<Vec<UeCollateral>, DbError> {
-        let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
-            return Ok(Vec::new());
-        };
-        let rtxn = self.env.read_txn()?;
-        let prefix = ue_collaterals_prefix(subnet_id);
-        let mut collaterals = Vec::new();
-        for item in db.prefix_iter(&rtxn, &prefix)? {
-            let (_key, collateral) = item?;
-            collaterals.push(collateral);
-        }
-        rtxn.commit()?;
-        Ok(collaterals)
+        self.ue_collaterals_with_prefix(&ue_collaterals_prefix(subnet_id))
     }
 
-    fn get_pending_ue_collaterals(
+    fn get_all_ue_collaterals(&self) -> Result<Vec<UeCollateral>, DbError> {
+        self.ue_collaterals_with_prefix(UE_COLLATERALS_KEY)
+    }
+
+    fn get_ue_collateral_by_outpoint(
         &self,
-        subnet_id: SubnetId,
-        max_timeout: u32,
-    ) -> Result<Vec<UeCollateral>, DbError> {
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<Option<UeCollateral>, DbError> {
         let Some(db) = self.lazy_table(&self.ue_collaterals_db, "ue_collaterals_db")? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let rtxn = self.env.read_txn()?;
-        let prefix = ue_pending_prefix(subnet_id);
-        let mut collaterals = Vec::new();
-        // The keys sort by timeout
-        for item in db.prefix_iter(&rtxn, &prefix)? {
-            let (_key, collateral) = item?;
-            if collateral.timeout > max_timeout {
-                break;
-            }
-            collaterals.push(collateral);
-        }
-        rtxn.commit()?;
-        Ok(collaterals)
+        Ok(db.get(&rtxn, &ue_outpoint_key(outpoint))?)
     }
 
-    fn set_ue_collateral_removed(
+    fn set_ue_collateral_spent(
         &self,
         txn: &mut RwTxn,
-        subnet_id: SubnetId,
-        join_txid: Txid,
-        pubkey: &XOnlyPublicKey,
+        outpoint: &bitcoin::OutPoint,
     ) -> Result<(), DbError> {
         let db = self.ue_collaterals_db()?;
-        let key = ue_collateral_key(subnet_id, join_txid, pubkey);
+        let outpoint_key = ue_outpoint_key(outpoint);
         let mut collateral = db
-            .get(txn, &key)?
-            .ok_or_else(|| DbError::KeyValueNotFound(key.clone()))?;
-        collateral.removed = true;
-        db.put(txn, &key, &collateral)?;
-        db.delete(
+            .get(txn, &outpoint_key)?
+            .ok_or_else(|| DbError::KeyValueNotFound(outpoint_key.clone()))?;
+        collateral.spent = true;
+        db.put(txn, &outpoint_key, &collateral)?;
+        db.put(
             txn,
-            &ue_pending_key(subnet_id, collateral.timeout, join_txid, pubkey),
+            &ue_collateral_key(
+                collateral.subnet_id,
+                collateral.join_txid,
+                &collateral.pubkey,
+            ),
+            &collateral,
         )?;
         Ok(())
     }
@@ -2029,13 +2195,98 @@ impl DatabaseCore for HeedDb {
         let db = self.ue_collaterals_db()?;
         let key = ue_collateral_key(subnet_id, join_txid, pubkey);
         if let Some(collateral) = db.get(txn, &key)? {
-            db.delete(
-                txn,
-                &ue_pending_key(subnet_id, collateral.timeout, join_txid, pubkey),
-            )?;
+            db.delete(txn, &ue_outpoint_key(&collateral.outpoint))?;
         }
         db.delete(txn, &key)?;
         Ok(())
+    }
+
+    fn add_eots_commitment(
+        &self,
+        txn: &mut RwTxn,
+        record: &EotsCommitmentRecord,
+    ) -> Result<(), DbError> {
+        let db = self.eots_commitments_db()?;
+        let key = eots_commitment_key(record.subnet_id, &record.pk_eots, record.commitment.start);
+        db.put(txn, &key, record)?;
+        Ok(())
+    }
+
+    fn get_eots_commitments(
+        &self,
+        subnet_id: SubnetId,
+        pk_eots: &XOnlyPublicKey,
+    ) -> Result<Vec<EotsCommitmentRecord>, DbError> {
+        let Some(db) = self.lazy_table(&self.eots_commitments_db, "eots_commitments_db")? else {
+            return Ok(Vec::new());
+        };
+        let rtxn = self.env.read_txn()?;
+        let prefix = eots_commitments_prefix(subnet_id, pk_eots);
+        let mut records = Vec::new();
+        for item in db.prefix_iter(&rtxn, &prefix)? {
+            let (_key, record) = item?;
+            records.push(record);
+        }
+        rtxn.commit()?;
+        Ok(records)
+    }
+
+    fn get_eots_commitments_of_key(
+        &self,
+        pk_eots: &XOnlyPublicKey,
+    ) -> Result<Vec<EotsCommitmentRecord>, DbError> {
+        let Some(db) = self.lazy_table(&self.eots_commitments_db, "eots_commitments_db")? else {
+            return Ok(Vec::new());
+        };
+        let rtxn = self.env.read_txn()?;
+        let mut records = Vec::new();
+        for item in db.prefix_iter(&rtxn, EOTS_COMMITMENTS_KEY)? {
+            let (_key, record): (_, EotsCommitmentRecord) = item?;
+            if record.pk_eots == *pk_eots {
+                records.push(record);
+            }
+        }
+        rtxn.commit()?;
+        Ok(records)
+    }
+
+    fn add_slash_presigs(
+        &self,
+        txn: &mut RwTxn,
+        record: &SlashPresigRecord,
+    ) -> Result<(), DbError> {
+        let db = self.slash_presigs_db()?;
+        let key = slash_presigs_key(record.subnet_id, &record.outpoint);
+        db.put(txn, &key, record)?;
+        Ok(())
+    }
+
+    fn get_slash_presigs(
+        &self,
+        subnet_id: SubnetId,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<Option<SlashPresigRecord>, DbError> {
+        let Some(db) = self.lazy_table(&self.slash_presigs_db, "slash_presigs_db")? else {
+            return Ok(None);
+        };
+        let rtxn = self.env.read_txn()?;
+        let key = slash_presigs_key(subnet_id, outpoint);
+        Ok(db.get(&rtxn, &key)?)
+    }
+
+    fn get_all_slash_presigs(&self, subnet_id: SubnetId) -> Result<Vec<SlashPresigRecord>, DbError> {
+        let Some(db) = self.lazy_table(&self.slash_presigs_db, "slash_presigs_db")? else {
+            return Ok(Vec::new());
+        };
+        let rtxn = self.env.read_txn()?;
+        let prefix = slash_presigs_prefix(subnet_id);
+        let mut records = Vec::new();
+        for item in db.prefix_iter(&rtxn, &prefix)? {
+            let (_key, record) = item?;
+            records.push(record);
+        }
+        rtxn.commit()?;
+        Ok(records)
     }
 
     fn get_token_balance(
@@ -2165,10 +2416,13 @@ pub mod tests {
             outpoint: bitcoin::OutPoint::new(create_rand_txid(), 1),
             value: Amount::from_sat(100_000),
             timeout: 1_000,
+            pk_eots: generate_xonly_pubkeys(1)[0],
+            committee_number: 0,
+            ip: "127.0.0.1:8080".parse().unwrap(),
             backup_address: Address::from_str("bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n")
                 .unwrap(),
             join_txid: create_rand_txid(),
-            removed: false,
+            spent: false,
         }
     }
 
@@ -2207,10 +2461,12 @@ pub mod tests {
             None
         );
         assert!(reader.get_ue_collaterals(subnet_id).unwrap().is_empty());
-        assert!(reader
-            .get_pending_ue_collaterals(subnet_id, u32::MAX)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            reader
+                .get_ue_collateral_by_outpoint(&collateral.outpoint)
+                .unwrap(),
+            None
+        );
 
         drop(reader);
 
@@ -2238,14 +2494,47 @@ pub mod tests {
         assert!(reader.ue_collaterals_db.read().unwrap().is_some());
         assert_eq!(
             reader
-                .get_pending_ue_collaterals(subnet_id, u32::MAX)
+                .get_ue_collateral_by_outpoint(&collateral.outpoint)
                 .unwrap(),
-            vec![collateral]
+            Some(collateral)
         );
     }
 
+    /// The multisig of the current configuration and of the previous one name the subnet
     #[test]
-    fn test_ue_collaterals_round_trip_and_removal() {
+    fn test_subnet_by_current_or_previous_multisig() {
+        let db = create_test_db();
+        let mut subnet = generate_subnet(3);
+        let previous = subnet.committee.validators[..2]
+            .to_vec()
+            .to_committee(&subnet.id, 1);
+        let unrelated = subnet.committee.validators[..1]
+            .to_vec()
+            .to_committee(&subnet.id, 0);
+        subnet.committee_number = 2;
+
+        let mut txn = db.write_txn().unwrap();
+        db.save_subnet_state(&mut txn, subnet.id, &subnet).unwrap();
+        db.save_committee(&mut txn, subnet.id, 1, &previous)
+            .unwrap();
+        txn.commit().unwrap();
+
+        for committee in [&subnet.committee, &previous] {
+            let found = db
+                .get_subnet_by_multisig_address(&committee.multisig_address)
+                .unwrap()
+                .expect("the subnet of the multisig");
+            assert_eq!(found.id, subnet.id);
+            assert_eq!(found.committee_number, 2);
+        }
+        assert!(db
+            .get_subnet_by_multisig_address(&unrelated.multisig_address)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_ue_collaterals_round_trip_and_spend() {
         let db = create_test_db();
         let subnet_id = generate_subnet_id();
         let other_subnet = generate_subnet_id();
@@ -2274,35 +2563,36 @@ pub mod tests {
             None
         );
 
-        // The pending index lists the open records in timeout order, up to a timeout
+        // The outpoint index finds a record of any subnet
         let mut d = test_ue_collateral(subnet_id);
         d.timeout = 500;
         let mut txn = db.write_txn().unwrap();
         db.add_ue_collateral(&mut txn, &d).unwrap();
         txn.commit().unwrap();
-        let pending = db.get_pending_ue_collaterals(subnet_id, 1_000).unwrap();
-        assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0], d);
-        assert_eq!(
-            db.get_pending_ue_collaterals(subnet_id, 999).unwrap(),
-            vec![d.clone()]
-        );
-        assert!(db
-            .get_pending_ue_collaterals(subnet_id, 499)
-            .unwrap()
-            .is_empty());
+        for record in [&a, &b, &c, &d] {
+            assert_eq!(
+                db.get_ue_collateral_by_outpoint(&record.outpoint).unwrap(),
+                Some(record.clone())
+            );
+        }
+        let unknown = bitcoin::OutPoint::new(create_rand_txid(), 0);
+        assert_eq!(db.get_ue_collateral_by_outpoint(&unknown).unwrap(), None);
 
+        // A spend is recorded by outpoint, in the record and the index; a deleted record
+        // leaves the index
         let mut txn = db.write_txn().unwrap();
-        db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid, &a.pubkey)
-            .unwrap();
-        assert!(db
-            .set_ue_collateral_removed(&mut txn, subnet_id, create_rand_txid(), &a.pubkey)
-            .is_err());
+        db.set_ue_collateral_spent(&mut txn, &a.outpoint).unwrap();
+        assert!(db.set_ue_collateral_spent(&mut txn, &unknown).is_err());
         db.delete_ue_collateral(&mut txn, subnet_id, d.join_txid, &d.pubkey)
             .unwrap();
         txn.commit().unwrap();
-        let pending = db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap();
-        assert_eq!(pending, vec![b.clone()]);
+        assert!(
+            db.get_ue_collateral_by_outpoint(&a.outpoint)
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        assert_eq!(db.get_ue_collateral_by_outpoint(&d.outpoint).unwrap(), None);
         assert_eq!(
             db.get_ue_collateral(subnet_id, d.join_txid, &d.pubkey)
                 .unwrap(),
@@ -2312,13 +2602,13 @@ pub mod tests {
             db.get_ue_collateral(subnet_id, a.join_txid, &a.pubkey)
                 .unwrap()
                 .unwrap()
-                .removed
+                .spent
         );
         assert!(
             !db.get_ue_collateral(subnet_id, b.join_txid, &b.pubkey)
                 .unwrap()
                 .unwrap()
-                .removed
+                .spent
         );
     }
 
@@ -2347,21 +2637,16 @@ pub mod tests {
             Some(b.clone())
         );
         assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 2);
-        assert_eq!(
-            db.get_pending_ue_collaterals(subnet_id, u32::MAX)
-                .unwrap()
-                .len(),
-            2
-        );
 
-        // Removing one leaves the other pending; deleting it leaves the other stored
+        // Spending one leaves the other unspent; deleting it leaves the other stored
         let mut txn = db.write_txn().unwrap();
-        db.set_ue_collateral_removed(&mut txn, subnet_id, a.join_txid, &a.pubkey)
-            .unwrap();
+        db.set_ue_collateral_spent(&mut txn, &a.outpoint).unwrap();
         txn.commit().unwrap();
-        assert_eq!(
-            db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap(),
-            vec![b.clone()]
+        assert!(
+            !db.get_ue_collateral(subnet_id, b.join_txid, &b.pubkey)
+                .unwrap()
+                .unwrap()
+                .spent
         );
         let mut txn = db.write_txn().unwrap();
         db.delete_ue_collateral(&mut txn, subnet_id, b.join_txid, &b.pubkey)
@@ -2369,7 +2654,7 @@ pub mod tests {
         txn.commit().unwrap();
         let stored = db.get_ue_collaterals(subnet_id).unwrap();
         assert_eq!(stored.len(), 1);
-        assert!(stored[0].pubkey == a.pubkey && stored[0].removed);
+        assert!(stored[0].pubkey == a.pubkey && stored[0].spent);
     }
 
     #[test]
@@ -2683,6 +2968,10 @@ pub mod tests {
             last_checkpoint_number: None,
             killed: SubnetKillState::NotKilled,
             marked_for_kill_checkpoint_number: None,
+            epoch: 1,
+            h_0: Some(0),
+            last_rotation_epoch: 1,
+            pending_multisig_changes: Vec::new(),
         };
 
         // Verify needs_rotation returns true when committees differ
@@ -2694,11 +2983,13 @@ pub mod tests {
         assert!(subnet_state.committee.is_validator(&pubkey2));
         assert!(!subnet_state.committee.is_validator(&pubkey3));
 
-        // Perform rotation
-        subnet_state.rotate_to_waiting_committee().unwrap();
+        // The rotation checkpoint of epoch 2 adopts the waiting committee as committee 2
+        let next = subnet_state.waiting_committee.take().unwrap();
+        subnet_state.adopt_committee(2, 2, next);
 
         // Verify committee was updated
-        assert_eq!(subnet_state.committee_number, 2); // Committee number incremented
+        assert_eq!(subnet_state.committee_number, 2);
+        assert_eq!(subnet_state.last_rotation_epoch, 2);
         assert!(subnet_state.committee.is_validator(&pubkey1));
         assert!(!subnet_state.committee.is_validator(&pubkey2)); // No longer in committee
         assert!(subnet_state.committee.is_validator(&pubkey3)); // New validator added
@@ -2708,16 +2999,6 @@ pub mod tests {
 
         // Verify needs_rotation now returns false
         assert!(!subnet_state.needs_rotation());
-
-        // Verify error when trying to rotate with no next committee
-        let result = subnet_state.rotate_to_waiting_committee();
-        assert!(result.is_err());
-
-        // Verify state didn't change after failed rotation
-        assert_eq!(subnet_state.committee_number, 2);
-        assert!(subnet_state.committee.is_validator(&pubkey1));
-        assert!(!subnet_state.committee.is_validator(&pubkey2));
-        assert!(subnet_state.committee.is_validator(&pubkey3));
     }
 
     #[test]
@@ -3263,3 +3544,6 @@ pub mod tests {
         assert_eq!(msgs_300.len(), 0);
     }
 }
+#[cfg(test)]
+#[path = "db_spec_tests.rs"]
+mod spec_tests;

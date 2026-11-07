@@ -1,11 +1,12 @@
 //! Unilateral-exit (UE) collateral: the collateral script, the checks of a `join-ue`, and
-//! the exit spend after maturity. The script has one leaf, the unilateral-exit leaf.
+//! the exit spend after maturity. The script has three leaves: unilateral exit, slash and
+//! cooperative exit.
 
 use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::{Keypair, Secp256k1},
-    opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_DROP},
+    opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_DROP},
     script::Builder,
     secp256k1::{self, Message},
     sighash::{Prevouts, SighashCache, TapSighashType},
@@ -14,14 +15,14 @@ use bitcoin::{
     Address, Amount, BlockHash, FeeRate, OutPoint, ScriptBuf, Sequence, Txid, Witness,
     XOnlyPublicKey,
 };
-use log::warn;
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 use crate::bitcoin_utils::{reveal_input, unsigned_commit_reveal, unspenable_internal_key};
 use crate::db::{self, DatabaseCore, UeCollateral};
-use crate::ipc_lib::{
-    IpcJoinUeMsg, IpcLibError, IpcUnstakeCollateralMsg, IpcValidate, IpcValidateError, SubnetId,
-};
+use crate::ipc_lib::{IpcJoinUeMsg, IpcLibError, IpcValidate, IpcValidateError, SubnetId};
+use crate::multisig::{Configuration, Power, MAX_TOTAL_POWER};
 
 /// Timeouts at or above this value are interpreted by Bitcoin as timestamps, not heights.
 pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
@@ -32,6 +33,9 @@ pub const UE_COLLATERAL_VOUT: u32 = 1;
 /// Name of the environment variable holding the UE activation height.
 pub const UE_ACTIVATION_HEIGHT_VAR: &str = "UE_ACTIVATION_HEIGHT";
 
+/// The committee number of the whitelist configuration `C_wlist`, the configuration of epoch 0.
+pub const WHITELIST_COMMITTEE_NUMBER: u64 = 0;
+
 #[derive(Debug, Error)]
 pub enum CollateralError {
     #[error("taproot builder is not finalizable")]
@@ -40,11 +44,17 @@ pub enum CollateralError {
     #[error(transparent)]
     TaprootBuilderError(#[from] bitcoin::taproot::TaprootBuilderError),
 
+    #[error(transparent)]
+    MultisigError(#[from] crate::multisig::MultisigError),
+
     #[error("join-ue rejected: {0}")]
     InvalidJoinUe(String),
 
     #[error("exit transaction: {0}")]
     InvalidExit(String),
+
+    #[error("slash transaction: {0}")]
+    InvalidSlash(String),
 
     #[error("fee rate overflow")]
     FeeRateOverflow,
@@ -64,40 +74,269 @@ pub fn ue_leaf_script(pubkey: &XOnlyPublicKey, timeout: u32) -> ScriptBuf {
         .into_script()
 }
 
-/// The taproot spend info of the UE collateral: unspendable internal key, one leaf.
-pub fn ue_spend_info(
-    secp: &Secp256k1<secp256k1::All>,
-    pubkey: &XOnlyPublicKey,
-    timeout: u32,
-) -> Result<TaprootSpendInfo, CollateralError> {
-    TaprootBuilder::new()
-        .add_leaf(0, ue_leaf_script(pubkey, timeout))?
-        .finalize(secp, unspenable_internal_key())
-        .map_err(|_| CollateralError::TaprootBuilderNotFinalizable)
-}
-
-/// The script pubkey of the UE collateral output for `pubkey` and `timeout`.
-pub fn ue_script_pubkey(
-    secp: &Secp256k1<secp256k1::All>,
-    pubkey: &XOnlyPublicKey,
-    timeout: u32,
+/// `<key> OP_CHECKSIGVERIFY` followed by the weighted multisig of the named configuration.
+fn key_and_multisig_leaf(
+    key: &XOnlyPublicKey,
+    configuration: &Configuration,
 ) -> Result<ScriptBuf, CollateralError> {
-    let info = ue_spend_info(secp, pubkey, timeout)?;
-    Ok(ScriptBuf::new_p2tr(
-        secp,
-        info.internal_key(),
-        info.merkle_root(),
+    let prefix = Builder::new()
+        .push_x_only_key(key)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .into_script();
+    let multisig = configuration.multisig_script()?;
+    Ok(ScriptBuf::from_bytes(
+        [prefix.into_bytes(), multisig.into_bytes()].concat(),
     ))
 }
 
-fn ue_control_block(
-    secp: &Secp256k1<secp256k1::All>,
-    pubkey: &XOnlyPublicKey,
-    timeout: u32,
-) -> Result<ControlBlock, CollateralError> {
-    ue_spend_info(secp, pubkey, timeout)?
-        .control_block(&(ue_leaf_script(pubkey, timeout), LeafVersion::TapScript))
-        .ok_or(CollateralError::TaprootBuilderNotFinalizable)
+/// The collateral script of a validator: its key, its EOTS key, its timeout and the
+/// configuration its slash and cooperative-exit leaves name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollateralScript {
+    pub pubkey: XOnlyPublicKey,
+    pub pk_eots: XOnlyPublicKey,
+    pub timeout: u32,
+    pub configuration: Configuration,
+}
+
+impl CollateralScript {
+    pub fn new(
+        pubkey: XOnlyPublicKey,
+        pk_eots: XOnlyPublicKey,
+        timeout: u32,
+        configuration: Configuration,
+    ) -> Self {
+        Self {
+            pubkey,
+            pk_eots,
+            timeout,
+            configuration,
+        }
+    }
+
+    /// The unilateral-exit leaf `U(pk, T)`.
+    pub fn exit_leaf(&self) -> ScriptBuf {
+        ue_leaf_script(&self.pubkey, self.timeout)
+    }
+
+    /// The slash leaf `L(pk_eots, C)`.
+    pub fn slash_leaf(&self) -> Result<ScriptBuf, CollateralError> {
+        key_and_multisig_leaf(&self.pk_eots, &self.configuration)
+    }
+
+    /// The cooperative-exit leaf `X(pk, C)`.
+    pub fn cooperative_exit_leaf(&self) -> Result<ScriptBuf, CollateralError> {
+        key_and_multisig_leaf(&self.pubkey, &self.configuration)
+    }
+
+    /// The taproot spend info: unspendable internal key, `X` at depth 1, `U` and `L` at depth 2.
+    pub fn spend_info(
+        &self,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<TaprootSpendInfo, CollateralError> {
+        TaprootBuilder::new()
+            .add_leaf(1, self.cooperative_exit_leaf()?)?
+            .add_leaf(2, self.exit_leaf())?
+            .add_leaf(2, self.slash_leaf()?)?
+            .finalize(secp, unspenable_internal_key())
+            .map_err(|_| CollateralError::TaprootBuilderNotFinalizable)
+    }
+
+    pub fn script_pubkey(
+        &self,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<ScriptBuf, CollateralError> {
+        let info = self.spend_info(secp)?;
+        Ok(ScriptBuf::new_p2tr(
+            secp,
+            info.internal_key(),
+            info.merkle_root(),
+        ))
+    }
+
+    pub fn control_block(
+        &self,
+        secp: &Secp256k1<secp256k1::All>,
+        leaf: &ScriptBuf,
+    ) -> Result<ControlBlock, CollateralError> {
+        self.spend_info(secp)?
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .ok_or(CollateralError::TaprootBuilderNotFinalizable)
+    }
+
+}
+
+/// The committee number of the configuration of epoch `epoch`: `C_wlist` for epoch 0, the
+/// configuration the monitor computed for the epoch otherwise.
+pub fn epoch_committee_number<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    epoch: u64,
+) -> Result<Option<u64>, db::DbError> {
+    if epoch == 0 {
+        return Ok(Some(WHITELIST_COMMITTEE_NUMBER));
+    }
+    db.get_epoch_committee_number(subnet_id, epoch)
+}
+
+/// The configurations a `join-ue` may name at this point of the subnet's life, each with its
+/// committee number: `C_wlist` before bootstrap, and from activation on the configurations
+/// of the current epoch `e` and of the previous one (the latest epoch below `e` that has a
+/// configuration, `C_wlist` for epoch 0). In epoch 0 a join names nothing: the monitor
+/// accepts none.
+pub fn named_configurations<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+) -> Result<Vec<(u64, Configuration)>, IpcLibError> {
+    let genesis_info = db.get_subnet_genesis_info(subnet_id)?.ok_or_else(|| {
+        IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet_id))
+    })?;
+    let Some(state) = db.get_subnet_state(subnet_id)? else {
+        return Ok(vec![(
+            WHITELIST_COMMITTEE_NUMBER,
+            genesis_info.whitelist_configuration(),
+        )]);
+    };
+    if !state.is_activated() {
+        return Err(IpcValidateError::InvalidMsg(format!(
+            "Subnet {subnet_id} is in epoch 0: it accepts no join transaction"
+        ))
+        .into());
+    }
+    let mut numbers = Vec::new();
+    for epoch in (0..=state.epoch).rev() {
+        if let Some(number) = epoch_committee_number(db, subnet_id, epoch)? {
+            numbers.push(number);
+            if numbers.len() == 2 {
+                break;
+            }
+        }
+    }
+    let mut named = Vec::new();
+    for number in numbers {
+        let configuration = configuration_by_number(db, subnet_id, number)?.ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!("Subnet {subnet_id} has no committee {number}"))
+        })?;
+        named.push((number, configuration));
+    }
+    Ok(named)
+}
+
+/// What a `join-ue` is checked against at this point of the subnet's life: the configurations
+/// its collateral may name and the epoch timing of rule 2.6.
+#[derive(Debug, Clone)]
+pub struct JoinContext {
+    pub named: Vec<(u64, Configuration)>,
+    /// The current epoch, 0 before activation
+    pub epoch: u64,
+    /// `H_0`, `None` before activation
+    pub h_0: Option<u64>,
+    pub epoch_length: u64,
+    pub min_timeout: u32,
+    pub max_timeout: u32,
+}
+
+impl JoinContext {
+    /// The epoch `E_T = ⌈(T - H_0) / K⌉` that contains `timeout`, with the join's block
+    /// height in place of `H_0` before activation.
+    pub fn timeout_epoch(&self, timeout: u32, block_height: u64) -> u64 {
+        let origin = self.h_0.unwrap_or(block_height);
+        u64::from(timeout)
+            .saturating_sub(origin)
+            .div_ceil(self.epoch_length)
+    }
+
+    /// Rule 2.6: `block_height + 1 < T < 500,000,000` and
+    /// `e + min_timeout + 3 ≤ E_T ≤ e + max_timeout + 3`.
+    pub fn check_timeout(&self, timeout: u32, block_height: u64) -> Result<(), String> {
+        let min_timeout = block_height
+            .checked_add(1)
+            .ok_or_else(|| "block height overflow".to_string())?;
+        if u64::from(timeout) <= min_timeout || timeout >= LOCKTIME_THRESHOLD {
+            return Err(format!(
+                "timeout {timeout} must be above {min_timeout} and below {LOCKTIME_THRESHOLD}"
+            ));
+        }
+        let timeout_epoch = self.timeout_epoch(timeout, block_height);
+        let lowest = self.epoch + u64::from(self.min_timeout) + 3;
+        let highest = self.epoch + u64::from(self.max_timeout) + 3;
+        if timeout_epoch < lowest || timeout_epoch > highest {
+            return Err(format!(
+                "timeout {timeout} is in epoch {timeout_epoch}, allowed epochs {lowest} to {highest}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The [`JoinContext`] of `subnet_id` from the monitor's state.
+pub fn join_context<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+) -> Result<JoinContext, IpcLibError> {
+    let named = named_configurations(db, subnet_id)?;
+    let genesis_info = db
+        .get_subnet_genesis_info(subnet_id)?
+        .ok_or_else(|| IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet_id)))?;
+    let params = &genesis_info.create_subnet_msg;
+    let state = db.get_subnet_state(subnet_id)?;
+    Ok(JoinContext {
+        named,
+        epoch: state.as_ref().map_or(0, |s| s.epoch),
+        h_0: state.and_then(|s| s.h_0),
+        epoch_length: params.epoch_length,
+        min_timeout: params.min_timeout,
+        max_timeout: params.max_timeout,
+    })
+}
+
+/// The configuration of committee `number` of `subnet_id`: the whitelist for 0, a stored
+/// committee otherwise.
+pub fn configuration_by_number<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    number: u64,
+) -> Result<Option<Configuration>, IpcLibError> {
+    if number == WHITELIST_COMMITTEE_NUMBER {
+        return Ok(db
+            .get_subnet_genesis_info(subnet_id)?
+            .map(|g| g.whitelist_configuration()));
+    }
+    Ok(db
+        .get_committee(subnet_id, number)?
+        .map(|c| c.configuration()))
+}
+
+/// The collateral script of a recorded collateral.
+pub fn collateral_script_of<D: DatabaseCore>(
+    db: &D,
+    record: &UeCollateral,
+) -> Result<CollateralScript, IpcLibError> {
+    let configuration = configuration_by_number(db, record.subnet_id, record.committee_number)?
+        .ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!(
+                "Subnet {} has no committee {}",
+                record.subnet_id, record.committee_number
+            ))
+        })?;
+    Ok(CollateralScript::new(
+        record.pubkey,
+        record.pk_eots,
+        record.timeout,
+        configuration,
+    ))
+}
+
+/// The Bitcoin block of a collateral's join: that of the EOTS nonce commitment the join carried.
+pub fn join_block_height<D: DatabaseCore>(
+    db: &D,
+    record: &UeCollateral,
+) -> Result<u64, db::DbError> {
+    Ok(db
+        .get_eots_commitments(record.subnet_id, &record.pk_eots)?
+        .iter()
+        .find(|c| c.txid == record.join_txid)
+        .map_or(0, |c| c.block_height))
 }
 
 /// The UE activation height from the environment, `None` when unset or empty (compose
@@ -119,16 +358,21 @@ pub fn ue_activation_height() -> Option<u64> {
 pub struct CheckedJoinUe {
     pub msg: IpcJoinUeMsg,
     pub outpoint: OutPoint,
+    /// The committee the collateral script names
+    pub committee_number: u64,
 }
 
 /// Checks the `join-ue` carried by input `input_index` of `reveal` against `commit`, the
-/// transaction that input spends, for a reveal mined in block `block_height`.
+/// transaction that input spends, for a reveal mined in block `block_height`. The collateral
+/// must name one of the configurations of `context` ([`join_context`]) and its timeout must
+/// satisfy rule 2.6.
 pub fn check_join_ue(
     secp: &Secp256k1<secp256k1::All>,
     reveal: &Transaction,
     input_index: usize,
     commit: &Transaction,
     block_height: u64,
+    context: &JoinContext,
 ) -> Result<CheckedJoinUe, CollateralError> {
     let err = CollateralError::InvalidJoinUe;
 
@@ -165,29 +409,32 @@ pub fn check_join_ue(
     }
 
     let collateral = &commit.output[UE_COLLATERAL_VOUT as usize];
-    if collateral.script_pubkey != ue_script_pubkey(secp, &msg.join.pubkey, msg.timeout)? {
-        return Err(err(
-            "collateral output is not the UE script of the declared key and timeout".to_string(),
-        ));
-    }
-
     msg.join.collateral = collateral.value;
     msg.validate()
         .map_err(|e| err(format!("invalid message: {e}")))?;
 
-    let min_timeout = block_height
-        .checked_add(1)
-        .ok_or_else(|| err("block height overflow".to_string()))?;
-    if u64::from(msg.timeout) <= min_timeout || msg.timeout >= LOCKTIME_THRESHOLD {
-        return Err(err(format!(
-            "timeout {} must be above {} and below {}",
-            msg.timeout, min_timeout, LOCKTIME_THRESHOLD
-        )));
+    let mut committee_number = None;
+    for (number, configuration) in &context.named {
+        let script = msg.collateral_script(configuration.clone());
+        if collateral.script_pubkey == script.script_pubkey(secp)? {
+            committee_number = Some(*number);
+            break;
+        }
     }
+    let Some(committee_number) = committee_number else {
+        return Err(err(
+            "collateral output is not the collateral script of the declared keys and timeout naming an accepted configuration".to_string(),
+        ));
+    };
+
+    context
+        .check_timeout(msg.timeout, block_height)
+        .map_err(err)?;
 
     Ok(CheckedJoinUe {
         msg,
         outpoint: OutPoint::new(commit_txid, UE_COLLATERAL_VOUT),
+        committee_number,
     })
 }
 
@@ -196,7 +443,7 @@ pub fn check_join_ue(
 pub struct UeExitInput {
     pub outpoint: OutPoint,
     pub value: Amount,
-    pub timeout: u32,
+    pub script: CollateralScript,
 }
 
 /// Builds and signs the exit transaction spending `inputs`, all collaterals of `keypair`,
@@ -214,7 +461,17 @@ pub fn build_ue_exit_tx(
     }
     let (pubkey, _) = keypair.x_only_public_key();
 
-    let lock_height = inputs.iter().map(|i| i.timeout).max().expect("non-empty");
+    if let Some(other) = inputs.iter().find(|i| i.script.pubkey != pubkey) {
+        return Err(err(format!(
+            "collateral {} belongs to {}, not to the signing key",
+            other.outpoint, other.script.pubkey
+        )));
+    }
+    let lock_height = inputs
+        .iter()
+        .map(|i| i.script.timeout)
+        .max()
+        .expect("non-empty");
     let lock_time = LockTime::from_height(lock_height)
         .map_err(|e| err(format!("timeout {lock_height} is not a height: {e}")))?;
 
@@ -223,7 +480,7 @@ pub fn build_ue_exit_tx(
         .map(|i| {
             Ok(TxOut {
                 value: i.value,
-                script_pubkey: ue_script_pubkey(secp, &pubkey, i.timeout)?,
+                script_pubkey: i.script.script_pubkey(secp)?,
             })
         })
         .collect::<Result<Vec<_>, CollateralError>>()?;
@@ -254,10 +511,9 @@ pub fn build_ue_exit_tx(
     let witnesses = inputs
         .iter()
         .map(|i| {
-            Ok((
-                ue_leaf_script(&pubkey, i.timeout),
-                ue_control_block(secp, &pubkey, i.timeout)?,
-            ))
+            let leaf = i.script.exit_leaf();
+            let control_block = i.script.control_block(secp, &leaf)?;
+            Ok((leaf, control_block))
         })
         .collect::<Result<Vec<_>, CollateralError>>()?;
     for (txin, (leaf, control_block)) in tx.input.iter_mut().zip(&witnesses) {
@@ -331,6 +587,20 @@ pub fn process_join_ue<D: DatabaseCore>(
     join.validate_for_subnet(&genesis_info, &subnet_state)?;
     join.validate()?;
     refuse_earlier_join(db, join.subnet_id, &join.pubkey, Some(join_txid))?;
+    refuse_earlier_eots_key(
+        db,
+        join.subnet_id,
+        &join.pubkey,
+        &checked.msg.pk_eots,
+        Some(join_txid),
+    )?;
+    refuse_excess_power(
+        db,
+        &genesis_info,
+        subnet_state.as_ref(),
+        block_height,
+        join.collateral,
+    )?;
 
     // Written before the join, so that a crash between the two leaves a record the next run reuses
     if !existed {
@@ -340,13 +610,31 @@ pub fn process_join_ue<D: DatabaseCore>(
             outpoint: checked.outpoint,
             value: join.collateral,
             timeout: checked.msg.timeout,
+            pk_eots: checked.msg.pk_eots,
+            committee_number: checked.committee_number,
+            ip: join.ip,
             backup_address: join.backup_address.clone(),
             join_txid,
-            removed: false,
+            spent: false,
         };
         let mut wtxn = db.write_txn()?;
         db.add_ue_collateral(&mut wtxn, &record)?;
+        db.add_eots_commitment(
+            &mut wtxn,
+            &db::EotsCommitmentRecord {
+                subnet_id: join.subnet_id,
+                pk_eots: checked.msg.pk_eots,
+                commitment: checked.msg.nonce_commitment,
+                block_height,
+                txid: join_txid,
+            },
+        )?;
         wtxn.commit()?;
+    }
+
+    // After activation the collateral seats the validator at the cutoffs it qualifies for
+    if subnet_state.is_some() {
+        return Ok(None);
     }
 
     match join.save_to_db(db, block_height, block_hash, join_txid) {
@@ -360,6 +648,81 @@ pub fn process_join_ue<D: DatabaseCore>(
             Err(e)
         }
     }
+}
+
+/// The total power of the validators that hold a counting collateral, with a new collateral
+/// of `new_collateral`, stays at most `MAX_TOTAL_POWER`. A collateral counts if it is unspent
+/// and matures after `H_{e+3}` (`3K` blocks after the join's block before activation), whatever
+/// configuration it names. Members without a collateral record (multisig joins) count with
+/// their power.
+fn refuse_excess_power<D: DatabaseCore>(
+    db: &D,
+    genesis_info: &db::SubnetGenesisInfo,
+    state: Option<&db::SubnetState>,
+    block_height: u64,
+    new_collateral: Amount,
+) -> Result<(), IpcLibError> {
+    let params = &genesis_info.create_subnet_msg;
+    let subnet_id = genesis_info.subnet_id;
+    let (origin, epoch) = match state.and_then(|s| s.h_0.map(|h_0| (h_0, s.epoch))) {
+        Some(known) => known,
+        None => (block_height, 0),
+    };
+    let boundary = params.cutoff_height(origin, epoch + 3);
+
+    let mut values: BTreeMap<XOnlyPublicKey, Amount> = BTreeMap::new();
+    for record in db.get_ue_collaterals(subnet_id)? {
+        if record.spent || u64::from(record.timeout) <= boundary {
+            continue;
+        }
+        let value = values.entry(record.pubkey).or_insert(Amount::ZERO);
+        *value = value.checked_add(record.value).ok_or_else(|| {
+            IpcValidateError::InvalidMsg("collateral value overflow".to_string())
+        })?;
+    }
+    let mut total: Power = 0;
+    for value in values.values() {
+        total = total.saturating_add(params.power_of(value)?);
+    }
+    let members = match state {
+        Some(state) => &state.latest_committee().validators,
+        None => &genesis_info.genesis_validators,
+    };
+    for member in members.iter() {
+        if !is_ue_validator(db, subnet_id, member.join_txid, &member.pubkey)? {
+            total = total.saturating_add(member.power);
+        }
+    }
+    total = total.saturating_add(params.power_of(&new_collateral)?);
+    if total > MAX_TOTAL_POWER {
+        return Err(IpcValidateError::InvalidMsg(format!(
+            "the total power {total} with this collateral exceeds the maximum {MAX_TOTAL_POWER}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Records the spend of every collateral that an input of `tx` spends, whatever the
+/// transaction is. Returns the records spent by it.
+pub fn record_collateral_spends<D: DatabaseCore>(
+    db: &D,
+    tx: &Transaction,
+) -> Result<Vec<UeCollateral>, db::DbError> {
+    let mut spent = Vec::new();
+    for input in &tx.input {
+        let Some(record) = db.get_ue_collateral_by_outpoint(&input.previous_output)? else {
+            continue;
+        };
+        if record.spent {
+            continue;
+        }
+        let mut wtxn = db.write_txn()?;
+        db.set_ue_collateral_spent(&mut wtxn, &input.previous_output)?;
+        wtxn.commit()?;
+        spent.push(record);
+    }
+    Ok(spent)
 }
 
 /// Refuses a join-ue of `pubkey` to `subnet_id` when an earlier accepted join of the subnet
@@ -404,101 +767,31 @@ pub fn refuse_earlier_join<D: DatabaseCore>(
     }
 }
 
-/// What the removal pass did with one matured UE collateral.
-#[derive(Debug, Clone)]
-pub struct UeRemoval {
-    pub subnet_id: SubnetId,
-    pub pubkey: XOnlyPublicKey,
-    pub join_txid: Txid,
-    pub outcome: String,
-}
-
-/// At block `block_height`, before its transactions: removes from the next committee every
-/// UE validator whose collateral matures at `block_height + 1`, through a multisig unstake
-/// of its whole collateral, on the state the previous block left. A record acts only on the
-/// membership its join created. A refused removal is retried at every block, and the only
-/// member of a committee is kept.
-pub fn remove_matured_ue_validators<D: DatabaseCore>(
+/// Refuses a join-ue carrying `pk_eots` when an earlier accepted join-ue of any subnet
+/// carries it. The join's own record, `pubkey` in the reveal `join_txid` of `subnet_id`, does
+/// not count (a replay).
+pub fn refuse_earlier_eots_key<D: DatabaseCore>(
     db: &D,
-    block_height: u64,
-    block_hash: BlockHash,
-) -> Result<Vec<UeRemoval>, IpcLibError> {
-    let mut removals = Vec::new();
-    for subnet in db.get_all_subnets()? {
-        let changed_in_this_block = db
-            .get_subnet_genesis_info(subnet.id)?
-            .and_then(|g| g.genesis_block_height)
-            .is_none_or(|h| h >= block_height)
-            || match subnet.last_checkpoint_number {
-                Some(n) => db
-                    .get_checkpoint(subnet.id, n)?
-                    .is_some_and(|c| c.block_height >= block_height),
-                None => false,
-            };
-        if changed_in_this_block {
-            continue;
-        }
-        let max_timeout = u32::try_from(block_height.saturating_add(1)).unwrap_or(u32::MAX);
-        for record in db.get_pending_ue_collaterals(subnet.id, max_timeout)? {
-            // Re-read: an earlier removal in this pass may have changed the committee
-            let state = db.get_subnet_state(subnet.id)?.ok_or_else(|| {
-                IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet.id))
-            })?;
-            let committee = state.latest_committee();
-            let member = committee
-                .validators
-                .iter()
-                .find(|v| v.pubkey == record.pubkey && v.join_txid == record.join_txid);
-
-            let (outcome, done) = if state.is_killed_or_pending() {
-                (
-                    "subnet killed or pending kill, nothing to do".to_string(),
-                    true,
-                )
-            } else if let Some(member) = member {
-                if committee.validators.len() <= 1 {
-                    ("only member of the committee, kept".to_string(), true)
-                } else {
-                    let unstake = IpcUnstakeCollateralMsg {
-                        subnet_id: subnet.id,
-                        amount: member.collateral,
-                        pubkey: Some(member.pubkey),
-                    };
-                    match unstake.save_to_db(db, block_height, block_hash, record.join_txid) {
-                        Ok(()) => ("removed from the next committee".to_string(), true),
-                        Err(IpcLibError::IpcValidateError(e)) => {
-                            warn!(
-                                "Subnet {} UE validator {} not removed at block {}, retrying next block: {}",
-                                subnet.id, record.pubkey, block_height, e
-                            );
-                            (format!("not removed, retrying: {e}"), false)
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            } else {
-                ("not in the committee, nothing to do".to_string(), true)
-            };
-
-            if done {
-                let mut wtxn = db.write_txn()?;
-                db.set_ue_collateral_removed(
-                    &mut wtxn,
-                    subnet.id,
-                    record.join_txid,
-                    &record.pubkey,
-                )?;
-                wtxn.commit()?;
-            }
-            removals.push(UeRemoval {
-                subnet_id: subnet.id,
-                pubkey: record.pubkey,
-                join_txid: record.join_txid,
-                outcome,
-            });
-        }
+    subnet_id: SubnetId,
+    pubkey: &XOnlyPublicKey,
+    pk_eots: &XOnlyPublicKey,
+    join_txid: Option<Txid>,
+) -> Result<(), IpcLibError> {
+    let own = |r: &UeCollateral| {
+        r.subnet_id == subnet_id && r.pubkey == *pubkey && Some(r.join_txid) == join_txid
+    };
+    let earlier = db
+        .get_all_ue_collaterals()?
+        .into_iter()
+        .find(|r| r.pk_eots == *pk_eots && !own(r));
+    match earlier {
+        Some(record) => Err(IpcValidateError::InvalidMsg(format!(
+            "EOTS key {pk_eots} was registered in subnet {} before (join {}): an EOTS key joins once",
+            record.subnet_id, record.join_txid
+        ))
+        .into()),
+        None => Ok(()),
     }
-    Ok(removals)
 }
 
 /// An unsigned commit and reveal pair for `msg` with `collateral` on output 1, shaped as
@@ -508,6 +801,7 @@ pub fn unsigned_join_ue_txs(
     secp: &Secp256k1<secp256k1::All>,
     msg: &IpcJoinUeMsg,
     collateral: Amount,
+    configuration: &Configuration,
 ) -> Result<(Transaction, Transaction, Vec<u8>), CollateralError> {
     let data = msg
         .to_bytes()
@@ -515,7 +809,9 @@ pub fn unsigned_join_ue_txs(
     let outputs = vec![
         TxOut {
             value: collateral,
-            script_pubkey: ue_script_pubkey(secp, &msg.join.pubkey, msg.timeout)?,
+            script_pubkey: msg
+                .collateral_script(configuration.clone())
+                .script_pubkey(secp)?,
         },
         TxOut {
             value: Amount::from_sat(50_000),
@@ -602,7 +898,9 @@ mod tests {
     use super::*;
     use crate::bitcoin_utils::make_push_data_script;
     use crate::db::{DatabaseCore, HeedDb, StakingChange, SubnetKillState};
-    use crate::ipc_lib::{IpcCreateSubnetMsg, IpcJoinSubnetMsg, IPC_JOIN_UE_TAG};
+    use crate::ipc_lib::{
+        IpcCreateSubnetMsg, IpcJoinSubnetMsg, IpcUnstakeCollateralMsg, IPC_JOIN_UE_TAG,
+    };
     use crate::test_utils::generate_keypairs;
     use crate::test_utils::{create_test_db, generate_subnet_id};
     use crate::{SubnetId, NETWORK};
@@ -664,12 +962,197 @@ mod tests {
     fn signed_msg(keypair: &Keypair, timeout: u32) -> IpcJoinUeMsg {
         let secp = Secp256k1::new();
         let (pubkey, _) = keypair.x_only_public_key();
-        IpcJoinUeMsg::new_signed(&secp, test_join_msg(pubkey), timeout, &keypair.secret_key())
+        IpcJoinUeMsg::new_signed(
+            &secp,
+            test_join_msg(pubkey),
+            timeout,
+            &keypair.secret_key(),
+            &eots_key_of(&pubkey),
+            test_commitment(),
+        )
+    }
+
+    /// A validator's EOTS secret key, derived from its key so that every validator has its own
+    fn eots_key_of(pubkey: &XOnlyPublicKey) -> secp256k1::SecretKey {
+        secp256k1::SecretKey::from_slice(&crate::ipc_lib::tagged_sha256(
+            b"test/eots",
+            &pubkey.serialize(),
+        ))
+        .unwrap()
+    }
+
+    fn test_commitment() -> crate::eots::EotsNonceCommitment {
+        crate::eots::EotsNonceCommitment {
+            start: 1,
+            count: 10,
+            root: [1u8; 32],
+        }
+    }
+
+    /// Three fixed keys with power 1 and threshold 2
+    fn test_configuration() -> Configuration {
+        let secp = Secp256k1::new();
+        Configuration {
+            keys: (11u8..14)
+                .map(|seed| {
+                    let sk = secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+                    (sk.x_only_public_key(&secp).0, 1)
+                })
+                .collect(),
+            threshold: 2,
+        }
+    }
+
+    fn named() -> Vec<(u64, Configuration)> {
+        vec![(WHITELIST_COMMITTEE_NUMBER, test_configuration())]
+    }
+
+    /// The join context of a subnet before activation, naming the test configuration: epochs
+    /// of ten blocks, timeouts of 1 to 1000 epochs
+    fn context() -> JoinContext {
+        JoinContext {
+            named: named(),
+            epoch: 0,
+            h_0: None,
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 1000,
+        }
+    }
+
+    fn test_script(pubkey: &XOnlyPublicKey, timeout: u32) -> CollateralScript {
+        let secp = Secp256k1::new();
+        CollateralScript::new(
+            *pubkey,
+            eots_key_of(pubkey).x_only_public_key(&secp).0,
+            timeout,
+            test_configuration(),
+        )
     }
 
     const TIMEOUT: u32 = 1_000;
     const BLOCK: u64 = 100;
     const COLLATERAL: Amount = Amount::from_sat(100_000);
+    /// One unit of power of the test subnets, the value of a `C_gen` member
+    const UNIT: Amount = Amount::from_sat(10_000);
+
+    /// The slash pre-signature entry of `record` by `signers`
+    fn presign_entry(
+        db: &impl DatabaseCore,
+        record: &UeCollateral,
+        signers: &[&Keypair],
+    ) -> crate::slash::SlashSignatureEntry {
+        let secp = Secp256k1::new();
+        let script = collateral_script_of(db, record).unwrap();
+        let mut signatures = signers
+            .iter()
+            .map(|k| crate::slash::sign_slash(&secp, &script, record.outpoint, record.value, k).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|(i, _)| *i);
+        crate::slash::SlashSignatureEntry::new(record.outpoint, signatures)
+    }
+
+    fn batch_with(
+        subnet_id: SubnetId,
+        entries: Vec<crate::slash::SlashSignatureEntry>,
+    ) -> crate::ipc_lib::IpcBatchTransferMsg {
+        crate::ipc_lib::IpcBatchTransferMsg {
+            subnet_id,
+            checkpoint_txid: Txid::from_slice(&[5u8; 32]).unwrap(),
+            checkpoint_vout: 0,
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+            slash_signatures: entries,
+        }
+    }
+
+    #[test]
+    fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
+        let secp = setup();
+        let db = create_test_db();
+        let keys = generate_keypairs(4);
+        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
+        let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1], pks[2]], 2);
+        let block_hash = BlockHash::all_zeros();
+        for key in &keys[..2] {
+            let (checked, join_txid) = checked_join_in_db(&db, &secp, key, subnet_id, TIMEOUT);
+            assert_eq!(checked.committee_number, WHITELIST_COMMITTEE_NUMBER);
+            process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        }
+        let state = db.get_subnet_state(subnet_id).unwrap().expect("bootstrapped");
+        assert_eq!(state.committee.validators.len(), 2);
+        // The commitments of the joins are recorded
+        let record0 = db.get_ue_collaterals(subnet_id).unwrap()[0].clone();
+        let commitments = db.get_eots_commitments(subnet_id, &record0.pk_eots).unwrap();
+        assert_eq!(commitments.len(), 1);
+        assert_eq!(commitments[0].commitment, test_commitment());
+        activate(&db, subnet_id, BLOCK);
+
+        // A third key joins after activation: recorded, naming committee 1, not seated
+        let (checked, join_txid) = checked_join_in_db(&db, &secp, &keys[2], subnet_id, TIMEOUT);
+        assert!(process_join_ue(&db, &checked, join_txid, BLOCK + 1, block_hash)
+            .unwrap()
+            .is_none());
+        let record = db.get_ue_collateral(subnet_id, join_txid, &pks[2]).unwrap().unwrap();
+        assert_eq!(record.committee_number, 1);
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert!(state.waiting_committee.is_none());
+        assert!(db.get_all_stake_changes(subnet_id).unwrap().is_empty());
+
+        // One member of committee 1 does not reach its threshold: valid, not slashable
+        let one = presign_entry(&db, &record, &[&keys[0]]);
+        assert!(batch_with(subnet_id, vec![one]).newly_slashable(&db).unwrap().is_empty());
+        // A signature by a key outside the configuration cannot be built
+        let script = collateral_script_of(&db, &record).unwrap();
+        assert!(crate::slash::sign_slash(&secp, &script, record.outpoint, record.value, &keys[3]).is_err());
+        // A corrupted signature fails the batch, as does an unknown output
+        let mut bad = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
+        bad.signatures[0].1[1][0] ^= 1;
+        assert!(batch_with(subnet_id, vec![bad]).newly_slashable(&db).is_err());
+        let mut unknown = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
+        unknown.vout = 7;
+        assert!(batch_with(subnet_id, vec![unknown]).newly_slashable(&db).is_err());
+        // Disorder is rejected by validation
+        let entry = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
+        assert!(batch_with(subnet_id, vec![entry.clone(), entry.clone()]).validate().is_err());
+        batch_with(subnet_id, vec![entry.clone()]).validate().unwrap();
+
+        // Both members reach the threshold: slashable
+        let newly = batch_with(subnet_id, vec![entry.clone()]).newly_slashable(&db).unwrap();
+        assert_eq!(newly.len(), 1);
+        assert_eq!(newly[0].0.outpoint, record.outpoint);
+        make_slashable(&db, subnet_id, join_txid, &pks[2], BLOCK + 2);
+        // A later entry for a slashable output changes nothing
+        assert!(batch_with(subnet_id, vec![entry]).newly_slashable(&db).unwrap().is_empty());
+        // A genesis member's collateral names the whitelist: two whitelisted keys suffice
+        let genesis_entry = presign_entry(&db, &record0, &[&keys[1], &keys[2]]);
+        assert_eq!(batch_with(subnet_id, vec![genesis_entry]).newly_slashable(&db).unwrap().len(), 1);
+        make_slashable(
+            &db,
+            subnet_id,
+            record0.join_txid,
+            &record0.pubkey,
+            BLOCK + 2,
+        );
+
+        // The next cutoff seats the slashable collaterals with their values: the third key and
+        // the genesis member whose collateral is slashable; the other genesis member leaves
+        let outcomes = cutoff(&db, BLOCK + 10);
+        assert_eq!(outcomes.len(), 1);
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(state.epoch, 2);
+        let next = state
+            .waiting_committee
+            .as_ref()
+            .expect("a new configuration");
+        assert!(next.is_validator(&pks[2]) && next.is_validator(&record0.pubkey));
+        assert_eq!(next.validators.len(), 2);
+        assert!(next.validators.iter().all(|v| v.collateral == COLLATERAL));
+        // A deposit and a withdrawal of the genesis members, a join and a deposit of the third
+        assert_eq!(db.get_all_stake_changes(subnet_id).unwrap().len(), 4);
+    }
 
     /// A commit and reveal pair as the provider builds them, unsigned, and the data.
     fn join_ue_txs(
@@ -684,14 +1167,15 @@ mod tests {
         msg: &IpcJoinUeMsg,
         collateral: Amount,
     ) -> (Transaction, Transaction, Vec<u8>) {
-        unsigned_join_ue_txs(secp, msg, collateral).unwrap()
+        unsigned_join_ue_txs(secp, msg, collateral, &test_configuration()).unwrap()
     }
 
     #[test]
     fn leaf_script_and_script_pubkey_are_stable() {
         let secp = setup();
         let (pubkey, _) = test_keypair().x_only_public_key();
-        let leaf = ue_leaf_script(&pubkey, TIMEOUT);
+        let script = test_script(&pubkey, TIMEOUT);
+        let leaf = script.exit_leaf();
         assert_eq!(
             leaf.to_string(),
             format!(
@@ -699,29 +1183,57 @@ mod tests {
                 pubkey
             )
         );
-        let spk = ue_script_pubkey(&secp, &pubkey, TIMEOUT).unwrap();
+        // The slash leaf is `<pk_eots> OP_CHECKSIGVERIFY` followed by the multisig of the
+        // named configuration, and the cooperative-exit leaf the same with the validator key
+        let multisig = test_configuration().multisig_script().unwrap();
+        assert_eq!(
+            script.slash_leaf().unwrap().to_bytes(),
+            [vec![0x20], script.pk_eots.serialize().to_vec(), vec![0xad], multisig.to_bytes()]
+                .concat()
+        );
+        assert_eq!(
+            script.cooperative_exit_leaf().unwrap().to_bytes(),
+            [vec![0x20], pubkey.serialize().to_vec(), vec![0xad], multisig.to_bytes()].concat()
+        );
+        let spk = script.script_pubkey(&secp).unwrap();
         assert!(spk.is_p2tr());
-        // Fixed vectors for this key and timeout, so that any change of the output is noticed
-        let control_block = ue_control_block(&secp, &pubkey, TIMEOUT)
+        // The exit leaf sits at depth 2 beside the slash leaf, under the cooperative-exit leaf:
+        // its control block carries `TapLeaf(L) ‖ TapLeaf(X)`
+        let control_block = script.control_block(&secp, &leaf).unwrap().serialize();
+        assert_eq!(control_block.len(), 97);
+        let slash_hash = script.slash_leaf().unwrap().tapscript_leaf_hash();
+        let coop_hash = script.cooperative_exit_leaf().unwrap().tapscript_leaf_hash();
+        assert_eq!(&control_block[33..65], slash_hash.as_byte_array());
+        assert_eq!(&control_block[65..], coop_hash.as_byte_array());
+        let coop_block = script
+            .control_block(&secp, &script.cooperative_exit_leaf().unwrap())
             .unwrap()
             .serialize();
+        assert_eq!(coop_block.len(), 65);
+        // Fixed vectors for these keys and timeout, so that any change of the output is noticed
         assert_eq!(
             (
                 spk.to_hex_string(),
                 Address::from_script(&spk, NETWORK).unwrap().to_string(),
-                hex::encode(&control_block)
+                hex::encode(&control_block[..33])
             ),
             (
-                "5120dbf730e4179424eae873522c7a14f1f058795548a0bf70605f064d003b814fcc".to_string(),
-                "bcrt1pm0mnpeqhjsjw46rn2gk859837pv8j42g5zlhqczlqexsqwupflxq2y2hlx".to_string(),
+                "512032d4ec1a2dd9fd389519c7f9791dfe85d1a3741cf6418dc273be25982c43afb2".to_string(),
+                "bcrt1pxt2wcx3dm87n39gecluhj807shg6xaqu7eqcmsnnhcjestzr47eq89xfrl".to_string(),
                 // Leaf version 0xc0 with even parity, then the unspendable internal key
                 "c079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81799".to_string()
             )
         );
-        // Another timeout or key gives another output
-        assert_ne!(spk, ue_script_pubkey(&secp, &pubkey, TIMEOUT + 1).unwrap());
+        // Another timeout, key, EOTS key or configuration gives another output
+        assert_ne!(spk, test_script(&pubkey, TIMEOUT + 1).script_pubkey(&secp).unwrap());
         let (other, _) = generate_keypairs(1)[0].x_only_public_key();
-        assert_ne!(spk, ue_script_pubkey(&secp, &other, TIMEOUT).unwrap());
+        assert_ne!(spk, test_script(&other, TIMEOUT).script_pubkey(&secp).unwrap());
+        let mut other_eots = script.clone();
+        other_eots.pk_eots = other;
+        assert_ne!(spk, other_eots.script_pubkey(&secp).unwrap());
+        let mut other_configuration = script.clone();
+        other_configuration.configuration.threshold = 3;
+        assert_ne!(spk, other_configuration.script_pubkey(&secp).unwrap());
         // Address round trip
         let address = Address::from_script(&spk, NETWORK).unwrap();
         assert_eq!(address.script_pubkey(), spk);
@@ -733,7 +1245,7 @@ mod tests {
         let keypair = test_keypair();
         let msg = signed_msg(&keypair, TIMEOUT);
         let (commit, reveal, _) = join_ue_txs(&secp, &msg);
-        let accepted = check_join_ue(&secp, &reveal, 0, &commit, BLOCK).unwrap();
+        let accepted = check_join_ue(&secp, &reveal, 0, &commit, BLOCK, &context()).unwrap();
         assert_eq!(accepted.outpoint, OutPoint::new(commit.compute_txid(), 1));
         assert_eq!(accepted.msg.join.collateral, COLLATERAL);
         assert_eq!(accepted.msg.join.pubkey, msg.join.pubkey);
@@ -744,7 +1256,7 @@ mod tests {
         commit2.output.pop();
         let mut reveal2 = reveal.clone();
         reveal2.input[0].previous_output = OutPoint::new(commit2.compute_txid(), 0);
-        assert!(check_join_ue(&secp, &reveal2, 0, &commit2, BLOCK).is_ok());
+        assert!(check_join_ue(&secp, &reveal2, 0, &commit2, BLOCK, &context()).is_ok());
 
         // A replaced reveal with other outputs and extra inputs is still accepted
         let mut replaced = reveal.clone();
@@ -756,7 +1268,7 @@ mod tests {
             previous_output: OutPoint::new(Txid::all_zeros(), 9),
             ..Default::default()
         });
-        assert!(check_join_ue(&secp, &replaced, 0, &commit, BLOCK).is_ok());
+        assert!(check_join_ue(&secp, &replaced, 0, &commit, BLOCK, &context()).is_ok());
 
         // The data input may be at any index: with an input prepended it is input 1
         let mut shifted = replaced.clone();
@@ -768,8 +1280,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(check_join_ue(&secp, &shifted, 0, &commit, BLOCK).is_err());
-        let accepted = check_join_ue(&secp, &shifted, 1, &commit, BLOCK).unwrap();
+        assert!(check_join_ue(&secp, &shifted, 0, &commit, BLOCK, &context()).is_err());
+        let accepted = check_join_ue(&secp, &shifted, 1, &commit, BLOCK, &context()).unwrap();
         assert_eq!(accepted.outpoint, OutPoint::new(commit.compute_txid(), 1));
         assert_eq!(accepted.msg.join.pubkey, msg.join.pubkey);
     }
@@ -784,7 +1296,7 @@ mod tests {
         // Input 0 spends another output of the commit
         let mut bad = reveal.clone();
         bad.input[0].previous_output.vout = 1;
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
 
         // The data sits in input 1: input 0 carries no join, input 1 does, there is no input 2
         let mut shifted = reveal.clone();
@@ -795,9 +1307,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(check_join_ue(&secp, &shifted, 0, &commit, BLOCK).is_err());
-        assert!(check_join_ue(&secp, &shifted, 1, &commit, BLOCK).is_ok());
-        assert!(check_join_ue(&secp, &shifted, 2, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &shifted, 0, &commit, BLOCK, &context()).is_err());
+        assert!(check_join_ue(&secp, &shifted, 1, &commit, BLOCK, &context()).is_ok());
+        assert!(check_join_ue(&secp, &shifted, 2, &commit, BLOCK, &context()).is_err());
 
         // The witness script carries the data but is not our data script
         let mut bad = reveal.clone();
@@ -809,7 +1321,7 @@ mod tests {
             .push_opcode(bitcoin::opcodes::OP_TRUE)
             .into_script();
         bad.input[0].witness = Witness::from_slice(&[other_script.to_bytes(), vec![0u8; 33]]);
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
 
         // Trailing bytes after the message in the leaf
         let mut longer = data.clone();
@@ -817,7 +1329,7 @@ mod tests {
         let mut bad = reveal.clone();
         bad.input[0].witness =
             Witness::from_slice(&[make_push_data_script(&longer).to_bytes(), vec![0u8; 33]]);
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
 
         // The data script is a stack element, but the executed leaf is another script
         let control_block = reveal.input[0].witness.nth(1).unwrap().to_vec();
@@ -831,16 +1343,16 @@ mod tests {
             other_leaf.to_bytes(),
             control_block.clone(),
         ]);
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
 
         // A key-path spend or a two-leaf control block
         let mut bad = reveal.clone();
         bad.input[0].witness = Witness::from_slice(&[vec![0u8; 64]]);
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
         let mut bad = reveal.clone();
         bad.input[0].witness =
             Witness::from_slice(&[make_push_data_script(&data).to_bytes(), vec![0u8; 65]]);
-        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &commit, BLOCK, &context()).is_err());
 
         // An annex after the control block is allowed
         let mut annexed = reveal.clone();
@@ -849,14 +1361,14 @@ mod tests {
             control_block,
             vec![0x50, 1, 2],
         ]);
-        assert!(check_join_ue(&secp, &annexed, 0, &commit, BLOCK).is_ok());
+        assert!(check_join_ue(&secp, &annexed, 0, &commit, BLOCK, &context()).is_ok());
 
         // Commit output 0 is not P2TR
         let mut bad_commit = commit.clone();
         bad_commit.output[0].script_pubkey = ScriptBuf::new_op_return([3]);
         let mut bad = reveal.clone();
         bad.input[0].previous_output = OutPoint::new(bad_commit.compute_txid(), 0);
-        assert!(check_join_ue(&secp, &bad, 0, &bad_commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &bad, 0, &bad_commit, BLOCK, &context()).is_err());
     }
 
     #[test]
@@ -868,15 +1380,15 @@ mod tests {
         // Signed by another key
         let other = generate_keypairs(1)[0];
         let msg =
-            IpcJoinUeMsg::new_signed(&secp, test_join_msg(pubkey), TIMEOUT, &other.secret_key());
+            IpcJoinUeMsg::new_signed(&secp, test_join_msg(pubkey), TIMEOUT, &other.secret_key(), &eots_key_of(&other.x_only_public_key().0), test_commitment());
         let (commit, reveal, _) = join_ue_txs(&secp, &msg);
-        assert!(check_join_ue(&secp, &reveal, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &reveal, 0, &commit, BLOCK, &context()).is_err());
 
         // Signed on the same fields with another timeout
         let mut msg = signed_msg(&keypair, TIMEOUT);
         msg.timeout = TIMEOUT + 1;
         let (commit, reveal, _) = join_ue_txs(&secp, &msg);
-        assert!(check_join_ue(&secp, &reveal, 0, &commit, BLOCK).is_err());
+        assert!(check_join_ue(&secp, &reveal, 0, &commit, BLOCK, &context()).is_err());
     }
 
     #[test]
@@ -890,7 +1402,7 @@ mod tests {
         let with_commit = |commit: Transaction| {
             let mut reveal = reveal.clone();
             reveal.input[0].previous_output = OutPoint::new(commit.compute_txid(), 0);
-            check_join_ue(&secp, &reveal, 0, &commit, BLOCK)
+            check_join_ue(&secp, &reveal, 0, &commit, BLOCK, &context())
         };
         let p2tr = |info: TaprootSpendInfo| {
             ScriptBuf::new_p2tr(&secp, info.internal_key(), info.merkle_root())
@@ -908,13 +1420,13 @@ mod tests {
 
         // Output 1 under another timeout
         let mut bad = commit.clone();
-        bad.output[1].script_pubkey = ue_script_pubkey(&secp, &pubkey, TIMEOUT + 1).unwrap();
+        bad.output[1].script_pubkey = test_script(&pubkey, TIMEOUT + 1).script_pubkey(&secp).unwrap();
         assert!(with_commit(bad).is_err());
 
         // Output 1 under another key
         let (other, _) = generate_keypairs(1)[0].x_only_public_key();
         let mut bad = commit.clone();
-        bad.output[1].script_pubkey = ue_script_pubkey(&secp, &other, TIMEOUT).unwrap();
+        bad.output[1].script_pubkey = test_script(&other, TIMEOUT).script_pubkey(&secp).unwrap();
         assert!(with_commit(bad).is_err());
 
         // Output 1 with a real internal key (a key path)
@@ -967,16 +1479,19 @@ mod tests {
         let check = |timeout: u32| {
             let msg = signed_msg(&keypair, timeout);
             let (commit, reveal, _) = join_ue_txs(&secp, &msg);
-            check_join_ue(&secp, &reveal, 0, &commit, BLOCK)
+            check_join_ue(&secp, &reveal, 0, &commit, BLOCK, &context())
         };
 
-        // T = h + 1 is too early, T = h + 2 is the first accepted
+        // Rule 2.6 before activation at block 100, epochs of ten blocks and timeouts of 1 to
+        // 1000 epochs: T is above h + 1 and in epochs 4 to 1003 from the block, 130 < T <= 10130
         assert!(check(BLOCK as u32 + 1).is_err());
-        assert!(check(BLOCK as u32 + 2).is_ok());
+        assert!(check(130).is_err());
+        assert!(check(131).is_ok());
+        assert!(check(10_130).is_ok());
+        assert!(check(10_131).is_err());
 
         // T at the locktime threshold is a timestamp
         assert!(check(LOCKTIME_THRESHOLD).is_err());
-        assert!(check(LOCKTIME_THRESHOLD - 1).is_ok());
     }
 
     #[test]
@@ -1017,19 +1532,19 @@ mod tests {
             UeExitInput {
                 outpoint: OutPoint::new(Txid::all_zeros(), 1),
                 value: COLLATERAL,
-                timeout: TIMEOUT,
+                script: test_script(pubkey, TIMEOUT),
             },
             UeExitInput {
                 outpoint: OutPoint::new(Txid::from_slice(&[1u8; 32]).unwrap(), 1),
                 value: COLLATERAL,
-                timeout: TIMEOUT - 10,
+                script: test_script(pubkey, TIMEOUT - 10),
             },
         ];
         let prevouts = inputs
             .iter()
             .map(|i| TxOut {
                 value: i.value,
-                script_pubkey: ue_script_pubkey(secp, pubkey, i.timeout).unwrap(),
+                script_pubkey: i.script.script_pubkey(secp).unwrap(),
             })
             .collect();
         (inputs, prevouts)
@@ -1111,13 +1626,27 @@ mod tests {
         secp: &Secp256k1<secp256k1::All>,
         joins: &[(&Keypair, SubnetId, u32)],
     ) -> (Vec<Transaction>, Transaction) {
+        let with_eots: Vec<_> = joins
+            .iter()
+            .map(|(keypair, subnet_id, timeout)| {
+                (*keypair, eots_key_of(&keypair.x_only_public_key().0), *subnet_id, *timeout)
+            })
+            .collect();
+        merged_join_ue_with(secp, &with_eots)
+    }
+
+    /// `merged_join_ue` with an EOTS key per join
+    fn merged_join_ue_with(
+        secp: &Secp256k1<secp256k1::All>,
+        joins: &[(&Keypair, secp256k1::SecretKey, SubnetId, u32)],
+    ) -> (Vec<Transaction>, Transaction) {
         let mut commits = Vec::new();
         let mut reveals = Vec::new();
-        for (keypair, subnet_id, timeout) in joins {
+        for (keypair, eots_key, subnet_id, timeout) in joins {
             let (pubkey, _) = keypair.x_only_public_key();
             let mut join = test_join_msg(pubkey);
             join.subnet_id = *subnet_id;
-            let msg = IpcJoinUeMsg::new_signed(secp, join, *timeout, &keypair.secret_key());
+            let msg = IpcJoinUeMsg::new_signed(secp, join, *timeout, &keypair.secret_key(), eots_key, test_commitment());
             let (commit, reveal, _) = join_ue_txs(secp, &msg);
             commits.push(commit);
             reveals.push(reveal);
@@ -1143,9 +1672,9 @@ mod tests {
         let join_txid = reveal.compute_txid();
 
         // Each input is one join, checked against the commit it spends
-        let a = check_join_ue(&secp, &reveal, 0, &commits[0], BLOCK).unwrap();
-        let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK).unwrap();
-        assert!(check_join_ue(&secp, &reveal, 0, &commits[1], BLOCK).is_err());
+        let a = check_join_ue(&secp, &reveal, 0, &commits[0], BLOCK, &context()).unwrap();
+        let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK, &context()).unwrap();
+        assert!(check_join_ue(&secp, &reveal, 0, &commits[1], BLOCK, &context()).is_err());
         assert_ne!(a.outpoint, b.outpoint);
         assert!(process_join_ue(&db, &a, join_txid, BLOCK, block_hash)
             .unwrap()
@@ -1179,36 +1708,21 @@ mod tests {
         let other = generate_keypairs(1)[0].x_only_public_key().0;
         assert!(!is_ue_validator(&db, subnet_id, join_txid, &other).unwrap());
 
-        // Each leaves at its own T - 1: key 0 first, then key 1, the only member, kept
-        let removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) - 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(
-            (removals[0].pubkey, removals[0].outcome.as_str()),
-            (pks[0], "removed from the next committee")
-        );
-        assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], COLLATERAL)]);
-        let mut records = db.get_ue_collaterals(subnet_id).unwrap();
-        records.sort_by_key(|r| r.timeout);
-        assert_eq!(
-            records.iter().map(|r| r.removed).collect::<Vec<_>>(),
-            vec![true, false]
-        );
+        // Once slashable, key 0 leaves at the cutoff whose boundary reaches T, with the value
+        // `C_gen` gave it; key 1 stays, and stays past its own timeout as the only member
+        activate(&db, subnet_id, BLOCK);
+        for pk in &pks {
+            make_slashable(&db, subnet_id, join_txid, pk, BLOCK + 1);
+        }
+        let h_87 = BLOCK + 87 * 10;
+        assert_eq!(cutoff(&db, h_87)[0].epoch, 88);
+        assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], UNIT)]);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-        assert!(!state.latest_committee().is_validator(&pks[0]));
-        assert!(state.latest_committee().is_validator(&pks[1]));
-        let removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) + 9, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(
-            (removals[0].pubkey, removals[0].outcome.as_str()),
-            (pks[1], "only member of the committee, kept")
-        );
-        assert!(db
-            .get_ue_collaterals(subnet_id)
-            .unwrap()
-            .iter()
-            .all(|r| r.removed));
+        assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
+        assert!(cutoff(&db, h_87 + 10)[0].new_committee.is_none());
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
+        assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], UNIT)]);
     }
 
     #[test]
@@ -1221,14 +1735,18 @@ mod tests {
         let subnet_b = subnet_with_whitelist(&db, vec![pk], 1);
         let block_hash = BlockHash::all_zeros();
 
-        // The same key joins two subnets in one reveal
-        let (commits, reveal) = merged_join_ue(
+        // The same key joins two subnets in one reveal, with an EOTS key per subnet
+        let eots_b = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let (commits, reveal) = merged_join_ue_with(
             &secp,
-            &[(&keypair, subnet_a, TIMEOUT), (&keypair, subnet_b, TIMEOUT)],
+            &[
+                (&keypair, eots_key_of(&pk), subnet_a, TIMEOUT),
+                (&keypair, eots_b, subnet_b, TIMEOUT),
+            ],
         );
         let join_txid = reveal.compute_txid();
-        let a = check_join_ue(&secp, &reveal, 0, &commits[0], BLOCK).unwrap();
-        let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK).unwrap();
+        let a = check_join_ue(&secp, &reveal, 0, &commits[0], BLOCK, &context()).unwrap();
+        let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK, &context()).unwrap();
         assert_ne!(a.outpoint, b.outpoint);
         assert!(process_join_ue(&db, &a, join_txid, BLOCK, block_hash)
             .unwrap()
@@ -1249,25 +1767,24 @@ mod tests {
             assert_eq!(state.latest_committee().validators.len(), 1);
         }
 
-        // At T - 1 both records are handled, each in its subnet
-        let mut removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) - 1, block_hash).unwrap();
-        removals.sort_by_key(|r| r.subnet_id);
+        // Past its timeout the key stays in each subnet, each handled by the same cutoff: a
+        // configuration needs a key
+        for subnet_id in [subnet_a, subnet_b] {
+            activate(&db, subnet_id, BLOCK);
+            make_slashable(&db, subnet_id, join_txid, &pk, BLOCK + 1);
+        }
+        let mut outcomes = cutoff(&db, BLOCK + 87 * 10);
+        outcomes.sort_by_key(|o| o.subnet_id);
         let mut expected = vec![subnet_a, subnet_b];
         expected.sort();
         assert_eq!(
-            removals.iter().map(|r| r.subnet_id).collect::<Vec<_>>(),
+            outcomes.iter().map(|o| o.subnet_id).collect::<Vec<_>>(),
             expected
         );
-        assert!(removals.iter().all(|r| r.pubkey == pk
-            && r.join_txid == join_txid
-            && r.outcome == "only member of the committee, kept"));
         for subnet_id in [subnet_a, subnet_b] {
-            assert!(db
-                .get_ue_collaterals(subnet_id)
-                .unwrap()
-                .iter()
-                .all(|r| r.removed));
+            let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+            assert_eq!(state.latest_committee().pubkeys(), vec![pk]);
+            assert!(withdrawals(&db, subnet_id).is_empty());
         }
     }
 
@@ -1288,7 +1805,7 @@ mod tests {
         );
         let join_txid = reveal.compute_txid();
         let joins: Vec<_> = (0..2)
-            .map(|i| check_join_ue(&secp, &reveal, i, &commits[i], BLOCK).unwrap())
+            .map(|i| check_join_ue(&secp, &reveal, i, &commits[i], BLOCK, &context()).unwrap())
             .collect();
         let apply = || {
             joins
@@ -1307,7 +1824,6 @@ mod tests {
                 format!("{:?}", db.get_subnet_state(subnet_id).unwrap()),
                 format!("{:?}", db.get_subnet_genesis_info(subnet_id).unwrap()),
                 records,
-                db.get_pending_ue_collaterals(subnet_id, u32::MAX).unwrap(),
             )
         };
 
@@ -1331,11 +1847,18 @@ mod tests {
             subnet_id,
             create_subnet_msg: IpcCreateSubnetMsg {
                 min_validator_stake: Amount::from_sat(10_000),
+                power_unit_exponent: 4,
                 min_validators,
                 bottomup_check_period: 10,
                 active_validators_limit: 10,
                 min_cross_msg_fee: Amount::from_sat(1),
                 whitelist,
+                epoch_length: 10,
+                min_timeout: 1,
+                max_timeout: 1000,
+                min_deposit: Amount::from_sat(330),
+                kill_vote_period: 36,
+                kill_delay_period: 5,
             },
             create_msg_block_height: 1,
             bootstrapped: false,
@@ -1370,17 +1893,101 @@ mod tests {
         let (pubkey, _) = keypair.x_only_public_key();
         let mut join = test_join_msg(pubkey);
         join.subnet_id = subnet_id;
-        let msg = IpcJoinUeMsg::new_signed(secp, join, timeout, &keypair.secret_key());
+        let msg = IpcJoinUeMsg::new_signed(secp, join, timeout, &keypair.secret_key(), &eots_key_of(&keypair.x_only_public_key().0), test_commitment());
         let (commit, reveal, _) = join_ue_txs_with(secp, &msg, collateral);
-        let checked = check_join_ue(secp, &reveal, 0, &commit, BLOCK).unwrap();
+        let checked = check_join_ue(secp, &reveal, 0, &commit, BLOCK, &context()).unwrap();
         (checked, reveal.compute_txid())
     }
 
-    /// Replaces the current committee by the waiting one, as a checkpoint does
+    /// Records the slash pre-signatures of the join's collateral, as the batch transfer that
+    /// carries them does: the collateral is slashable from then on
+    fn make_slashable(
+        db: &HeedDb,
+        subnet_id: SubnetId,
+        join_txid: Txid,
+        pubkey: &XOnlyPublicKey,
+        height: u64,
+    ) {
+        let record = db.get_ue_collateral(subnet_id, join_txid, pubkey).unwrap().unwrap();
+        let mut wtxn = db.write_txn().unwrap();
+        db.add_slash_presigs(
+            &mut wtxn,
+            &db::SlashPresigRecord {
+                subnet_id,
+                outpoint: record.outpoint,
+                signatures: vec![],
+                block_height: height,
+                batch_transfer_txid: Txid::all_zeros(),
+            },
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    /// Activates a bootstrapped subnet at `h_0`, with `C_gen` as the configuration of epoch 1
+    fn activate(db: &HeedDb, subnet_id: SubnetId, h_0: u64) {
+        let mut state = db
+            .get_subnet_state(subnet_id)
+            .unwrap()
+            .expect("bootstrapped");
+        state.h_0 = Some(h_0);
+        state.epoch = 1;
+        state.last_rotation_epoch = 1;
+        let mut wtxn = db.write_txn().unwrap();
+        db.save_committee(
+            &mut wtxn,
+            subnet_id,
+            state.committee_number,
+            &state.committee,
+        )
+        .unwrap();
+        db.save_epoch_committee_number(&mut wtxn, subnet_id, 1, state.committee_number)
+            .unwrap();
+        db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    /// The cutoff pass of block `height`
+    fn cutoff(db: &HeedDb, height: u64) -> Vec<crate::epochs::CutoffOutcome> {
+        crate::epochs::process_cutoffs(db, height, BlockHash::all_zeros()).unwrap()
+    }
+
+    /// A join checked against the configurations the subnet's state names, as the monitor does
+    fn checked_join_in_db(
+        db: &HeedDb,
+        secp: &Secp256k1<secp256k1::All>,
+        keypair: &Keypair,
+        subnet_id: SubnetId,
+        timeout: u32,
+    ) -> (CheckedJoinUe, Txid) {
+        let (pubkey, _) = keypair.x_only_public_key();
+        let mut join = test_join_msg(pubkey);
+        join.subnet_id = subnet_id;
+        let msg = IpcJoinUeMsg::new_signed(
+            secp,
+            join,
+            timeout,
+            &keypair.secret_key(),
+            &eots_key_of(&pubkey),
+            test_commitment(),
+        );
+        let context = join_context(db, subnet_id).unwrap();
+        let (commit, reveal, _) =
+            unsigned_join_ue_txs(secp, &msg, COLLATERAL, &context.named[0].1).unwrap();
+        let checked = check_join_ue(secp, &reveal, 0, &commit, BLOCK, &context).unwrap();
+        (checked, reveal.compute_txid())
+    }
+
+    /// Adopts the waiting committee, as the rotation checkpoint of the epoch does
     fn rotate(db: &HeedDb, subnet_id: SubnetId) {
         let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         let next = state.waiting_committee.take().expect("a waiting committee");
-        state.rotate_to_committee(next);
+        let epoch = state.epoch;
+        let number = db
+            .get_epoch_committee_number(subnet_id, epoch)
+            .unwrap()
+            .expect("a cutoff");
+        state.adopt_committee(epoch, number, next);
         let mut wtxn = db.write_txn().unwrap();
         db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
         wtxn.commit().unwrap();
@@ -1447,7 +2054,7 @@ mod tests {
         assert_eq!(record.outpoint, checked.outpoint);
         assert_eq!(record.value, COLLATERAL);
         assert_eq!(record.timeout, TIMEOUT);
-        assert!(!record.removed);
+        assert!(!record.spent);
         assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[0]).unwrap());
         assert!(!is_ue_validator(&db, subnet_id, join_txid, &pks[1]).unwrap());
 
@@ -1476,13 +2083,22 @@ mod tests {
             .any(|v| v.join_txid == join_txid2));
         assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 2);
 
-        // After bootstrap a third key joins the waiting committee
+        // After activation a third key joins; the next cutoff seats it once slashable
+        activate(&db, subnet_id, BLOCK);
         let (checked3, join_txid3) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 500);
         assert!(
             process_join_ue(&db, &checked3, join_txid3, BLOCK + 1, block_hash)
                 .unwrap()
                 .is_none()
         );
+        for (pk, txid) in [
+            (pks[0], join_txid),
+            (pks[1], join_txid2),
+            (pks[2], join_txid3),
+        ] {
+            make_slashable(&db, subnet_id, txid, &pk, BLOCK + 1);
+        }
+        cutoff(&db, BLOCK + 10);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert!(state.latest_committee().is_validator(&pks[2]));
 
@@ -1514,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_pass_removes_matured_validators_once() {
+    fn cutoffs_drop_the_collaterals_that_mature_within_three_epochs() {
         let secp = setup();
         let db = create_test_db();
         let keys = generate_keypairs(3);
@@ -1523,23 +2139,25 @@ mod tests {
         let block_hash = BlockHash::all_zeros();
         let late = TIMEOUT + 500;
         for (key, timeout) in keys.iter().zip([TIMEOUT, TIMEOUT, late]) {
+            if timeout == late {
+                activate(&db, subnet_id, BLOCK);
+            }
             let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
             process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
         }
         assert!(withdrawals(&db, subnet_id).is_empty());
 
-        // Two blocks before maturity nothing happens
-        let h = u64::from(TIMEOUT) - 2;
-        assert!(remove_matured_ue_validators(&db, h, block_hash)
-            .unwrap()
-            .is_empty());
+        // The cutoff whose boundary is below T seats all three with their collaterals
+        let h_86 = BLOCK + 86 * 10;
+        assert_eq!(cutoff(&db, h_86)[0].epoch, 87);
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(state.latest_committee().validators.len(), 3);
+        assert!(withdrawals(&db, subnet_id).is_empty());
 
-        // At T - 1 both validators with that timeout leave, with their whole collateral
-        let removals = remove_matured_ue_validators(&db, h + 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 2);
-        assert!(removals
-            .iter()
-            .all(|r| r.outcome == "removed from the next committee"));
+        // The cutoff whose boundary reaches T drops both validators with that timeout, each
+        // with its whole collateral
+        cutoff(&db, h_86 + 10);
         let mut withdrawn = withdrawals(&db, subnet_id);
         withdrawn.sort();
         let mut expected = vec![(pks[0], COLLATERAL), (pks[1], COLLATERAL)];
@@ -1547,56 +2165,24 @@ mod tests {
         assert_eq!(withdrawn, expected);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert_eq!(state.latest_committee().pubkeys(), vec![pks[2]]);
-        assert!(db
-            .get_ue_collaterals(subnet_id)
-            .unwrap()
-            .iter()
-            .all(|r| r.removed == (r.timeout == TIMEOUT)));
 
-        // The pass examines a record once
-        assert!(remove_matured_ue_validators(&db, h + 1, block_hash)
-            .unwrap()
-            .is_empty());
-
-        // The only member stays, and its record is marked removed
-        let removals = remove_matured_ue_validators(&db, u64::from(late) - 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].outcome, "only member of the committee, kept");
+        // A dropped collateral is not withdrawn again
+        assert!(cutoff(&db, h_86 + 20)[0].new_committee.is_none());
         assert_eq!(withdrawals(&db, subnet_id).len(), 2);
-        assert!(db
-            .get_ue_collaterals(subnet_id)
-            .unwrap()
-            .iter()
-            .all(|r| r.removed));
 
-        // A subnet pending kill or killed: nothing to do, the record is marked removed
-        for (i, killed) in [
-            SubnetKillState::ToBeKilled,
-            SubnetKillState::Killed { parent_height: 1 },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-            state.killed = killed;
-            let mut wtxn = db.write_txn().unwrap();
-            db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
-            let mut record = db.get_ue_collaterals(subnet_id).unwrap()[0].clone();
-            record.join_txid = Txid::from_slice(&[8 + i as u8; 32]).unwrap();
-            record.removed = false;
-            db.add_ue_collateral(&mut wtxn, &record).unwrap();
-            wtxn.commit().unwrap();
-            let removals = remove_matured_ue_validators(&db, u64::from(late), block_hash).unwrap();
-            assert_eq!(removals.len(), 1);
-            assert!(removals[0].outcome.contains("killed"));
-            assert_eq!(withdrawals(&db, subnet_id).len(), 2);
-            assert!(
-                db.get_ue_collateral(subnet_id, record.join_txid, &record.pubkey)
-                    .unwrap()
-                    .unwrap()
-                    .removed
-            );
-        }
+        // The only member stays past its timeout: a configuration needs a key
+        assert!(cutoff(&db, BLOCK + 137 * 10)[0].new_committee.is_none());
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(state.latest_committee().pubkeys(), vec![pks[2]]);
+        assert_eq!(withdrawals(&db, subnet_id).len(), 2);
+
+        // A killed subnet has no cutoff
+        let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        state.killed = SubnetKillState::Killed { parent_height: 1 };
+        let mut wtxn = db.write_txn().unwrap();
+        db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
+        wtxn.commit().unwrap();
+        assert!(cutoff(&db, BLOCK + 138 * 10).is_empty());
     }
 
     #[test]
@@ -1610,13 +2196,15 @@ mod tests {
         for (key, timeout) in keys.iter().take(2).zip([TIMEOUT, TIMEOUT + 1000]) {
             let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
             process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
         }
+        activate(&db, subnet_id, BLOCK);
 
-        // Block T - 1: the removal pass, then a join-ue of a third key
-        let h = u64::from(TIMEOUT) - 1;
+        // The cutoff block whose boundary reaches key 0's timeout, then a join-ue of a third key
+        let h = BLOCK + 87 * 10;
         let (checked3, join_txid3) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 2000);
         let run_block = || {
-            remove_matured_ue_validators(&db, h, block_hash).unwrap();
+            cutoff(&db, h);
             process_join_ue(&db, &checked3, join_txid3, h, block_hash).unwrap()
         };
         run_block();
@@ -1629,104 +2217,12 @@ mod tests {
             )
         };
         let first = snapshot(&db);
-        assert_eq!(first.0, vec![pks[1], pks[2]]);
-        assert_eq!(first.1, 3, "one withdraw, one join, one deposit");
+        assert_eq!(first.0, vec![pks[1]]);
+        assert_eq!(first.1, 2, "one deposit, one withdrawal");
 
         // The same block again, as after a crash before the processed height was saved
         run_block();
         assert_eq!(snapshot(&db), first);
-    }
-
-    #[test]
-    fn waiting_validator_removal_retries_until_rotation() {
-        let secp = setup();
-        let db = create_test_db();
-        let keys = generate_keypairs(2);
-        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
-        let subnet_id = subnet_with_whitelist(&db, vec![pks[0]], 1);
-        let block_hash = BlockHash::all_zeros();
-        let (small, txid_small) = checked_join_with(
-            &secp,
-            &keys[0],
-            subnet_id,
-            TIMEOUT + 1000,
-            Amount::from_sat(50_000),
-        );
-        process_join_ue(&db, &small, txid_small, BLOCK, block_hash)
-            .unwrap()
-            .expect("bootstrapped");
-        let (large, txid_large) = checked_join_with(
-            &secp,
-            &keys[1],
-            subnet_id,
-            TIMEOUT,
-            Amount::from_sat(100_000),
-        );
-        process_join_ue(&db, &large, txid_large, BLOCK + 1, block_hash).unwrap();
-
-        // The waiting member's collateral exceeds the committee's total: refused, retried
-        let h = u64::from(TIMEOUT) - 1;
-        let removals = remove_matured_ue_validators(&db, h, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert!(removals[0].outcome.starts_with("not removed, retrying"));
-        assert!(
-            !db.get_ue_collateral(subnet_id, txid_large, &pks[1])
-                .unwrap()
-                .unwrap()
-                .removed
-        );
-        assert!(withdrawals(&db, subnet_id).is_empty());
-
-        // After a checkpoint rotates the committee, the next block removes it
-        rotate(&db, subnet_id);
-        let removals = remove_matured_ue_validators(&db, h + 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].outcome, "removed from the next committee");
-        assert_eq!(
-            withdrawals(&db, subnet_id),
-            vec![(pks[1], Amount::from_sat(100_000))]
-        );
-        assert!(
-            db.get_ue_collateral(subnet_id, txid_large, &pks[1])
-                .unwrap()
-                .unwrap()
-                .removed
-        );
-    }
-
-    #[test]
-    fn collateral_matured_before_bootstrap_is_removed_after_it() {
-        let secp = setup();
-        let db = create_test_db();
-        let keys = generate_keypairs(2);
-        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
-        let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
-        let block_hash = BlockHash::all_zeros();
-        let early = BLOCK as u32 + 2;
-        let (checked, join_txid) = checked_join(&secp, &keys[0], subnet_id, early);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
-
-        // Not bootstrapped: the record waits
-        assert!(remove_matured_ue_validators(&db, BLOCK + 1, block_hash)
-            .unwrap()
-            .is_empty());
-        assert!(
-            !db.get_ue_collateral(subnet_id, join_txid, &pks[0])
-                .unwrap()
-                .unwrap()
-                .removed
-        );
-
-        // The second join bootstraps the subnet; the first block after that removes it
-        let (checked2, join_txid2) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT);
-        process_join_ue(&db, &checked2, join_txid2, BLOCK + 50, block_hash)
-            .unwrap()
-            .expect("bootstrapped");
-        let removals = remove_matured_ue_validators(&db, BLOCK + 51, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].outcome, "removed from the next committee");
-        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-        assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
     }
 
     #[test]
@@ -1767,116 +2263,6 @@ mod tests {
     }
 
     #[test]
-    fn replayed_bootstrap_block_removes_nothing_early() {
-        let secp = setup();
-        let db = create_test_db();
-        let keys = generate_keypairs(2);
-        let subnet_id = subnet_with_whitelist(
-            &db,
-            keys.iter().map(|k| k.x_only_public_key().0).collect(),
-            2,
-        );
-        let block_hash = BlockHash::all_zeros();
-        // The first key matures before the subnet bootstraps
-        let (first, first_txid) = checked_join(&secp, &keys[0], subnet_id, BLOCK as u32 + 2);
-        process_join_ue(&db, &first, first_txid, BLOCK, block_hash).unwrap();
-
-        // Block H: the pass finds no bootstrapped subnet, then the second join bootstraps it
-        let h = BLOCK + 5;
-        assert!(remove_matured_ue_validators(&db, h, block_hash)
-            .unwrap()
-            .is_empty());
-        let (second, second_txid) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT);
-        process_join_ue(&db, &second, second_txid, h, block_hash)
-            .unwrap()
-            .expect("bootstrapped");
-
-        // Block H replayed after a crash: still nothing, the subnet bootstrapped in H
-        assert!(remove_matured_ue_validators(&db, h, block_hash)
-            .unwrap()
-            .is_empty());
-        assert!(process_join_ue(&db, &second, second_txid, h, block_hash)
-            .unwrap()
-            .is_none());
-        assert!(withdrawals(&db, subnet_id).is_empty());
-
-        // Block H + 1 removes the first key, once
-        let removals = remove_matured_ue_validators(&db, h + 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].outcome, "removed from the next committee");
-        assert_eq!(withdrawals(&db, subnet_id).len(), 1);
-    }
-
-    #[test]
-    fn replayed_rotation_block_retries_nothing_early() {
-        let secp = setup();
-        let db = create_test_db();
-        let keys = generate_keypairs(2);
-        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
-        let subnet_id = subnet_with_whitelist(&db, vec![pks[0]], 1);
-        let block_hash = BlockHash::all_zeros();
-        let (small, txid_small) = checked_join_with(
-            &secp,
-            &keys[0],
-            subnet_id,
-            TIMEOUT + 1000,
-            Amount::from_sat(50_000),
-        );
-        process_join_ue(&db, &small, txid_small, BLOCK, block_hash)
-            .unwrap()
-            .expect("bootstrapped");
-        let (large, txid_large) = checked_join_with(
-            &secp,
-            &keys[1],
-            subnet_id,
-            TIMEOUT,
-            Amount::from_sat(100_000),
-        );
-        process_join_ue(&db, &large, txid_large, BLOCK + 1, block_hash).unwrap();
-
-        // Block H: the removal is refused, then a checkpoint in H rotates the committee
-        let h = u64::from(TIMEOUT) - 1;
-        let removals = remove_matured_ue_validators(&db, h, block_hash).unwrap();
-        assert!(removals[0].outcome.starts_with("not removed, retrying"));
-        rotate(&db, subnet_id);
-        let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-        state.last_checkpoint_number = Some(0);
-        let checkpoint = db::SubnetCheckpoint {
-            checkpoint_number: 0,
-            checkpoint_hash: bitcoin::hashes::sha256::Hash::all_zeros(),
-            checkpoint_height: 1,
-            block_height: h,
-            txid: Txid::all_zeros(),
-            batch_transfer_txid: None,
-            batch_transfer_block_height: None,
-            signed_committee_number: 1,
-            next_committee_number: 2,
-            next_configuration_number: 2,
-            is_kill_checkpoint: false,
-        };
-        let mut wtxn = db.write_txn().unwrap();
-        db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
-        db.save_checkpoint(&mut wtxn, subnet_id, &checkpoint, 0)
-            .unwrap();
-        wtxn.commit().unwrap();
-
-        // Block H replayed: the rotation happened in H, so the pass waits, as it did
-        assert!(remove_matured_ue_validators(&db, h, block_hash)
-            .unwrap()
-            .is_empty());
-        assert!(withdrawals(&db, subnet_id).is_empty());
-
-        // Block H + 1 removes it
-        let removals = remove_matured_ue_validators(&db, h + 1, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].outcome, "removed from the next committee");
-        assert_eq!(
-            withdrawals(&db, subnet_id),
-            vec![(pks[1], Amount::from_sat(100_000))]
-        );
-    }
-
-    #[test]
     fn one_reveal_can_carry_a_ue_join_and_an_ordinary_join() {
         let secp = setup();
         let db = create_test_db();
@@ -1887,12 +2273,15 @@ mod tests {
         for key in &keys[..2] {
             let (checked, join_txid) = checked_join(&secp, key, subnet_id, TIMEOUT + 500);
             process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
         }
+        activate(&db, subnet_id, BLOCK);
 
         // A replaced reveal carries the UE join of key 2 and an ordinary join of a fresh key
         let ordinary = generate_keypairs(1)[0].x_only_public_key().0;
         let (checked, join_txid) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 100);
         process_join_ue(&db, &checked, join_txid, BLOCK + 1, block_hash).unwrap();
+        make_slashable(&db, subnet_id, join_txid, &pks[2], BLOCK + 1);
         let mut plain = test_join_msg(ordinary);
         plain.subnet_id = subnet_id;
         plain.collateral = COLLATERAL;
@@ -1902,18 +2291,19 @@ mod tests {
 
         assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[2]).unwrap());
         assert!(!is_ue_validator(&db, subnet_id, join_txid, &ordinary).unwrap());
+        // The next cutoff seats both
+        cutoff(&db, BLOCK + 10);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         let committee = state.latest_committee();
         assert!(committee.is_validator(&pks[2]) && committee.is_validator(&ordinary));
 
-        // At T - 1 only the UE member leaves
-        let removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) + 99, block_hash).unwrap();
-        assert_eq!(removals.len(), 1);
-        assert_eq!(removals[0].pubkey, pks[2]);
+        // The cutoff whose boundary reaches the UE member's timeout drops it; the ordinary
+        // member, with no timeout, is carried
+        cutoff(&db, BLOCK + 97 * 10);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert!(!state.latest_committee().is_validator(&pks[2]));
         assert!(state.latest_committee().is_validator(&ordinary));
+        assert!(state.latest_committee().is_validator(&pks[0]));
     }
 
     #[test]
@@ -1928,6 +2318,9 @@ mod tests {
         process_join_ue(&db, &a, txid_a, BLOCK, block_hash).unwrap();
         let (b, txid_b) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT + 1000);
         process_join_ue(&db, &b, txid_b, BLOCK, block_hash).unwrap();
+        activate(&db, subnet_id, BLOCK);
+        make_slashable(&db, subnet_id, txid_a, &pks[0], BLOCK);
+        make_slashable(&db, subnet_id, txid_b, &pks[1], BLOCK);
         let ordinary = generate_keypairs(1)[0].x_only_public_key().0;
         let mut plain = test_join_msg(ordinary);
         plain.subnet_id = subnet_id;
@@ -1950,10 +2343,11 @@ mod tests {
         refuse_ue_member(&db, subnet_id, &ordinary).unwrap();
         refuse_ue_member(&db, subnet_id, &outsider).unwrap();
 
-        // The removal pass is not affected: at T - 1 A's whole collateral is withdrawn, once
-        let removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) - 1, block_hash).unwrap();
-        assert_eq!(removals[0].outcome, "removed from the next committee");
+        // The cutoffs are not affected: the one whose boundary reaches A's timeout withdraws
+        // its whole collateral
+        cutoff(&db, BLOCK + 10);
+        assert!(withdrawals(&db, subnet_id).is_empty());
+        cutoff(&db, BLOCK + 87 * 10);
         assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], COLLATERAL)]);
         // A is no longer a member: not refused
         refuse_ue_member(&db, subnet_id, &pks[0]).unwrap();
@@ -1967,24 +2361,15 @@ mod tests {
         let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
         let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
         let block_hash = BlockHash::all_zeros();
-        for key in &keys {
-            let (checked, join_txid) = checked_join(&secp, key, subnet_id, TIMEOUT);
+        for (key, timeout) in keys.iter().zip([TIMEOUT, TIMEOUT + 1000]) {
+            let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
             process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
         }
+        activate(&db, subnet_id, BLOCK);
 
-        // Key 0 leaves by hand and is rotated out
-        IpcUnstakeCollateralMsg {
-            subnet_id,
-            amount: COLLATERAL,
-            pubkey: Some(pks[0]),
-        }
-        .save_to_db(
-            &db,
-            BLOCK + 10,
-            block_hash,
-            Txid::from_slice(&[5u8; 32]).unwrap(),
-        )
-        .unwrap();
+        // Key 0 leaves at the cutoff whose boundary reaches its timeout and is rotated out
+        cutoff(&db, BLOCK + 87 * 10);
         rotate(&db, subnet_id);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert!(!state.latest_committee().is_validator(&pks[0]));
@@ -2001,12 +2386,6 @@ mod tests {
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert!(!state.latest_committee().is_validator(&pks[0]));
         assert!(state.latest_committee().is_validator(&pks[1]));
-
-        // At its timeout the old record finds no membership of its own: nothing to do
-        let removals =
-            remove_matured_ue_validators(&db, u64::from(TIMEOUT) - 1, block_hash).unwrap();
-        let first = removals.iter().find(|r| r.pubkey == pks[0]).unwrap();
-        assert_eq!(first.outcome, "not in the committee, nothing to do");
     }
 
     #[test]
@@ -2031,29 +2410,45 @@ mod tests {
         };
 
         // Key 0 joins through the multisig before bootstrap, key 1 bootstraps with join-ue,
-        // key 2 joins through the multisig after bootstrap
+        // key 2 joins through the multisig after activation
         multisig_join(pks[0], BLOCK, 1);
         let (checked, join_txid) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT);
         process_join_ue(&db, &checked, join_txid, BLOCK, block_hash)
             .unwrap()
             .expect("bootstrapped");
+        activate(&db, subnet_id, BLOCK);
+        make_slashable(&db, subnet_id, join_txid, &pks[1], BLOCK);
         multisig_join(pks[2], BLOCK + 1, 2);
 
-        // Keys 0 and 2 leave and are rotated out
+        // The next cutoff seats key 2 and the rotation checkpoint adopts the configuration
+        cutoff(&db, BLOCK + 10);
+        rotate(&db, subnet_id);
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(state.committee.validators.len(), 3);
+
+        // Keys 0 and 2 unstake their whole collateral; the next cutoff drops them
         for (pk, txid_byte) in [(pks[0], 3u8), (pks[2], 4)] {
+            let amount = state
+                .committee
+                .validators
+                .iter()
+                .find(|v| v.pubkey == pk)
+                .unwrap()
+                .collateral;
             IpcUnstakeCollateralMsg {
                 subnet_id,
-                amount: COLLATERAL,
+                amount,
                 pubkey: Some(pk),
             }
             .save_to_db(
                 &db,
-                BLOCK + 10,
+                BLOCK + 15,
                 block_hash,
                 Txid::from_slice(&[txid_byte; 32]).unwrap(),
             )
             .unwrap();
         }
+        cutoff(&db, BLOCK + 20);
         rotate(&db, subnet_id);
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
@@ -2075,6 +2470,130 @@ mod tests {
     }
 
     #[test]
+    fn cutoffs_without_a_rotation_checkpoint_continue_from_the_waiting_configuration() {
+        let secp = setup();
+        let db = create_test_db();
+        let keys = generate_keypairs(3);
+        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
+        let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
+        let block_hash = BlockHash::all_zeros();
+        for (key, timeout) in keys.iter().zip([TIMEOUT, TIMEOUT, TIMEOUT + 500]) {
+            if key.x_only_public_key().0 == pks[2] {
+                activate(&db, subnet_id, BLOCK);
+            }
+            let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
+            process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
+        }
+
+        // The first cutoff computes C_2 from C_gen, committee 1
+        let (number, committee) = cutoff(&db, BLOCK + 10)[0]
+            .new_committee
+            .clone()
+            .expect("a new configuration");
+        assert_eq!((number, committee.validators.len()), (2, 3));
+
+        // No rotation checkpoint yet: the next cutoff computes C_3 from C_2, which has the same
+        // members, so C_3 is C_2 with its number
+        let outcomes = cutoff(&db, BLOCK + 20);
+        assert_eq!(outcomes[0].epoch, 3);
+        assert!(outcomes[0].new_committee.is_none());
+        assert_eq!(
+            db.get_epoch_committee_number(subnet_id, 3).unwrap(),
+            Some(2)
+        );
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!((state.epoch, state.last_rotation_epoch), (3, 1));
+        assert_eq!(
+            state.waiting_committee.as_ref().unwrap().validators.len(),
+            3
+        );
+
+        // The rotation checkpoint of epoch 3 adopts it; the cutoff whose boundary reaches T
+        // numbers the configuration of the two remaining keys 3
+        rotate(&db, subnet_id);
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!((state.committee_number, state.last_rotation_epoch), (2, 3));
+        let (number, committee) = cutoff(&db, BLOCK + 87 * 10)[0]
+            .new_committee
+            .clone()
+            .expect("a new configuration");
+        assert_eq!((number, committee.pubkeys()), (3, vec![pks[2]]));
+    }
+
+    /// A UE collateral record of `pubkey` with EOTS key `pk_eots`, as `process_join_ue` writes it
+    fn ue_record(
+        subnet_id: SubnetId,
+        pubkey: XOnlyPublicKey,
+        pk_eots: XOnlyPublicKey,
+        join_txid: Txid,
+    ) -> UeCollateral {
+        let join = test_join_msg(pubkey);
+        UeCollateral {
+            subnet_id,
+            pubkey,
+            outpoint: OutPoint::new(join_txid, 1),
+            value: COLLATERAL,
+            timeout: TIMEOUT,
+            pk_eots,
+            committee_number: 0,
+            ip: join.ip,
+            backup_address: join.backup_address,
+            join_txid,
+            spent: false,
+        }
+    }
+
+    #[test]
+    fn an_eots_key_joins_once_across_subnets_and_within_a_reveal() {
+        setup();
+        let db = create_test_db();
+        let pks: Vec<_> = generate_keypairs(3)
+            .iter()
+            .map(|k| k.x_only_public_key().0)
+            .collect();
+        let pk_eots = pks[2];
+        let (subnet_a, subnet_b) = (generate_subnet_id(), generate_subnet_id());
+        let txid = Txid::from_slice(&[1u8; 32]).unwrap();
+        let other = Txid::from_slice(&[2u8; 32]).unwrap();
+        let mut wtxn = db.write_txn().unwrap();
+        db.add_ue_collateral(&mut wtxn, &ue_record(subnet_a, pks[0], pk_eots, txid))
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        // The join's own record is a replay
+        assert!(refuse_earlier_eots_key(&db, subnet_a, &pks[0], &pk_eots, Some(txid)).is_ok());
+        // Another input of the same reveal, a join in another subnet, the provider's check
+        for (subnet_id, pubkey, join_txid) in [
+            (subnet_a, pks[1], Some(txid)),
+            (subnet_b, pks[0], Some(other)),
+            (subnet_b, pks[1], Some(other)),
+            (subnet_a, pks[0], None),
+        ] {
+            let err = refuse_earlier_eots_key(&db, subnet_id, &pubkey, &pk_eots, join_txid)
+                .unwrap_err();
+            assert!(err.to_string().contains("an EOTS key joins once"), "{err}");
+        }
+        assert!(refuse_earlier_eots_key(&db, subnet_b, &pks[1], &pks[1], Some(other)).is_ok());
+    }
+
+    #[test]
+    fn a_zero_collateral_fails_the_subnet_checks_not_the_message_checks() {
+        setup();
+        let db = create_test_db();
+        let pk = generate_keypairs(1)[0].x_only_public_key().0;
+        let subnet_id = subnet_with_whitelist(&db, vec![pk], 1);
+        let genesis = db.get_subnet_genesis_info(subnet_id).unwrap().unwrap();
+        let mut join = test_join_msg(pk);
+        join.subnet_id = subnet_id;
+        assert!(join.validate().is_ok());
+        let err = join.validate_for_subnet(&genesis, &None).unwrap_err();
+        assert!(matches!(err, IpcValidateError::InvalidField("collateral", _)), "{err}");
+        join.collateral = COLLATERAL;
+        assert!(join.validate_for_subnet(&genesis, &None).is_ok());
+    }
+
+    #[test]
     fn malformed_messages_and_numeric_edges() {
         let secp = setup();
         let keypair = test_keypair();
@@ -2090,7 +2609,7 @@ mod tests {
 
         // The block height at its maximum cannot be followed by a timeout
         let (commit, reveal, _) = join_ue_txs(&secp, &msg);
-        assert!(check_join_ue(&secp, &reveal, 0, &commit, u64::MAX).is_err());
+        assert!(check_join_ue(&secp, &reveal, 0, &commit, u64::MAX, &context()).is_err());
 
         // Timeouts around the script-number push sizes keep one leaf shape per value
         for (timeout, expected_push) in [
@@ -2183,13 +2702,14 @@ mod tests {
         let (pubkey, _) = keypair.x_only_public_key();
         let mine_to = rpc.get_new_address(None, None).unwrap().assume_checked();
 
-        // join-ue with a timeout 5 blocks after the tip
+        // join-ue with a timeout in the lowest epoch rule 2.6 allows: `min_timeout + 3`
+        // epochs of ten blocks after the join's block, the tip's successor
         let tip = rpc.get_block_count().unwrap();
-        let timeout = tip as u32 + 5;
+        let timeout = (tip + 1 + 4 * 10) as u32;
         let mut join = test_join_msg(pubkey);
         join.collateral = COLLATERAL;
-        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &keypair.secret_key());
-        let reveal_txid = msg.submit_to_bitcoin(rpc).unwrap();
+        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &keypair.secret_key(), &eots_key_of(&keypair.x_only_public_key().0), test_commitment());
+        let reveal_txid = msg.submit_to_bitcoin(rpc, &context()).unwrap();
         rpc.generate_to_address(1, &mine_to).unwrap();
         let join_height = rpc.get_block_count().unwrap();
         assert_eq!(join_height, tip + 1);
@@ -2198,7 +2718,7 @@ mod tests {
         let reveal = rpc.get_raw_transaction(&reveal_txid, None).unwrap();
         let commit_txid = reveal.input[0].previous_output.txid;
         let commit = rpc.get_raw_transaction(&commit_txid, None).unwrap();
-        let accepted = check_join_ue(&secp, &reveal, 0, &commit, join_height).unwrap();
+        let accepted = check_join_ue(&secp, &reveal, 0, &commit, join_height, &context()).unwrap();
         assert_eq!(accepted.msg.join.collateral, COLLATERAL);
         assert_eq!(accepted.outpoint, OutPoint::new(commit_txid, 1));
         assert!(rpc
@@ -2211,7 +2731,7 @@ mod tests {
         let inputs = vec![UeExitInput {
             outpoint: accepted.outpoint,
             value: accepted.msg.join.collateral,
-            timeout,
+            script: accepted.msg.collateral_script(test_configuration()),
         }];
         let exit = build_ue_exit_tx(
             &secp,
@@ -2256,4 +2776,169 @@ mod tests {
         assert_eq!(ue_activation_height(), None);
         std::env::remove_var(UE_ACTIVATION_HEIGHT_VAR);
     }
+
+    /// Rule 2.6 with `K = 10`, `min_timeout = 1`, `max_timeout = 2`: `E_T` from the join's
+    /// block before activation, from `H_0` afterwards
+    #[test]
+    fn join_context_checks_the_timeout_epoch() {
+        let context = |epoch, h_0| JoinContext {
+            named: Vec::new(),
+            epoch,
+            h_0,
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 2,
+        };
+        // Before activation at block 100: epochs 4 to 5, so 130 < T <= 150
+        let before = context(0, None);
+        assert_eq!(before.timeout_epoch(131, 100), 4);
+        assert!(before.check_timeout(130, 100).is_err());
+        assert!(before.check_timeout(131, 100).is_ok());
+        assert!(before.check_timeout(150, 100).is_ok());
+        assert!(before.check_timeout(151, 100).is_err());
+        // Epoch 2 with H_0 = 100, at block 125: epochs 6 to 7, so 150 < T <= 170
+        let after = context(2, Some(100));
+        assert_eq!(after.timeout_epoch(170, 125), 7);
+        assert!(after.check_timeout(150, 125).is_err());
+        assert!(after.check_timeout(151, 125).is_ok());
+        assert!(after.check_timeout(170, 125).is_ok());
+        assert!(after.check_timeout(171, 125).is_err());
+        // T must be above block height + 1 whatever its epoch
+        assert!(after.check_timeout(161, 160).is_err());
+        assert!(after.check_timeout(162, 160).is_ok());
+        // T must be a height
+        let far = context(0, Some(LOCKTIME_THRESHOLD as u64 - 20));
+        assert!(far
+            .check_timeout(LOCKTIME_THRESHOLD, LOCKTIME_THRESHOLD as u64 - 20)
+            .is_err());
+    }
+
+    /// A checkpoint carrying change number `number`, recorded by the monitor at block `height`
+    fn record_checkpoint(
+        db: &HeedDb,
+        subnet_id: SubnetId,
+        is_rotation_checkpoint: bool,
+        number: u64,
+        height: u64,
+    ) -> Result<crate::db::SubnetCheckpoint, IpcLibError> {
+        let msg = crate::ipc_lib::IpcCheckpointSubnetMsg {
+            subnet_id,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::all_zeros(),
+            checkpoint_height: height,
+            next_committee_configuration_number: number,
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+            slash_signatures: vec![],
+            unstakes: vec![],
+            change_address: None,
+            is_kill_checkpoint: false,
+            is_rotation_checkpoint,
+            slash_pre_signature_count: None,
+        };
+        msg.save_to_db(
+            db,
+            height,
+            BlockHash::all_zeros(),
+            crate::test_utils::create_rand_txid(),
+        )
+    }
+
+    fn unconfirmed_changes(db: &HeedDb, subnet_id: SubnetId) -> usize {
+        db.get_unconfirmed_stake_changes(subnet_id).unwrap().len()
+    }
+
+    #[test]
+    fn a_rotation_checkpoint_carrying_the_previous_change_number_is_that_of_its_epoch() {
+        let secp = setup();
+        let db = create_test_db();
+        let keys = generate_keypairs(3);
+        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
+        let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
+        let block_hash = BlockHash::all_zeros();
+        for (key, timeout) in keys.iter().zip([TIMEOUT, TIMEOUT, TIMEOUT + 500]) {
+            if key.x_only_public_key().0 == pks[2] {
+                activate(&db, subnet_id, BLOCK);
+            }
+            let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
+            process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
+        }
+        // The cutoff H_1 releases the configuration updates of C_2
+        let (number, c_2) = cutoff(&db, BLOCK + 10)[0]
+            .new_committee
+            .clone()
+            .expect("a new configuration");
+        let released = unconfirmed_changes(&db, subnet_id);
+        assert!(released > 0);
+
+        // The first checkpoint after it is the rotation checkpoint of epoch 2, though the subnet
+        // has not applied them yet and carries the previous change number
+        let rotation = record_checkpoint(&db, subnet_id, true, 0, BLOCK + 11).unwrap();
+        assert!(rotation.is_rotation_checkpoint);
+        let recorded = |cp: &crate::db::SubnetCheckpoint| {
+            (
+                cp.epoch,
+                cp.signed_committee_number,
+                cp.next_committee_number,
+            )
+        };
+        assert_eq!(recorded(&rotation), (2, 1, number));
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        let adopted = (state.committee_number, state.last_rotation_epoch);
+        assert_eq!(adopted, (number, 2));
+        assert!(state.waiting_committee.is_none());
+        assert_eq!(unconfirmed_changes(&db, subnet_id), released);
+
+        // Epoch 2 has its rotation checkpoint
+        assert!(record_checkpoint(&db, subnet_id, true, 0, BLOCK + 12).is_err());
+
+        // The later checkpoint carrying the new change number is regular, signed by C_2
+        let applied = c_2.configuration_number;
+        let regular = record_checkpoint(&db, subnet_id, false, applied, BLOCK + 12).unwrap();
+        assert!(!regular.is_rotation_checkpoint);
+        assert_eq!(recorded(&regular), (2, number, number));
+        let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!((state.committee_number, state.last_rotation_epoch), adopted);
+        assert_eq!(unconfirmed_changes(&db, subnet_id), 0);
+    }
+
+    #[test]
+    fn the_rotation_checkpoint_of_epoch_1_with_c_1_equal_to_c_gen_leaves_c_wlist() {
+        let secp = setup();
+        let db = create_test_db();
+        let keys = generate_keypairs(2);
+        let pks: Vec<_> = keys.iter().map(|k| k.x_only_public_key().0).collect();
+        let subnet_id = subnet_with_whitelist(&db, pks, 2);
+        let block_hash = BlockHash::all_zeros();
+        for key in &keys {
+            let (checked, join_txid) = checked_join(&secp, key, subnet_id, TIMEOUT);
+            process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+            make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
+        }
+        // Epoch 1 with C_1 = C_gen, before its rotation checkpoint
+        activate(&db, subnet_id, BLOCK);
+        let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        state.last_rotation_epoch = 0;
+        let mut wtxn = db.write_txn().unwrap();
+        db.save_subnet_state(&mut wtxn, subnet_id, &state).unwrap();
+        wtxn.commit().unwrap();
+
+        // `C_wlist` signs it; it adopts C_1, which signs the next checkpoint
+        let rotation = record_checkpoint(&db, subnet_id, true, 0, BLOCK + 1).unwrap();
+        assert!(rotation.is_rotation_checkpoint);
+        assert_eq!(rotation.epoch, 1);
+        assert_eq!(rotation.signed_committee_number, WHITELIST_COMMITTEE_NUMBER);
+        assert_eq!(rotation.next_committee_number, state.committee_number);
+        let after = db.get_subnet_state(subnet_id).unwrap().unwrap();
+        assert_eq!(after.last_rotation_epoch, 1);
+        let regular = record_checkpoint(&db, subnet_id, false, 0, BLOCK + 2).unwrap();
+        assert!(!regular.is_rotation_checkpoint);
+        assert_eq!(regular.signed_committee_number, state.committee_number);
+    }
 }
+#[cfg(test)]
+#[path = "collateral_spec_tests.rs"]
+mod spec_tests;

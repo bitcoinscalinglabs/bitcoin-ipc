@@ -478,11 +478,18 @@ mod tests {
         ) -> SubnetGenesisInfo {
             let create_subnet_msg = IpcCreateSubnetMsg {
                 min_validator_stake: Amount::from_sat(100_000_000),
+                power_unit_exponent: 4,
                 min_validators: 4,
                 bottomup_check_period: 1,
                 active_validators_limit: 10,
                 min_cross_msg_fee: Amount::from_sat(1),
                 whitelist,
+                epoch_length: 10,
+                min_timeout: 1,
+                max_timeout: 1000,
+                min_deposit: Amount::from_sat(330),
+                kill_vote_period: 36,
+                kill_delay_period: 5,
             };
 
             SubnetGenesisInfo {

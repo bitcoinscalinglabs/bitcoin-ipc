@@ -1,5 +1,10 @@
 # each snapshot is 10 blocks long
 # snapshot 0: blocks 101-110, snapshot 1: blocks 111-120, etc
+#
+# The first checkpoint activates the subnet with H_0 = 107, so the cutoffs are at 117, 127,
+# 137, ...: a join, stake or unstake takes effect at the cutoff after it, and the rotation
+# checkpoint in the block after the cutoff adopts the configuration.
+# Run with testers/db.txt or testers/monitor.txt.
 
 setup
 
@@ -32,15 +37,18 @@ deposit subnet1 validator2 500_000_000
 deposit subnet1 validator3 500_000_000
 deposit subnet1 validator4 500_000_000
 
+block 108
+checkpoint subnet1 # the first checkpoint: validators 1-4 with their collaterals from block 108
+
 block 111
 read reward_results 0 # snapshot 0: blocks 101-110
 expect result.total_rewarded_collateral = 0 # subnet not active for whole snapshot
 
 block 114
-join subnet1 validator5 500_000_000
+join subnet1 validator5 500_000_000 # takes effect at the cutoff 117
 
-block 116
-checkpoint subnet1 # validator5 effectively joins at block 116
+block 118
+checkpoint subnet1
 
 block 121
 read reward_results 1 # snapshot 1: blocks 111-120
@@ -48,68 +56,61 @@ expect result.rewards_list.validator1 = 100_000_000 # validators 1-4 in subnet f
 expect result.rewards_list.validator5 = 0 # validator 5 not in subnet for whole snapshot
 
 block 129
-join subnet1 validator6 600_000_000
+join subnet1 validator6 600_000_000 # takes effect at the cutoff 137
 
 block 131
 read reward_results 2 # snapshot 2: blocks 121-130
 expect result.total_rewarded_collateral = 1_500_000_000 # validators 1-5 in subnet for whole snapshot
 expect result.rewards_list.validator5 = 500_000_000
 
-checkpoint subnet1 # validator6 effectively joins at block 131
-
 block 138
-join subnet1 validator7 700_000_000
+checkpoint subnet1
+join subnet1 validator7 700_000_000 # takes effect at the cutoff 147
 unstake subnet1 validator2 100_000_000
 
-block 140
+block 141
+read reward_results 3 # snapshot 3: blocks 131-140
+expect result.total_rewarded_collateral = 1_500_000_000
+expect result.rewards_list.validator2 = 200_000_000 # the unstake takes effect at 147
+expect result.rewards_list.validator6 = 0 # validator6 joined at block 137, within the snapshot
+expect result.rewards_list.validator7 = 0
+
+block 148
 checkpoint subnet1
 
-block 141
-
-read reward_results 3 # snapshot 3: blocks 131-140
-expect result.total_rewarded_collateral = 2_000_000_000
-
-# validator2's minimum collateral across snapshot was 100_000_000
-# (the rotation checkpoint was written at height 140)
-expect result.rewards_list.validator2 = 100_000_000
-
-expect result.rewards_list.validator6 = 600_000_000 # validator6 joined on the first block of the snapshot
-expect result.rewards_list.validator7 = 0 # validator7 joined on the first block of the snapshot
-
 block 151
-
 read reward_results 4 # snapshot 4: blocks 141-150
+expect result.rewards_list.validator2 = 100_000_000 # validator2's minimum collateral across the snapshot
+expect result.rewards_list.validator6 = 600_000_000 # validator6 in subnet for whole snapshot
+expect result.rewards_list.validator7 = 0 # validator7 joined at block 147, within the snapshot
+stake subnet1 validator4 400_000_000 # takes effect at the cutoff 157
 
-expect result.rewards_list.validator2 = 100_000_000 # validator2's collateral is still 100_000_000
-
-expect result.rewards_list.validator7 = 700_000_000 # validator7 joined on the first block of the snapshot
-
-stake subnet1 validator4 400_000_000
-
-block 153
+block 158
 checkpoint subnet1
 
 block 161
 read reward_results 5 # snapshot 5: blocks 151-160
 expect result.rewards_list.validator4 = 400_000_000 # validator4's min collateral across snapshot was 400_000_000
+expect result.rewards_list.validator7 = 700_000_000
 
 block 166
-unstake subnet1 validator1 100_000_000 # remaining stake 0, equiv to leaving subnet
+unstake subnet1 validator1 100_000_000 # remaining stake 0, equiv to leaving subnet at the cutoff 167
 
-block 169
+block 168
 checkpoint subnet1
 
 block 171
 read reward_results 6 # snapshot 6: blocks 161-170
 expect result.rewards_list.validator1 = 0
 expect result.rewards_list.validator4 = 800_000_000
+unstake subnet1 validator2 100_000_000 # remaining stake 0, leaves at the cutoff 177
 
-unstake subnet1 validator2 100_000_000 # remaining stake 0, equiv to leaving subnet
+block 178
+checkpoint subnet1
 
 block 181
-checkpoint subnet1
-read reward_results 7 # last block of snapshot was 180
-expect result.rewards_list.validator2 = 100_000_000 # still had collateral at block 180
+read reward_results 7 # snapshot 7: blocks 171-180
+expect result.rewards_list.validator2 = 0 # validator2 left at block 177, within the snapshot
 
 block 191
 read reward_results 8

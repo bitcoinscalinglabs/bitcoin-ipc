@@ -77,6 +77,43 @@ pub fn read_validators<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
+/// `read subnet_state <subnet>`. Fields: `activated`, `epoch`, `h_0` (`none` before
+/// activation), `last_rotation_epoch`, `committee_number`, `pending_multisig_changes`.
+pub fn read_subnet_state<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    subnet_name: &str,
+) -> Result<UeRead, EasyTesterError> {
+    let state = db
+        .get_subnet_state(subnet_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            EasyTesterError::runtime(format!("subnet '{subnet_name}' is not bootstrapped"))
+        })?;
+    let mut fields = BTreeMap::new();
+    fields.insert("activated".to_string(), state.is_activated().to_string());
+    fields.insert("epoch".to_string(), state.epoch.to_string());
+    fields.insert(
+        "h_0".to_string(),
+        state.h_0.map_or("none".to_string(), |h| h.to_string()),
+    );
+    fields.insert(
+        "last_rotation_epoch".to_string(),
+        state.last_rotation_epoch.to_string(),
+    );
+    fields.insert(
+        "committee_number".to_string(),
+        state.committee_number.to_string(),
+    );
+    fields.insert(
+        "pending_multisig_changes".to_string(),
+        state.pending_multisig_changes.len().to_string(),
+    );
+    let what = format!("subnet_state {subnet_name}");
+    print_read(&what, &fields);
+    Ok(UeRead { what, fields })
+}
+
 /// `read subnet_genesis <subnet>`. Fields: `exists`, and when the subnet exists
 /// `bootstrapped`, `min_validators` and `genesis_validators` (the joins accepted before
 /// bootstrap).
@@ -108,23 +145,25 @@ pub fn read_subnet_genesis<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
-/// `read ue_collaterals <subnet>`. Fields: `count`, `removed_count`, and per validator
-/// `<name>.count` (records of that key) and, for its record with the largest timeout,
-/// `<name>.value`, `<name>.timeout`, `<name>.removed`.
+/// `read ue_collaterals <subnet>`. Fields: `count`, `spent_count` (records whose outpoint a
+/// Bitcoin transaction spends), `slashable_count` (outputs recorded as slashable), and per
+/// validator `<name>.count` (records of that key) and, for its record with the largest
+/// timeout, `<name>.value`, `<name>.timeout`, `<name>.spent`, `<name>.slashable`.
 pub fn read_ue_collaterals<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
     subnet_name: &str,
     names: &Names,
-    spent: Option<&dyn Fn(&bitcoin::OutPoint) -> Result<bool, EasyTesterError>>,
 ) -> Result<UeRead, EasyTesterError> {
     let records = db.get_ue_collaterals(subnet_id).map_err(db_err)?;
     let mut fields = BTreeMap::new();
     fields.insert("count".to_string(), records.len().to_string());
     fields.insert(
-        "removed_count".to_string(),
-        records.iter().filter(|r| r.removed).count().to_string(),
+        "spent_count".to_string(),
+        records.iter().filter(|r| r.spent).count().to_string(),
     );
+    let slashable = db.get_all_slash_presigs(subnet_id).map_err(db_err)?;
+    fields.insert("slashable_count".to_string(), slashable.len().to_string());
     let mut per_name: HashMap<String, Vec<&crate::db::UeCollateral>> = HashMap::new();
     for r in &records {
         per_name.entry(name(names, &r.pubkey)).or_default().push(r);
@@ -135,16 +174,14 @@ pub fn read_ue_collaterals<D: DatabaseCore>(
         fields.insert(format!("{n}.count"), rs.len().to_string());
         fields.insert(format!("{n}.value"), last.value.to_sat().to_string());
         fields.insert(format!("{n}.timeout"), last.timeout.to_string());
-        fields.insert(format!("{n}.removed"), last.removed.to_string());
-        if let Some(spent) = spent {
-            let mut spent_count = 0;
-            for r in &rs {
-                if spent(&r.outpoint)? {
-                    spent_count += 1;
-                }
-            }
-            fields.insert(format!("{n}.spent_count"), spent_count.to_string());
-        }
+        fields.insert(format!("{n}.spent"), last.spent.to_string());
+        fields.insert(
+            format!("{n}.slashable"),
+            slashable
+                .iter()
+                .any(|p| p.outpoint == last.outpoint)
+                .to_string(),
+        );
     }
     let what = format!("ue_collaterals {subnet_name}");
     print_read(&what, &fields);

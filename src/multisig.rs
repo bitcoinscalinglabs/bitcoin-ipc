@@ -20,6 +20,42 @@ use crate::SubnetId;
 pub type Power = u32;
 pub type WeightedKey = (XOnlyPublicKey, Power);
 
+/// A configuration as a script names it: its weighted keys and its threshold.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Configuration {
+    pub keys: Vec<WeightedKey>,
+    pub threshold: Power,
+}
+
+impl Configuration {
+    pub fn total_power(&self) -> Power {
+        self.keys.iter().map(|(_, p)| p).sum()
+    }
+
+    /// The keys in ascending order: a key's index here is its signature's index in a slash
+    /// pre-signature entry.
+    pub fn sorted_keys(&self) -> Vec<WeightedKey> {
+        sort_committee_keys(&self.keys)
+    }
+
+    /// The index of `key` in the ascending order of the keys.
+    pub fn key_index(&self, key: &XOnlyPublicKey) -> Option<u16> {
+        self.sorted_keys()
+            .iter()
+            .position(|(k, _)| k == key)
+            .map(|i| i as u16)
+    }
+
+    /// The power of the key at `index` in ascending order.
+    pub fn power_at(&self, index: u16) -> Option<Power> {
+        self.sorted_keys().get(usize::from(index)).map(|(_, p)| *p)
+    }
+
+    pub fn multisig_script(&self) -> Result<ScriptBuf, MultisigError> {
+        create_multisig_script(&self.keys, self.threshold)
+    }
+}
+
 fn sort_committee_keys(committee_keys: &[WeightedKey]) -> Vec<WeightedKey> {
     let mut sorted_keys = committee_keys.to_vec();
     sorted_keys.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
@@ -123,9 +159,10 @@ pub fn multisig_threshold(total_power: Power) -> Power {
     total_power * 2 / 3 + 1
 }
 
-// TODO figure out scaling factor
-pub const POWER_SCALE_FACTOR: u64 = 10_000;
-pub const MAX_POWER: u64 = u32::MAX as u64;
+/// The maximum total power of a configuration.
+pub const MAX_TOTAL_POWER: Power = i32::MAX as Power;
+/// A configuration with fewer validators stalls the subnet.
+pub const MIN_CONFIGURATION_SIZE: usize = 4;
 
 /// How many extra (smallest) committee UTXOs a checkpoint folds in beyond what
 /// coin-selection needs. Data-carrying checkpoints leak a small commit-reveal
@@ -136,24 +173,23 @@ pub const MAX_POWER: u64 = u32::MAX as u64;
 /// gradually. The cap keeps a single checkpoint from growing too large.
 pub const CHECKPOINT_CONSOLIDATION_LIMIT: usize = 50;
 
-/// Converts a Bitcoin Amount to a power/weight value (u32) using a fixed scale factor.
-/// Discards small satoshi values based on the provided minimum amount.
-//
-// TODO improve this, maybe cap the total power so we don't have
-// the CollateralTooHigh error possibility
-pub fn collateral_to_power(amount: &Amount, min_amount: &Amount) -> Result<Power, MultisigError> {
-    // Check if amount is below minimum threshold
+/// The power of a collateral: `⌊amount / power_unit⌋`, for an amount of at least `min_amount`.
+/// A single collateral above `MAX_TOTAL_POWER` is `CollateralTooHigh`.
+pub fn collateral_to_power(
+    amount: &Amount,
+    min_amount: &Amount,
+    power_unit: &Amount,
+) -> Result<Power, MultisigError> {
     if amount < min_amount {
         return Err(MultisigError::InsufficientCollateral);
     }
 
-    let power = amount.to_sat().min(MAX_POWER) / POWER_SCALE_FACTOR;
+    let power = amount.to_sat() / power_unit.to_sat();
 
-    let power: Power = power
-        .try_into()
-        .map_err(|_| MultisigError::CollateralTooHigh)?;
-
-    Ok(power)
+    Power::try_from(power)
+        .ok()
+        .filter(|p| *p <= MAX_TOTAL_POWER)
+        .ok_or(MultisigError::CollateralTooHigh)
 }
 
 /// Calculates the size in bytes of witness elements for spending a multisig utxo
@@ -2671,3 +2707,6 @@ mod exhaust_unspent_tests {
         );
     }
 }
+#[cfg(test)]
+#[path = "multisig_spec_tests.rs"]
+mod spec_tests;

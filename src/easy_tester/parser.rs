@@ -29,8 +29,12 @@ enum SetupBuilder {
         name: String,
         whitelist_names: Option<Vec<String>>,
         min_validators: Option<u16>,
+        epoch_length: Option<u64>,
     },
 }
+
+/// The epoch length of a subnet whose setup does not set `epoch_length`
+const DEFAULT_EPOCH_LENGTH: u64 = 10;
 
 impl SetupBuilder {
     fn name(&self) -> &str {
@@ -67,6 +71,7 @@ impl SetupBuilder {
                 name,
                 whitelist_names,
                 min_validators,
+                epoch_length,
             } => {
                 if setup.subnets.contains_key(&name) {
                     return Err(EasyTesterError::parse(
@@ -94,21 +99,23 @@ impl SetupBuilder {
                     ));
                 };
 
-                if min_validators < 4 {
+                // lifecycle.md, validity of the parameters: boot_validators > 0 and at most
+                // the whitelist size
+                if min_validators == 0 {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         line_no,
-                        format!("subnet '{name}' min must be at least 4 (got {min_validators})"),
+                        format!("subnet '{name}' min must be at least 1"),
                         original_line,
                     ));
                 }
 
-                if whitelist_names.len() < 4 {
+                if whitelist_names.len() < usize::from(min_validators) {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         line_no,
                         format!(
-                            "subnet '{name}' whitelist must have at least 4 entries (got {})",
+                            "subnet '{name}' whitelist must have at least {min_validators} entries (got {})",
                             whitelist_names.len()
                         ),
                         original_line,
@@ -161,6 +168,7 @@ impl SetupBuilder {
                         min_validators,
                         whitelist_names,
                         whitelist_pubkeys,
+                        epoch_length: epoch_length.unwrap_or(DEFAULT_EPOCH_LENGTH),
                     },
                 );
                 Ok(())
@@ -256,6 +264,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             name,
                             whitelist_names: None,
                             min_validators: None,
+                            epoch_length: None,
                         });
                     }
                     continue;
@@ -286,14 +295,15 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     SetupBuilder::Subnet {
                         whitelist_names,
                         min_validators,
+                        epoch_length,
                         ..
                     } => match tokens[0] {
                         "whitelist" => {
-                            if tokens.len() < 5 {
+                            if tokens.len() < 2 {
                                 return Err(EasyTesterError::parse(
                                     path.clone(),
                                     line_no,
-                                    "whitelist requires at least 4 validator names",
+                                    "whitelist requires at least 1 validator name",
                                     original_line,
                                 ));
                             }
@@ -314,6 +324,28 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
                             })?;
                             *min_validators = Some(v);
+                        }
+                        "epoch_length" => {
+                            if tokens.len() != 2 {
+                                return Err(EasyTesterError::parse(
+                                    path.clone(),
+                                    line_no,
+                                    "epoch_length requires exactly one numeric argument",
+                                    original_line,
+                                ));
+                            }
+                            let v = parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?;
+                            if v == 0 {
+                                return Err(EasyTesterError::parse(
+                                    path.clone(),
+                                    line_no,
+                                    "epoch_length must be positive",
+                                    original_line,
+                                ));
+                            }
+                            *epoch_length = Some(v);
                         }
                         _ => {
                             return Err(EasyTesterError::parse(
@@ -560,6 +592,32 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         cmd: ScenarioCommand::Checkpoint {
                             subnets: tokens[1..].iter().map(|s| s.to_string()).collect(),
                             shape,
+                        },
+                    });
+                }
+                "presign" => {
+                    // presign <subnet> <owner> by <signer> [<signer>...] [bad]
+                    let mut rest = tokens.get(3..).unwrap_or(&[]).to_vec();
+                    let bad = rest.last() == Some(&"bad");
+                    if bad {
+                        rest.pop();
+                    }
+                    if tokens.len() < 5 || tokens[3] != "by" || rest.len() < 2 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "presign syntax: presign <subnet> <owner> by <signer> [<signer>...] [bad]",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::Presign {
+                            subnet_name: tokens[1].to_string(),
+                            owner: tokens[2].to_string(),
+                            signers: rest[1..].iter().map(|s| s.to_string()).collect(),
+                            bad,
                         },
                     });
                 }
@@ -1029,6 +1087,39 @@ fn validate_scenario(
                     ));
                 }
             }
+            ScenarioCommand::Presign {
+                subnet_name,
+                owner,
+                signers,
+                ..
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                for name in std::iter::once(owner).chain(signers.iter()) {
+                    if !setup.validators.contains_key(name) {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            format!("validator '{name}' was not declared in setup"),
+                            &entry.text,
+                        ));
+                    }
+                }
+            }
             ScenarioCommand::UnstakeUe {
                 subnet_name,
                 validator_name,
@@ -1191,6 +1282,7 @@ fn validate_scenario(
                     | OutputDb::Validators
                     | OutputDb::UeCollaterals
                     | OutputDb::Withdrawals
+                    | OutputDb::SubnetState
                     | OutputDb::RewardCandidates => {
                         let subnet_arg_index = if *db == OutputDb::RewardCandidates {
                             1
@@ -1272,6 +1364,7 @@ fn validate_scenario(
                         | Some(OutputDb::UeCollaterals)
                         | Some(OutputDb::Withdrawals)
                         | Some(OutputDb::SubnetGenesis)
+                        | Some(OutputDb::SubnetState)
                 );
                 if !valid_precursor {
                     return Err(EasyTesterError::parse(
@@ -1413,6 +1506,7 @@ fn parse_output_db(s: &str) -> Result<OutputDb, String> {
         "validators" => Ok(OutputDb::Validators),
         "ue_collaterals" => Ok(OutputDb::UeCollaterals),
         "withdrawals" => Ok(OutputDb::Withdrawals),
+        "subnet_state" => Ok(OutputDb::SubnetState),
         _ => Err(format!("unknown output db '{s}'")),
     }
 }
@@ -1497,7 +1591,7 @@ fn validate_output_args(
                 return Err(err("expected: read validators <subnetName> [current]"));
             }
         }
-        OutputDb::UeCollaterals | OutputDb::Withdrawals => {
+        OutputDb::UeCollaterals | OutputDb::Withdrawals | OutputDb::SubnetState => {
             if args.len() != 1 {
                 return Err(err("expected: read <db> <subnetName>"));
             }

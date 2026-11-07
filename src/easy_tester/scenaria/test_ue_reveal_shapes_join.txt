@@ -2,6 +2,12 @@
 # middle, with inputs that carry no message before and after, several joins in one reveal for
 # one subnet and for two, a duplicate key inside one reveal, and a reveal with other outputs.
 # Run with testers/db-ue.txt or testers/monitor-ue.txt.
+# A collateral with timeout T seats its validator in every configuration computed with a
+# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
+# Epochs are K = 10 blocks here, and the first checkpoint sets H_0 to the block before it.
+# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
+# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
+# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
 
 setup
 
@@ -14,13 +20,17 @@ validator6
 validator7
 validator8
 validator9
+validator10
+validator11
+validator12
+validator13
 
 subnet1
 whitelist validator1 validator2 validator3 validator4
 min 4
 
 subnet2
-whitelist validator1 validator2 validator3 validator4
+whitelist validator10 validator11 validator12 validator13
 min 4
 
 scenario
@@ -41,45 +51,59 @@ read ue_collaterals subnet1
 expect result.count = 4
 read subnet_genesis subnet1
 expect result.bootstrapped = true
-# The data input last
+deposit subnet1 validator1 500_000_000
+presign subnet1 validator1 by validator1 validator2 validator3
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator4 by validator1 validator2 validator3
+
+# the first checkpoint activates subnet1 (H_0 = 113): joins are accepted from then on
+block 114
+checkpoint subnet1
+
+block 115
+read subnet_state subnet1
+expect result.activated = true
+# A join after activation is recorded and seated at a cutoff once slashable: the records
+# are counted. The data input last
 join-ue subnet1 validator5 100_000 400 @input-before
 
-block 113
-read validators subnet1
+block 116
+read ue_collaterals subnet1
 expect result.count = 5
 # The data input first, with an input after it
 join-ue subnet1 validator6 100_000 400 @input-after
 
-block 114
-read validators subnet1
+block 117
+read ue_collaterals subnet1
 expect result.count = 6
 # A rebuilt reveal with other outputs
 join-ue subnet1 validator7 100_000 400 @other-output
 
-block 115
-read validators subnet1
+block 118
+read ue_collaterals subnet1
 expect result.count = 7
 # The same key twice in one reveal, inputs reversed: one join accepted
 join-ue subnet1 validator8 100_000 400 validator8 100_000 400 @reversed
 
-block 116
+block 119
 read validators subnet1
-expect result.count = 8
-expect result.names = validator1,validator2,validator3,validator4,validator5,validator6,validator7,validator8
+expect result.count = 4
 read ue_collaterals subnet1
 expect result.count = 8
 expect result.validator8.count = 1
+expect result.validator5.count = 1
+expect result.validator7.count = 1
+# join.md, Verifying 2.7 and 5: fresh EOTS keys let subnet2 bootstrap in this reveal.
 # One reveal for two subnets: subnet2 bootstraps and validator9 joins subnet1
-join-ue subnet2 validator1 100_000 400 validator2 100_000 400 subnet1:validator9 100_000 400 validator3 100_000 400 validator4 100_000 400 @inputs-around
+join-ue subnet2 validator10 100_000 400 validator11 100_000 400 subnet1:validator9 100_000 400 validator12 100_000 400 validator13 100_000 400 @inputs-around
 
-block 118
+block 121
 read validators subnet2
 expect result.count = 4
-expect result.names = validator1,validator2,validator3,validator4
+expect result.names = validator10,validator11,validator12,validator13
 read ue_collaterals subnet2
 expect result.count = 4
-read validators subnet1
-expect result.count = 9
 read ue_collaterals subnet1
 expect result.count = 9
 expect result.validator9.count = 1

@@ -6,6 +6,8 @@ Scenario-based integration test runner for Bitcoin IPC.
 cargo run --bin easy_tester -- --scenario <scenario_file> --tester <config_file>
 ```
 
+Full-subnet scenarios (ipc-cli, fendermint, outages) run through `ue_scenario.sh`: see [ipc_tester/README.md](ipc_tester/README.md).
+
 ---
 
 ## Config file format
@@ -63,6 +65,11 @@ validators validator1 validator2 validator3
 subnet subnet_a min 2 whitelist validator1 validator2 validator3
 ```
 
+A subnet's setup block takes `whitelist <validators...>`, `min <n>` (`boot_validators`) and
+optionally `epoch_length <n>` (`K`, default 10). The other subnet parameters are fixed
+(`build_create_subnet_msg` in `model.rs`: power unit `10^4` sat, timeouts of 1 to 1000 epochs,
+minimum deposit 330 sat).
+
 ### Commands
 
 | Command | Description |
@@ -71,10 +78,11 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | `create <subnet> [@<shape>]` | Create a subnet (uses setup whitelist). With a shape the reveal is rebuilt (see "Reveal shapes"); the name still resolves to the subnet id the reveal names, so `read subnet_genesis` can check whether the monitor accepted it. |
 | `checkpoint <subnet> [<subnet>...] [@<shape>]` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). Several subnets: one checkpoint each, their batch transfers in one reveal transaction; a shape rebuilds that reveal. |
 | `join <subnet> <validator> <collateral_sats>` | Queue a join command. |
-| `join-ue <subnet> <[subnet:]validator> <collateral_sats> <timeout_height> [<[subnet:]validator> <collateral_sats> <timeout_height>]... [@<shape>]` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`. Several triples: all the joins in one reveal transaction, in that order, each read from its own input; a triple's `subnet:validator` targets another subnet than the line's. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. |
+| `join-ue <subnet> <[subnet:]validator> <collateral_sats> <timeout_height> [<[subnet:]validator> <collateral_sats> <timeout_height>]... [@<shape>]` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`, which must satisfy rule 2.6 of the join (its epoch, counted from `H_0` or from the join's block before activation, is `e + 4` to `e + 1003`). Several triples: all the joins in one reveal transaction, in that order, each read from its own input; a triple's `subnet:validator` targets another subnet than the line's. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. |
 | `stake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-increase command. `@raw` (monitor tester): the transaction is built with the library and the tester's wallet, not by the provider, so that the monitor's own rules decide; a refusal is logged, not fatal. The db tester's stakes are always hand-built. |
 | `unstake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-decrease command; `@raw` as for `stake`. |
 | `unstake-ue <subnet> <validator>` | The validator's provider spends its matured unilateral-exit collaterals to its backup address (`unstakeue`). A refusal is logged, not fatal. Monitor tester only. |
+| `presign <subnet> <owner> by <signer> [<signer>...] [bad]` | Queues slash pre-signatures of the owner's latest collateral by the signers' keys for the subnet's next `checkpoint`, which carries them in its batch transfer. `bad` corrupts the first signature. The db tester hands the entry to the monitor as is; the monitor tester sends it through the provider's dev checkpoint route. |
 | `register_token <subnet> <name> <symbol> <initial_supply>` | Queue an ERC20 token registration (ETR). Decimals are fixed at 18. |
 | `mint_token <subnet> <token> <amount>` | Queue a supply increase (ETS). |
 | `burn_token <subnet> <token> <amount>` | Queue a supply decrease (ETS). |
@@ -84,8 +92,9 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | `read token_balance <subnet> <token>` | Read and cache the token balance on the subnet. |
 | `read reward_results <snapshot>` | Read reward results for the given snapshot. |
 | `read subnet_genesis <subnet>` | Fields: `exists`, and when it exists `bootstrapped`, `min_validators`, `genesis_validators`. |
+| `read subnet_state <subnet>` | The bootstrapped subnet's state. Fields: `activated`, `epoch` (0 until activation), `h_0` (`none` until activation), `last_rotation_epoch`, `committee_number`, `pending_multisig_changes`. |
 | `read validators <subnet> [current]` | The latest committee (the waiting one if any), or the current one. Fields: `count`, `names` (sorted, comma-separated), `waiting`, `<validator>.collateral`, `<validator>.ue`. |
-| `read ue_collaterals <subnet>` | The unilateral-exit collateral records. Fields: `count`, `removed_count`, `<validator>.count`, and for the validator's record with the greatest timeout `<validator>.value`, `<validator>.timeout`, `<validator>.removed`; monitor tester only: `<validator>.spent_count`, the validator's collateral outputs spent on the chain. |
+| `read ue_collaterals <subnet>` | The unilateral-exit collateral records. Fields: `count`, `spent_count`, the records whose collateral outpoint a Bitcoin transaction has spent; `slashable_count`, the outputs the monitor recorded as slashable; per validator `<validator>.count`, and for the validator's record with the greatest timeout `<validator>.value`, `<validator>.timeout`, `<validator>.spent`, `<validator>.slashable`. |
 | `read withdrawals <subnet>` | The Withdraw stake changes not yet confirmed by a checkpoint. Fields: `count`, `<validator>` (amount). |
 | `expect result.<path> = <value>` | Assert a field in the **last** `read` result. |
 
@@ -150,7 +159,7 @@ It runs a real integration stack: spawns `bitcoind`, compiles and starts `monito
 
 - Requires `bitcoind` and `bitcoin-cli` in PATH.
 - On startup, creates a wallet and mines 101 blocks to mature coinbase UTXOs. **Scenario block heights must therefore start at 102 or higher**.
-- After each block is confirmed, the tester automatically performs the **bootstrap handover** (`genbootstraphandover` → `dev_multisignpsbt` → `finalizebootstraphandover`) for any subnet that just reached its `min_validators` count. This moves collateral from the whitelist multisig address to the committee multisig address, which is required before the first checkpoint can be created. Scenarios do not need a dedicated command for this.
+- The checkpoints of a bootstrapped subnet before activation are regular checkpoints of epoch 0: built with `dev_gencheckpointpsbt`, signed by the whitelist members, spending the whitelist's fund UTXOs. Each `checkpoint` is a checkpoint of epoch 0, and its batch transfer carries the queued `presign` entries. The monitor sets `H_0` and activates the subnet at the first Bitcoin L1 height at which every unspent join collateral of a member of `C_gen` is slashable; the next `checkpoint` is the rotation checkpoint of epoch 1, spending to `C_1`.
 - Checkpoints use `dev_gencheckpointpsbt` (no balance check) → `dev_multisignpsbt` (all validator keys) → `finalizecheckpointpsbt`. This intentionally bypasses the provider's firewall so that the monitor's own enforcement is what is tested.
 - Monitor and provider stderr are forwarded to the tester's stderr, prefixed with `[monitor]` / `[provider]`.
 - The tester uses the provider compiled with the `--dev` flag for creating the required bitcoin transactions. For checkpoints, it uses `dev_gencheckpointpsbt()` in order to create wrong checkpoint messages, that a correct provider would never create (see `do_checkpoint_malicious()` in the tester code).

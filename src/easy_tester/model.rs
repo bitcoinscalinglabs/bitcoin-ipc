@@ -12,6 +12,9 @@ pub struct ValidatorSpec {
     pub name: String,
     pub secret_key: SecretKey,
     pub pubkey: XOnlyPublicKey,
+    pub eots_secret_key: SecretKey,
+    /// The seed of the EOTS nonces the key commits to
+    pub eots_seed: crate::eots::EotsSeed,
     pub default_ip: SocketAddr,
     pub default_backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
 }
@@ -22,6 +25,8 @@ pub struct SubnetSpec {
     pub min_validators: u16,
     pub whitelist_names: Vec<String>,
     pub whitelist_pubkeys: Vec<XOnlyPublicKey>,
+    /// `K`, the epoch length in Bitcoin blocks
+    pub epoch_length: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +110,8 @@ pub enum OutputDb {
     UeCollaterals,
     /// `read withdrawals <subnet>`: the Withdraw stake changes not yet in a checkpoint
     Withdrawals,
+    /// `read subnet_state <subnet>`: activation, epoch and `H_0`
+    SubnetState,
 }
 
 /// One join of a `join-ue` line: the collateral matures at `timeout`. `subnet_name` is set
@@ -154,6 +161,14 @@ pub enum ScenarioCommand {
     UnstakeUe {
         subnet_name: String,
         validator_name: String,
+    },
+    /// Slash pre-signatures of `owner`'s latest collateral by `signers`, carried by the next
+    /// checkpoint of the subnet; `bad` corrupts the first signature
+    Presign {
+        subnet_name: String,
+        owner: String,
+        signers: Vec<String>,
+        bad: bool,
     },
     /// One checkpoint per subnet; their batch transfers go in one reveal, in `shape`
     Checkpoint {
@@ -308,9 +323,99 @@ pub fn generate_validator(name: &str, ordinal: usize) -> ValidatorSpec {
         name: name.to_string(),
         secret_key: sk,
         pubkey: xonly_pubkey,
+        eots_secret_key: SecretKey::new(&mut rand::thread_rng()),
+        eots_seed: crate::eots::EotsSeed::new(&mut rand::thread_rng()),
         default_ip: ip,
         default_backup_address: backup,
     }
+}
+
+/// A queued `presign` line.
+#[derive(Debug, Clone)]
+pub struct PresignSpec {
+    pub owner: String,
+    pub signers: Vec<String>,
+    pub bad: bool,
+}
+
+/// The slash pre-signature entries of queued `presign` lines, for the next checkpoint: each
+/// signs the owner's latest recorded collateral in `subnet_id` with the signers' keys.
+pub fn build_slash_entries<D: crate::db::DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    specs: &[PresignSpec],
+    validators: &HashMap<String, ValidatorSpec>,
+) -> Result<Vec<crate::slash::SlashSignatureEntry>, crate::easy_tester::EasyTesterError> {
+    use crate::easy_tester::EasyTesterError;
+    let secp = Secp256k1::new();
+    let mut entries: Vec<crate::slash::SlashSignatureEntry> = Vec::new();
+    for spec in specs {
+        let owner = validators
+            .get(&spec.owner)
+            .ok_or_else(|| EasyTesterError::runtime(format!("unknown validator '{}'", spec.owner)))?;
+        let record = db
+            .get_ue_collaterals(subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .into_iter()
+            .filter(|r| r.pubkey == owner.pubkey)
+            .max_by_key(|r| r.timeout)
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!("'{}' has no join-ue collateral", spec.owner))
+            })?;
+        let script = crate::collateral::collateral_script_of(db, &record)
+            .map_err(|e| EasyTesterError::runtime(format!("collateral script: {e}")))?;
+        let mut signatures = Vec::new();
+        for signer_name in &spec.signers {
+            let signer = validators.get(signer_name).ok_or_else(|| {
+                EasyTesterError::runtime(format!("unknown validator '{signer_name}'"))
+            })?;
+            let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &signer.secret_key);
+            let (index, mut signature) =
+                crate::slash::sign_slash(&secp, &script, record.outpoint, record.value, &keypair)
+                    .map_err(|e| EasyTesterError::runtime(format!("presign: {e}")))?;
+            if spec.bad && signatures.is_empty() {
+                signature[1][0] ^= 1;
+            }
+            signatures.push((index, signature));
+        }
+        signatures.sort_by_key(|(index, _)| *index);
+        match entries.iter_mut().find(|e| e.outpoint() == record.outpoint) {
+            Some(entry) => {
+                entry.signatures.extend(signatures);
+                entry.signatures.sort_by_key(|(index, _)| *index);
+            }
+            None => entries.push(crate::slash::SlashSignatureEntry::new(record.outpoint, signatures)),
+        }
+    }
+    entries.sort_by_key(|e| (e.txid, e.vout));
+    Ok(entries)
+}
+
+/// The number of heights a tester's EOTS nonce commitment covers, from height 1.
+pub const TEST_EOTS_NONCE_COUNT: u32 = 1_000;
+
+/// A signed `join-ue` message of `validator` with its EOTS nonce commitment for heights
+/// `1..=TEST_EOTS_NONCE_COUNT`.
+pub fn join_ue_msg(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    join: crate::ipc_lib::IpcJoinSubnetMsg,
+    timeout: u32,
+    validator: &ValidatorSpec,
+) -> crate::ipc_lib::IpcJoinUeMsg {
+    let (commitment, _) = crate::eots::commit_nonces(
+        &validator.eots_seed,
+        &join.subnet_id,
+        1,
+        TEST_EOTS_NONCE_COUNT,
+    );
+    crate::ipc_lib::IpcJoinUeMsg::new_signed(
+        secp,
+        join,
+        timeout,
+        &validator.secret_key,
+        &validator.eots_secret_key,
+        commitment,
+    )
 }
 
 pub fn build_create_subnet_msg(subnet: &SubnetSpec) -> IpcCreateSubnetMsg {
@@ -319,11 +424,18 @@ pub fn build_create_subnet_msg(subnet: &SubnetSpec) -> IpcCreateSubnetMsg {
 
     IpcCreateSubnetMsg {
         min_validator_stake: Amount::from_sat(100_000),
+        power_unit_exponent: 4,
         min_validators,
         bottomup_check_period: 1,
         active_validators_limit,
         min_cross_msg_fee: Amount::from_sat(1),
         whitelist: subnet.whitelist_pubkeys.clone(),
+        epoch_length: subnet.epoch_length,
+        min_timeout: 1,
+        max_timeout: 1000,
+        min_deposit: Amount::from_sat(330),
+        kill_vote_period: 36,
+        kill_delay_period: 5,
     }
 }
 

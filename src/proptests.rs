@@ -72,11 +72,18 @@ fn create_msg() -> impl Strategy<Value = IpcCreateSubnetMsg> {
             |(min_validator_stake, min_validators, period, limit, fee, whitelist)| {
                 IpcCreateSubnetMsg {
                     min_validator_stake,
+                    power_unit_exponent: 0,
                     min_validators,
                     bottomup_check_period: period,
                     active_validators_limit: limit,
                     min_cross_msg_fee: fee,
                     whitelist,
+                    epoch_length: 10,
+                    min_timeout: 1,
+                    max_timeout: 1000,
+                    min_deposit: Amount::from_sat(330),
+                    kill_vote_period: 36,
+                    kill_delay_period: 5,
                 }
             },
         )
@@ -236,18 +243,33 @@ proptest! {
         let secp = Secp256k1::new();
         let (pubkey, _) = keypair.x_only_public_key();
         let join = IpcJoinSubnetMsg { pubkey, ..join };
-        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &keypair.secret_key());
+        let eots_sk = bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let commitment = crate::eots::EotsNonceCommitment { start: 1, count: 1, root: [2u8; 32] };
+        // Before activation: epochs of ten blocks, timeouts of 1 to 1000 epochs
+        let context = crate::collateral::JoinContext {
+            named: vec![(
+                0,
+                crate::multisig::Configuration { keys: vec![(pubkey, 1)], threshold: 1 },
+            )],
+            epoch: 0,
+            h_0: None,
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 1000,
+        };
+        let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &keypair.secret_key(), &eots_sk, commitment);
         let data = msg.to_bytes().unwrap();
         let parsed = IpcJoinUeMsg::from_bytes(&data).unwrap();
         prop_assert_eq!(parsed.timeout, timeout);
         prop_assert_eq!(parsed.join.pubkey, pubkey);
         prop_assert_eq!(parsed.signature, msg.signature);
 
-        // The pair as the provider builds it is accepted below the timeout
-        let (commit, reveal, _) = unsigned_join_ue_txs(&secp, &msg, collateral).unwrap();
-        let block_height = u64::from(timeout) - 2;
-        prop_assert!(check_join_ue(&secp, &reveal, 0, &commit, block_height).is_ok());
-        prop_assert!(check_join_ue(&secp, &reveal, 0, &commit, u64::from(timeout) - 1).is_err());
+        // The pair as the provider builds it is accepted four epochs below the timeout, and
+        // refused at the block before the timeout
+        let (commit, reveal, _) = unsigned_join_ue_txs(&secp, &msg, collateral, &context.named[0].1).unwrap();
+        let block_height = u64::from(timeout) - 40;
+        prop_assert!(check_join_ue(&secp, &reveal, 0, &commit, block_height, &context).is_ok());
+        prop_assert!(check_join_ue(&secp, &reveal, 0, &commit, u64::from(timeout) - 1, &context).is_err());
 
         // One byte flipped, or bytes added or removed: rejected
         let mut mutated = data.clone();
@@ -256,7 +278,7 @@ proptest! {
         let collateral_output = commit.output[1].clone();
         let (commit_m, reveal_m) =
             unsigned_commit_reveal(&secp, &mutated, vec![collateral_output.clone()]).unwrap();
-        prop_assert!(check_join_ue(&secp, &reveal_m, 0, &commit_m, block_height).is_err());
+        prop_assert!(check_join_ue(&secp, &reveal_m, 0, &commit_m, block_height, &context).is_err());
         prop_assert!(IpcJoinUeMsg::from_bytes(&mutated).is_err());
         let mut resized = data.clone();
         if growth >= 0 {
@@ -266,7 +288,7 @@ proptest! {
         }
         let (commit_r, reveal_r) =
             unsigned_commit_reveal(&secp, &resized, vec![collateral_output]).unwrap();
-        prop_assert!(check_join_ue(&secp, &reveal_r, 0, &commit_r, block_height).is_err());
+        prop_assert!(check_join_ue(&secp, &reveal_r, 0, &commit_r, block_height, &context).is_err());
     }
 
     #[test]
@@ -333,9 +355,12 @@ proptest! {
             token_registrations: vec![],
             token_supply_adjustments: vec![],
             token_transfers: vec![],
+            slash_signatures: vec![],
             unstakes: vec![],
             change_address: Some(subnet.committee.multisig_address.clone()),
             is_kill_checkpoint: kill,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
         };
         let fee_rate = bitcoin::FeeRate::from_sat_per_vb(10).unwrap();
         let metadata = msg.make_metadata_tx_out(fee_rate);

@@ -1,7 +1,39 @@
+# Refresh from the bootstrap-written config after every devnet reset or subnet creation.
+# From the bitcoin-ipc repository root (Python 3.11+ and Docker on the host):
+#   config=src/easy_tester/testers/fendermint.txt
+#   sed -n 's/^#|//p' "$config" | python3 - "$config"
+# HOST_ADDR overrides the bootstrap's host when needed inside bitcoin-ipc.
+# create-subnet.md, Verifying 3: subnet ids depend on the create reveal txid.
+#|import os
+#|from pathlib import Path
+#|import subprocess
+#|import sys
+#|import tomllib
+#|from urllib.parse import urlsplit
+#|
+#|path = Path(sys.argv[1])
+#|config = tomllib.loads(subprocess.check_output(
+#|    ["docker", "exec", "bitcoin-ipc", "cat", "/root/.ipc/validator1/config.toml"], text=True))
+#|replacements = {}
+#|for name, port, provider_port in [("subnet1", 8545, 3030), ("subnet2", 9545, 3130)]:
+#|    entries = [s for s in config["subnets"]
+#|               if s["config"].get("network_type") == "fevm"
+#|               and urlsplit(s["config"]["provider_http"]).port == port]
+#|    if not entries:
+#|        raise SystemExit(f"bootstrap is missing the subnet at port {port}")
+#|    subnet = entries[-1]
+#|    host = os.environ.get("HOST_ADDR") or urlsplit(subnet["config"]["provider_http"]).hostname
+#|    if host in ("localhost", "127.0.0.1", None):
+#|        raise SystemExit("set HOST_ADDR to an address reachable from bitcoin-ipc")
+#|    replacements[name] = f"{name} {subnet['id']} http://{host}:{port} http://{host}:{provider_port}"
+#|lines = [replacements.get(line.split()[0], line) if line.strip() and not line.startswith("#")
+#|         else line for line in path.read_text().splitlines()]
+#|path.write_text("\n".join(lines) + "\n")
+
 tester fendermint
 
-subnet1 /b4/t410fi6wjf3rduogixzbih3tmhhbpovjekcdbmk23kxi http://localhost:8545 http://localhost:3030
+subnet1 /b4/t410fd3f45qroksu3csdg56phwbukfl7rpmnmh5cf2xy http://10.0.0.4:8545 http://10.0.0.4:3030
 
-subnet2 /b4/t410fg4bil4rro5xjzfigjy7xfiywn42jqz5xwashehq http://localhost:9545 http://localhost:3030
+subnet2 /b4/t410fh2mbafkayr7fmwyamgiqc3buombxgnrrctpfwaa http://10.0.0.4:9545 http://10.0.0.4:3130
 
 print_ipc_queries on

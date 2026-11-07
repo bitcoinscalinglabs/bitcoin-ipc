@@ -21,7 +21,7 @@ use crate::{
     eth_utils,
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer,
-        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg,
+        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg,
         IpcLibError, IpcMessage, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
     },
     rewards::{RewardConfig, RewardTracker},
@@ -73,6 +73,7 @@ pub struct DbTester {
     pending_registrations: HashMap<String, Vec<IpcErcTokenRegistration>>,
     pending_supply_adjustments: HashMap<String, Vec<IpcErcSupplyAdjustment>>,
     pending_erc_transfers: HashMap<String, Vec<IpcCrossSubnetErcTransfer>>,
+    pending_presigns: HashMap<String, Vec<super::model::PresignSpec>>,
     last_rootnet_msgs: Option<LastRootnetMsgs>,
     last_token_balance: Option<alloy_primitives::U256>,
     // Reward fields
@@ -81,7 +82,6 @@ pub struct DbTester {
     // Unilateral exit: on from this height, as the monitor's switch
     ue_activation_height: Option<u64>,
     last_ue: Option<UeRead>,
-    removal_pass_height: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -135,43 +135,19 @@ impl DbTester {
             pending_registrations: HashMap::new(),
             pending_supply_adjustments: HashMap::new(),
             pending_erc_transfers: HashMap::new(),
+            pending_presigns: HashMap::new(),
             last_rootnet_msgs: None,
             last_token_balance: None,
             reward_tracker,
             last_reward_results: None,
             ue_activation_height,
             last_ue: None,
-            removal_pass_height: None,
         })
     }
 
     fn ue_active(&self, height: u64) -> bool {
         self.ue_activation_height
             .is_some_and(|activation| height >= activation)
-    }
-
-    /// The monitor's removal pass for block `height`, run once before the block's first command
-    fn run_removal_pass(&mut self, height: u64) -> Result<(), EasyTesterError> {
-        if self.removal_pass_height >= Some(height) || !self.ue_active(height) {
-            return Ok(());
-        }
-        self.removal_pass_height = Some(height);
-        let block_hash = self.block_hash(height);
-        let removals = collateral::remove_matured_ue_validators(&self.db, height, block_hash)
-            .map_err(|e| EasyTesterError::runtime(format!("removal pass at {height}: {e}")))?;
-        let names = self.validator_names();
-        for r in removals {
-            info!(
-                "Block {}: UE validator '{}' matured: {}",
-                height,
-                names
-                    .get(&r.pubkey)
-                    .cloned()
-                    .unwrap_or_else(|| r.pubkey.to_string()),
-                r.outcome
-            );
-        }
-        Ok(())
     }
 
     fn validator_names(&self) -> Names {
@@ -192,7 +168,7 @@ impl DbTester {
         shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
         if !self.ue_active(height) {
-            info!("join-ue ignored: unilateral exit is not active at block {height}");
+            warn!("join-ue ignored: unilateral exit is not active at block {height}");
             return Ok(());
         }
         let secp = Secp256k1::new();
@@ -213,9 +189,25 @@ impl DbTester {
                 backup_address: validator.default_backup_address.clone(),
                 pubkey: validator.pubkey,
             };
-            let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator.secret_key);
-            let (commit, reveal, _) = collateral::unsigned_join_ue_txs(&secp, &msg, collateral)
-                .map_err(|e| EasyTesterError::runtime(format!("join-ue transactions: {e}")))?;
+            let msg = super::model::join_ue_msg(&secp, join, timeout, &validator);
+            // In epoch 0 the subnet names no configuration: the join names the whitelist, and
+            // the monitor's refusal is what the scenario checks
+            let configuration = match collateral::named_configurations(&self.db, subnet_id) {
+                Ok(named) => named[0].1.clone(),
+                Err(e) => {
+                    warn!("JoinUe: '{}' names the whitelist: {e}", spec.validator_name);
+                    self.db
+                        .get_subnet_genesis_info(subnet_id)
+                        .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+                        .ok_or_else(|| {
+                            EasyTesterError::runtime(format!("subnet '{subnet_name}' not found"))
+                        })?
+                        .whitelist_configuration()
+                }
+            };
+            let (commit, reveal, _) =
+                collateral::unsigned_join_ue_txs(&secp, &msg, collateral, &configuration)
+                    .map_err(|e| EasyTesterError::runtime(format!("join-ue transactions: {e}")))?;
             commits.push(commit);
             reveals.push(reveal);
         }
@@ -242,8 +234,16 @@ impl DbTester {
                 warn!("JoinUe: input {input} spends an unknown commit {spent}");
                 continue;
             };
-            let checked = match collateral::check_join_ue(&secp, &reveal, input, commit, height) {
-                Ok(checked) => checked,
+            let context = match collateral::join_context(&self.db, msg.join.subnet_id) {
+                Ok(context) => context,
+                Err(e) => {
+                    warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
+                    continue;
+                }
+            };
+            let checked =
+                match collateral::check_join_ue(&secp, &reveal, input, commit, height, &context) {
+                    Ok(checked) => checked,
                 Err(e) => {
                     warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
                     continue;
@@ -555,6 +555,7 @@ impl DbTester {
         token_registrations: Vec<IpcErcTokenRegistration>,
         supply_adjustments: Vec<IpcErcSupplyAdjustment>,
         erc_transfers: Vec<IpcCrossSubnetErcTransfer>,
+        slash_signatures: Vec<crate::slash::SlashSignatureEntry>,
     ) -> Result<(SubnetCheckpoint, Option<Transaction>), EasyTesterError> {
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
         let block_hash = self.block_hash(height);
@@ -565,16 +566,14 @@ impl DbTester {
             .ok_or_else(|| {
                 EasyTesterError::runtime(format!("subnet state missing for {subnet_id}"))
             })?;
-        let current_cfg = subnet_state.committee.configuration_number;
-        let latest_cfg = self
-            .db
-            .get_last_stake_change_configuration_number(subnet_id)
-            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
-        let next_cfg = if latest_cfg > current_cfg {
-            latest_cfg
-        } else {
-            0
-        };
+        // As the provider: the first checkpoint of an epoch is its rotation checkpoint. As the
+        // subnet: the last change number of the configuration whose changes it applies, 0 when
+        // none await it
+        let is_rotation_checkpoint = subnet_state.last_rotation_epoch < subnet_state.epoch;
+        let next_cfg = subnet_state
+            .waiting_committee
+            .as_ref()
+            .map_or(0, |configuration| configuration.configuration_number);
         let checkpoint_height = self
             .checkpoint_heights
             .entry(subnet_name.to_string())
@@ -590,9 +589,12 @@ impl DbTester {
             token_registrations,
             token_supply_adjustments: supply_adjustments,
             token_transfers: erc_transfers,
+            slash_signatures,
             unstakes: vec![],
             change_address: None,
             is_kill_checkpoint: false,
+            is_rotation_checkpoint,
+            slash_pre_signature_count: None,
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint msg invalid: {e}")))?;
@@ -923,7 +925,15 @@ fn validator_ordinal(name: &str) -> Option<u64> {
 
 impl Tester for DbTester {
     fn exec_mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
+        let block_hash = self.block_hash(height);
+        for outcome in crate::epochs::process_cutoffs(&self.db, height, block_hash)
+            .map_err(|e| EasyTesterError::runtime(format!("cutoff at block {height}: {e}")))?
+        {
+            info!(
+                "Block {height}: subnet {} begins epoch {}",
+                outcome.subnet_id, outcome.epoch
+            );
+        }
         self.mine_block(height)?;
 
         if let Some(rt) = &mut self.reward_tracker {
@@ -950,7 +960,6 @@ impl Tester for DbTester {
         subnet_name: &str,
         shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.create_subnet(height, subnet_name, shape)
     }
 
@@ -961,7 +970,6 @@ impl Tester for DbTester {
         validator_name: &str,
         collateral_sats: u64,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.join_subnet(height, subnet_name, validator_name, collateral_sats)
     }
 
@@ -972,7 +980,6 @@ impl Tester for DbTester {
         joins: &[JoinUeSpec],
         shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.join_ue(height, subnet_name, joins, shape)
     }
 
@@ -985,7 +992,6 @@ impl Tester for DbTester {
         amount_sats: u64,
         _raw: bool,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.stake_subnet(height, subnet_name, validator_name, amount_sats)
     }
 
@@ -997,18 +1003,16 @@ impl Tester for DbTester {
         amount_sats: u64,
         _raw: bool,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.unstake_subnet(height, subnet_name, validator_name, amount_sats)
     }
 
     fn exec_deposit(
         &mut self,
-        height: u64,
+        _height: u64,
         subnet_name: &str,
         address_name: &str,
         amount_sats: u64,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         // The db tester has no real Bitcoin UTXOs, so deposit is a no-op.
         // We still resolve the subnet to catch typos early.
         self.resolve_subnet_id(subnet_name)?;
@@ -1025,7 +1029,6 @@ impl Tester for DbTester {
         subnets: &[String],
         shape: RevealShape,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         let mut reveals = Vec::new();
         for subnet_name in subnets {
             let token_registrations = self
@@ -1040,14 +1043,22 @@ impl Tester for DbTester {
                 .pending_erc_transfers
                 .remove(subnet_name)
                 .unwrap_or_default();
+            let presigns = self.pending_presigns.remove(subnet_name).unwrap_or_default();
 
             let subnet_id = self.resolve_subnet_id(subnet_name)?;
+            let slash_signatures = super::model::build_slash_entries(
+                &self.db,
+                subnet_id,
+                &presigns,
+                &self.setup.validators,
+            )?;
             let (checkpoint, reveal) = self.checkpoint_subnet(
                 height,
                 subnet_name,
                 token_registrations,
                 supply_adjustments,
                 erc_transfers,
+                slash_signatures,
             )?;
             reveals.extend(reveal);
 
@@ -1071,8 +1082,26 @@ impl Tester for DbTester {
         symbol: &str,
         initial_supply: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.queue_token_registration(height, subnet_name, name, symbol, initial_supply)
+    }
+
+    fn exec_presign(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        spec: super::model::PresignSpec,
+    ) -> Result<(), EasyTesterError> {
+        info!(
+            "presign queued: '{}' by {:?} on '{subnet_name}'{}",
+            spec.owner,
+            spec.signers,
+            if spec.bad { " (corrupted)" } else { "" }
+        );
+        self.pending_presigns
+            .entry(subnet_name.to_string())
+            .or_default()
+            .push(spec);
+        Ok(())
     }
 
     fn exec_mint_token(
@@ -1082,7 +1111,6 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.queue_mint(height, subnet_name, token_name, amount)
     }
 
@@ -1093,7 +1121,6 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.queue_burn(height, subnet_name, token_name, amount)
     }
 
@@ -1105,7 +1132,6 @@ impl Tester for DbTester {
         token_name: &str,
         amount: alloy_primitives::U256,
     ) -> Result<(), EasyTesterError> {
-        self.run_removal_pass(height)?;
         self.queue_erc_transfer(height, src_subnet, dst_subnet, token_name, amount)
     }
 
@@ -1135,7 +1161,7 @@ impl Tester for DbTester {
                         args.len() == 2,
                     )?,
                     OutputDb::UeCollaterals => {
-                        ue_reads::read_ue_collaterals(&self.db, subnet_id, subnet_name, &names, None)?
+                        ue_reads::read_ue_collaterals(&self.db, subnet_id, subnet_name, &names)?
                     }
                     _ => ue_reads::read_withdrawals(&self.db, subnet_id, subnet_name, &names)?,
                 };
@@ -1286,6 +1312,16 @@ impl Tester for DbTester {
                 let subnet_name = &args[0];
                 let subnet_id = self.resolve_subnet_id(subnet_name)?;
                 self.last_ue = Some(ue_reads::read_subnet_genesis(
+                    &self.db,
+                    subnet_id,
+                    subnet_name,
+                )?);
+            }
+
+            OutputDb::SubnetState => {
+                let subnet_name = &args[0];
+                let subnet_id = self.resolve_subnet_id(subnet_name)?;
+                self.last_ue = Some(ue_reads::read_subnet_state(
                     &self.db,
                     subnet_id,
                     subnet_name,

@@ -1,10 +1,12 @@
 use crate::{
     bitcoin_utils, collateral,
     db::{self, DatabaseCore, StakingChange},
+    eots,
     ipc_lib::{
         self, validate_erc_batch_data, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg,
-        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcKillSubnetMsg, IpcPrefundSubnetMsg,
-        IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
+        IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcKillSubnetMsg, IpcLibError,
+        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
+        SubnetId,
     },
     multisig, wallet, NETWORK,
 };
@@ -12,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::{debug, error, info, trace, warn};
+use log::{error, info, trace, warn};
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,6 +41,9 @@ pub enum RpcError {
 
     #[error("Internal server error: {0}")]
     InternalError(String),
+
+    #[error("the monitor has not processed Bitcoin height {requested} yet: last processed {processed}")]
+    MonitorBehind { requested: u64, processed: u64 },
 }
 
 impl ErrorLike for RpcError {
@@ -47,6 +52,7 @@ impl ErrorLike for RpcError {
             RpcError::Unauthorized => -32001,
             RpcError::InvalidParams(_) => -32602,
             RpcError::InternalError(_) | RpcError::DbError(_) => -32603,
+            RpcError::MonitorBehind { .. } => -32004,
         }
     }
 
@@ -79,7 +85,14 @@ pub struct ServerData {
     pub btc_rpc: Arc<Client>,
     pub btc_watchonly_rpc: Arc<Client>,
     pub validator: Option<(bitcoin::XOnlyPublicKey, bitcoin::secp256k1::SecretKey)>,
+    /// The EOTS secret key and the seed of its nonces, from `EOTS_SK_PATH` and `EOTS_SEED_PATH`
+    pub eots: Option<(bitcoin::secp256k1::SecretKey, eots::EotsSeed)>,
+    /// The EOTS signer with its sign record, for the same key
+    pub eots_signer: Option<Arc<std::sync::Mutex<super::eots_signer::EotsSigner>>>,
 }
+
+/// The number of heights the EOTS nonce commitment of a `join-ue` covers by default.
+pub const DEFAULT_EOTS_NONCE_COUNT: u32 = 100_000;
 
 //
 // Bitcoin RPC
@@ -159,9 +172,15 @@ pub struct JoinSubnetRequest {
     pub ip: std::net::SocketAddr,
     pub backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     pub pubkey: bitcoin::XOnlyPublicKey,
-    /// With it, a `join-ue`: the collateral matures `lock_blocks` blocks after the current tip
+    /// With it, a `join-ue`: the collateral seats the validator for `epochs` epochs
     #[serde(default)]
-    pub lock_blocks: Option<u64>,
+    pub epochs: Option<u32>,
+    /// The first subnet height the EOTS nonce commitment of a `join-ue` covers (default 1)
+    #[serde(default)]
+    pub eots_nonce_start: Option<u64>,
+    /// The number of heights it covers (default `DEFAULT_EOTS_NONCE_COUNT`)
+    #[serde(default)]
+    pub eots_nonce_count: Option<u32>,
 }
 
 impl From<JoinSubnetRequest> for IpcJoinSubnetMsg {
@@ -185,12 +204,16 @@ pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
     Params(req): Params<JoinSubnetRequest>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
-    let lock_blocks = req.lock_blocks;
+    let epochs = req.epochs;
+    let nonce_range = (
+        req.eots_nonce_start.unwrap_or(1),
+        req.eots_nonce_count.unwrap_or(DEFAULT_EOTS_NONCE_COUNT),
+    );
     let msg: IpcJoinSubnetMsg = req.into();
-    info!("joinsubnet: {:?} lock_blocks={:?}", msg, lock_blocks);
+    info!("joinsubnet: {:?} epochs={:?}", msg, epochs);
 
     // The activation switch is checked before any validation
-    let tip = match lock_blocks {
+    let tip = match epochs {
         Some(_) => {
             let tip = data
                 .btc_rpc
@@ -233,8 +256,8 @@ pub async fn join_subnet(
             RpcError::InvalidParams(e.to_string())
         })?;
 
-    if let (Some(lock_blocks), Some(tip)) = (lock_blocks, tip) {
-        let join_txid = join_subnet_ue(&data, msg, lock_blocks, tip)?;
+    if let (Some(epochs), Some(tip)) = (epochs, tip) {
+        let join_txid = join_subnet_ue(&data, &genesis_info, msg, epochs, tip, nonce_range)?;
         return Ok(JoinSubnetResponse { join_txid });
     }
 
@@ -249,13 +272,16 @@ pub async fn join_subnet(
 }
 
 /// The join-ue path of `joinsubnet`: the join signed by this provider's validator key, with
-/// `T = tip + lock_blocks` and `lock_blocks` at least 3. The caller has checked the
-/// activation switch at `tip`.
+/// the timeout `T` that seats the validator for `epochs` epochs, the EOTS nonce commitment of
+/// this provider's EOTS key for `nonce_range = (start, count)`, and the collateral naming the
+/// current configuration. The caller has checked the activation switch at `tip`.
 fn join_subnet_ue(
     data: &ServerData,
+    genesis_info: &db::SubnetGenesisInfo,
     join: IpcJoinSubnetMsg,
-    lock_blocks: u64,
+    epochs: u32,
     tip: u64,
+    nonce_range: (u64, u32),
 ) -> Result<bitcoin::Txid, JsonRpcError> {
     let invalid = |m: String| -> JsonRpcError {
         error!("joinsubnet (join-ue) rejected: {m}");
@@ -264,32 +290,70 @@ fn join_subnet_ue(
     let Some((validator_xpk, validator_sk)) = data.validator else {
         return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
     };
+    let Some((eots_sk, eots_seed)) = data.eots else {
+        return Err(RpcError::InternalError("No EOTS key configured (EOTS_SK_PATH).".to_string()).into());
+    };
     if join.pubkey != validator_xpk {
         return Err(invalid(format!(
             "join-ue signs with this provider's validator key {validator_xpk}, not {}",
             join.pubkey
         )));
     }
-    // The reveal lands in block tip + 1 at the earliest and the monitor requires T > that + 1
-    if lock_blocks < 3 {
+    let params = &genesis_info.create_subnet_msg;
+    if epochs < params.min_timeout || epochs > params.max_timeout {
         return Err(invalid(format!(
-            "lock_blocks must be at least 3, got {lock_blocks}"
+            "epochs must be between min_timeout {} and max_timeout {}, got {epochs}",
+            params.min_timeout, params.max_timeout
         )));
     }
-    let timeout = tip
-        .checked_add(lock_blocks)
-        .and_then(|t| u32::try_from(t).ok())
-        .ok_or_else(|| invalid(format!("tip {tip} + lock_blocks {lock_blocks} overflows")))?;
 
     collateral::refuse_earlier_join(&*data.db, join.subnet_id, &join.pubkey, None)
         .map_err(|e| invalid(e.to_string()))?;
+    let context =
+        collateral::join_context(&*data.db, join.subnet_id).map_err(|e| invalid(e.to_string()))?;
+
+    // `T = H_0 + (e + epochs + 3) K`, with the latest final height in place of `H_0` before
+    // activation; the monitor's rule 2.6 is checked at the next block before submission
+    let origin = match context.h_0 {
+        Some(h_0) => h_0,
+        None => data
+            .db
+            .get_last_processed_block()
+            .map_err(|e| RpcError::DbError(e))?,
+    };
+    let timeout =
+        u32::try_from(params.cutoff_height(origin, context.epoch + u64::from(epochs) + 3))
+            .ok()
+            .filter(|t| *t < collateral::LOCKTIME_THRESHOLD)
+            .ok_or_else(|| invalid("the timeout is not a block height".to_string()))?;
+    context.check_timeout(timeout, tip + 1).map_err(invalid)?;
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk);
+    let (start, count) = nonce_range;
+    if start < 1 || count < 1 {
+        return Err(invalid(format!(
+            "the EOTS nonce range needs start >= 1 and count >= 1, got start {start} count {count}"
+        )));
+    }
+    let (commitment, _) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count);
+    let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk, &eots_sk, commitment);
     msg.validate().map_err(|e| invalid(e.to_string()))?;
+    collateral::refuse_earlier_eots_key(
+        &*data.db,
+        msg.join.subnet_id,
+        &msg.join.pubkey,
+        &msg.pk_eots,
+        None,
+    )
+    .map_err(|e| invalid(e.to_string()))?;
 
-    info!("joinsubnet (join-ue): timeout {timeout} = tip {tip} + {lock_blocks}");
-    msg.submit_to_bitcoin(&data.btc_rpc)
+    info!(
+        "joinsubnet (join-ue): timeout {timeout} for {epochs} epochs from epoch {} (origin {origin}, tip {tip}), EOTS key {} nonces {start}..{}",
+        context.epoch,
+        msg.pk_eots,
+        start + u64::from(count)
+    );
+    msg.submit_to_bitcoin(&data.btc_rpc, &context)
         .map_err(|e| JsonRpcError::internal(e.to_string()))
 }
 
@@ -306,6 +370,95 @@ fn check_ue_active(activation: Option<u64>, tip: u64) -> Result<(), String> {
             collateral::UE_ACTIVATION_HEIGHT_VAR
         )),
     }
+}
+
+/// How a checkpoint is built from the monitor's state: who signs its fund inputs, which
+/// unspent outputs they are, where the change goes and whether it rotates.
+struct CheckpointPlan {
+    signer: ipc_lib::CheckpointSigner,
+    change_address: bitcoin::Address,
+    unspent: Vec<bitcoincore_rpc::json::ListUnspentResultEntry>,
+    rotation: bool,
+    /// The change goes to another multisig: the checkpoint spends every fund UTXO
+    sweep: bool,
+}
+
+impl CheckpointPlan {
+    /// The plan from the monitor's epoch `e`, without the unspent outputs: the first checkpoint
+    /// after the cutoff `H_{e-1}` is the rotation checkpoint of `e`, which pays `C_e`; any other
+    /// checkpoint pays the signing configuration. The change number it carries plays no part.
+    fn of_state(
+        genesis_info: &db::SubnetGenesisInfo,
+        subnet: &db::SubnetState,
+    ) -> Result<Self, JsonRpcError> {
+        let signer = signing_configuration(genesis_info, subnet)?;
+        let rotation = subnet.last_rotation_epoch < subnet.epoch;
+        let change_address = if rotation {
+            subnet.latest_committee().address_checked()
+        } else {
+            signer.address.clone()
+        };
+        let sweep = change_address != signer.address;
+        Ok(Self {
+            signer,
+            change_address,
+            unspent: Vec::new(),
+            rotation,
+            sweep,
+        })
+    }
+}
+
+/// The configuration that signs a checkpoint's fund inputs: `C_wlist`, which holds the funds
+/// until the rotation checkpoint of epoch 1 moves them to `C_1`, then the current one.
+fn signing_configuration(
+    genesis_info: &db::SubnetGenesisInfo,
+    subnet: &db::SubnetState,
+) -> Result<ipc_lib::CheckpointSigner, JsonRpcError> {
+    if subnet.last_rotation_epoch == 0 {
+        ipc_lib::CheckpointSigner::of_configuration(
+            &subnet.id,
+            &genesis_info.whitelist_configuration(),
+        )
+        .map_err(|e| RpcError::InternalError(e.to_string()).into())
+    } else {
+        Ok(ipc_lib::CheckpointSigner::of_committee(&subnet.committee))
+    }
+}
+
+/// The configured validator must sign the checkpoint: a member of the signing configuration.
+fn check_checkpoint_signer(
+    genesis_info: &db::SubnetGenesisInfo,
+    subnet: &db::SubnetState,
+    validator: &bitcoin::XOnlyPublicKey,
+) -> Result<(), JsonRpcError> {
+    let signs = signing_configuration(genesis_info, subnet)?
+        .keys
+        .iter()
+        .any(|(key, _)| key == validator);
+    if !signs {
+        error!("Configured validator isn't a validator in the specified subnet.");
+        return Err(RpcError::InvalidParams(
+            "Configured validator isn't a validator in the specified subnet.".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Plans the checkpoint from the monitor's state, sets its rotation flag and takes the unspent
+/// outputs of the signing configuration.
+fn plan_checkpoint(
+    data: &ServerData,
+    genesis_info: &db::SubnetGenesisInfo,
+    subnet: &db::SubnetState,
+    msg: &mut IpcCheckpointSubnetMsg,
+) -> Result<CheckpointPlan, JsonRpcError> {
+    let mut plan = CheckpointPlan::of_state(genesis_info, subnet)?;
+    msg.is_rotation_checkpoint = plan.rotation;
+    plan.unspent = wallet::get_unspent_for_address(&data.btc_watchonly_rpc, &plan.signer.address)
+        .map_err(|e| JsonRpcError::from(RpcError::InternalError(e.to_string())))?;
+    Ok(plan)
 }
 
 /// The members of `committee` that joined with `join-ue`: the rotation and kill checkpoints
@@ -463,8 +616,8 @@ pub struct GetSubnetBalanceResponse {
 
 /// Returns the on-chain balance of the subnet — i.e. the sats held by the
 /// current committee multisig, summed across all unspent outputs the watch-only
-/// wallet tracks for it. The monitor auto-imports the multisig on CREATE /
-/// handover, so no setup needed.
+/// wallet tracks for it. The monitor imports the multisig of each configuration
+/// into the watch-only wallet when it records it, so no setup needed.
 pub async fn get_subnet_balance(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetSubnetParams>,
@@ -571,7 +724,19 @@ pub async fn fund_subnet(
             msg.subnet_id
         )))?;
 
-    let multisig_address = subnet_state.multisig_address();
+    // The current configuration: `C_wlist` in epoch 0, from a cutoff on the next configuration
+    let multisig_address = if subnet_state.is_activated() {
+        subnet_state.latest_committee().address_checked()
+    } else {
+        data.db
+            .get_subnet_genesis_info(msg.subnet_id)
+            .map_err(RpcError::DbError)?
+            .ok_or(RpcError::InvalidParams(format!(
+                "Subnet {} not found.",
+                msg.subnet_id
+            )))?
+            .multisig_address()
+    };
 
     let fund_txid = msg
         .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
@@ -658,6 +823,9 @@ pub async fn get_token_balance(
 pub struct GetSubnetCheckpointParams {
     subnet_id: SubnetId,
     number: Option<u64>,
+    /// With it, the latest checkpoint in a Bitcoin block at or below this height
+    #[serde(default)]
+    max_block_height: Option<u64>,
 }
 
 pub async fn get_subnet_checkpoint(
@@ -665,21 +833,54 @@ pub async fn get_subnet_checkpoint(
     Params(params): Params<GetSubnetCheckpointParams>,
 ) -> Result<Option<db::SubnetCheckpoint>, JsonRpcError> {
     info!(
-        "getsubnetcheckpoint: {} number={:?}",
-        params.subnet_id, params.number
+        "getsubnetcheckpoint: {} number={:?} max_block_height={:?}",
+        params.subnet_id, params.number, params.max_block_height
     );
+    Ok(latest_checkpoint_at(
+        &data.db,
+        params.subnet_id,
+        params.number,
+        params.max_block_height,
+    )?)
+}
+
+/// The checkpoint `number` of the subnet, the last one without it; with `max_block_height`,
+/// the latest checkpoint in a Bitcoin block at or below that height. The answer for a
+/// `max_block_height` depends on that height alone: a height the monitor has not processed
+/// yet is refused with `RpcError::MonitorBehind`, never answered with an older checkpoint.
+pub fn latest_checkpoint_at(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    number: Option<u64>,
+    max_block_height: Option<u64>,
+) -> Result<Option<db::SubnetCheckpoint>, RpcError> {
+    if let Some(max_block_height) = max_block_height {
+        let processed = db.get_last_processed_block().map_err(|e| {
+            error!("Error getting last processed block from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+        if processed < max_block_height {
+            warn!(
+                "getsubnetcheckpoint: {} asks for Bitcoin height {max_block_height}, monitor at {processed}",
+                subnet_id
+            );
+            return Err(RpcError::MonitorBehind {
+                requested: max_block_height,
+                processed,
+            });
+        }
+    }
 
     // Check if subnet exists
-    let subnet = data
-        .db
-        .get_subnet_state(params.subnet_id)
+    let subnet = db
+        .get_subnet_state(subnet_id)
         .map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
             RpcError::DbError(e)
         })?
         .ok_or_else(|| {
-            error!("Subnet {} not found.", params.subnet_id);
-            RpcError::InvalidParams(format!("Subnet {} not found.", params.subnet_id))
+            error!("Subnet {} not found.", subnet_id);
+            RpcError::InvalidParams(format!("Subnet {} not found.", subnet_id))
         })?;
 
     let last_checkpoint_number = match subnet.last_checkpoint_number {
@@ -690,14 +891,27 @@ pub async fn get_subnet_checkpoint(
     };
 
     // Default to the last checkpoint
-    let number = params.number.unwrap_or(last_checkpoint_number);
-
-    data.db
-        .get_checkpoint(params.subnet_id, number)
-        .map_err(|e| {
+    let number = number.unwrap_or(last_checkpoint_number);
+    let get = |number: u64| {
+        db.get_checkpoint(subnet_id, number).map_err(|e| {
             error!("Error getting checkpoint from Db: {}", e);
-            RpcError::DbError(e).into()
+            RpcError::DbError(e)
         })
+    };
+    let Some(max_block_height) = max_block_height else {
+        return get(number);
+    };
+    // Checkpoint numbers follow Bitcoin heights: walk back to the first one in range
+    let mut number = number;
+    loop {
+        match get(number)? {
+            Some(checkpoint) if checkpoint.block_height <= max_block_height => {
+                return Ok(Some(checkpoint))
+            }
+            _ if number == 0 => return Ok(None),
+            _ => number -= 1,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -815,180 +1029,6 @@ pub async fn gen_multisig_spend_psbt(
     })
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PostBoostrapHandoverParams {
-    subnet_id: SubnetId,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PostBoostrapHandoverResponse {
-    unsigned_psbt: bitcoin::Psbt,
-    unsigned_psbt_base64: String,
-    psbt_inputs_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
-}
-
-pub async fn gen_bootstrap_handover(
-    data: Data<Arc<ServerData>>,
-    Params(params): Params<PostBoostrapHandoverParams>,
-) -> Result<PostBoostrapHandoverResponse, JsonRpcError> {
-    info!("post_bootstrap_handover: {:?}", params);
-
-    let (validator_xonly_pubkey, validator_sk) = match data.validator {
-        Some(validator) => validator,
-        None => {
-            error!("No validator keypair configured.");
-            return Err(
-                RpcError::InternalError("No validator keypair configured.".to_string()).into(),
-            );
-        }
-    };
-
-    // Check genesis info
-    let genesis_info = data
-        .db
-        .get_subnet_genesis_info(params.subnet_id)
-        .map_err(|e| {
-            error!("Error getting subnet info from Db: {}", e);
-            RpcError::DbError(e)
-        })?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            params.subnet_id
-        )))?;
-
-    // Check subnet exists
-    let subnet = data
-        .db
-        .get_subnet_state(params.subnet_id)
-        .map_err(|e| {
-            error!("Error getting subnet info from Db: {}", e);
-            RpcError::DbError(e)
-        })?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            params.subnet_id
-        )))?;
-
-    // Check if self is a validator in the subnet
-    if !subnet.is_validator(&validator_xonly_pubkey) {
-        error!("Configured validator isn't a validator in the specified subnet.");
-        return Err(RpcError::InvalidParams(
-            "Configured validator isn't a validator in the specified subnet.".to_string(),
-        )
-        .into());
-    }
-
-    if subnet.last_checkpoint_number.is_some() {
-        // NOTE: we should accept to bootstrap handover even if the subnet already has checkpoints
-        // normally it should be done before the first checkpoint is posted, but in an
-        // exceptional case better to handover to the 2nd committee then not at all?
-        // if subnet.last_checkpoint_number.is_some() {
-        //     error!(
-        //         "Subnet {} already has checkpoints, cannot post bootstrap handover.",
-        //         params.subnet_id
-        //     );
-        //     return Err(RpcError::InvalidParams(format!(
-        //         "Subnet {} already has checkpoints, cannot post bootstrap handover.",
-        //         params.subnet_id
-        //     ))
-        //     .into());
-        // }
-
-        warn!(
-            "Subnet {} already has checkpoints, but proceeding with bootstrap handover.",
-            params.subnet_id
-        );
-    }
-
-    // Collect committee information
-
-    let committee_address = subnet
-        .committee
-        .multisig_address
-        .clone()
-        .require_network(NETWORK)
-        .expect("Multisig should be valid for saved subnet genesis info");
-
-    // Collect whitelist collateral
-
-    let whitelist_keys: Vec<multisig::WeightedKey> = genesis_info
-        .create_subnet_msg
-        .whitelist
-        .iter()
-        // Each key has the same weight
-        .map(|xpk| (*xpk, 1))
-        .collect::<Vec<_>>();
-    let whitelist_threshold: u32 = genesis_info.create_subnet_msg.min_validators.into();
-    let whitelist_multisig_addr = genesis_info
-        .create_subnet_msg
-        .multisig_address_from_whitelist(&params.subnet_id)
-        .map_err(|e| {
-            error!("Error creating multisig address from whitelist: {}", e);
-            RpcError::InternalError(e.to_string())
-        })?;
-
-    let unspent =
-        wallet::get_unspent_for_address(&data.btc_watchonly_rpc, &whitelist_multisig_addr)
-            .map_err(|e| {
-                error!("Error getting unspent for whitelist multisig: {}", e);
-                RpcError::InternalError(e.to_string())
-            })?;
-
-    if unspent.is_empty() {
-        return Err(RpcError::InvalidParams(format!(
-            "No unspent outputs found for whitelist multisig address {}. The handover was possibly already done.",
-            whitelist_multisig_addr
-        ))
-        .into());
-    }
-
-    debug!("Unspent for whitelist multisig: {:?}", unspent);
-
-    // Create the handover PSBT
-
-    let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-
-    let unsigned_psbt = multisig::construct_spend_psbt(
-        &secp,
-        &params.subnet_id,
-        &whitelist_keys,
-        whitelist_threshold,
-        &committee_address,
-        &unspent,
-        true,
-        &[],
-        &fee_rate,
-        0,
-    )
-    .map_err(|e| {
-        error!(
-            "Error generating multisig spend psbt for subnet_id={}: {}",
-            &params.subnet_id, e
-        );
-        RpcError::InternalError(e.to_string())
-    })?;
-
-    let validator_keypair = validator_sk.keypair(&secp);
-
-    let (_, psbt_inputs_signatures) =
-        multisig::sign_spend_psbt(&secp, unsigned_psbt.clone(), validator_keypair).map_err(
-            |e| {
-                error!(
-                    "Error signing multisig spend psbt for subnet_id={}: {}",
-                    &params.subnet_id, e
-                );
-                RpcError::InternalError(e.to_string())
-            },
-        )?;
-
-    Ok(PostBoostrapHandoverResponse {
-        unsigned_psbt: unsigned_psbt.clone(),
-        unsigned_psbt_base64: BASE64_STANDARD.encode(unsigned_psbt.serialize()),
-        psbt_inputs_signatures,
-    })
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct GenCheckpointPsbtResponse {
     // Checkpoint
@@ -1026,6 +1066,10 @@ pub async fn gen_checkpoint_psbt(
             RpcError::InvalidParams("Specifying change address not supported".to_string()).into(),
         );
     }
+    // The subnet posts every pre-signature; the batch transfer carries the complete entries
+    counted_slash_entries(&mut msg);
+    msg.slash_signatures = carried_slash_entries(&*data.db, msg.subnet_id, &msg.slash_signatures);
+    fit_slash_entries(&mut msg).map_err(|e| RpcError::InternalError(e.to_string()))?;
 
     if !msg.unstakes.len().is_zero() {
         return Err(
@@ -1048,14 +1092,15 @@ pub async fn gen_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    // Check if self is a validator in the subnet
-    if !subnet.is_validator(&validator_xonly_pubkey) {
-        error!("Configured validator isn't a validator in the specified subnet.");
-        return Err(RpcError::InvalidParams(
-            "Configured validator isn't a validator in the specified subnet.".to_string(),
-        )
-        .into());
-    }
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(RpcError::DbError)?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+    check_checkpoint_signer(&genesis_info, &subnet, &validator_xonly_pubkey)?;
 
     if subnet.is_killed() {
         error!(
@@ -1077,22 +1122,18 @@ pub async fn gen_checkpoint_psbt(
         RpcError::InvalidParams(e.to_string())
     })?;
 
-    let unspent = subnet
-        .committee
-        .get_unspent(&data.btc_watchonly_rpc)
-        .map_err(|e| RpcError::InternalError(e.to_string()))?;
-
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
-    let ue_members = ue_members(&data.db, msg.subnet_id, &subnet.committee)?;
+    let plan = plan_checkpoint(&data, &genesis_info, &subnet, &mut msg)?;
+    let unspent = &plan.unspent;
+    let mut exhaust_unspent = plan.sweep;
 
-    // assume no change in the committee
-    let mut next_committee = subnet.committee.clone();
-    let current_committee_configuration = subnet.committee.configuration_number;
+    let ue_members = ue_members(&data.db, msg.subnet_id, &subnet.committee)?;
 
     if should_kill_subnet {
         // Mark the checkpoint as a kill checkpoint
         msg.is_kill_checkpoint = true;
+        exhaust_unspent = true;
 
         // Calculation of total unspent and stake amounts, alongside with transfers and withdrawals to process
 
@@ -1135,23 +1176,8 @@ pub async fn gen_checkpoint_psbt(
             msg.subnet_id,
             msg.unstakes.len()
         );
-    } else
-    // update next_committee and process unstakes if the configuration number changed
-    if msg.next_committee_configuration_number > current_committee_configuration {
-        next_committee = data
-            .db
-            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
-            .map_err(|e| {
-                error!("Error getting stake change from Db: {}", e);
-                RpcError::DbError(e)
-            })?
-            .ok_or(RpcError::InvalidParams(format!(
-                "Stake change with configuration number {} not found.",
-                msg.next_committee_configuration_number
-            )))?
-            .committee_after_change;
-
-        // Get unconfirmed/unprocessed unstakes
+    } else if plan.rotation && subnet.is_activated() {
+        // The rotation checkpoint pays the multisig members that leave
         let unconfirmed_stake_changes = data
             .db
             .get_unconfirmed_stake_changes(msg.subnet_id)
@@ -1163,25 +1189,10 @@ pub async fn gen_checkpoint_psbt(
             rotation_unstakes(&unconfirmed_stake_changes, &subnet.committee, &ue_members);
 
         info!(
-            "Rotating committee to configuration number {} multisig address {}",
-            msg.next_committee_configuration_number,
-            next_committee.address_checked()
+            "Rotation checkpoint of epoch {} to multisig address {}",
+            subnet.epoch, plan.change_address
         );
         info!("Processing {} unstakes.", msg.unstakes.len());
-    }
-    // no change if the configuration number is zero or the same
-    else if msg.next_committee_configuration_number.is_zero()
-        || msg.next_committee_configuration_number == current_committee_configuration
-    {
-        trace!("gen_checkpoint_psbt: no change to the committee configuration")
-    }
-    // error if the configuration number is less than the current one, unexpected
-    else {
-        return Err(RpcError::InvalidParams(format!(
-            "Invalid next committee configuration number: {}",
-            msg.next_committee_configuration_number
-        ))
-        .into());
     }
 
     validate_erc_batch_data(
@@ -1194,7 +1205,13 @@ pub async fn gen_checkpoint_psbt(
     .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
 
     let unsigned_psbt = msg
-        .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
+        .build_checkpoint_psbt(
+            &plan.signer,
+            &plan.change_address,
+            exhaust_unspent,
+            fee_rate,
+            unspent,
+        )
         .map_err(|e| {
             error!(
                 "Error generating checkpoint psbt for subnet_id={}: {}",
@@ -1207,11 +1224,7 @@ pub async fn gen_checkpoint_psbt(
     let checkpoint_txid = unsigned_psbt.unsigned_tx.compute_txid();
 
     let batch_transfer_tx = msg
-        .make_reveal_batch_transfer_tx(
-            checkpoint_txid,
-            fee_rate,
-            &subnet.committee.address_checked(),
-        )
+        .make_reveal_batch_transfer_tx(checkpoint_txid, fee_rate, &plan.signer.address)
         .map_err(|e| {
             error!(
                 "Error generating batch transfer tx for subnet_id={}: {}",
@@ -1308,13 +1321,15 @@ pub async fn dev_gen_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    if !subnet.is_validator(&validator_xonly_pubkey) {
-        error!("Configured validator isn't a validator in the specified subnet.");
-        return Err(RpcError::InvalidParams(
-            "Configured validator isn't a validator in the specified subnet.".to_string(),
-        )
-        .into());
-    }
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(msg.subnet_id)
+        .map_err(RpcError::DbError)?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            msg.subnet_id
+        )))?;
+    check_checkpoint_signer(&genesis_info, &subnet, &validator_xonly_pubkey)?;
 
     if subnet.is_killed() {
         error!(
@@ -1333,37 +1348,20 @@ pub async fn dev_gen_checkpoint_psbt(
         RpcError::InvalidParams(e.to_string())
     })?;
 
-    let unspent = subnet
-        .committee
-        .get_unspent(&data.btc_watchonly_rpc)
-        .map_err(|e| RpcError::InternalError(e.to_string()))?;
-
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
-    // Look up the actual next committee when a rotation is requested,
-    // so the checkpoint exhausts the old committee's UTXOs and sends
-    // change to the new committee's multisig address.
-    let current_cfg = subnet.committee.configuration_number;
-    let next_committee = if msg.next_committee_configuration_number > current_cfg {
-        data.db
-            .get_stake_change(msg.subnet_id, msg.next_committee_configuration_number)
-            .map_err(|e| {
-                error!("Error getting stake change from Db: {}", e);
-                RpcError::DbError(e)
-            })?
-            .ok_or(RpcError::InvalidParams(format!(
-                "Stake change with configuration number {} not found.",
-                msg.next_committee_configuration_number
-            )))?
-            .committee_after_change
-    } else {
-        subnet.committee.clone()
-    };
+    let plan = plan_checkpoint(&data, &genesis_info, &subnet, &mut msg)?;
 
     // balance check intentionally omitted
 
     let unsigned_psbt = msg
-        .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)
+        .build_checkpoint_psbt(
+            &plan.signer,
+            &plan.change_address,
+            plan.sweep,
+            fee_rate,
+            &plan.unspent,
+        )
         .map_err(|e| {
             error!(
                 "Error generating checkpoint psbt for subnet_id={}: {}",
@@ -1375,11 +1373,7 @@ pub async fn dev_gen_checkpoint_psbt(
     let checkpoint_txid = unsigned_psbt.unsigned_tx.compute_txid();
 
     let batch_transfer_tx = msg
-        .make_reveal_batch_transfer_tx(
-            checkpoint_txid,
-            fee_rate,
-            &subnet.committee.address_checked(),
-        )
+        .make_reveal_batch_transfer_tx(checkpoint_txid, fee_rate, &plan.signer.address)
         .map_err(|e| {
             error!(
                 "Error generating batch transfer tx for subnet_id={}: {}",
@@ -1541,9 +1535,16 @@ pub async fn finalize_checkpoint_psbt(
             params.subnet_id
         )))?;
 
-    // Get committee info
-    let committee_keys = subnet.committee.validator_weighted_keys();
-    let committee_threshold = subnet.committee.threshold;
+    let genesis_info = data
+        .db
+        .get_subnet_genesis_info(params.subnet_id)
+        .map_err(RpcError::DbError)?
+        .ok_or(RpcError::InvalidParams(format!(
+            "Subnet {} not found.",
+            params.subnet_id
+        )))?;
+    let signer = signing_configuration(&genesis_info, &subnet)?;
+    let (committee_keys, committee_threshold) = (signer.keys, signer.threshold);
 
     let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {
         Some(hex) => {
@@ -1668,146 +1669,6 @@ pub async fn finalize_checkpoint_psbt(
         txid,
         tx_hex,
         batch_transfer_txid,
-    })
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct FinalizeBootstrapHandoverParams {
-    subnet_id: SubnetId,
-    unsigned_psbt_base64: String,
-    signatures: Vec<(
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    )>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct FinalizeBootstrapHandoverResponse {
-    tx: bitcoin::Transaction,
-    txid: String,
-    tx_hex: String,
-}
-
-pub async fn finalize_bootstrap_handover(
-    data: Data<Arc<ServerData>>,
-    Params(params): Params<FinalizeBootstrapHandoverParams>,
-) -> Result<FinalizeBootstrapHandoverResponse, JsonRpcError> {
-    info!(
-        "finalize_bootstrap_handover for subnet {}",
-        params.subnet_id
-    );
-
-    // Check genesis info
-    let genesis_info = data
-        .db
-        .get_subnet_genesis_info(params.subnet_id)
-        .map_err(|e| {
-            error!("Error getting subnet genesis info from Db: {}", e);
-            RpcError::DbError(e)
-        })?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            params.subnet_id
-        )))?;
-
-    // Get whitelist multisig info for signature verification
-    let whitelist_keys: Vec<multisig::WeightedKey> = genesis_info
-        .create_subnet_msg
-        .whitelist
-        .iter()
-        // Each key has the same weight
-        .map(|xpk| (*xpk, 1))
-        .collect::<Vec<_>>();
-    let whitelist_threshold: u32 = genesis_info.create_subnet_msg.min_validators.into();
-
-    // Decode base64 PSBT
-    let psbt_bytes = BASE64_STANDARD
-        .decode(params.unsigned_psbt_base64.as_bytes())
-        .map_err(|e| {
-            error!("Invalid base64 format for PSBT: {}", e);
-            RpcError::InvalidParams(format!("Invalid base64 format for PSBT: {}", e))
-        })?;
-
-    // Deserialize PSBT
-    let unsigned_psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|e| {
-        error!("Invalid PSBT format: {}", e);
-        RpcError::InvalidParams(format!("Invalid PSBT format: {}", e))
-    })?;
-
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-
-    // Create a map of provided signatures indexed by public key
-    let signatures_map: std::collections::HashMap<
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    > = params.signatures.into_iter().collect();
-
-    // Prepare signature sets in the same order as whitelist keys
-    let mut signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> =
-        Vec::with_capacity(whitelist_keys.len());
-
-    // Check if any unrecognized public keys were provided
-    for pubkey in signatures_map.keys() {
-        if !whitelist_keys
-            .iter()
-            .any(|(whitelist_key, _)| whitelist_key == pubkey)
-        {
-            error!("Unrecognized public key in signatures: {}", pubkey);
-            return Err(RpcError::InvalidParams(format!(
-                "Unrecognized public key in signatures: {}",
-                pubkey
-            ))
-            .into());
-        }
-    }
-
-    // For each whitelist key, get the corresponding signatures or use empty set
-    for (pubkey, _) in &whitelist_keys {
-        let sigs = match signatures_map.get(pubkey) {
-            Some(sigs) => sigs.as_slice(),
-            None => &[],
-        };
-        signature_sets.push(sigs);
-    }
-
-    // Finalize the PSBT using multisig::finalize_spend_psbt_from_sigs
-    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(
-        &secp,
-        &params.subnet_id,
-        &whitelist_keys,
-        whitelist_threshold,
-        &unsigned_psbt,
-        &signature_sets,
-    )
-    .map_err(|e| {
-        error!("Error finalizing bootstrap handover PSBT: {}", e);
-        RpcError::InternalError(e.to_string())
-    })?;
-
-    // Convert transaction to hex
-    let tx_hex = hex::encode(bitcoin::consensus::serialize(&finalized_tx));
-
-    // Get transaction ID
-    let txid = finalized_tx.compute_txid().to_string();
-
-    trace!("bootstrap_handover_txid = {}", txid);
-
-    // Send the transaction to the Bitcoin network
-    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![finalized_tx.clone()]).map_err(|e| {
-        error!(
-            "Error sending bootstrap handover transaction to Bitcoin network: {}",
-            e
-        );
-        RpcError::InternalError(format!(
-            "Error sending bootstrap handover transaction to Bitcoin network: {}",
-            e
-        ))
-    })?;
-
-    Ok(FinalizeBootstrapHandoverResponse {
-        tx: finalized_tx,
-        txid,
-        tx_hex,
     })
 }
 
@@ -2000,41 +1861,19 @@ pub async fn unstake_ue(
 
     let tip = data.btc_rpc.get_block_count().map_err(|e| internal(&e))?;
     check_ue_active(collateral::ue_activation_height(), tip).map_err(invalid)?;
-    let mut unspent = Vec::new();
-    let mut pending = 0;
-    for r in records {
-        let tx_out = |mempool| {
-            data.btc_rpc
-                .get_tx_out(&r.outpoint.txid, r.outpoint.vout, Some(mempool))
-                .map_err(|e| internal(&e))
-        };
-        if tx_out(true)?.is_some() {
-            unspent.push(r);
-        } else if tx_out(false)?.is_some() {
-            // Spent by a transaction still in the mempool: an exit waiting to be mined
-            pending += 1;
-        }
-    }
-    if unspent.is_empty() {
-        return Err(invalid(format!(
-            "Every join-ue collateral of validator {validator_xpk} in subnet {} is spent \
-             ({pending} by an exit still in the mempool)",
-            params.subnet_id
-        )));
-    }
     // The matured records paying the backup address of the latest matured one
-    let Some(latest) = unspent
+    let Some(latest) = records
         .iter()
         .filter(|r| u64::from(r.timeout) <= tip)
         .max_by_key(|r| r.timeout)
         .cloned()
     else {
-        let earliest = unspent.iter().map(|r| r.timeout).min().expect("non-empty");
+        let earliest = records.iter().map(|r| r.timeout).min().expect("non-empty");
         return Err(invalid(format!(
             "No matured join-ue collateral: the earliest matures at block {earliest}, the tip is {tip}"
         )));
     };
-    let matured = unspent
+    let matured = records
         .iter()
         .filter(|r| u64::from(r.timeout) <= tip && r.backup_address == latest.backup_address)
         .collect::<Vec<_>>();
@@ -2056,12 +1895,15 @@ pub async fn unstake_ue(
     let inputs = matured
         .iter()
         .take(MAX_EXIT_INPUTS)
-        .map(|r| collateral::UeExitInput {
-            outpoint: r.outpoint,
-            value: r.value,
-            timeout: r.timeout,
+        .map(|r| {
+            Ok(collateral::UeExitInput {
+                outpoint: r.outpoint,
+                value: r.value,
+                script: collateral::collateral_script_of(&*data.db, r)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, IpcLibError>>()
+        .map_err(|e| internal(&e))?;
     let amount = inputs.iter().map(|i| i.value).sum::<bitcoin::Amount>();
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let keypair = validator_sk.keypair(&secp);
@@ -2422,6 +2264,385 @@ pub async fn get_rewarded_collaterals(
     })
 }
 
+//
+// EOTS and slashing
+//
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubnetParams {
+    pub subnet_id: SubnetId,
+}
+
+/// A validator's EOTS key
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EotsKeyEntry {
+    pub pubkey: bitcoin::XOnlyPublicKey,
+    pub pk_eots: bitcoin::XOnlyPublicKey,
+}
+
+/// `geteotskeys`: the EOTS key of every validator that joined the subnet with a collateral
+/// output.
+pub async fn get_eots_keys(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<SubnetParams>,
+) -> Result<Vec<EotsKeyEntry>, JsonRpcError> {
+    let mut keys = data
+        .db
+        .get_ue_collaterals(params.subnet_id)
+        .map_err(RpcError::DbError)?
+        .into_iter()
+        .map(|r| EotsKeyEntry {
+            pubkey: r.pubkey,
+            pk_eots: r.pk_eots,
+        })
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|k| k.pubkey);
+    keys.dedup_by_key(|k| k.pubkey);
+    Ok(keys)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetEotsCommitmentsParams {
+    pub subnet_id: SubnetId,
+    pub pk_eots: bitcoin::XOnlyPublicKey,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EotsCommitmentEntry {
+    pub start: u64,
+    pub count: u32,
+    pub root: String,
+    /// The Bitcoin block that holds the transaction that carried it
+    pub block_height: u64,
+}
+
+/// `geteotscommitments`: every EOTS nonce commitment the monitor recorded for an EOTS key.
+pub async fn get_eots_commitments(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetEotsCommitmentsParams>,
+) -> Result<Vec<EotsCommitmentEntry>, JsonRpcError> {
+    Ok(data
+        .db
+        .get_eots_commitments(params.subnet_id, &params.pk_eots)
+        .map_err(RpcError::DbError)?
+        .into_iter()
+        .map(|r| EotsCommitmentEntry {
+            start: r.commitment.start,
+            count: r.commitment.count,
+            root: hex::encode(r.commitment.root),
+            block_height: r.block_height,
+        })
+        .collect())
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SignEotsVoteParams {
+    pub subnet_id: SubnetId,
+    pub height: u64,
+    /// The subnet block hash, hex
+    pub block_hash: String,
+}
+
+/// An EOTS vote with its proof, hex-encoded
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EotsVoteJson {
+    pub pk_eots: String,
+    pub height: u64,
+    pub block_hash: String,
+    pub signature: String,
+    pub start: u64,
+    pub proof: Vec<String>,
+}
+
+impl From<&eots::EotsVote> for EotsVoteJson {
+    fn from(vote: &eots::EotsVote) -> Self {
+        Self {
+            pk_eots: hex::encode(vote.pk_eots),
+            height: vote.height,
+            block_hash: hex::encode(vote.block_hash),
+            signature: hex::encode(eots::signature_to_bytes(&vote.signature)),
+            start: vote.start,
+            proof: vote.proof.iter().map(hex::encode).collect(),
+        }
+    }
+}
+
+fn hex32(what: &str, value: &str) -> Result<[u8; 32], JsonRpcError> {
+    hex::decode(value)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| RpcError::InvalidParams(format!("{what} must be 32 bytes in hex")).into())
+}
+
+/// Refuses a new EOTS vote at a height the latest checkpoint has made final already, and
+/// every vote after the kill checkpoint.
+fn refuse_checkpointed_height(
+    latest: Option<&db::SubnetCheckpoint>,
+    height: u64,
+) -> Result<(), String> {
+    match latest {
+        Some(checkpoint) if checkpoint.is_kill_checkpoint => Err(format!(
+            "the kill checkpoint at subnet height {} ends finality",
+            checkpoint.checkpoint_height
+        )),
+        Some(checkpoint) if height <= checkpoint.checkpoint_height => Err(format!(
+            "height {height} is at or below the latest checkpointed height {}",
+            checkpoint.checkpoint_height
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The latest checkpoint the monitor recorded for a subnet, `None` before the first one.
+fn latest_checkpoint<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+) -> Result<Option<db::SubnetCheckpoint>, db::DbError> {
+    match db
+        .get_subnet_state(subnet_id)?
+        .and_then(|s| s.last_checkpoint_number)
+    {
+        Some(number) => db.get_checkpoint(subnet_id, number),
+        None => Ok(None),
+    }
+}
+
+/// `signeotsvote`: this validator's EOTS vote for a subnet block, signed with the nonce it
+/// committed for that height, or the vote it already signed there. A second block at a signed
+/// height is refused, and so is a new vote at or below the latest checkpointed height or
+/// after the kill checkpoint.
+pub async fn sign_eots_vote(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<SignEotsVoteParams>,
+) -> Result<EotsVoteJson, JsonRpcError> {
+    let Some(signer) = &data.eots_signer else {
+        return Err(RpcError::InternalError("No EOTS key configured (EOTS_SK_PATH).".to_string()).into());
+    };
+    let block_hash = hex32("block_hash", &params.block_hash)?;
+    let mut signer = signer.lock().expect("EOTS signer lock");
+    let already_signed = signer
+        .signed(params.subnet_id, params.height)
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
+    if already_signed.is_none() {
+        let latest = latest_checkpoint(&*data.db, params.subnet_id).map_err(RpcError::DbError)?;
+        refuse_checkpointed_height(latest.as_ref(), params.height).map_err(|e| {
+            error!("signeotsvote refused at height {}: {e}", params.height);
+            JsonRpcError::from(RpcError::InvalidParams(e))
+        })?;
+    }
+    let commitments = data
+        .db
+        .get_eots_commitments(params.subnet_id, &signer.pk_eots())
+        .map_err(RpcError::DbError)?
+        .into_iter()
+        .map(|r| r.commitment)
+        .collect::<Vec<_>>();
+    let vote = signer
+        .sign(params.subnet_id, &commitments, params.height, &block_hash)
+        .map_err(|e| {
+            error!("signeotsvote refused at height {}: {e}", params.height);
+            JsonRpcError::from(RpcError::InvalidParams(e.to_string()))
+        })?;
+    Ok(EotsVoteJson::from(&vote))
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SignSlashParams {
+    pub subnet_id: SubnetId,
+    pub txid: bitcoin::Txid,
+    pub vout: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SignSlashResponse {
+    /// This validator's index in the configuration the output names
+    pub index: u16,
+    /// The pre-signature, hex
+    pub signature: String,
+}
+
+/// `signslash`: this validator's pre-signature of the slash transaction of a collateral
+/// output, as a member of the configuration the output's script names.
+pub async fn sign_slash(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<SignSlashParams>,
+) -> Result<SignSlashResponse, JsonRpcError> {
+    let Some((_, validator_sk)) = data.validator else {
+        return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
+    };
+    let outpoint = bitcoin::OutPoint::new(params.txid, params.vout);
+    let record = data
+        .db
+        .get_ue_collaterals(params.subnet_id)
+        .map_err(RpcError::DbError)?
+        .into_iter()
+        .find(|r| r.outpoint == outpoint)
+        .ok_or_else(|| {
+            RpcError::InvalidParams(format!(
+                "{outpoint} is not a collateral of subnet {}",
+                params.subnet_id
+            ))
+        })?;
+    let script = collateral::collateral_script_of(&*data.db, &record)
+        .map_err(|e| RpcError::InternalError(e.to_string()))?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (index, signature) = crate::slash::sign_slash(
+        &secp,
+        &script,
+        outpoint,
+        record.value,
+        &validator_sk.keypair(&secp),
+    )
+    .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    Ok(SignSlashResponse {
+        index,
+        signature: hex::encode(eots::signature_to_bytes(&signature)),
+    })
+}
+
+/// A collateral output that is not slashable yet, with the configuration its script names.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UnslashableOutput {
+    pub txid: bitcoin::Txid,
+    pub vout: u32,
+    pub pubkey: bitcoin::XOnlyPublicKey,
+    /// The join (reveal) transaction of the collateral
+    pub join_txid: bitcoin::Txid,
+    /// The Bitcoin block of the join
+    pub block_height: u64,
+    pub committee_number: u64,
+    pub threshold: multisig::Power,
+    /// The keys of the named configuration in ascending order, with their powers
+    pub keys: Vec<(bitcoin::XOnlyPublicKey, multisig::Power)>,
+    /// Whether this provider's validator key is one of them
+    pub signer: bool,
+}
+
+/// `getunslashableoutputs`: the unspent collateral outputs of a subnet that the monitor has
+/// not recorded as slashable, oldest first.
+pub async fn get_unslashable_outputs(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<SubnetParams>,
+) -> Result<Vec<UnslashableOutput>, JsonRpcError> {
+    let validator = data.validator.map(|(k, _)| k);
+    let mut outputs = Vec::new();
+    let mut records = data
+        .db
+        .get_ue_collaterals(params.subnet_id)
+        .map_err(RpcError::DbError)?;
+    records.sort_by_key(|r| (r.timeout, r.outpoint));
+    for record in records {
+        if record.spent
+            || data
+                .db
+                .get_slash_presigs(params.subnet_id, &record.outpoint)
+                .map_err(RpcError::DbError)?
+                .is_some()
+        {
+            continue;
+        }
+        let block_height =
+            collateral::join_block_height(&*data.db, &record).map_err(RpcError::DbError)?;
+        let configuration = collateral::configuration_by_number(
+            &*data.db,
+            params.subnet_id,
+            record.committee_number,
+        )
+        .map_err(|e| RpcError::InternalError(e.to_string()))?
+        .ok_or_else(|| {
+            RpcError::InternalError(format!("No committee {}", record.committee_number))
+        })?;
+        let keys = configuration.sorted_keys();
+        outputs.push(UnslashableOutput {
+            txid: record.outpoint.txid,
+            vout: record.outpoint.vout,
+            pubkey: record.pubkey,
+            join_txid: record.join_txid,
+            block_height,
+            committee_number: record.committee_number,
+            threshold: configuration.threshold,
+            signer: validator.is_some_and(|v| keys.iter().any(|(k, _)| *k == v)),
+            keys,
+        });
+    }
+    outputs.sort_by_key(|o| (o.block_height, o.txid, o.vout));
+    Ok(outputs)
+}
+
+/// The slash pre-signature entries a checkpoint carries, from the ones posted on the subnet:
+/// invalid signatures are dropped, and an entry is kept only when the valid ones reach the
+/// threshold of the named configuration and the output is not slashable yet. Oldest output
+/// first; the batch transfer data orders them by outpoint.
+pub(crate) fn carried_slash_entries<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    posted: &[crate::slash::SlashSignatureEntry],
+) -> Vec<crate::slash::SlashSignatureEntry> {
+    let mut entries = Vec::new();
+    for entry in posted {
+        let checked = match ipc_lib::check_slash_entry(db, subnet_id, entry) {
+            Ok(checked) => checked,
+            Err(e) => {
+                warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());
+                continue;
+            }
+        };
+        if !checked.invalid.is_empty() {
+            warn!(
+                "Slash pre-signatures of {} with invalid signatures {:?} left out",
+                entry.outpoint(),
+                checked.invalid
+            );
+        }
+        if checked.slashable || !checked.reaches_threshold() {
+            continue;
+        }
+        let join_height = match collateral::join_block_height(db, &checked.record) {
+            Ok(height) => height,
+            Err(e) => {
+                warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());
+                continue;
+            }
+        };
+        entries.push((
+            join_height,
+            crate::slash::SlashSignatureEntry::new(entry.outpoint(), checked.valid),
+        ));
+    }
+    entries.sort_by_key(|(height, e)| (*height, e.txid, e.vout));
+    entries.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Keeps the first `slash_pre_signature_count` entries of the checkpoint's slash pre-signature
+/// list, those the subnet held at the end of the checkpoint height, so that every validator
+/// builds the same reveal; all of them when the count is absent.
+fn counted_slash_entries(msg: &mut IpcCheckpointSubnetMsg) {
+    if let Some(count) = msg.slash_pre_signature_count {
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        msg.slash_signatures.truncate(count);
+    }
+}
+
+/// Keeps the longest prefix of the checkpoint's slash pre-signature entries whose batch
+/// transfer reveal is a standard transaction. The weight grows with the prefix, so a binary
+/// search finds it.
+fn fit_slash_entries(msg: &mut IpcCheckpointSubnetMsg) -> Result<(), IpcLibError> {
+    let max = bitcoin::Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT));
+    let entries = std::mem::take(&mut msg.slash_signatures);
+    let (mut fits, mut high) = (0, entries.len());
+    while fits < high {
+        let mid = (fits + high).div_ceil(2);
+        msg.slash_signatures = entries[..mid].to_vec();
+        if msg.batch_transfer_reveal_weight()? <= max {
+            fits = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    msg.slash_signatures = entries[..fits].to_vec();
+    Ok(())
+}
+
 pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
     let server = jsonrpc_v2::Server::new()
         .with_data(Data::new(server_data))
@@ -2444,8 +2665,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("gettokenbalance", get_token_balance)
         // multisig
         .with_method("genmultisigspendpsbt", gen_multisig_spend_psbt)
-        .with_method("genbootstraphandover", gen_bootstrap_handover)
-        .with_method("finalizebootstraphandover", finalize_bootstrap_handover)
         // checkpoints
         .with_method("gencheckpointpsbt", gen_checkpoint_psbt)
         .with_method("finalizecheckpointpsbt", finalize_checkpoint_psbt)
@@ -2454,6 +2673,11 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("stakecollateral", stake_collateral)
         .with_method("unstakecollateral", unstake_collateral)
         .with_method("unstakeue", unstake_ue)
+        .with_method("geteotskeys", get_eots_keys)
+        .with_method("geteotscommitments", get_eots_commitments)
+        .with_method("signeotsvote", sign_eots_vote)
+        .with_method("signslash", sign_slash)
+        .with_method("getunslashableoutputs", get_unslashable_outputs)
         .with_method("getstakechanges", get_stake_changes)
         // kill requests
         .with_method("getkillrequests", get_kill_requests);
@@ -2474,6 +2698,283 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
 #[cfg(test)]
 mod ue_tests {
     use super::*;
+
+    #[test]
+    fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
+        use crate::test_utils::{create_rand_txid, create_test_db, generate_subnet};
+        let db = create_test_db();
+        let mut subnet = generate_subnet(3);
+        subnet.last_checkpoint_number = Some(1);
+        let subnet_id = subnet.id;
+        let checkpoint = |number: u64, block_height: u64| db::SubnetCheckpoint {
+            checkpoint_number: number,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::all_zeros(),
+            checkpoint_height: 10 * (number + 1),
+            block_height,
+            txid: create_rand_txid(),
+            batch_transfer_txid: None,
+            batch_transfer_block_height: None,
+            signed_committee_number: 0,
+            next_committee_number: 0,
+            next_configuration_number: 0,
+            is_kill_checkpoint: false,
+            epoch: 1,
+            is_rotation_checkpoint: false,
+        };
+        let mut wtxn = db.write_txn().unwrap();
+        db.save_subnet_state(&mut wtxn, subnet_id, &subnet).unwrap();
+        db.save_checkpoint(&mut wtxn, subnet_id, &checkpoint(0, 100), 0)
+            .unwrap();
+        db.save_checkpoint(&mut wtxn, subnet_id, &checkpoint(1, 120), 1)
+            .unwrap();
+        wtxn.commit().unwrap();
+        db.set_last_processed_block(125).unwrap();
+
+        let at = |height: Option<u64>| latest_checkpoint_at(&db, subnet_id, None, height);
+        // Processed heights answer by the height alone
+        assert_eq!(at(Some(110)).unwrap().unwrap().checkpoint_number, 0);
+        assert_eq!(at(Some(120)).unwrap().unwrap().checkpoint_number, 1);
+        assert_eq!(at(Some(125)).unwrap().unwrap().checkpoint_number, 1);
+        assert!(at(Some(99)).unwrap().is_none());
+        assert_eq!(at(None).unwrap().unwrap().checkpoint_number, 1);
+        // A height the monitor has not processed is refused, not answered with checkpoint 1
+        assert!(matches!(
+            at(Some(126)),
+            Err(RpcError::MonitorBehind {
+                requested: 126,
+                processed: 125
+            })
+        ));
+        // Once the monitor is there, the same question has an answer
+        db.set_last_processed_block(126).unwrap();
+        assert_eq!(at(Some(126)).unwrap().unwrap().checkpoint_number, 1);
+        // Without a Bitcoin height the monitor's lag does not matter
+        db.set_last_processed_block(0).unwrap();
+        assert_eq!(at(None).unwrap().unwrap().checkpoint_number, 1);
+        assert_eq!(
+            latest_checkpoint_at(&db, subnet_id, Some(0), None)
+                .unwrap()
+                .unwrap()
+                .checkpoint_number,
+            0
+        );
+    }
+
+    #[test]
+    fn carried_entries_keep_complete_valid_ones_only() {
+        use crate::collateral::{self, CollateralScript};
+        use crate::slash::{sign_slash, SlashSignatureEntry};
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let db = create_test_db();
+        let subnet_id = generate_subnet_id();
+        let keys = (1u8..9)
+            .map(|seed| bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap())
+            .collect::<Vec<_>>();
+        let pks = keys
+            .iter()
+            .map(|k| k.x_only_public_key(&secp).0)
+            .collect::<Vec<_>>();
+        // A subnet created with a whitelist of three keys, min 2: committee 0 has threshold 2
+        let genesis = db::SubnetGenesisInfo {
+            subnet_id,
+            create_subnet_msg: IpcCreateSubnetMsg {
+                min_validator_stake: bitcoin::Amount::from_sat(10_000),
+                power_unit_exponent: 4,
+                min_validators: 2,
+                bottomup_check_period: 10,
+                active_validators_limit: 10,
+                min_cross_msg_fee: bitcoin::Amount::from_sat(1),
+                whitelist: vec![pks[0], pks[1], pks[2]],
+                epoch_length: 10,
+                min_timeout: 1,
+                max_timeout: 1000,
+                min_deposit: bitcoin::Amount::from_sat(330),
+                kill_vote_period: 36,
+                kill_delay_period: 5,
+            },
+            create_msg_block_height: 1,
+            bootstrapped: false,
+            genesis_block_height: None,
+            genesis_validators: vec![],
+            genesis_balance_entries: vec![],
+        };
+        let record = UeCollateral {
+            subnet_id,
+            pubkey: pks[3],
+            outpoint: bitcoin::OutPoint::new(create_rand_txid(), 1),
+            value: bitcoin::Amount::from_sat(1_000_000),
+            timeout: 1_000,
+            pk_eots: pks[0],
+            committee_number: 0,
+            ip: "127.0.0.1:8080".parse().unwrap(),
+            backup_address: crate::test_utils::create_rand_addr().into_unchecked(),
+            join_txid: create_rand_txid(),
+            spent: false,
+        };
+        let mut wtxn = db.write_txn().unwrap();
+        db.save_subnet_genesis_info(&mut wtxn, subnet_id, &genesis).unwrap();
+        db.add_ue_collateral(&mut wtxn, &record).unwrap();
+        wtxn.commit().unwrap();
+        let script: CollateralScript = collateral::collateral_script_of(&db, &record).unwrap();
+        let sign = |k: &bitcoin::secp256k1::SecretKey| {
+            sign_slash(&secp, &script, record.outpoint, record.value, &k.keypair(&secp)).unwrap()
+        };
+        let (s0, s1) = (sign(&keys[0]), sign(&keys[1]));
+        let mut bad = sign(&keys[2]);
+        bad.1[1][0] ^= 1;
+        // Two valid of three: carried with the valid ones only; one valid: left out
+        let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1, bad])];
+        let carried = carried_slash_entries(&db, subnet_id, &posted);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].signatures, vec![s0, s1]);
+        let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, bad])];
+        assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
+        // An unknown output is left out; a slashable one too
+        let mut unknown = SlashSignatureEntry::new(record.outpoint, vec![s0, s1]);
+        unknown.vout = 3;
+        assert!(carried_slash_entries(&db, subnet_id, &[unknown]).is_empty());
+        let mut wtxn = db.write_txn().unwrap();
+        db.add_slash_presigs(
+            &mut wtxn,
+            &db::SlashPresigRecord {
+                subnet_id,
+                outpoint: record.outpoint,
+                signatures: vec![s0, s1],
+                block_height: 5,
+                batch_transfer_txid: create_rand_txid(),
+            },
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1])];
+        assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
+
+        // A second collateral whose join is in an earlier block comes first, whatever its outpoint
+        let older = UeCollateral {
+            pubkey: pks[4],
+            outpoint: bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([0xff; 32]), 1),
+            pk_eots: pks[5],
+            join_txid: create_rand_txid(),
+            ..record.clone()
+        };
+        let newer = UeCollateral {
+            pubkey: pks[6],
+            outpoint: bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([0x00; 32]), 1),
+            pk_eots: pks[7],
+            join_txid: create_rand_txid(),
+            ..record.clone()
+        };
+        let mut wtxn = db.write_txn().unwrap();
+        for (collateral, block_height) in [(&older, 10), (&newer, 20)] {
+            db.add_ue_collateral(&mut wtxn, collateral).unwrap();
+            db.add_eots_commitment(
+                &mut wtxn,
+                &db::EotsCommitmentRecord {
+                    subnet_id,
+                    pk_eots: collateral.pk_eots,
+                    commitment: crate::eots::EotsNonceCommitment {
+                        start: 1,
+                        count: 1,
+                        root: [0; 32],
+                    },
+                    block_height,
+                    txid: collateral.join_txid,
+                },
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+        let entry_of = |collateral: &UeCollateral| {
+            let script = collateral::collateral_script_of(&db, collateral).unwrap();
+            let signatures = keys[..2]
+                .iter()
+                .map(|k| {
+                    sign_slash(
+                        &secp,
+                        &script,
+                        collateral.outpoint,
+                        collateral.value,
+                        &k.keypair(&secp),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            SlashSignatureEntry::new(collateral.outpoint, signatures)
+        };
+        let posted = vec![entry_of(&newer), entry_of(&older)];
+        let carried = carried_slash_entries(&db, subnet_id, &posted);
+        assert_eq!(
+            carried.iter().map(|e| e.outpoint()).collect::<Vec<_>>(),
+            vec![older.outpoint, newer.outpoint]
+        );
+    }
+
+    /// Synthetic entries of 350 signatures each, about 23 kB: 17 fit a standard reveal
+    #[test]
+    fn checkpoint_carries_the_longest_prefix_of_entries_that_fits() {
+        let entry = |i: u8| crate::slash::SlashSignatureEntry {
+            txid: [i; 32],
+            vout: 1,
+            signatures: (0..350u16)
+                .map(|index| (index, [[index as u8; 32]; 2]))
+                .collect(),
+        };
+        let mut msg = IpcCheckpointSubnetMsg {
+            subnet_id: generate_subnet_id(),
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::from_byte_array([0; 32]),
+            checkpoint_height: 1,
+            next_committee_configuration_number: 0,
+            withdrawals: vec![],
+            transfers: vec![],
+            token_registrations: vec![],
+            token_supply_adjustments: vec![],
+            token_transfers: vec![],
+            slash_signatures: (0..20).map(entry).collect(),
+            unstakes: vec![],
+            change_address: None,
+            is_kill_checkpoint: false,
+            slash_pre_signature_count: None,
+            is_rotation_checkpoint: false,
+        };
+        let max = bitcoin::Weight::from_wu(u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT));
+        assert!(msg.batch_transfer_reveal_weight().unwrap() > max);
+        fit_slash_entries(&mut msg).unwrap();
+        assert_eq!(msg.slash_signatures.len(), 17);
+        assert_eq!(msg.slash_signatures, (0..17).map(entry).collect::<Vec<_>>());
+        assert!(msg.batch_transfer_reveal_weight().unwrap() <= max);
+        msg.slash_signatures.push(entry(17));
+        assert!(msg.batch_transfer_reveal_weight().unwrap() > max);
+        // Entries that fit are all kept
+        msg.slash_signatures = (0..5).map(entry).collect();
+        fit_slash_entries(&mut msg).unwrap();
+        assert_eq!(msg.slash_signatures.len(), 5);
+    }
+
+    #[test]
+    fn eots_votes_are_refused_at_checkpointed_heights_and_after_the_kill_checkpoint() {
+        let checkpoint = |height: u64, kill: bool| db::SubnetCheckpoint {
+            checkpoint_number: 3,
+            checkpoint_hash: bitcoin::hashes::sha256::Hash::from_byte_array([0; 32]),
+            checkpoint_height: height,
+            block_height: 100,
+            txid: create_rand_txid(),
+            batch_transfer_txid: None,
+            batch_transfer_block_height: None,
+            signed_committee_number: 1,
+            next_committee_number: 1,
+            next_configuration_number: 0,
+            is_kill_checkpoint: kill,
+            epoch: 1,
+            is_rotation_checkpoint: false,
+        };
+        assert!(refuse_checkpointed_height(None, 1).is_ok());
+        let latest = checkpoint(50, false);
+        assert!(refuse_checkpointed_height(Some(&latest), 50).is_err());
+        assert!(refuse_checkpointed_height(Some(&latest), 10).is_err());
+        assert!(refuse_checkpointed_height(Some(&latest), 51).is_ok());
+        let kill = checkpoint(50, true);
+        assert!(refuse_checkpointed_height(Some(&kill), 51).is_err());
+    }
     use crate::db::{SubnetValidator, SubnetValidators, UeCollateral};
     use crate::test_utils::{
         create_rand_eth_addr, create_rand_txid, create_test_db, generate_subnet_id,
@@ -2516,9 +3017,12 @@ mod ue_tests {
             outpoint: bitcoin::OutPoint::new(create_rand_txid(), 1),
             value: bitcoin::Amount::from_sat(1_000_000),
             timeout: 1_000,
+            pk_eots: generate_xonly_pubkeys(1)[0],
+            committee_number: 0,
+            ip: "127.0.0.1:8080".parse().unwrap(),
             backup_address: members[0].backup_address.clone(),
             join_txid: shared_txid,
-            removed: false,
+            spent: false,
         };
         let mut txn = db.write_txn().unwrap();
         db.add_ue_collateral(&mut txn, &record).unwrap();
@@ -2600,9 +3104,9 @@ mod ue_tests {
         check_ue_active(Some(500), 501).unwrap();
     }
 
-    /// `lock_blocks` is optional in the request and absent in the join message.
+    /// `epochs` is optional in the request and absent in the join message.
     #[test]
-    fn join_request_lock_blocks_is_optional() {
+    fn join_request_epochs_is_optional() {
         let json = serde_json::json!({
             "subnet_id": generate_subnet_id(),
             "collateral": 100_000,
@@ -2611,12 +3115,100 @@ mod ue_tests {
             "pubkey": generate_xonly_pubkeys(1)[0],
         });
         let req: JoinSubnetRequest = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(req.lock_blocks, None);
-        let mut with_lock = json;
-        with_lock["lock_blocks"] = serde_json::json!(20);
-        let req: JoinSubnetRequest = serde_json::from_value(with_lock).unwrap();
-        assert_eq!(req.lock_blocks, Some(20));
+        assert_eq!(req.epochs, None);
+        let mut with_epochs = json;
+        with_epochs["epochs"] = serde_json::json!(20);
+        let req: JoinSubnetRequest = serde_json::from_value(with_epochs).unwrap();
+        assert_eq!(req.epochs, Some(20));
         let msg: IpcJoinSubnetMsg = req.into();
         assert_eq!(msg.collateral.to_sat(), 100_000);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_plan_tests {
+    use super::*;
+    use crate::test_utils::{generate_subnet, generate_xonly_pubkeys};
+
+    /// The genesis information of `subnet_id`, created with `whitelist`, min 2
+    fn genesis(
+        subnet_id: SubnetId,
+        whitelist: Vec<bitcoin::XOnlyPublicKey>,
+    ) -> db::SubnetGenesisInfo {
+        db::SubnetGenesisInfo {
+            subnet_id,
+            create_subnet_msg: IpcCreateSubnetMsg {
+                min_validator_stake: bitcoin::Amount::from_sat(10_000),
+                power_unit_exponent: 4,
+                min_validators: 2,
+                bottomup_check_period: 10,
+                active_validators_limit: 10,
+                min_cross_msg_fee: bitcoin::Amount::from_sat(1),
+                whitelist,
+                epoch_length: 10,
+                min_timeout: 1,
+                max_timeout: 1000,
+                min_deposit: bitcoin::Amount::from_sat(330),
+                kill_vote_period: 36,
+                kill_delay_period: 5,
+            },
+            create_msg_block_height: 1,
+            bootstrapped: true,
+            genesis_block_height: Some(1),
+            genesis_validators: vec![],
+            genesis_balance_entries: vec![],
+        }
+    }
+
+    fn plan(genesis: &db::SubnetGenesisInfo, subnet: &db::SubnetState) -> CheckpointPlan {
+        CheckpointPlan::of_state(genesis, subnet).unwrap_or_else(|_| panic!("no checkpoint plan"))
+    }
+
+    #[test]
+    fn an_unchanged_epoch_gets_a_rotation_checkpoint_that_sweeps_nothing() {
+        let mut subnet = generate_subnet(3);
+        let genesis = genesis(subnet.id, generate_xonly_pubkeys(3));
+        // Epoch 2 with `C_2` = `C_1`, after the rotation checkpoint of epoch 1
+        subnet.epoch = 2;
+        subnet.last_rotation_epoch = 1;
+        subnet.waiting_committee = None;
+        let rotation = plan(&genesis, &subnet);
+        assert!(rotation.rotation);
+        assert!(!rotation.sweep);
+        assert_eq!(rotation.signer.address, subnet.committee.address_checked());
+        assert_eq!(rotation.change_address, rotation.signer.address);
+
+        // After it, the checkpoints of the epoch are regular
+        subnet.last_rotation_epoch = 2;
+        let regular = plan(&genesis, &subnet);
+        assert!(!regular.rotation);
+        assert!(!regular.sweep);
+    }
+
+    #[test]
+    fn epoch_1_with_c_1_equal_to_c_gen_sweeps_the_whitelist_multisig() {
+        let mut subnet = generate_subnet(2);
+        let mut whitelist: Vec<_> = subnet
+            .committee
+            .validators
+            .iter()
+            .map(|v| v.pubkey)
+            .collect();
+        whitelist.extend(generate_xonly_pubkeys(1));
+        let genesis = genesis(subnet.id, whitelist);
+        // Epoch 1 with `C_1` = `C_gen`, before its rotation checkpoint: `C_wlist` holds the funds
+        subnet.epoch = 1;
+        subnet.last_rotation_epoch = 0;
+        subnet.waiting_committee = None;
+        let wlist = ipc_lib::CheckpointSigner::of_configuration(
+            &subnet.id,
+            &genesis.whitelist_configuration(),
+        )
+        .unwrap();
+        let rotation = plan(&genesis, &subnet);
+        assert!(rotation.rotation);
+        assert!(rotation.sweep);
+        assert_eq!(rotation.signer.address, wlist.address);
+        assert_eq!(rotation.change_address, subnet.committee.address_checked());
     }
 }

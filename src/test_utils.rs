@@ -64,6 +64,8 @@ pub fn generate_keypairs(n: usize) -> Vec<Keypair> {
 }
 
 pub fn generate_subnet_id() -> SubnetId {
+    // Ensure FVM address network is set for SubnetId serde roundtrips.
+    crate::eth_utils::set_fvm_network();
     SubnetId::from_txid(&Txid::from_slice(&rand::random::<[u8; 32]>()).unwrap())
 }
 
@@ -103,7 +105,7 @@ pub fn generate_subnet(n_val: usize) -> db::SubnetState {
                 bitcoin::Address::from_str("bcrt1qvr3jycfxtrkk8u6hp5caxc25tueek5f90mpnsv").unwrap();
 
             let collateral = Amount::from_sat(100000);
-            let power = collateral_to_power(&collateral, &Amount::from_sat(10000))
+            let power = collateral_to_power(&collateral, &Amount::from_sat(10000), &Amount::from_sat(10_000))
                 .expect("expect good collateral");
 
             db::SubnetValidator {
@@ -147,6 +149,11 @@ pub fn generate_subnet(n_val: usize) -> db::SubnetState {
         last_checkpoint_number: None,
         killed: db::SubnetKillState::NotKilled,
         marked_for_kill_checkpoint_number: None,
+        // Activated at genesis, with its committee as the configuration of epoch 1
+        epoch: 1,
+        h_0: Some(0),
+        last_rotation_epoch: 1,
+        pending_multisig_changes: Vec::new(),
     }
 }
 

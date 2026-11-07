@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bitcoin_ipc::db::HeedDb;
+use bitcoin_ipc::db::{DatabaseCore, HeedDb};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, provider};
 use clap::Parser;
 use log::{error, info, warn};
@@ -61,12 +61,36 @@ async fn main() -> std::io::Result<()> {
     let btc_rpc = Arc::new(bitcoin_utils::make_rpc_client_from_env());
     let btc_watchonly_rpc = Arc::new(bitcoin_utils::make_watchonly_rpc_client_from_env());
 
-    // Load validator secret key
-    let validator = load_validator()?;
-
-    // Set correct fvm network
+    // Set correct fvm network, before anything parses a subnet id (the EOTS sign record holds them)
 
     eth_utils::set_fvm_network();
+
+    // Load validator secret key
+    let validator = load_validator()?;
+    let eots = match load_secret_key("EOTS_SK_PATH", "EOTS")? {
+        Some(sk) => {
+            let Some(seed) = load_hex32("EOTS_SEED_PATH", "EOTS nonce seed")? else {
+                error!("EOTS_SEED_PATH is empty: an EOTS key needs the seed of its nonces");
+                return Err(std::io::Error::other("EOTS_SEED_PATH is empty"));
+            };
+            Some((sk, bitcoin_ipc::eots::EotsSeed::from_bytes(seed)))
+        }
+        None => None,
+    };
+    let eots_signer = match eots {
+        Some((sk, seed)) => {
+            let signer = provider::eots_signer::EotsSigner::load(
+                sk,
+                seed,
+                &PathBuf::from(std::env::var("EOTS_SK_PATH").expect("set above")),
+            )
+            .map_err(|e| std::io::Error::other(format!("EOTS sign record: {e}")))?;
+            let signer = Arc::new(std::sync::Mutex::new(signer));
+            build_nonce_trees(db.clone(), signer.clone());
+            Some(signer)
+        }
+        None => None,
+    };
 
     // Start up the actix-web server
 
@@ -77,6 +101,8 @@ async fn main() -> std::io::Result<()> {
         btc_rpc,
         btc_watchonly_rpc,
         validator,
+        eots,
+        eots_signer,
     });
 
     provider::Server::new(token, port, server_data)
@@ -84,50 +110,109 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
+/// Builds, in the background, the nonce tree of every commitment of the signer's key that the
+/// monitor has recorded, so that the first vote after a start does not wait for it. A vote at a
+/// commitment whose tree is not built yet builds it itself.
+fn build_nonce_trees(
+    db: Arc<HeedDb>,
+    signer: Arc<std::sync::Mutex<provider::eots_signer::EotsSigner>>,
+) {
+    std::thread::spawn(move || {
+        let (pk_eots, seed) = {
+            let signer = signer.lock().expect("EOTS signer lock");
+            (signer.pk_eots(), signer.seed())
+        };
+        let records = match db.get_eots_commitments_of_key(&pk_eots) {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("EOTS nonce trees not built: {e}");
+                return;
+            }
+        };
+        for record in records {
+            if signer
+                .lock()
+                .expect("EOTS signer lock")
+                .has_tree(record.subnet_id, &record.commitment)
+            {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let tree = bitcoin_ipc::eots::nonce_tree(&seed, &record.subnet_id, &record.commitment);
+            signer.lock().expect("EOTS signer lock").insert_tree(
+                record.subnet_id,
+                record.commitment.start,
+                tree,
+            );
+            info!(
+                "EOTS nonce tree of subnet {} heights {}..{} built in {:.1} s",
+                record.subnet_id,
+                record.commitment.start,
+                record.commitment.end(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+    });
+}
+
 fn load_validator(
 ) -> Result<Option<(bitcoin::XOnlyPublicKey, bitcoin::secp256k1::SecretKey)>, std::io::Error> {
-    // Load validator secret key from path
-    let sk_path = match std::env::var("VALIDATOR_SK_PATH") {
-        Ok(path) if !path.is_empty() => path,
+    let Some(validator_sk) = load_secret_key("VALIDATOR_SK_PATH", "validator")? else {
+        warn!("VALIDATOR_SK_PATH is empty, you won't be able to sign transactions!");
+        return Ok(None);
+    };
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (validator_pk, _) = validator_sk.x_only_public_key(&secp);
+    info!("Validator PK: {}", validator_pk);
+    Ok(Some((validator_pk, validator_sk)))
+}
+
+/// The secp256k1 secret key in the hex file named by the environment variable `var`, `None`
+/// when the variable is unset or empty.
+fn load_secret_key(
+    var: &str,
+    what: &str,
+) -> Result<Option<bitcoin::secp256k1::SecretKey>, std::io::Error> {
+    let Some(sk_bytes) = load_hex32(var, &format!("{what} secret key"))? else {
+        return Ok(None);
+    };
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes).map_err(|e| {
+        error!("Invalid {what} secret key: {}", e);
+        std::io::Error::other(format!("Invalid {what} secret key: {}", e))
+    })?;
+    Ok(Some(sk))
+}
+
+/// The 32 bytes in the hex file named by the environment variable `var`, `None` when the
+/// variable is unset or empty.
+fn load_hex32(var: &str, what: &str) -> Result<Option<[u8; 32]>, std::io::Error> {
+    let path = match std::env::var(var) {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
         _ => {
-            warn!("VALIDATOR_SK_PATH is empty, you won't be able to sign transactions!");
+            warn!("{var} is empty: no {what} loaded");
             return Ok(None);
         }
     };
-    let sk_path = PathBuf::from(sk_path);
-
-    let sk_hex = std::fs::read_to_string(&sk_path).map_err(|e| {
-        error!(
-            "Couldn't read validator secret key from {}: {}",
-            sk_path.display(),
-            e
-        );
-        std::io::Error::other(format!("Couldn't read validator secret key: {}", e))
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        error!("Couldn't read {what} from {}: {}", path.display(), e);
+        std::io::Error::other(format!("Couldn't read {what}: {}", e))
     })?;
-
-    // Trim whitespace and remove any '0x' prefix if present
-    let sk_hex = sk_hex.trim();
-    let sk_hex = sk_hex.strip_prefix("0x").unwrap_or(sk_hex);
-
-    // Convert hex string to bytes
-    let sk_bytes = hex::decode(sk_hex).map_err(|e| {
-        error!("Invalid hex encoding in secret key file: {}", e);
+    let text = text.trim();
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    let bytes = hex::decode(text).map_err(|e| {
+        error!("Invalid hex encoding in {what} file: {}", e);
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Invalid hex encoding in secret key file: {}", e),
+            format!("Invalid hex encoding in {what} file: {}", e),
         )
     })?;
-
-    let validator_sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes).map_err(|e| {
-        error!("Invalid validator secret key: {}", e);
-        std::io::Error::other(format!("Invalid validator secret key: {}", e))
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        error!("Invalid {what}: not 32 bytes");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid {what}: not 32 bytes"),
+        )
     })?;
-
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-    let (validator_pk, _) = validator_sk.x_only_public_key(&secp);
-
-    info!("Loaded validator secret key from {}.", sk_path.display(),);
-    info!("Validator PK: {}", validator_pk);
-
-    Ok(Some((validator_pk, validator_sk)))
+    info!("Loaded {what} from {}.", path.display());
+    Ok(Some(bytes))
 }

@@ -1,7 +1,16 @@
 # join-ue requests the monitor must reject, and the ones it must accept right after.
 # Run with testers/db-ue.txt or testers/monitor-ue.txt. The minimum collateral of a subnet is
-# 100_000 sats; a join in block N needs a timeout above N + 1. Every rejection here is the
-# monitor's: the monitor tester submits the transactions without the provider's own check.
+# 100_000 sats. Every rejection here is the monitor's: the monitor tester submits the
+# transactions without the provider's own check.
+# A collateral with timeout T seats its validator in every configuration computed with a
+# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
+# Epochs are K = 10 blocks here. H_0 is the first height at which the join collateral of every
+# member of C_gen is slashable: the block of the first checkpoint, whose batch transfer carries
+# the pre-signatures. That checkpoint is a regular one; C_gen stays the current configuration
+# until the next checkpoint, the rotation checkpoint of epoch 1.
+# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
+# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
+# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
 
 setup
 
@@ -28,19 +37,20 @@ block 108
 read ue_collaterals subnet1
 expect result.count = 0
 
-# below the minimum collateral, and a timeout that is not after the join
+# below the minimum collateral, and a timeout below the fourth epoch from the join (140)
 block 110
 join-ue subnet1 validator1 99_999 200
-join-ue subnet1 validator2 100_000 111
+join-ue subnet1 validator2 100_000 140
 
 block 112
 read ue_collaterals subnet1
 expect result.count = 0
 
-# exactly the minimum collateral is accepted; the subnet bootstraps
+# exactly the minimum collateral is accepted, and a timeout in the fourth epoch from the
+# join (144 at block 113); the subnet bootstraps
 block 113
 join-ue subnet1 validator1 100_000 200
-join-ue subnet1 validator2 100_000 200
+join-ue subnet1 validator2 100_000 144
 join-ue subnet1 validator3 100_000 200
 join-ue subnet1 validator5 100_000 200
 
@@ -48,6 +58,8 @@ block 115
 read validators subnet1
 expect result.count = 4
 expect result.names = validator1,validator2,validator3,validator5
+read ue_collaterals subnet1
+expect result.validator2.timeout = 144
 # the same key again, with another timeout: rejected, the first record stays
 join-ue subnet1 validator1 100_000 300
 
@@ -59,28 +71,84 @@ expect result.count = 4
 expect result.validator1.count = 1
 expect result.validator1.timeout = 200
 
-# after bootstrap anyone can join: a timeout at the join's block or the next one is
-# rejected (T = 118 and T = 119 for a join in block 118), the next is accepted
+# epoch 0: nobody joins before the first checkpoint
 block 118
-join-ue subnet1 validator4 100_000 118
-join-ue subnet1 validator4 100_000 119
-join-ue subnet1 validator4 100_000 125
+join-ue subnet1 validator4 100_000 300
 
 block 120
+read ue_collaterals subnet1
+expect result.count = 4
+deposit subnet1 validator1 500_000_000
+presign subnet1 validator1 by validator1 validator2 validator3
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator5 by validator1 validator2 validator3
+
+# the first checkpoint, H_0 = 121: C_1 needs T > 151, so validator2 (144) is not in it and
+# leaves with the one unit of value C_gen gave it
+block 121
+checkpoint subnet1
+
+block 122
+read subnet_state subnet1
+expect result.activated = true
+expect result.h_0 = 121
+expect result.epoch = 1
+expect result.last_rotation_epoch = 0
+# C_1 waits for the rotation checkpoint of epoch 1; C_gen is current
 read validators subnet1
-expect result.count = 5
+expect result.names = validator1,validator3,validator5
 expect result.waiting = true
+read validators subnet1 current
+expect result.names = validator1,validator2,validator3,validator5
+expect result.waiting = true
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator2 = 10_000
+# after activation anyone can join, with a timeout in epochs 5 to 1004 from H_0 in epoch 1:
+# 161 is rejected, 162 accepted
+join-ue subnet1 validator4 100_000 161
+join-ue subnet1 validator4 100_000 162
+
+block 124
+read validators subnet1
+expect result.count = 3
+expect result.waiting = true
+read validators subnet1 current
+expect result.count = 4
 read ue_collaterals subnet1
 expect result.validator4.count = 1
-expect result.validator4.timeout = 125
+expect result.validator4.timeout = 162
+presign subnet1 validator4 by validator1 validator3 validator5
 
-# validator4 matures while still waiting for its first checkpoint: removed from the
-# waiting committee at T - 1 = 124, visible at the line `block 125`
+# the next checkpoint after H_0, the rotation checkpoint of epoch 1: it applies C_1 and
+# confirms the withdrawal of validator2
 block 125
+checkpoint subnet1
+
+block 126
+read subnet_state subnet1
+expect result.last_rotation_epoch = 1
+read validators subnet1 current
+expect result.names = validator1,validator3,validator5
+expect result.waiting = false
+read withdrawals subnet1
+expect result.count = 0
+read ue_collaterals subnet1
+expect result.validator4.slashable = true
+
+# the cutoff at 131 computes C_2 with boundary 161: validator4 (162) is seated
+block 132
 read validators subnet1
-expect result.names = validator1,validator2,validator3,validator5
+expect result.names = validator1,validator3,validator4,validator5
+expect result.waiting = true
+read withdrawals subnet1
+expect result.count = 0
+
+# the cutoff at 141 computes C_3 with boundary 171: validator4 leaves with its collateral
+block 142
+read validators subnet1
+expect result.names = validator1,validator3,validator5
 read withdrawals subnet1
 expect result.count = 1
 expect result.validator4 = 100_000
-read ue_collaterals subnet1
-expect result.validator4.removed = true

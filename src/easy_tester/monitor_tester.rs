@@ -3,7 +3,7 @@ use std::{
     fs::File,
     net::TcpListener,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +18,7 @@ use crate::{
         create_commit_reveal_txs, merge_reveals, reshape_reveal, submit_to_mempool, RevealShape,
     },
     collateral,
-    db::HeedDb,
+    db::{DatabaseCore, HeedDb},
     easy_tester::{
         error::EasyTesterError,
         model::{
@@ -32,11 +32,11 @@ use crate::{
     eth_utils::eth_addr_from_x_only_pubkey,
     ipc_lib::{
         IpcCheckpointSubnetMsg, IpcCrossSubnetErcTransfer, IpcErcSupplyAdjustment,
-        IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcStakeCollateralMsg,
+        IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcStakeCollateralMsg,
         IpcUnstakeCollateralMsg,
     },
     provider::rpc::{DevMultisignPsbtParams, DevMultisignPsbtResponse},
-    SubnetId, NETWORK,
+    SubnetId, NETWORK, WATCHONLY_WALLET_SUFFIX,
 };
 
 /// A reveal that carries no message, its commit submitted: for the rebuilt reveals
@@ -177,10 +177,17 @@ fn write_validator_sk(
     name: &str,
     sk: &bitcoin::secp256k1::SecretKey,
 ) -> Result<PathBuf, EasyTesterError> {
-    let path = dir.join(format!("{name}.sk"));
-    let hex = hex::encode(sk.secret_bytes());
-    std::fs::write(&path, hex)
-        .map_err(|e| EasyTesterError::runtime(format!("failed to write {name}.sk: {e}")))?;
+    write_hex32(dir, &format!("{name}.sk"), &sk.secret_bytes())
+}
+
+fn write_hex32(
+    dir: &std::path::Path,
+    file_name: &str,
+    bytes: &[u8; 32],
+) -> Result<PathBuf, EasyTesterError> {
+    let path = dir.join(file_name);
+    std::fs::write(&path, hex::encode(bytes))
+        .map_err(|e| EasyTesterError::runtime(format!("failed to write {file_name}: {e}")))?;
     Ok(path)
 }
 
@@ -191,6 +198,8 @@ fn write_env(
     provider_port: u16,
     db_url: &str,
     sk_path: &str,
+    eots_sk_path: &str,
+    eots_seed_path: &str,
     activation_height: Option<u64>,
     snapshot_length: Option<u64>,
     ue_activation_height: Option<u64>,
@@ -203,6 +212,8 @@ fn write_env(
          RPC_URL=http://127.0.0.1:{BITCOIND_RPC_PORT}\n\
          WALLET_NAME={WALLET_NAME}\n\
          VALIDATOR_SK_PATH={sk_path}\n\
+         EOTS_SK_PATH={eots_sk_path}\n\
+         EOTS_SEED_PATH={eots_seed_path}\n\
          DATABASE_URL={db_url}\n\
          PROVIDER_PORT={provider_port}\n\
          PROVIDER_AUTH_TOKEN={AUTH_TOKEN}\n\
@@ -258,8 +269,8 @@ fn compile_binaries(workspace_root: &std::path::Path) -> Result<(), EasyTesterEr
 
 // ---- params (Serialize) ----
 
-/// Generic single-subnet-id param: covers genbootstraphandover, getgenesisinfo,
-/// getkillrequests, getsubnet (all expect `{ "subnet_id": "..." }`).
+/// Generic single-subnet-id param: covers getgenesisinfo, getkillrequests,
+/// getsubnet (all expect `{ "subnet_id": "..." }`).
 #[derive(serde::Serialize)]
 struct SubnetIdParam {
     subnet_id: SubnetId,
@@ -287,16 +298,6 @@ struct JoinSubnetLocalRequest {
     ip: std::net::SocketAddr,
     backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     pubkey: bitcoin::XOnlyPublicKey,
-}
-
-#[derive(serde::Serialize)]
-struct FinalizeBootstrapHandoverLocalParams {
-    subnet_id: SubnetId,
-    unsigned_psbt_base64: String,
-    signatures: Vec<(
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    )>,
 }
 
 #[derive(serde::Serialize)]
@@ -333,14 +334,9 @@ struct UnstakeCollateralLocalParams {
 
 // ---- responses (Deserialize) ----
 
-/// genbootstraphandover / dev_gencheckpointpsbt both include a full
-/// `bitcoin::Psbt` object that does not roundtrip through JSON (Parity
-/// serde mismatch).  We only need the base64 string, so we capture just that.
-#[derive(serde::Deserialize)]
-struct GenBootstrapHandoverResult {
-    unsigned_psbt_base64: String,
-}
-
+/// dev_gencheckpointpsbt includes a full `bitcoin::Psbt` object that does not
+/// roundtrip through JSON (Parity serde mismatch), so we capture only its
+/// base64 string.
 #[derive(serde::Deserialize)]
 struct GenCheckpointPsbtResult {
     unsigned_psbt_base64: String,
@@ -350,12 +346,6 @@ struct GenCheckpointPsbtResult {
 #[derive(serde::Deserialize)]
 struct CreateSubnetLocalResponse {
     subnet_id: SubnetId,
-}
-
-/// Only `bootstrapped` is needed to decide whether to run the handover.
-#[derive(serde::Deserialize)]
-struct GenesisInfoBootstrapped {
-    bootstrapped: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -417,6 +407,7 @@ pub struct MonitorTester {
     /// Token name → (home_subnet_name, home_token_address)
     registered_tokens: HashMap<String, (String, alloy_primitives::Address)>,
     pending_registrations: HashMap<String, Vec<IpcErcTokenRegistration>>,
+    pending_presigns: HashMap<String, Vec<super::model::PresignSpec>>,
     pending_supply_adjustments: HashMap<String, Vec<IpcErcSupplyAdjustment>>,
     pending_erc_transfers: HashMap<String, Vec<IpcCrossSubnetErcTransfer>>,
     last_rootnet_msgs: Option<LastRootnetMsgs>,
@@ -424,15 +415,11 @@ pub struct MonitorTester {
     last_reward_results: Option<LastRewardResults>,
     checkpoint_heights: HashMap<String, u64>,
     all_sk_hex: HashMap<String, String>,
-    /// Subnet names for which the bootstrap handover has already been broadcast.
-    done_handovers: std::collections::HashSet<String>,
     /// Directory where log files are written.
     log_dir: PathBuf,
     /// The monitor's LMDB directory, opened read-only for the unilateral-exit reads.
     db_url: String,
     last_ue: Option<UeRead>,
-    /// Subnets that received an ordinary `join`, whose whitelist multisig holds funds.
-    subnets_with_joins: std::collections::HashSet<String>,
 }
 
 impl MonitorTester {
@@ -537,6 +524,12 @@ impl MonitorTester {
             let mut all_sk_hex = HashMap::new();
             for (name, v) in &setup.validators {
                 write_validator_sk(&datadir, name, &v.secret_key)?;
+                write_validator_sk(&datadir, &format!("{name}.eots"), &v.eots_secret_key)?;
+                write_hex32(
+                    &datadir,
+                    &format!("{name}.eots.seed"),
+                    v.eots_seed.as_bytes(),
+                )?;
                 all_sk_hex.insert(name.clone(), hex::encode(v.secret_key.secret_bytes()));
             }
             let primary_validator = setup
@@ -562,6 +555,8 @@ impl MonitorTester {
                 monitor_port,
                 db_url_str,
                 primary_sk_path.to_str().unwrap_or("/tmp/validator1.sk"),
+                "",
+                "",
                 activation_height,
                 snapshot_length,
                 ue_activation_height,
@@ -584,15 +579,22 @@ impl MonitorTester {
             std::mem::forget(monitor);
             guard.track(monitor_pid);
 
-            // 9b. Wait for the monitor to create the LMDB database file before
-            // starting providers (they open the DB in read-only mode).
+            // 9b. Wait for the monitor to create the LMDB database file and its watch-only
+            // wallet before starting providers (they open the DB in read-only mode, and a
+            // provider that creates the same wallet concurrently fails on bitcoind's lock).
             let mdb_file = db_url.join("data.mdb");
+            let watchonly_wallet = format!("{WALLET_NAME}{WATCHONLY_WALLET_SUFFIX}");
+            let monitor_ready = || {
+                mdb_file.exists()
+                    && bitcoin_cli(&datadir, &["listwallets"])
+                        .is_ok_and(|wallets| wallets.contains(&watchonly_wallet))
+            };
             let db_deadline = Instant::now() + Duration::from_secs(30);
-            while !mdb_file.exists() {
+            while !monitor_ready() {
                 if Instant::now() > db_deadline {
-                    return Err(EasyTesterError::runtime(
-                        "timed out waiting for monitor to initialize DB".to_string(),
-                    ));
+                    return Err(EasyTesterError::runtime(format!(
+                        "timed out waiting for monitor to initialize DB and wallet '{watchonly_wallet}'"
+                    )));
                 }
                 thread::sleep(Duration::from_millis(200));
             }
@@ -603,15 +605,22 @@ impl MonitorTester {
             sorted_validators.sort();
 
             let mut providers: Vec<(String, u32, u16)> = Vec::new();
+            let mut provider_children: Vec<Child> = Vec::new();
             for name in &sorted_validators {
                 let port = free_port();
                 let sk_path = datadir.join(format!("{name}.sk"));
+                let eots_sk_path = datadir.join(format!("{name}.eots.sk"));
+                let eots_seed_path = datadir.join(format!("{name}.eots.seed"));
                 let env_path = datadir.join(format!("provider-{name}.env"));
                 write_env(
                     &env_path,
                     port,
                     db_url_str,
                     sk_path.to_str().unwrap_or("/tmp/validator.sk"),
+                    eots_sk_path.to_str().unwrap_or("/tmp/validator.eots.sk"),
+                    eots_seed_path
+                        .to_str()
+                        .unwrap_or("/tmp/validator.eots.seed"),
                     activation_height,
                     snapshot_length,
                     ue_activation_height,
@@ -632,20 +641,20 @@ impl MonitorTester {
                         ))
                     })?;
                 let pid = child.id();
-                std::mem::forget(child);
                 guard.track(pid);
                 providers.push(((*name).clone(), pid, port));
+                provider_children.push(child);
             }
 
             // 11. Poll until every provider responds to HTTP.
-            for (name, _pid, port) in &providers {
-                wait_for_provider_http(*port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS).map_err(
-                    |e| {
+            for ((name, _pid, port), child) in providers.iter().zip(&mut provider_children) {
+                wait_for_provider_http(child, *port, AUTH_TOKEN, PROVIDER_READY_TIMEOUT_SECS)
+                    .map_err(|e| {
                         EasyTesterError::runtime(format!(
-                            "provider for {name} (port {port}) failed to start: {e}"
+                            "provider for {name} (port {port}) failed to start: {e} \
+                             (log: {LOG_DIR}/provider-{name}.log)"
                         ))
-                    },
-                )?;
+                    })?;
             }
 
             // Success — disarm the guard so processes survive past this scope.
@@ -696,6 +705,7 @@ impl MonitorTester {
             created_subnets: HashMap::new(),
             registered_tokens: HashMap::new(),
             pending_registrations: HashMap::new(),
+            pending_presigns: HashMap::new(),
             pending_supply_adjustments: HashMap::new(),
             pending_erc_transfers: HashMap::new(),
             last_rootnet_msgs: None,
@@ -703,11 +713,9 @@ impl MonitorTester {
             last_reward_results: None,
             checkpoint_heights: HashMap::new(),
             all_sk_hex: started.all_sk_hex,
-            done_handovers: std::collections::HashSet::new(),
             log_dir,
             db_url: started.db_url,
             last_ue: None,
-            subnets_with_joins: std::collections::HashSet::new(),
         })
     }
 
@@ -791,6 +799,27 @@ impl MonitorTester {
         Err(EasyTesterError::runtime(
             "no setup validator with a provider found in the current committee".to_string(),
         ))
+    }
+
+    /// Find the name of a validator in the subnet's whitelist that has a running provider.
+    /// Used to route the first checkpoint, which spends the whitelist multisig's funds, to a
+    /// provider whose configured validator is a whitelist member.
+    fn find_whitelist_validator_name(&self, subnet_name: &str) -> Result<String, EasyTesterError> {
+        self.setup
+            .subnets
+            .get(subnet_name)
+            .and_then(|subnet| {
+                subnet
+                    .whitelist_names
+                    .iter()
+                    .find(|name| self.validator_provider_urls.contains_key(*name))
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!(
+                    "no setup validator with a provider found in the whitelist of '{subnet_name}'"
+                ))
+            })
     }
 
     fn resolve_subnet_id(&self, subnet_name: &str) -> Result<SubnetId, EasyTesterError> {
@@ -920,76 +949,7 @@ impl MonitorTester {
     /// sign it with all validator keys, and finalize it.  This simulates a
     /// malicious or out-of-order checkpoint that bypasses the provider's
     /// balance firewall so we can verify the monitor handles it correctly.
-    /// Performs the whitelist→committee multisig handover for a subnet that just bootstrapped.
-    fn do_bootstrap_handover(
-        &mut self,
-        subnet_name: &str,
-        subnet_id: SubnetId,
-    ) -> Result<(), EasyTesterError> {
-        eprintln!("[easy_tester] bootstrap handover for subnet '{subnet_name}'");
-
-        let gen_resp: GenBootstrapHandoverResult =
-            match self.rpc_call("genbootstraphandover", SubnetIdParam { subnet_id }) {
-                Ok(resp) => resp,
-                // A join-ue-only subnet has no whitelist funds: nothing to hand over
-                Err(e)
-                    if e.to_string().contains("No unspent outputs")
-                        && !self.subnets_with_joins.contains(subnet_name) =>
-                {
-                    warn!(
-                        "No whitelist funds to hand over for subnet '{}' (join-ue only), skipping",
-                        subnet_name
-                    );
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            };
-
-        let sign_params = DevMultisignPsbtParams {
-            unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
-            secret_keys: self.sk_hex_for_subnet(subnet_name),
-        };
-        let sign_resp: DevMultisignPsbtResponse =
-            self.rpc_call("dev_multisignpsbt", sign_params)?;
-
-        let finalize_params = FinalizeBootstrapHandoverLocalParams {
-            subnet_id,
-            unsigned_psbt_base64: gen_resp.unsigned_psbt_base64,
-            signatures: sign_resp.signatures,
-        };
-        let _: serde_json::Value = self.rpc_call("finalizebootstraphandover", finalize_params)?;
-
-        info!("Bootstrap handover broadcast for subnet '{}'", subnet_name);
-        Ok(())
-    }
-
-    /// After each block confirmation, check all known subnets for bootstrap and
-    /// run the whitelist→committee handover if not yet done.
-    fn do_handovers_if_needed(&mut self) -> Result<(), EasyTesterError> {
-        let subnets: Vec<(String, SubnetId)> = self
-            .created_subnets
-            .iter()
-            .map(|(name, id)| (name.clone(), *id))
-            .collect();
-
-        for (subnet_name, subnet_id) in subnets {
-            if self.done_handovers.contains(&subnet_name) {
-                continue;
-            }
-            let genesis_info: GenesisInfoBootstrapped =
-                match self.rpc_call("getgenesisinfo", SubnetIdParam { subnet_id }) {
-                    Ok(info) => info,
-                    Err(_) => continue,
-                };
-            if !genesis_info.bootstrapped {
-                continue;
-            }
-            self.do_bootstrap_handover(&subnet_name, subnet_id)?;
-            self.done_handovers.insert(subnet_name);
-        }
-        Ok(())
-    }
-
+    ///
     /// With `submit_batch` the provider submits the checkpoint and its batch transfer reveal
     /// together; without it the reveal is returned and the caller submits it.
     fn do_checkpoint_malicious(
@@ -999,6 +959,7 @@ impl MonitorTester {
         token_registrations: Vec<IpcErcTokenRegistration>,
         supply_adjustments: Vec<IpcErcSupplyAdjustment>,
         erc_transfers: Vec<IpcCrossSubnetErcTransfer>,
+        slash_signatures: Vec<crate::slash::SlashSignatureEntry>,
         submit_batch: bool,
     ) -> Result<Option<Transaction>, EasyTesterError> {
         let checkpoint_height = self
@@ -1008,22 +969,32 @@ impl MonitorTester {
             .or_insert(1);
         let checkpoint_height = *checkpoint_height;
 
-        // Determine if there is a pending committee rotation.
-        // If a waiting_committee exists, its configuration_number is the next one.
         let subnet_state: crate::db::SubnetState =
             self.rpc_call("getsubnet", SubnetIdParam { subnet_id })?;
-        let current_cfg = subnet_state.committee.configuration_number;
+        // As the provider: the first checkpoint of an epoch is its rotation checkpoint. As the
+        // subnet: the last change number of the configuration whose changes it applies, 0 when
+        // none await it
+        let is_rotation_checkpoint = subnet_state.last_rotation_epoch < subnet_state.epoch;
         let next_cfg = subnet_state
             .waiting_committee
             .as_ref()
-            .map(|wc| wc.configuration_number)
-            .filter(|&wc_cfg| wc_cfg > current_cfg)
-            .unwrap_or(0);
+            .map_or(0, |configuration| configuration.configuration_number);
 
-        // Route checkpoint RPCs to a provider whose validator is still in the
-        // committee (the default provider's validator may have left).
-        let committee_validator_name =
-            self.find_committee_validator_name(&subnet_state.committee)?;
+        // Route checkpoint RPCs to a provider whose validator signs the checkpoint and sign
+        // its inputs with that configuration's keys: the whitelist until the rotation
+        // checkpoint of epoch 1, which spends the whitelist multisig's funds, the current
+        // committee afterwards (the default provider's validator may have left).
+        let (signer_name, secret_keys) = if subnet_state.last_rotation_epoch == 0 {
+            (
+                self.find_whitelist_validator_name(subnet_name)?,
+                self.sk_hex_for_subnet(subnet_name),
+            )
+        } else {
+            (
+                self.find_committee_validator_name(&subnet_state.committee)?,
+                self.sk_hex_for_committee(&subnet_state.committee),
+            )
+        };
 
         let msg = IpcCheckpointSubnetMsg {
             subnet_id,
@@ -1035,20 +1006,23 @@ impl MonitorTester {
             token_registrations,
             token_supply_adjustments: supply_adjustments,
             token_transfers: erc_transfers,
+            slash_signatures,
             unstakes: vec![],
             change_address: None,
             is_kill_checkpoint: false,
+            is_rotation_checkpoint,
+            slash_pre_signature_count: None,
         };
 
         let gen_resp: GenCheckpointPsbtResult =
-            self.rpc_call_as(&committee_validator_name, "dev_gencheckpointpsbt", msg)?;
+            self.rpc_call_as(&signer_name, "dev_gencheckpointpsbt", msg)?;
 
         let sign_params = DevMultisignPsbtParams {
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64.clone(),
-            secret_keys: self.sk_hex_for_committee(&subnet_state.committee),
+            secret_keys,
         };
         let sign_resp: DevMultisignPsbtResponse =
-            self.rpc_call_as(&committee_validator_name, "dev_multisignpsbt", sign_params)?;
+            self.rpc_call_as(&signer_name, "dev_multisignpsbt", sign_params)?;
 
         let reveal = match &gen_resp.batch_transfer_tx_hex {
             Some(hex) if !submit_batch && !hex.is_empty() => {
@@ -1072,11 +1046,8 @@ impl MonitorTester {
                 None
             },
         };
-        let _: serde_json::Value = self.rpc_call_as(
-            &committee_validator_name,
-            "finalizecheckpointpsbt",
-            finalize_params,
-        )?;
+        let _: serde_json::Value =
+            self.rpc_call_as(&signer_name, "finalizecheckpointpsbt", finalize_params)?;
 
         info!(
             "Checkpoint #{} for subnet '{}' finalized",
@@ -1122,8 +1093,9 @@ fn wait_for_bitcoind(datadir: &std::path::Path, timeout_secs: u64) -> Result<(),
     }
 }
 
-/// Blocking check: poll with real HTTP until provider responds, or timeout.
+/// Blocking check: poll with real HTTP until provider responds, exits, or timeout.
 fn wait_for_provider_http(
+    provider: &mut Child,
     port: u16,
     auth_token: &str,
     timeout_secs: u64,
@@ -1132,6 +1104,11 @@ fn wait_for_provider_http(
     let body = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}"#;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
+        if let Ok(Some(status)) = provider.try_wait() {
+            return Err(EasyTesterError::runtime(format!(
+                "provider exited ({status})"
+            )));
+        }
         let result = Command::new("curl")
             .args([
                 "-s",
@@ -1272,8 +1249,7 @@ fn kill_pid(pid: u32) {
 impl Tester for MonitorTester {
     fn exec_mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
         self.mine_to_height(height)?;
-        self.wait_for_confirmation(height)?;
-        self.do_handovers_if_needed()
+        self.wait_for_confirmation(height)
     }
 
     /// `create`: through the provider as built; a rebuilt reveal is made with the tester's
@@ -1345,7 +1321,6 @@ impl Tester for MonitorTester {
         };
 
         let _: serde_json::Value = self.rpc_call_as(validator_name, "joinsubnet", req)?;
-        self.subnets_with_joins.insert(subnet_name.to_string());
 
         info!(
             "Joined validator '{}' to subnet '{}'",
@@ -1382,12 +1357,28 @@ impl Tester for MonitorTester {
                 backup_address: v.default_backup_address.clone(),
                 pubkey: v.pubkey,
             };
-            let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &v.secret_key);
+            let msg = super::model::join_ue_msg(&secp, join, timeout, &v);
             let data = msg.to_bytes().map_err(|e| err(&e))?;
             let return_address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
+            // In epoch 0 the subnet names no configuration: the join names the whitelist, and
+            // the monitor's refusal is what the scenario checks
+            let monitor_db = self.open_db()?;
+            let configuration = match collateral::named_configurations(&monitor_db, subnet_id) {
+                Ok(named) => named[0].1.clone(),
+                Err(e) => {
+                    log::warn!("JoinUe: '{}' names the whitelist: {e}", spec.validator_name);
+                    monitor_db
+                        .get_subnet_genesis_info(subnet_id)
+                        .map_err(|e| err(&e))?
+                        .ok_or_else(|| err(&"subnet not found"))?
+                        .whitelist_configuration()
+                }
+            };
             let collateral_output = bitcoin::TxOut {
                 value: collateral,
-                script_pubkey: collateral::ue_script_pubkey(&secp, &v.pubkey, timeout)
+                script_pubkey: msg
+                    .collateral_script(configuration)
+                    .script_pubkey(&secp)
                     .map_err(|e| err(&e))?,
             };
             let (commit_tx, reveal_tx) = crate::bitcoin_utils::create_commit_reveal_txs(
@@ -1575,6 +1566,13 @@ impl Tester for MonitorTester {
                 .pending_erc_transfers
                 .remove(subnet_name)
                 .unwrap_or_default();
+            let presigns = self.pending_presigns.remove(subnet_name).unwrap_or_default();
+            let slash_signatures = super::model::build_slash_entries(
+                &self.open_db()?,
+                subnet_id,
+                &presigns,
+                &self.setup.validators,
+            )?;
 
             reveals.extend(self.do_checkpoint_malicious(
                 subnet_name,
@@ -1582,6 +1580,7 @@ impl Tester for MonitorTester {
                 registrations,
                 adjustments,
                 transfers,
+                slash_signatures,
                 via_provider,
             )?);
         }
@@ -1589,6 +1588,25 @@ impl Tester for MonitorTester {
             let rpc = self.wallet_client()?;
             submit_reshaped(&rpc, merge_reveals(reveals), shape)?;
         }
+        Ok(())
+    }
+
+    fn exec_presign(
+        &mut self,
+        _height: u64,
+        subnet_name: &str,
+        spec: super::model::PresignSpec,
+    ) -> Result<(), EasyTesterError> {
+        info!(
+            "presign queued: '{}' by {:?} on '{subnet_name}'{}",
+            spec.owner,
+            spec.signers,
+            if spec.bad { " (corrupted)" } else { "" }
+        );
+        self.pending_presigns
+            .entry(subnet_name.to_string())
+            .or_default()
+            .push(spec);
         Ok(())
     }
 
@@ -1754,21 +1772,7 @@ impl Tester for MonitorTester {
                         args.len() == 2,
                     )?,
                     OutputDb::UeCollaterals => {
-                        // A collateral output is spent once the exit transaction is mined
-                        let rpc = self.wallet_client()?;
-                        let spent = |outpoint: &bitcoin::OutPoint| {
-                            use bitcoincore_rpc::RpcApi;
-                            rpc.get_tx_out(&outpoint.txid, outpoint.vout, Some(false))
-                                .map(|o| o.is_none())
-                                .map_err(|e| EasyTesterError::runtime(format!("gettxout: {e}")))
-                        };
-                        ue_reads::read_ue_collaterals(
-                            &monitor_db,
-                            subnet_id,
-                            subnet_name,
-                            &names,
-                            Some(&spent),
-                        )?
+                        ue_reads::read_ue_collaterals(&monitor_db, subnet_id, subnet_name, &names)?
                     }
                     _ => ue_reads::read_withdrawals(&monitor_db, subnet_id, subnet_name, &names)?,
                 };
@@ -1851,6 +1855,17 @@ impl Tester for MonitorTester {
                 let subnet_id = self.resolve_subnet_id(subnet_name)?;
                 let monitor_db = self.open_db()?;
                 self.last_ue = Some(ue_reads::read_subnet_genesis(
+                    &monitor_db,
+                    subnet_id,
+                    subnet_name,
+                )?);
+            }
+
+            OutputDb::SubnetState => {
+                let subnet_name = &args[0];
+                let subnet_id = self.resolve_subnet_id(subnet_name)?;
+                let monitor_db = self.open_db()?;
+                self.last_ue = Some(ue_reads::read_subnet_state(
                     &monitor_db,
                     subnet_id,
                     subnet_name,
