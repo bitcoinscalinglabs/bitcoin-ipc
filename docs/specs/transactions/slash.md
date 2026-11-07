@@ -20,7 +20,7 @@ The transaction pays no fee. Whoever broadcasts it submits it as a package with 
 
 ## Creating the transaction
 
-The members of `C` pre-sign the transaction, and checkpoints carry their pre-signatures to Bitcoin L1 ([pre-signatures](../slashing.md#pre-signatures)). Anyone who computes the secret key of `pk_eots` from two votes of the validator at the same height adds `σ_eots` to the witness and broadcasts the transaction with a fee-paying child ([slashing a validator that equivocated](../slashing.md#slashing-a-validator-that-equivocated)).
+The members of `C` pre-sign the transaction, and checkpoints carry their pre-signatures to Bitcoin L1 ([slash pre-signatures](../slashing.md#slash-pre-signatures)). Anyone who computes the secret key of `pk_eots` from two votes of the validator at the same height adds `σ_eots` to the witness and broadcasts the transaction with a fee-paying child.
 
 ## Verifying the transaction
 

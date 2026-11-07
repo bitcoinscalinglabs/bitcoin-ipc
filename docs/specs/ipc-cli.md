@@ -1,46 +1,47 @@
 # ipc-cli with a Bitcoin parent
 
-`ipc-cli` commands for subnets whose parent is Bitcoin. For the Bitcoin side, `ipc-cli` calls the bitcoin-ipc provider's JSON-RPC.
+The `ipc-cli` commands for subnets whose parent is Bitcoin L1. Commands that act on Bitcoin L1 or read the monitor's state go through the provider of the parent's entry in the configuration. The other commands go to the subnet's EVM endpoint.
 
-## Configuration and subnet ids
+## Common behaviour
 
-- Config file: `--config-path <path>` or `IPC_CLI_CONFIG_PATH`, default `~/.ipc/config.toml`.
-- The Bitcoin L1 parent is a `[[subnets]]` entry whose `id` is the network prefix alone, for example `/b4` ([network prefixes](lifecycle.md#network-parameters)), with `[subnets.config]` `network_type = "btc"`, `provider_http = "http://<host>:<PROVIDER_PORT>/api"`, optional `auth_token` (sent as `Authorization: Bearer`, equal to the provider's `PROVIDER_AUTH_TOKEN`) and optional `provider_timeout` in seconds.
-- `--subnet` takes the child id, for example `/b4/t410f…`, the same string as the provider's subnet id. Commands that act on the parent find it as the parent of `--subnet`. Commands that act on the child, and the relayer, also need a `[[subnets]]` entry for the child id with `network_type = "fevm"`.
-- `--network` (FVM address network) stays `testnet`, the default: the provider parses only `t`-prefixed FVM addresses.
-- Keys: `join-ue` takes the validator key from the EVM keystore entry of `--from` (or the default entry), and the provider signs the join with its own key (`VALIDATOR_SK_PATH`). Both must be the same key. `unstake-ue` and `leave` sign with the provider's own key.
-- Before bootstrap (until the join that completes the genesis validators), the provider has genesis info but no subnet state for the subnet. Every method that reads the subnet state answers `Subnet <id> not found.`, so `list-validators`, `kill`, `cross-msg fund`, `list-topdown-msgs`, `list-validator-changes` and `last-bottomup-checkpoint-height` fail. `getgenesisinfo` is the lookup. `create`, `join-ue` and `cross-msg pre-fund` work before bootstrap, and `pre-fund` works only then.
-- Every call is `POST <provider_http>` with `{"jsonrpc":"2.0","id":1,"method":…,"params":{…}}`. Amounts are satoshis.
+- **Configuration.** `ipc-cli` reads `~/.ipc/config.toml`, or the file given with `--config-path`. The entry of the parent subnet names its provider (URL and bearer token).
+- **Default key.** An optional `--from` or `--to` defaults to the default key of the EVM keystore.
+- **Bitcoin L1 transactions.** The provider funds and signs them with its wallet, at the fee rate of its Bitcoin L1 node's estimate. The provider of a validator signs with that validator's key.
+- **Heights.** "submitted at height `<n>`" gives the last block that the monitor has processed when the transaction is submitted, not the block that includes it.
+- **Output.** Lines are written to stdout. A line marked "logs" is a log line, with timestamp and level, shown at log level `info`.
+- **Errors.** Any error ends the command with exit code 1 and `main process failed: <error>`. A subnet missing from the configuration gives `subnet not found: <id>; known subnets: [<ids>]`. An error of the provider gives `JSON-RPC error: code=<code>, message=<message>, details=<details>`.
 
-## Commands that call the provider
+## Commands that act on Bitcoin L1
 
 ### Create a subnet
 
 ```
-ipc-cli subnet create --parent <network prefix, e.g. /b4> --min-validators <n> --bottomup-check-period <blocks> [--active-validators-limit <n>] btc --min-validator-stake <sats> --power-unit-exponent <p> [--min-cross-msg-fee <sats>] --validator-whitelist <xonly>,<xonly>,… --epoch-length <blocks> --min-timeout <epochs> --max-timeout <epochs> --min-deposit <sats> --kill-vote-period <subnet blocks> --kill-delay-period <epochs>
+ipc-cli subnet create --parent <prefix> --min-validators <n> --bottomup-check-period <n> [--active-validators-limit <n>] btc --min-validator-stake <sats> --power-unit-exponent <p> [--min-cross-msg-fee <sats>] --validator-whitelist <keys> --epoch-length <n> --min-timeout <n> --max-timeout <n> --min-deposit <sats> --kill-vote-period <n> --kill-delay-period <n>
 ```
 
-- Provider: `createsubnet` with `min_validator_stake`, `min_validators`, `bottomup_check_period`, `active_validators_limit` (default 100), `min_cross_msg_fee` (default 1), `whitelist`, and `power_unit_exponent`, `epoch_length` (`K`), `min_timeout`, `max_timeout`, `min_deposit`, `kill_vote_period`, `kill_delay_period`, which have no default. Transaction: [create subnet](transactions/create-subnet.md).
-- Output: logs `created subnet with id: <subnet id>`.
+- Parameters: `--parent` is the prefix of the Bitcoin L1 network ([network parameters](lifecycle.md#network-parameters)). `--validator-whitelist` is a comma-separated list of x-only keys in hex. `--epoch-length` sets `K`. Every other flag sets the [subnet parameter](lifecycle.md#subnet-parameters) of the same name. Defaults: `--active-validators-limit` 100, `--min-cross-msg-fee` 1.
+- Action: submits a [create transaction](transactions/create-subnet.md). Its reveal transaction pays a new address of the provider's wallet.
+- Returns: logs `created subnet with id: <subnet id>`.
 
 ### Join
 
 ```
-ipc-cli subnet join-ue [--from <addr>] --subnet <id> --collateral <sats> [--initial-balance <sats>] --ip <ip:port> --backup-address <bitcoin address> --epochs <n>
+ipc-cli subnet join-ue [--from <address>] --subnet <id> --collateral <sats> [--initial-balance <sats>] --ip <ip:port> --backup-address <address> --epochs <n>
 ```
 
-- Provider: optional `prefundsubnet`, then `joinsubnet` with the join fields and `epochs`, the number of epochs the collateral seats the validator ([join](transactions/join.md#creating-the-transaction) step 5). Transaction: [join](transactions/join.md).
-- After joining: the validator's EVM address needs an account on the subnet before its fendermint can broadcast its signatures. A [prefund](#prefund-the-genesis-balance) before bootstrap (`--initial-balance`) or a [deposit](#deposit-into-the-subnet) after activation with `--to <validator EVM address>` creates it.
-- Output: `join-ue transaction submitted at height: <n>`.
+- Parameters: `--from` is the validator's EVM key. `--ip` is the validator's network address. `--backup-address` is the Bitcoin L1 address to which the exit transaction pays the collateral. `--epochs` is the number of epochs for which the collateral seats the validator.
+- Action: with `--initial-balance` above 0, first submits a prefund transaction of that amount to the address of `--from` and logs `pre-funding address with <sats>`. Then submits a [join transaction](transactions/join.md). Its key `pk` is the x-only key of `--from`, which must be the provider's validator key. The provider sets the timeout `T` from `--epochs` and names the current configuration.
+- Returns: `join-ue transaction submitted at height: <n>`.
 
 ### Stake
 
 ```
-ipc-cli subnet stake-ue [--from <addr>] --subnet <id> --collateral <sats> --epochs <n> [--renew <txid:vout>]
+ipc-cli subnet stake-ue [--from <address>] --subnet <id> --collateral <sats> --epochs <n> [--renew <txid:vout>]
 ```
 
-- Provider: `stakeue` with `subnet_id`, the collateral, `epochs` (as for the join) and, with `--renew`, the outpoint of a matured collateral of the validator to spend at input 0. Transaction: [stake](transactions/stake.md).
-- Output: `stake transaction submitted at height: <n>`.
+- Parameters: `--epochs` as for the join. `--renew` is a matured collateral of the validator that the stake transaction spends.
+- Action: submits a [stake transaction](transactions/stake.md) (command **unimplemented**).
+- Returns: `stake transaction submitted at height: <n>`.
 
 ### Exit with the matured collateral
 
@@ -48,8 +49,8 @@ ipc-cli subnet stake-ue [--from <addr>] --subnet <id> --collateral <sats> --epoc
 ipc-cli subnet unstake-ue --subnet <id>
 ```
 
-- Provider: `unstakeue` with `subnet_id`. It also spends the unbonding outputs whose delay has passed. Transaction: [exit](transactions/exit.md).
-- Output: the txid, the spent amount and the backup address.
+- Action: submits an [exit transaction](transactions/exit.md) that spends the validator's matured collaterals and the unbonding outputs whose delay has passed.
+- Returns: `unstake-ue transaction submitted: txid <txid>; <amount> sats of collateral spent, paid minus the fee to <address>`.
 
 ### Refresh collaterals
 
@@ -57,8 +58,8 @@ ipc-cli subnet unstake-ue --subnet <id>
 ipc-cli subnet refresh --subnet <id> [--collateral <txid:vout>]
 ```
 
-- The provider signs with its validator key and `SIGHASH_SINGLE|ANYONECANPAY` the refresh pair, for the subnet's current configuration, of the named collateral, or of every unspent collateral of its validator key in the subnet that is locked under the previous configuration. The signatures go to the subnet, and a later checkpoint of the epoch carries the refreshes ([collateral refresh](lifecycle.md#collateral-refresh)).
-- Output: the collaterals whose refreshes were signed.
+- Action: signs with the validator key and `SIGHASH_SINGLE|ANYONECANPAY` the refresh pair, for the subnet's current configuration, of the given collateral, or of every unspent collateral of the validator in the subnet that is locked under the previous configuration. The signatures go to the subnet, and a later checkpoint of the epoch carries the refresh pairs ([collateral refresh](lifecycle.md#collateral-refresh)) (command **unimplemented**).
+- Returns: the collaterals whose refresh pairs were signed.
 
 ### Leave the subnet before the timeout
 
@@ -66,8 +67,8 @@ ipc-cli subnet refresh --subnet <id> [--collateral <txid:vout>]
 ipc-cli subnet leave --subnet <id> [--collateral <txid:vout>]
 ```
 
-- The provider signs with its validator key and `SIGHASH_SINGLE|ANYONECANPAY` the exit pair, for the subnet's current configuration, of the named collateral, or of every unspent collateral of its validator key in the subnet. The signatures go to the subnet, and a later checkpoint carries the exits ([cooperative exit](lifecycle.md#cooperative-exit)).
-- Output: the collaterals whose exits were signed.
+- Action: signs with the validator key and `SIGHASH_SINGLE|ANYONECANPAY` the cooperative-exit pair, for the subnet's current configuration, of the given collateral, or of every unspent collateral of the validator in the subnet. The signatures go to the subnet, and a later checkpoint carries the exits ([cooperative exit](lifecycle.md#cooperative-exit)) (command **unimplemented**).
+- Returns: the collaterals whose exits were signed.
 
 ### Vote to kill the subnet
 
@@ -75,36 +76,18 @@ ipc-cli subnet leave --subnet <id> [--collateral <txid:vout>]
 ipc-cli subnet kill --subnet <id> btc
 ```
 
-- Submits the validator's kill vote to the subnet, or a kill proposal if none is open, signed with the validator's key on the subnet ([the end of a subnet](lifecycle.md#the-end-of-a-subnet)). No Bitcoin L1 transaction.
-- Output: none.
-
-### List the validators
-
-```
-ipc-cli subnet list-validators --subnet <id>
-```
-
-- Provider: `getsubnet` with `subnet_id`.
-- Output: one line `<f410 address>: <info>` per member of the current configuration (active) and per validator with an accepted join whom the current configuration does not seat yet (waiting). Before bootstrap: fails with `Subnet <id> not found.`
-
-### Show the genesis epoch
-
-```
-ipc-cli subnet genesis-epoch --subnet <id>
-```
-
-- Provider: `getgenesisinfo` with `subnet_id`.
-- Output: `genesis epoch: <Bitcoin height of the bootstrap>`.
+- Action: posts the validator's kill vote on the subnet, or a kill proposal if none is open, signed with the validator key ([the end of a subnet](lifecycle.md#the-end-of-a-subnet)). No Bitcoin L1 transaction (vote on the subnet **unimplemented**).
+- Returns: nothing.
 
 ### Deposit into the subnet
 
 ```
-ipc-cli cross-msg fund --subnet <id> btc [--to <addr>] <sats>
+ipc-cli cross-msg fund --subnet <id> btc [--to <address>] <sats>
 ```
 
-- Provider: `fundsubnet` with `subnet_id`, `amount`, `address` (`--to`, else the default EVM key), then `getconfirmedcount`. Transaction: [deposit](transactions/deposit.md).
-- Also creates the subnet account of a validator (`--to <validator EVM address>`), which it needs to broadcast signatures ([join](#join)).
-- Output: `fund transaction submitted at height: <n>`.
+- Parameters: `--to` is the EVM address to credit.
+- Action: submits a [deposit transaction](transactions/deposit.md) to the multisig of the subnet's current configuration.
+- Returns: `fund transaction submitted at height: <n>`.
 
 ### Top up the fee reserve
 
@@ -112,17 +95,54 @@ ipc-cli cross-msg fund --subnet <id> btc [--to <addr>] <sats>
 ipc-cli cross-msg fee-top-up --subnet <id> btc <sats>
 ```
 
-- Provider: `fundsubnet` with `subnet_id` and `amount`, without `address`, then `getconfirmedcount`. Transaction: [fee top-up](transactions/deposit.md).
-- Output: `fee top-up submitted at height: <n>`.
+- Action: submits a fee top-up transaction ([deposit](transactions/deposit.md)) (command **unimplemented**).
+- Returns: `fee top-up submitted at height: <n>`.
 
 ### Prefund the genesis balance
 
 ```
-ipc-cli cross-msg pre-fund --subnet <id> btc [--to <addr>] <sats>
+ipc-cli cross-msg pre-fund --subnet <id> btc [--to <address>] <sats>
 ```
 
-- Provider: `prefundsubnet` with `subnet_id`, `amount`, `address`. Transaction: [prefund](transactions/prefund.md).
-- Output: logs `address pre-funded successfully`.
+- Parameters: `--to` is the EVM address that receives the genesis balance.
+- Action: submits a [prefund transaction](transactions/prefund.md).
+- Returns: logs `address pre-funded successfully`.
+
+### Run the checkpoint relayer
+
+```
+ipc-cli checkpoint relayer --subnet <id> [--checkpoint-interval-sec <s>] [--finalization-blocks <n>] [--max-parallelism <n>] [--metrics-address <ip:port>]
+```
+
+- Parameters: defaults `--checkpoint-interval-sec` 15, `--finalization-blocks` 0, `--max-parallelism` 4. Metrics are served only with `--metrics-address`.
+- Action: every interval, submits the next [checkpoint](transactions/checkpoint.md) with its batch-transfer transaction once its signatures reach the threshold. Every validator runs it.
+- Returns: runs until stopped. Logs `checkpoint submitted on btc at height: <n>` for each checkpoint and `cannot submit checkpoint due to: <error>` on a failure.
+
+## Queries of the monitor's state
+
+### List the subnets
+
+```
+ipc-cli subnet list --parent <prefix>
+```
+
+- Returns: one line `<subnet id>: <status>, created at <Bitcoin height>` per subnet that the monitor has recorded, in the order of their create transactions. The status is one of the [subnet status](lifecycle.md#subnet-status) values. No subnet: no line (command **unimplemented**).
+
+### List the validators
+
+```
+ipc-cli subnet list-validators --subnet <id>
+```
+
+- Returns: one line per member of the current configuration, then per validator with an accepted join transaction whom the current configuration does not seat yet: `<f410 address>: ValidatorInfo(staking: ValidatorStaking(confirmed_collateral: <BTC>, total_collateral: <BTC>, metadata: 0x), is_active: <bool>, is_waiting: <bool>)`. Amounts are in BTC. Before bootstrap it fails with `Subnet <id> not found.`
+
+### Show the genesis epoch
+
+```
+ipc-cli subnet genesis-epoch --subnet <id>
+```
+
+- Returns: `genesis epoch: <H_boot>`. Before bootstrap it fails with `Invalid bootstrap_block_height`.
 
 ### List the top-down messages
 
@@ -130,8 +150,8 @@ ipc-cli cross-msg pre-fund --subnet <id> btc [--to <addr>] <sats>
 ipc-cli cross-msg list-topdown-msgs --subnet <id> --from <height> --to <height>
 ```
 
-- Provider: `getrootnetmessages` with `subnet_id`, `block_height` for each height, and `getblockhash` for a height without messages.
-- Output: block hash and messages per height.
+- Parameters: `--from` and `--to` are Bitcoin L1 heights.
+- Returns: per height, `block height: <height>, block hash: <hash>, number of messages: <n>`, then per message `from: <address>, to: <address>, message: <hex>, value: <amount>, nonce: <n>`. The value is in the subnet's smallest unit (10¹⁰ per sat).
 
 ### List the validator changes
 
@@ -139,8 +159,8 @@ ipc-cli cross-msg list-topdown-msgs --subnet <id> --from <height> --to <height>
 ipc-cli checkpoint list-validator-changes --subnet <id> --from-epoch <height> --to-epoch <height>
 ```
 
-- Provider: `getstakechanges` with `subnet_id`, `block_height` for each height.
-- Output: per height, the configuration changes the monitor recorded at a cutoff ([configuration numbers](lifecycle.md#adopting-a-new-configuration)).
+- Parameters: `--from-epoch` and `--to-epoch` are Bitcoin L1 heights.
+- Returns: per height, logs `changes at height: <height> are: <changes>`, the configuration updates that the monitor released at that Bitcoin block ([configuration updates](lifecycle.md#configuration-updates)).
 
 ### Show the last checkpoint height
 
@@ -148,90 +168,102 @@ ipc-cli checkpoint list-validator-changes --subnet <id> --from-epoch <height> --
 ipc-cli checkpoint last-bottomup-checkpoint-height --subnet <id>
 ```
 
-- Provider: `getsubnetcheckpoint` with `subnet_id`.
-- Output: `height: <child height of the last checkpoint>` (0 without checkpoint).
+- Returns: `height: <n>`, the subnet height of the last recorded checkpoint, or 0 without a checkpoint.
 
-### Run the checkpoint relayer
+## Commands that run on the subnet
 
-```
-ipc-cli checkpoint relayer --subnet <id> [--checkpoint-interval-sec <s>] [--finalization-blocks <n>] [--submitter <addr>] [--max-parallelism <n>] [--metrics-address <ip:port>]
-```
-
-- Provider: each interval (default 15 s) `getsubnetcheckpoint`, `getgenesisinfo` (checkpoint period) and `finalizecheckpointpsbt` ([checkpoint](transactions/checkpoint.md)), the first checkpoint included. Defaults: `--finalization-blocks 0`, `--max-parallelism 4`.
-- Output: runs until stopped.
-
-Fendermint calls `gencheckpointpsbt`, `getstakechanges`, `getrootnetmessages`, `getgenesisinfo`, `getblockhash`, `getconfirmedcount` and, with the build feature `emission_chain` (validator rewards), `getrewardedcollaterals` through the provider's JSON-RPC. `getsubnet` (subnet state), `getsubnetbalance`, `gettokenbalance` and `getblockcount` are reached with direct JSON-RPC calls.
-
-## Commands that run on the child subnet
-
-These commands call the child subnet's EVM endpoint, not the provider.
+These commands call the subnet's EVM endpoint.
 
 ### Withdraw to Bitcoin
 
 ```
-ipc-cli cross-msg release [--from <addr>] --subnet <child id> btc --to <bitcoin address> <sats>
+ipc-cli cross-msg release [--from <address>] --subnet <id> btc --to <address> <sats>
 ```
 
-- Effect: a withdrawal on the child, which a later [checkpoint](transactions/checkpoint.md) pays.
+- Parameters: `--to` is the Bitcoin L1 address to pay.
+- Action: a withdrawal on the subnet, which a later [checkpoint](transactions/checkpoint.md) pays.
+- Returns: `release performed in epoch: <subnet height>`.
 
 ### Transfer BTC to another subnet
 
 ```
-ipc-cli cross-msg transfer [--source-gateway-address <addr>] --source-subnet <child id> [--source-address <addr>] --destination-subnet <child id> --destination-address <addr> <sats>
+ipc-cli cross-msg transfer [--source-gateway-address <address>] --source-subnet <id> [--source-address <address>] --destination-subnet <id> --destination-address <address> <sats>
 ```
 
-- Effect: a cross-subnet transfer on the source child, which a [batch transfer](transactions/batch-transfer.md) carries.
+- Parameters: `--source-gateway-address` defaults to the gateway of the configuration, `--source-address` to the default key.
+- Action: a cross-subnet transfer on the source subnet, which a [batch-transfer transaction](transactions/batch-transfer.md) carries.
+- Returns: `transfer performed in epoch: <subnet height>`.
 
 ### Transfer an ERC20 token to another subnet
 
 ```
-ipc-cli cross-msg transfer-erc [--source-gateway-address <addr>] --source-subnet <child id> [--source-address <addr>] --destination-subnet <child id> --destination-address <addr> --token <token address> <amount>
+ipc-cli cross-msg transfer-erc [--source-gateway-address <address>] --source-subnet <id> [--source-address <address>] --destination-subnet <id> --destination-address <address> --token <address> <amount>
 ```
 
-- Effect: an ERC20 transfer on the source child, which a [batch transfer](transactions/batch-transfer.md) carries.
+- Parameters: `<amount>` is an integer in the token's smallest unit.
+- Action: an ERC20 transfer on the source subnet, which a batch-transfer transaction carries.
+- Returns: `transfer-erc performed in epoch: <subnet height>`. A revert gives `transfer-erc failed: <reason>`.
 
 ### Show a wrapped token's metadata
 
 ```
-ipc-cli cross-msg query-token-metadata --subnet <child id> --home-subnet <child id> --home-token <token address> [--gateway-address <addr>]
+ipc-cli cross-msg query-token-metadata --subnet <id> --home-subnet <id> --home-token <address> [--gateway-address <address>]
 ```
 
-- Output: the token metadata stored on the queried child, as JSON.
+- Returns: the JSON object `{"name", "symbol", "decimals", "wrapped_token"}` of the token on the queried subnet. `wrapped_token` is null on the home subnet. A token that is not registered gives `Token (<home subnet>, <home token>) is not registered on subnet <id>`.
 
 ### Send value within the subnet
 
 ```
-ipc-cli subnet send-value [--from <addr>] --to <addr> --subnet <child id> <amount>
+ipc-cli subnet send-value [--from <address>] --to <address> --subnet <id> <amount>
 ```
 
+- Parameters: `<amount>` is in BTC, a decimal number.
+- Returns: logs `sending FIL from <from> to <to> in tx <hash>`.
 
 ### Show the parent finality
 
 ```
-ipc-cli cross-msg parent-finality --subnet <child id>
+ipc-cli cross-msg parent-finality --subnet <id>
 ```
 
-- Output: the latest Bitcoin height committed as parent finality in the child.
+- Returns: the latest Bitcoin L1 height committed as parent finality on the subnet.
 
 ### List checkpoint signature bundles
 
 ```
-ipc-cli checkpoint list-bottomup-bundle --subnet <child id> --from-epoch <height> --to-epoch <height>
+ipc-cli checkpoint list-bottomup-bundle --subnet <id> --from-epoch <height> --to-epoch <height>
 ```
 
+- Parameters: `--from-epoch` and `--to-epoch` are subnet heights.
+- Returns: per height with a bundle, `bottom up checkpoint bundle at height: <height>`, then the bundle as one JSON line.
 
 ### List quorum-reached events
 
 ```
-ipc-cli checkpoint quorum-reached-events --subnet <child id> --from-epoch <height> --to-epoch <height>
+ipc-cli checkpoint quorum-reached-events --subnet <id> --from-epoch <height> --to-epoch <height>
 ```
 
+- Parameters: `--from-epoch` and `--to-epoch` are subnet heights.
+- Returns: one line per event, `QuorumReachedEvent<height: <height>, checkpoint: <hash>, quorum_weight: <weight>>`.
 
 ### Show wallet balances
 
 ```
-ipc-cli wallet balances --subnet <child id> --wallet-type <evm|btc|fvm>
+ipc-cli wallet balances --subnet <id> --wallet-type <type>
 ```
 
+- Parameters: `--wallet-type` is `evm`, `btc` or `fvm`.
+- Returns: one line `<address> - Balance: <amount>` per key: for `evm` and `btc` the keys of the EVM keystore, with the balance in the subnet's smallest unit for `evm` and in sats for `btc`, and for `fvm` the keys of the FVM wallet. A failed lookup fails the whole command with `Error fetching balances`.
+
+## Local commands
+
+These commands need neither the provider nor the subnet.
+
+### Generate the EOTS key
+
+- Parameters: the paths of the two files to write.
+- Action: generates a validator's EOTS key and its nonce seed ([EOTS key](slashing.md#eots-key-and-eots-nonce-commitments)), each a random 32-byte secret. It writes each to its file as 64 hex characters: the secret key of the EOTS key to the file that the validator's provider loads from `EOTS_SK_PATH`, and the nonce seed to the file that it loads from `EOTS_SEED_PATH` (command **unimplemented**).
+- Returns: the EOTS key `pk_eots`, an x-only key, as 64 hex characters.
 
 The other `wallet` commands, the `util` commands and `config init` are local.

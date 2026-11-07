@@ -22,7 +22,7 @@ Integers in OP_RETURN layouts are little-endian unless the layout says otherwise
 
 ## Fee rate
 
-Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (create, prefund, join, stake, deposit) may use any fee its wallet chooses. `r` fixes the values that the protocol computes itself: commitment outputs, reveal outputs, configuration multisig spends and the exit.
+Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (the create subnet, prefund, join, stake, deposit and fee top-up transactions) may use any fee its wallet chooses (fee top-up transaction **unimplemented**). `r` fixes the values that the protocol computes itself: commitment outputs, the outputs of reveal transactions, configuration multisig spends and the exit transaction.
 
 Each provider uses its own estimate for a checkpoint, so two providers can build different transactions for the same checkpoint.
 
@@ -78,13 +78,13 @@ Types with their own encoding:
 
 ### OP_RETURN output
 
-The OP_RETURN output of a message is `OP_RETURN` (`0x6a`) followed by one minimal push of its data (`OP_PUSHBYTES_n` for `n ≤ 75` bytes, `OP_PUSHDATA1 n` for `76 ≤ n ≤ 255`). Its value is 0, except output 0 of the kill checkpoint, which burns its value. A message in an OP_RETURN must be in output 0 and must be the only push of that script.
+The OP_RETURN output of a message is `OP_RETURN` (`0x6a`) followed by one minimal push of its data (`OP_PUSHBYTES_n` for `n ≤ 75` bytes, `OP_PUSHDATA1 n` for `76 ≤ n ≤ 255`). Its value is 0, except output 0 of the kill checkpoint, which burns its value. A message in an OP_RETURN must be in output 0 and must be the only push of that script (single-push check **unimplemented**).
 
 | Data length (bytes) | Script | Used by |
 |---|---|---|
-| 26 | `6a 1a ‖ data` | fee top-up |
-| 46 | `6a 2e ‖ data` | prefund, deposit |
-| 62 | `6a 3e ‖ data` | stake |
+| 26 | `6a 1a ‖ data` | fee top-up transaction (**unimplemented**) |
+| 46 | `6a 2e ‖ data` | prefund and deposit transactions |
+| 62 | `6a 3e ‖ data` | stake transaction |
 | 77 | `6a 4c 4d ‖ data` | checkpoint |
 
 ### Data leaf script
@@ -99,10 +99,10 @@ A message `D` too large for an OP_RETURN travels in a commit-reveal pair.
 
 - The **commitment output** is output 0 of the commit transaction (in a checkpoint, output `p + W + 1`, [checkpoint](transactions/checkpoint.md#outputs)): a P2TR output with internal key `K_NUMS` and a single leaf (leaf version `0xc0`), the data leaf script `S` of `D`.
 - The **reveal transaction** spends the commitment output through `S`. Its input witness is `[S, cb]`, where `cb` = `(0xc0 | parity)` ‖ `K_NUMS` (33 bytes), and `parity` is 1 if the y coordinate of the output key is odd and 0 otherwise (BIP341). Every control block in this specification starts with this byte. The input needs no signature.
-- The commitment output's value covers the reveal's output and its fee: `v + fee_r(weight(reveal))`, where `v ≥ max(dust_r(P), dust(P), dust(destination))` is the reveal output's value and `P` the commitment scriptPubKey.
-- Both transactions have version 2 and nLockTime 0. The reveal input has nSequence `0xffffffff`.
+- The commitment output's value covers the reveal transaction's output and its fee: `v + fee_r(weight(reveal))`, where `v ≥ max(dust_r(P), dust(P), dust(destination))` is the value of the reveal transaction's output and `P` the commitment scriptPubKey.
+- Both transactions have version 2 and nLockTime 0. The input of the reveal transaction has nSequence `0xffffffff`.
 
-The monitor finds a message in the reveal: the data is the concatenation of the chunks that the pushes followed by `OP_DROP` push, in the leaf script executed by the input that spends the commitment output. Anyone who sees the commit transaction can build a reveal of the same data with other outputs, so the protocol takes only the data from the reveal.
+The monitor finds a message in the reveal transaction: the data is the concatenation of the chunks that the pushes followed by `OP_DROP` push, in the leaf script executed by the input that spends the commitment output. Anyone who sees the commit transaction can build a reveal transaction of the same data with other inputs, another input order and other outputs, so the protocol takes only the data from the reveal transaction.
 
 ### Configuration multisig
 
@@ -149,3 +149,7 @@ An EOTS nonce commitment `(start, count, root)` commits an EOTS key to one publi
 `root` is the RFC 6962 Merkle tree hash, with SHA-256, of the list `R_start, …, R_{start+count−1}`. A list of one element `x` hashes to `sha256(0x00 ‖ x)`. A list of `n > 1` elements splits after its first `k` elements, where `k` is the largest power of two smaller than `n`, and hashes to `sha256(0x01 ‖ left ‖ right)`. The proof of `R_h` is its RFC 6962 audit path in that tree, for the leaf index `h − start`.
 
 In a message, an EOTS nonce commitment is the postcard tuple `(start: u64, count: u32, root: 32 bytes)`.
+
+### EOTS vote
+
+An EOTS vote ([slashing](slashing.md#the-vote)) is the postcard tuple `(pk_eots: 32 bytes, h: u64, b: 32 bytes, signature: 64 bytes, start: u64, proof: list of 32 bytes)`: the EOTS key, the subnet height, the subnet block hash, the BIP340 signature `R_h ‖ s`, the `start` of the EOTS nonce commitment whose range holds `h`, and the audit path of `R_h` in that commitment's tree, from the leaf up. On the subnet it travels inside the signed vote envelope of the top-down finality votes (`VoteRecord`), as its content, signed with the validator key.

@@ -1,6 +1,6 @@
 # Exit
 
-A validator spends its matured collateral outputs, through the unilateral-exit leaf, and its unbonding outputs after their delay, through the unilateral-unbonding leaf, to its backup address, without the subnet's validators. The code calls it the unilateral-exit spend, and the provider's call is `unstakeue`.
+With the exit transaction, a validator spends its matured collateral outputs, through the unilateral-exit leaf, and its unbonding outputs after their delay, through the unilateral-unbonding leaf, to its backup address, without the subnet's validators. The code calls it the unilateral-exit spend, and the provider's call is `unstakeue`.
 
 ## Transaction format
 
@@ -9,7 +9,7 @@ A validator spends its matured collateral outputs, through the unilateral-exit l
 | version | 2 |
 | nLockTime | the maximum timeout `T` of the collateral inputs, as a block height, or 0 if there is none |
 | inputs | collateral outputs and unbonding outputs of one validator, with an empty scriptSig. A collateral input has nSequence `0xfffffffd` and the witness `[sig, U(pk, T), cb]`. An unbonding input has nSequence `3K` and the witness `[sig, B(pk), cb]`. `sig` is the 64-byte BIP340 signature of `pk` over the BIP341 script-path sighash of the leaf (`SIGHASH_DEFAULT`, all prevouts), and `cb` the leaf's control block |
-| output 0 | the backup address of the join, with value = the sum of the inputs minus the fee |
+| output 0 | the backup address of the join transaction, with value = the sum of the inputs minus the fee |
 
 `OP_CHECKLOCKTIMEVERIFY` makes the transaction valid from block `T + 1` on, and `OP_CHECKSEQUENCEVERIFY` from `3K` blocks after the block that includes each unbonding input.
 
@@ -25,4 +25,4 @@ Anyone holding the key can build the same transaction by hand.
 
 ## Verifying the transaction
 
-Bitcoin L1 verifies the leaves. The monitor records the spend of each collateral and unbonding output that the transaction spends. No configuration seats the validator through such a collateral any more ([maturity of a collateral](../lifecycle.md#maturity-of-a-collateral)).
+Bitcoin L1 verifies the leaves. The monitor records the spend of each collateral and unbonding output that the transaction spends. No configuration seats the validator through such a collateral any more.
