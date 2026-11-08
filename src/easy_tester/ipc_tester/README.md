@@ -29,6 +29,22 @@ Missing prerequisites run automatically; completed ones reuse the saved state un
 docker exec -e HOST_ADDR=<host address> bitcoin-ipc ue_scenario.sh --step subnet_b_cli_routing
 ```
 
+## Checkpoint matrix
+
+`make checkpoint-matrix`, from `bitcoin-ipc`, runs the checkpoint steps for each period P in `PERIODS` (default `30 100`) and K = m·P + 15 for each m in `MULTIPLES` (default `1`), plus K = P when `EQUAL=1` (default). Each cell wipes the devnet, starts it with `BLOCK_INTERVAL=1 UE_ACTIVATION_HEIGHT=1`, waits past Bitcoin block 101 and until the providers of validators 1 to 6 and users 1 and 2 answer `getconfirmedcount` with a height above 101 (a cell that is not ready after 300 s fails), then runs `--group setup`, `--group deposits`, `--step join_v5`, `--step traffic`, `--step removal` and `--step checkpoint_invariants` with `UE_CHECK_PERIOD`=P, `UE_EPOCH_LENGTH`=K, `UE_STEP_TIMEOUT`=12·K + 900 and `UE_BUILD_IMAGE=0` (1 when `fendermint:latest` is missing). It copies `~/.ipc/logs`, the scenario state and the `docker logs` of every container to `OUT/P<period>-K<K>/`, goes on after a failure and writes one line per cell (period, K, multiple, the totals `PASS`, `FAIL`, `OUT_OF_SCOPE`, `DEFERRED`, exit code, duration) to `OUT/matrix.tsv`.
+
+Full matrix:
+
+```
+make checkpoint-matrix OUT=<folder> HOST_ADDR=<host address>
+```
+
+One cell:
+
+```
+make checkpoint-matrix PERIODS=30 MULTIPLES=1 EQUAL=0 OUT=<folder> HOST_ADDR=<host address>
+```
+
 ## Sign-record reader
 
 `spec_eots_sign_record.rs` is a cargo integration test (`[[test]] spec_eots_sign_record`) used as a read-only helper: it dumps the signed EOTS votes of a heed database (`EOTS_SIGN_RECORD_DB`, `EOTS_SIGN_RECORD_OUTPUT`). The step `provider_outage` runs it as `/tmp/spec-eots-sign-record` in the container, or as the executable that `UE_SIGN_RECORD_READER` names. The scenario does not build it, as the container has no source tree. A run that selects `provider_outage` stops before its first step when the reader is missing or does not start.
