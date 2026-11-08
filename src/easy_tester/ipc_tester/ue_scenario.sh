@@ -37,12 +37,12 @@ shopt -s inherit_errexit
 # Once subnet B's L2 runs and its monitor has set H_0, on the same devnet and state:
 #   docker exec -e HOST_ADDR=<host address> bitcoin-ipc ue_scenario.sh --step subnet_b_cli_routing
 
-EPOCH_LENGTH=90       # K, in Bitcoin blocks (not shorter than a checkpoint period)
-EPOCHS_BOOTSTRAP=107  # seating epochs for validators 1-4: 9630 blocks, more than all step timeouts together
-EPOCHS_V5=6           # seating epochs, 540 blocks, about 540 s for validator 5 to be seated; maturity follows removal by 3K blocks
+EPOCH_LENGTH=${UE_EPOCH_LENGTH:-90} # K, Bitcoin blocks; also exercise K=P in the matrix
+EPOCHS_BOOTSTRAP=107  # epochs: the block duration scales with K (9630 blocks at the default)
+EPOCHS_V5=6           # epochs: 6K blocks seated, followed by 3K blocks to maturity
 POWER_UNIT_EXPONENT=6 # one power unit is 1,000,000 sat; collateral below has power 100
 MIN_TIMEOUT=1
-MAX_TIMEOUT=1000
+MAX_TIMEOUT=1000     # epochs, so the permitted timeout in Bitcoin blocks scales with K
 MIN_DEPOSIT=330
 KILL_VOTE_PERIOD=36
 KILL_DELAY_PERIOD=5
@@ -50,11 +50,11 @@ GATEWAY=0x77aa40b105843728088c0132e43fc44348881da8
 COLLATERAL=100000000  # sats, the minimum validator stake below
 MIN_VALIDATOR_STAKE=100000000
 MIN_VALIDATORS=4
-CHECK_PERIOD=30       # L2 blocks per checkpoint
+CHECK_PERIOD=${UE_CHECK_PERIOD:-30} # L2 blocks per periodic checkpoint; batches can checkpoint earlier
 DEPOSIT=50000000      # sats per deposit
 WITHDRAWAL=10000000   # sats released from the L2 while validator 5 is a member
 VALIDATOR_FUND=100000000 # sats deposited after bootstrap; credited when parent finality reaches the deposit's Bitcoin block
-CHECKPOINT_TIMEOUT=630   # seconds for one wait; the longest is the Bitcoin blocks up to V5_REMOVAL or T5 (EPOCHS_V5 * K = 540 s)
+CHECKPOINT_TIMEOUT=630   # recomputed as 7K after loading the saved scenario parameters
 MONITOR_TIMEOUT=60       # seconds for the monitor to process an already-mined block (2 s polling, 30 s error backoff)
 OUTAGE_STABLE_SECONDS=20 # seconds with no target-node progress while its peers keep committing
 IP_PREFIX="66.222.44.55:808"   # validator n advertises ${IP_PREFIX}$((n - 1))
@@ -1179,7 +1179,7 @@ PY
     fail "ipc-cli's subnet B query also reached provider 3030"
   fi
   # join.md, Creating 1: in epoch 0 every join is refused before the key rule, so subnet B must be active.
-  CHECKPOINT_TIMEOUT=270 wait_for "subnet B's monitor has set H_0" 0 subnet_b_active
+  CHECKPOINT_TIMEOUT=$((3 * EPOCH_LENGTH)) wait_for "subnet B's monitor has set H_0" 0 subnet_b_active
   before=$(provider_reply 1 geteotskeys "{\"subnet_id\":\"$PAIR_B\"}" b | jq -ceS '.result | sort_by(.pubkey)')
   backup=$(new_btc_address)
   timeout 30 ipc-cli --config-path /root/.ipc/validator1/config.toml \
@@ -1321,8 +1321,391 @@ clean_previous_run() {
   pkill -f "checkpoint relayer" || true
 }
 
+# Read-only history audit, deliberately selected separately from `all`. The
+# matrix calls it after removal, on the same saved fixture. No fixed P-multiple
+# assumption is made about recorded checkpoint heights.
+step_checkpoint_invariants() {
+  say "checkpoint invariants for P=$CHECK_PERIOD subnet blocks, K=$EPOCH_LENGTH Bitcoin blocks"
+  python3 - "$SUBNET" "$EPOCH_LENGTH" "$CHECK_PERIOD" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" \
+    "${HOST_ADDR:-host.docker.internal}" "$GATEWAY" "$LOGS" "$(xonly 5)" "$T5" <<'PY'
+import base64
+import bisect
+import collections
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+
+subnet, k, period, provider, token, host, gateway, logdir, v5, t5 = sys.argv[1:]
+k, period = int(k), int(period)
+totals = collections.Counter({name: 0 for name in ("PASS", "FAIL", "OUT_OF_SCOPE", "DEFERRED")})
+first_missing_rotation = None
+
+def result(ok, epoch, location, description, category=None):
+    if first_missing_rotation is not None and epoch >= first_missing_rotation:
+        category = "OUT_OF_SCOPE"
+        description += f"; rotation missing by cutoff in epoch {first_missing_rotation}"
+    category = category or ("PASS" if ok else "FAIL")
+    totals[category] += 1
+    print(f"{category}\tepoch={epoch} {location}\t{description}".replace("\n", " "), flush=True)
+
+def btc(*args):
+    # bitcoin-cli prints a bare string (a block hash, a raw transaction) as plain text, not JSON
+    out = subprocess.check_output(["bitcoin-cli", *map(str, args)], text=True).strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+def rpc(url, method, params, bearer=None):
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    request = urllib.request.Request(url, json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=params)).encode(), headers)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        reply = json.load(response)
+    if reply.get("error") is not None:
+        raise RuntimeError(f"{method}: {reply['error']}")
+    return reply["result"]
+
+def query(method, **params):
+    return rpc(provider, method, dict(subnet_id=subnet, **params), token)
+
+def eth(method, params):
+    return rpc(f"http://{host}:8545/", method, params)
+
+# encoding.md:75-77,107-114: derive the unit-power whitelist/genesis script
+# independently, including the subnet-binding leaf. Later configurations come
+# from the cutoff's committee_after_change, never from a checkpoint's change.
+field = 2**256 - 2**32 - 977
+generator = (0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,
+             0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8)
+def add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    x, y = a
+    u, v = b
+    if x == u and (y + v) % field == 0:
+        return None
+    slope = ((3*x*x) * pow(2*y, -1, field) if a == b else (v-y) * pow(u-x, -1, field)) % field
+    nx = (slope*slope-x-u) % field
+    return nx, (slope*(x-nx)-y) % field
+
+def tagged(tag, data):
+    h = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(h + h + data).digest()
+
+def compact(n):
+    return bytes([n]) if n < 253 else b"\xfd" + n.to_bytes(2, "little")
+
+def unit_multisig(keys, threshold, subnet_bytes):
+    assert 1 <= threshold <= 16
+    script = b"\x00" + b"".join(b"\x7c\x20" + bytes.fromhex(key) + b"\xac\x63\x51\x93\x68" for key in sorted(keys)) + bytes([0x50 + threshold, 0xa2])
+    leaves = sorted(tagged("TapLeaf", b"\xc0" + compact(len(leaf)) + leaf) for leaf in (script, b"\x6a\x14" + subnet_bytes))
+    internal_x = generator[0] + 1
+    internal_y = pow((internal_x**3 + 7) % field, (field + 1)//4, field)
+    internal = internal_x, internal_y if internal_y % 2 == 0 else field - internal_y
+    tweak = int.from_bytes(tagged("TapTweak", internal_x.to_bytes(32, "big") + tagged("TapBranch", b"".join(leaves))), "big")
+    point, multiple = None, generator
+    while tweak:
+        if tweak & 1:
+            point = add(point, multiple)
+        multiple = add(multiple, multiple)
+        tweak >>= 1
+    return "5120" + add(internal, point)[0].to_bytes(32, "big").hex()
+
+def main():
+    global first_missing_rotation
+    genesis = query("getgenesisinfo")
+    for attempt in range(10):
+        processed = rpc(provider, "getconfirmedcount", None, token)
+        state = query("getsubnet")
+        if rpc(provider, "getconfirmedcount", None, token) == processed:
+            break
+    else:
+        raise RuntimeError("could not capture a stable monitor height")
+    params = genesis["create_subnet_msg"]
+    h0 = state["h_0"]
+    assert h0 is not None, "H_0 has not been recorded"
+    # Freeze the monitor history. Later mining during this audit cannot add a
+    # partial epoch or checkpoint to the observations below.
+    current = (processed - h0)//k + 1
+    result(params["epoch_length"] == k and params["bottomup_check_period"] == period,
+           0, f"Bitcoin-height={h0}", "saved (P,K) agrees with the create transaction")
+    checkpoints = []
+    assert state["last_checkpoint_number"] is not None, "no checkpoint history"
+    for number in range(state["last_checkpoint_number"] + 1):
+        cp = query("getsubnetcheckpoint", number=number)
+        assert cp is not None, f"checkpoint number {number} missing"
+        if cp["block_height"] <= processed:
+            checkpoints.append(cp)
+    assert checkpoints, "no checkpoint recorded by the snapshot height"
+    # Logs identify the two stated limits. Count attempts PER provider, never
+    # by adding identical messages from different providers. The fixed-name
+    # provider logs belong to subnet A; subnet B uses separate *-subnet-b logs.
+    logs = pathlib.Path(logdir)
+    missing = set()
+    for path in logs.glob("monitor*.log"):
+        for line in path.read_text(errors="replace").splitlines():
+            match = re.search(r"Subnet " + re.escape(subnet) + r": no rotation checkpoint of epoch (\d+) by its cutoff block (\d+)", line)
+            if match and 1 <= int(match[1]) < current and int(match[2]) <= processed:
+                missing.add(int(match[1]))
+    logged_missing = missing.copy()
+    # The recorded history is also authoritative when a monitor log has been
+    # rotated away. A closed epoch without its rotation is the stated limit,
+    # regardless of P/K; the brief classifies it OUT_OF_SCOPE in every cell.
+    missing.update(epoch for epoch in range(1, current)
+                   if not any(cp["is_rotation_checkpoint"] and cp["epoch"] == epoch
+                              and cp["block_height"] <= h0 + epoch*k for cp in checkpoints))
+    duplicate_epochs, attempted_epochs, attempted_heights = set(), collections.defaultdict(set), set()
+    for path in sorted(logs.glob("provider-validator[1-6].log")):
+        counts, height = collections.Counter(), None
+        for line in path.read_text(errors="replace").splitlines():
+            if "gen_checkpoint_psbt:" in line:
+                match = re.search(r"checkpoint_height: (\d+)", line)
+                height = int(match[1]) if match else None
+                if height is not None:
+                    attempted_heights.add(height)
+            match = re.search(r"Rotation checkpoint of epoch (\d+)\b", line)
+            if match:
+                epoch = int(match[1])
+                counts[epoch] += 1
+                if height is not None:
+                    attempted_epochs[height].add(epoch)
+        duplicate_epochs.update(epoch for epoch, count in counts.items() if count >= 2)
+    if missing:
+        first_missing_rotation = min(missing)
+        for epoch in sorted(missing):
+            evidence = "monitor log and recorded history" if epoch in logged_missing else "recorded history (monitor log unavailable)"
+            result(False, epoch, f"Bitcoin-height={h0 + epoch*k}", f"no rotation checkpoint by its next cutoff: {evidence}", "OUT_OF_SCOPE")
+
+    encoded = subnet.rsplit("/", 1)[1][5:].upper()
+    subnet_bytes = base64.b32decode(encoded + "=" * (-len(encoded) % 8))[:20]
+    whitelist = unit_multisig(params["whitelist"], 2*params["min_validators"]//3 + 1, subnet_bytes)
+    genesis_keys = {v["pubkey"] for v in genesis["genesis_validators"]}
+    cgen = unit_multisig(genesis_keys, 2*len(genesis_keys)//3 + 1, subnet_bytes)
+    scripts, numbers, members = {0: whitelist}, {0: 0}, {0: genesis_keys}
+    changes_by_epoch = {}
+    previous_script = cgen
+    # lifecycle.md:134,170: a cutoff's transactions belong to its ending epoch;
+    # the configuration update becomes current only AFTER those transactions.
+    for epoch in range(1, current + 1):
+        cutoff = h0 + (epoch-1)*k
+        changes = sorted(query("getstakechanges", block_height=cutoff), key=lambda c: c["configuration_number"])
+        changes_by_epoch[epoch] = changes
+        previous_number = numbers[epoch-1]
+        if changes:
+            committee = changes[-1]["committee_after_change"]
+            previous_script = btc("validateaddress", committee["multisig_address"])["scriptPubKey"]
+            numbers[epoch] = committee["configuration_number"]
+            members[epoch] = {v["pubkey"] for v in committee["validators"]}
+        else:
+            numbers[epoch], members[epoch] = previous_number, members[epoch-1]
+        scripts[epoch] = previous_script
+        expected = list(range(previous_number + 1, previous_number + len(changes) + 1))
+        ok = ([c["configuration_number"] for c in changes] == expected
+              and numbers[epoch] == previous_number + len(changes)
+              and all(c["block_height"] == cutoff for c in changes))
+        result(ok, epoch, f"Bitcoin-height={cutoff}", "invariant 6: change number advances exactly for cutoff updates and stays unchanged otherwise")
+
+    # Read all Bitcoin transactions, not only monitor-accepted deposits. This
+    # also reconstructs fund UTXOs at each PAST cutoff; a current scan alone
+    # cannot detect a sweep that happened after its deadline.
+    transactions, positions, spent, fund_outputs, block_times = {}, {}, {}, {}, []
+    deposits = []
+    known_scripts = set(scripts.values())
+    for height in range(genesis["create_msg_block_height"], processed + 1):
+        block = btc("getblock", btc("getblockhash", height), 2)
+        block_times.append((height, block["time"]))
+        for index, tx in enumerate(block["tx"]):
+            txid = tx["txid"]
+            transactions[txid], positions[txid] = tx, (height, index)
+            for vin in tx["vin"]:
+                if "txid" in vin:
+                    spent[(vin["txid"], vin["vout"])] = ((height, index), txid)
+            for output in tx["vout"]:
+                if output["scriptPubKey"]["hex"] in known_scripts:
+                    fund_outputs[(txid, output["n"])] = (output["scriptPubKey"]["hex"], (height, index))
+            if not tx["vout"]:
+                continue
+            opreturn = bytes.fromhex(tx["vout"][0]["scriptPubKey"]["hex"])
+            # Implemented deposit format: one 46-byte OP_RETURN push.
+            if opreturn[:2] == b"\x6a\x2e" and opreturn[2:28] == b"IPCFND" + subnet_bytes:
+                deposits.append(tx)
+
+    # Check every monitor record against Bitcoin Core's transaction index too.
+    # Keep the actual block time, rather than the time the monitor logged it.
+    inclusion_times = {}
+    for cp in checkpoints:
+        tx = btc("getrawtransaction", cp["txid"], 1)
+        header = btc("getblockheader", tx["blockhash"])
+        assert tx.get("confirmations", 0) > 0, f"checkpoint-height={cp['checkpoint_height']} is not mined"
+        assert header["height"] == positions[cp["txid"]][0]
+        inclusion_times[cp["txid"]] = header["time"]
+
+    by_epoch = collections.defaultdict(list)
+    for cp in checkpoints:
+        by_epoch[cp["epoch"]].append(cp)
+    result(all(not cp["is_rotation_checkpoint"] for cp in by_epoch[0]), 0,
+           f"Bitcoin-height={h0}", "invariant 1: epoch 0 checkpoints are regular")
+    for epoch in range(1, current + 1):
+        cps = by_epoch[epoch]
+        rotations = [cp for cp in cps if cp["is_rotation_checkpoint"]]
+        ok = (len(rotations) == 1 and bool(cps) and cps[0] is rotations[0]
+              and all(not cp["is_rotation_checkpoint"] for cp in cps[1:]))
+        if epoch == current and not cps:
+            continue  # no exact-one assertion before the epoch's next cutoff
+        result(ok, epoch, f"Bitcoin-height={h0 + epoch*k}", "invariant 1: first recorded checkpoint rotates, all others are regular")
+        if epoch < current:
+            result(len(rotations) == 1 and h0 + (epoch-1)*k < rotations[0]["block_height"] <= h0 + epoch*k,
+                   epoch, f"Bitcoin-height={h0 + epoch*k}", "invariant 2: rotation included by H_e")
+
+    # Obtain a successor even for the last recorded checkpoint. Periodic
+    # creation heights plus BitcoinCheckpointAdded events include full-batch
+    # checkpoints at arbitrary heights, including ones never recorded on L1.
+    last_height = checkpoints[-1]["checkpoint_height"]
+    next_period = (last_height//period + 1)*period
+    deadline = time.monotonic() + 7*k
+    while True:
+        head = int(eth("eth_blockNumber", []), 16)
+        if head >= next_period:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"no successor subnet block {next_period} for checkpoint-height={last_height}")
+        time.sleep(1)
+    topic = subprocess.check_output(["cast", "keccak", "BitcoinCheckpointAdded(uint256,address,bytes32)"], text=True).strip()
+    events = eth("eth_getLogs", [dict(address=gateway, fromBlock=hex(checkpoints[0]["checkpoint_height"]), toBlock=hex(head), topics=[topic])])
+    created = {cp["checkpoint_height"] for cp in checkpoints}
+    created.update(range((min(created)//period + 1)*period, head + 1, period))
+    created.update(int(event["topics"][1], 16) for event in events)
+    created.update(h for h in attempted_heights if min(created) <= h <= head)
+    created = sorted(created)
+    l2_blocks = {}
+    def creation_time(height):
+        if height not in l2_blocks:
+            block = eth("eth_getBlockByNumber", [hex(height), False])
+            assert block is not None, f"missing subnet block {height}"
+            l2_blocks[height] = int(block["timestamp"], 16)
+        return l2_blocks[height]
+    unsafe = set()
+    for cp in checkpoints:
+        height, epoch = cp["checkpoint_height"], cp["epoch"]
+        next_height = created[bisect.bisect_right(created, height)]
+        included_time, next_time = inclusion_times[cp["txid"]], creation_time(next_height)
+        if included_time >= next_time:
+            unsafe.add(height)
+        result(height not in unsafe, epoch, f"checkpoint-height={height}",
+               f"Bitcoin-height={cp['block_height']} time={included_time}; next checkpoint-height={next_height} creation-time={next_time}; inclusion must precede creation",
+               "OUT_OF_SCOPE" if height in unsafe else None)
+
+    adopted_epoch = 0
+    for index, cp in enumerate(checkpoints):
+        height, epoch = cp["checkpoint_height"], cp["epoch"]
+        tx = transactions[cp["txid"]]
+        scope = "OUT_OF_SCOPE" if height in unsafe else None
+        if cp["is_rotation_checkpoint"]:
+            adopted_epoch = epoch
+        result(epoch == adopted_epoch and bool(bytes.fromhex(tx["vout"][0]["scriptPubKey"]["hex"])[-1] & 4) == cp["is_rotation_checkpoint"],
+               epoch, f"checkpoint-height={height}", "invariant 1: epoch follows the latest rotation and the recorded flag matches the transaction", scope)
+        result(tx["vout"][-1]["scriptPubKey"]["hex"] == scripts[epoch], epoch,
+               f"checkpoint-height={height}", "invariant 3: change pays MS(C_epoch)", scope)
+        result(cp["next_configuration_number"] == numbers[epoch], epoch,
+               f"checkpoint-height={height}", "invariant 6: recorded configuration change number matches its epoch (the applied wire change number may lag)", scope)
+        result(cp["block_height"] == positions[cp["txid"]][0], epoch,
+               f"checkpoint-height={height}", "recorded Bitcoin height matches its block", scope)
+        if index:
+            previous = checkpoints[index-1]
+            previous_tx = transactions[previous["txid"]]
+            # Judge only the presence of the previous change, not the
+            # unimplemented ordering/selection of other fund inputs.
+            chained = any(v.get("txid") == previous["txid"] and v.get("vout") == previous_tx["vout"][-1]["n"] for v in tx["vin"])
+            chain_scope = "OUT_OF_SCOPE" if previous["checkpoint_height"] in unsafe else scope
+            result(chained, epoch, f"checkpoint-height={height}",
+                   f"invariant 5: spends change of checkpoint-height={previous['checkpoint_height']}", chain_scope)
+
+    # Every periodic height between recorded checkpoints must be present;
+    # full-batch/event heights are allowed too. Attribute a gap to its own
+    # creation time or, preferentially, the provider's rotation-attempt epoch.
+    recorded_heights = {cp["checkpoint_height"] for cp in checkpoints}
+    for height in created:
+        if not checkpoints[0]["checkpoint_height"] < height < last_height or height in recorded_heights:
+            continue
+        time_created = creation_time(height)
+        # Block timestamps need not increase, so do not bisect them.
+        bitcoin_height = max((h for h, stamp in block_times if stamp <= time_created), default=h0)
+        epoch = 0 if bitcoin_height <= h0 else (bitcoin_height-h0-1)//k + 1
+        attempts = attempted_epochs.get(height, set())
+        epoch = min(attempts & duplicate_epochs or attempts or {epoch})
+        result(False, epoch, f"checkpoint-height={height}", "invariant 5: created checkpoint missing from recorded history",
+               "DEFERRED" if epoch in duplicate_epochs else None)
+
+    # One current UTXO scan corroborates the historical reconstruction. Check
+    # only outputs created before the rotation; delayed arrivals and the
+    # unimplemented K/2 acceptance window are outside this audit.
+    scan = btc("scantxoutset", "start", json.dumps([f"raw({script})" for script in sorted(known_scripts)]))
+    assert scan["success"] and scan["height"] >= processed, "incomplete UTXO scan"
+    unspent_now = {(u["txid"], u["vout"]) for u in scan["unspents"]}
+    for epoch in range(1, current):
+        if scripts[epoch] == scripts[epoch-1] and epoch != 1:
+            continue
+        rotation = next((cp for cp in by_epoch[epoch] if cp["is_rotation_checkpoint"]), None)
+        cutoff = h0 + epoch*k
+        if rotation is None:
+            result(False, epoch, f"Bitcoin-height={cutoff}", "invariant 4: no rotation from which to judge the previous-multisig sweep")
+            continue
+        before = positions[rotation["txid"]]
+        old_funds = [outpoint for outpoint, (script, position) in fund_outputs.items()
+                     if script == scripts[epoch-1] and position < before
+                     and (outpoint not in spent or spent[outpoint][0] >= before)]
+        epoch_txids = {cp["txid"] for cp in by_epoch[epoch]}
+        remaining = [outpoint for outpoint in old_funds
+                     if outpoint not in spent or spent[outpoint][0][0] > cutoff
+                     or spent[outpoint][1] not in epoch_txids or outpoint in unspent_now]
+        result(not remaining, epoch, f"Bitcoin-height={cutoff}",
+               f"invariant 4: previous multisig swept by next cutoff; remaining={remaining}")
+
+    for tx in deposits:
+        height = positions[tx["txid"]][0]
+        epoch = 0 if height <= h0 else (height-h0-1)//k + 1
+        location = f"deposit={tx['txid']}:1 Bitcoin-height={height}"
+        result(tx["vout"][1]["scriptPubKey"]["hex"] == scripts[epoch], epoch, location,
+               "invariant 7: deposit pays configuration current at its Bitcoin block")
+        spend = spent.get((tx["txid"], 1))
+        spender = next((cp for cp in checkpoints if spend and cp["txid"] == spend[1]), None)
+        spend_epoch = spender["epoch"] if spender else current
+        scope = "OUT_OF_SCOPE" if spender and spender["checkpoint_height"] in unsafe else None
+        result(spender is not None and positions[spender["txid"]] > positions[tx["txid"]], spend_epoch, location,
+               "invariant 7: a later recorded checkpoint spends the deposit", scope)
+    result(bool(deposits), 0, f"Bitcoin-height={processed}", "invariant 7: observed deposits (including bootstrap funding)")
+    if t5:
+        entries = [e for e in range(1, current+1) if v5 in members[e] and v5 not in members[e-1]]
+        departures = [e for e in range(1, current+1) if v5 not in members[e] and v5 in members[e-1]]
+        for name, epochs in (("entry", entries), ("departure", departures)):
+            epoch = epochs[0] if epochs else current
+            result(bool(epochs) and all(changes_by_epoch[e] and numbers[e] > numbers[e-1] for e in epochs),
+                   epoch, f"Bitcoin-height={h0 + (epoch-1)*k}", f"invariant 6: validator5 {name} increases the change number")
+
+try:
+    main()
+except Exception as error:
+    # Missing evidence is a failure, never a timing-limit classification.
+    totals["FAIL"] += 1
+    print(f"FAIL\tepoch=0 evidence\t{type(error).__name__}: {error}".replace("\n", " "), flush=True)
+finally:
+    for category, count in totals.items():
+        print(f"{category}\tTOTAL\t{count}", flush=True)
+sys.exit(1 if totals["FAIL"] else 0)
+PY
+}
+
 ALL_STEPS="create bootstrap commitment_queries spin_up eots_finality epoch_genesis epoch_checkpoint_timing deposits provider_outage monitor_outage join_v5 traffic removal exit spent_commitment_queries rejoin steady l2_replay"
-FIXTURE_STEPS="checkpoint_fixture"
+FIXTURE_STEPS="checkpoint_fixture checkpoint_invariants"
 PAIR_STEPS="provider_key_isolation bootstrap_a bootstrap_b bootstrap_a_queries bootstrap_b_queries bootstrap_pair"
 # Needs subnet B active: run with --step after subnet B's monitor has set H_0.
 PAIR_ACTIVE_STEPS="subnet_b_cli_routing"
@@ -1340,6 +1723,10 @@ A fresh devnet is required to repeat create, bootstrap, spin_up, join_v5, exit o
 Outages run after the deposits, before the lifecycle; the crash runs last. Each step restores
 its interrupted services. Each step has its own timeout; UE_STEP_TIMEOUT=<seconds> sets all.
 UE_BUILD_IMAGE=0 reuses a fendermint image explicitly built by the round runner.
+UE_EPOCH_LENGTH=90 and UE_CHECK_PERIOD=30 select K (Bitcoin blocks) and P (subnet blocks).
+Both persist in the scenario state; use a fresh state/devnet for a different (P,K).
+The matrix runs --step checkpoint_invariants last; this step is excluded from group all.
+It prints PASS, FAIL, OUT_OF_SCOPE and DEFERRED rows and totals, and fails only on FAIL.
 subnet_b_cli_routing needs subnet B active: run it with --step on the bootstrap-pair state once
 subnet B's monitor has set H_0.
 EOF
@@ -1348,24 +1735,26 @@ EOF
 # Seconds per step at 1 s blocks, about three times a passing run; the outage, replay and checkpoint
 # steps wait for several checkpoints. Building the fendermint image adds three times its 411 s.
 step_timeout() {
+  local base overhead=0
   case "$1" in
-    spin_up) if [ "${UE_BUILD_IMAGE:-1}" = 1 ]; then echo 1920; else echo 720; fi ;;
-    removal) echo 900 ;;
-    epoch_checkpoint_timing|provider_outage|monitor_outage|l2_replay) echo 1440 ;;
-    join_v5) echo 600 ;;
-    exit) echo 600 ;;
-    deposits|checkpoint_fixture|traffic|steady) echo 960 ;;
-    eots_finality|subnet_b_cli_routing) echo 360 ;;
-    bootstrap|bootstrap_a|bootstrap_b) echo 180 ;;
-    *) echo 60 ;;
+    spin_up) base=720; if [ "${UE_BUILD_IMAGE:-1}" = 1 ]; then overhead=1200; fi ;;
+    removal) base=900 ;;
+    epoch_checkpoint_timing|provider_outage|monitor_outage|l2_replay) base=1440 ;;
+    join_v5|exit) base=600 ;;
+    deposits|checkpoint_fixture|traffic|steady) base=960 ;;
+    eots_finality|subnet_b_cli_routing) base=360 ;;
+    bootstrap|bootstrap_a|bootstrap_b) base=180 ;;
+    checkpoint_invariants) echo $((12 * EPOCH_LENGTH + 900)); return ;;
+    *) base=60 ;;
   esac
+  echo $(( (base * EPOCH_LENGTH + 89) / 90 + overhead ))
 }
 
 dependencies() {
   case "$1" in
     bootstrap) echo create ;;
     commitment_queries|spin_up) echo bootstrap ;;
-    eots_finality|epoch_genesis|epoch_checkpoint_timing|deposits|steady|checkpoint_fixture) echo spin_up ;;
+    eots_finality|epoch_genesis|epoch_checkpoint_timing|deposits|steady|checkpoint_fixture|checkpoint_invariants) echo spin_up ;;
     join_v5) echo 'deposits_sent epoch_checkpoint_timing' ;;
     provider_outage|monitor_outage|l2_replay) echo checkpoint_fixture ;;
     traffic) echo 'join_v5 deposits_sent' ;;
@@ -1379,7 +1768,7 @@ dependencies() {
 }
 
 save_state() {
-  declare -p BACKUP JOIN_TXID COMMIT_TXID T5 V5_REMOVAL V5_CONFIG V5_CP SUBNET PAIR_A PAIR_B \
+  declare -p BACKUP JOIN_TXID COMMIT_TXID T5 V5_REMOVAL V5_CONFIG V5_CP SUBNET PAIR_A PAIR_B EPOCH_LENGTH CHECK_PERIOD \
     | sed 's/^declare /declare -g /' > "$STATE_DIR/state.env.tmp"
   mv "$STATE_DIR/state.env.tmp" "$STATE_DIR/state.env"
 }
@@ -1449,6 +1838,13 @@ fi
 mkdir -p "$STATE_DIR" "$LOGS"
 STATE_DIR=$(cd "$STATE_DIR" && pwd)
 if [ -f "$STATE_DIR/state.env" ]; then source "$STATE_DIR/state.env"; fi
+[[ "$EPOCH_LENGTH" =~ ^[1-9][0-9]*$ && "$CHECK_PERIOD" =~ ^[1-9][0-9]*$ ]] \
+  || fail "UE_EPOCH_LENGTH and UE_CHECK_PERIOD must be positive integers"
+[ "$((3 * EPOCH_LENGTH))" -le 65535 ] || fail "UE_EPOCH_LENGTH must satisfy 3K <= 65535"
+[ "${UE_EPOCH_LENGTH:-$EPOCH_LENGTH}" = "$EPOCH_LENGTH" ] \
+  && [ "${UE_CHECK_PERIOD:-$CHECK_PERIOD}" = "$CHECK_PERIOD" ] \
+  || fail "requested (P,K) differs from saved state; use a fresh devnet/state directory"
+CHECKPOINT_TIMEOUT=$((7 * EPOCH_LENGTH))
 
 if [ -n "$internal" ]; then
   STEP_CHECKS="$STATE_DIR/$internal.checks"

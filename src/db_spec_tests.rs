@@ -974,6 +974,13 @@ mod epoch_zero {
         data: &Arc<ServerData>,
         msg: IpcCheckpointSubnetMsg,
     ) -> bitcoin::Psbt {
+        provider_checkpoint_and_reveal(data, msg).await.0
+    }
+
+    async fn provider_checkpoint_and_reveal(
+        data: &Arc<ServerData>,
+        msg: IpcCheckpointSubnetMsg,
+    ) -> (bitcoin::Psbt, Option<bitcoin::Transaction>) {
         let response = rpc::gen_checkpoint_psbt(Data::new(data.clone()), Params(msg))
             .await
             .unwrap_or_else(|e| {
@@ -986,7 +993,300 @@ mod epoch_zero {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(response["unsigned_psbt_base64"].as_str().unwrap())
             .unwrap();
-        bitcoin::Psbt::deserialize(&bytes).unwrap()
+        let reveal = response["batch_transfer_tx_hex"]
+            .as_str()
+            .map(|raw| bitcoin::consensus::deserialize(&hex::decode(raw).unwrap()).unwrap());
+        (bitcoin::Psbt::deserialize(&bytes).unwrap(), reveal)
+    }
+
+    // lifecycle.md:133-158,170; checkpoint.md:23-35,47,102:
+    // Invariants 1,3,4,6, with P measured in Bitcoin blocks in this deterministic
+    // fixture only. The devnet checks the actual subnet-block period and latency.
+    // Use the public provider builder (and hence CheckpointPlan::of_state) rather
+    // than deciding the rotation flag in the test. Only Bitcoin Core is stubbed.
+    #[tokio::test]
+    async fn checkpoint_epochs_across_periods_and_epoch_lengths() {
+        let cells = [30_u64, 50, 100].into_iter().flat_map(|p| {
+            [p, p + 15, 2 * p + 15, 3 * p + 15]
+                .into_iter()
+                .map(move |k| (p, k))
+        });
+        for (p, k) in cells.chain([(30, 10)]) {
+            let full_invariants = k >= p + 15;
+            let h_boot = 102;
+            let h_zero = h_boot + p;
+            let end = h_zero + 8 * k;
+            let f = Fixture::new([9000; 4]).await;
+            let id = f.id;
+            let mut genesis = f.db.get_subnet_genesis_info(id).unwrap().unwrap();
+            genesis.create_subnet_msg.bottomup_check_period = p;
+            genesis.create_subnet_msg.epoch_length = k;
+            let mut txn = f.db.write_txn().unwrap();
+            f.db.save_subnet_genesis_info(&mut txn, id, &genesis)
+                .unwrap();
+            txn.commit().unwrap();
+            let mut request = f.message(&[1, 2, 3, 4]);
+            request.change_address = None;
+            let whitelist = f.signer().address;
+            let wallet = WalletRpc::default();
+            wallet.0.lock().unwrap().funds = fund_utxos(&whitelist, 3);
+            let (_dir, data) = provider(f, &wallet);
+            let db = &*data.db;
+            let mut recorded = Vec::new();
+            let mut configurations = std::collections::BTreeMap::<u64, SubnetCommittee>::new();
+            let mut saw_entry = false;
+            let mut saw_departure = false;
+
+            for height in h_boot + 1..=end {
+                let hash = BlockHash::from_byte_array([height as u8; 32]);
+                // A fifth UE collateral becomes slashable in a batch reveal;
+                // its timeout removes it at H_5, after several unchanged epochs.
+                if full_invariants && height == h_zero + k + 1 {
+                    let state = db.get_subnet_state(id).unwrap().unwrap();
+                    let mut join = checked(id, 5, 25, 15);
+                    join.committee_number = state.committee_number;
+                    join.msg = IpcJoinUeMsg::new_signed(
+                        &Secp256k1::new(),
+                        join.msg.join.clone(),
+                        (h_zero + 8 * k).try_into().unwrap(),
+                        &secret(5),
+                        &secret(25),
+                        join.msg.nonce_commitment,
+                    );
+                    process_join_ue(db, &join, Txid::from_byte_array([35; 32]), height, hash)
+                        .unwrap();
+                    let record = db
+                        .get_ue_collateral(id, Txid::from_byte_array([35; 32]), &pubkey(5))
+                        .unwrap()
+                        .unwrap();
+                    request.slash_signatures = vec![slash_entry(db, &record, &[1, 2, 3])];
+                }
+
+                // Transactions precede cutoff processing, including at H_e.
+                if (height - h_boot) % p == 0 {
+                    let before = db.get_subnet_state(id).unwrap().unwrap();
+                    request.checkpoint_height = height - h_boot;
+                    request.next_committee_configuration_number =
+                        before.latest_committee().configuration_number;
+                    let funds = wallet.0.lock().unwrap().funds.clone();
+                    let (psbt, reveal) =
+                        provider_checkpoint_and_reveal(&data, request.clone()).await;
+                    let tx = psbt.unsigned_tx;
+                    let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(db, &tx).unwrap();
+                    let cp = parsed
+                        .save_to_db(db, height, hash, tx.compute_txid())
+                        .unwrap();
+                    let expected_epoch = if height <= h_zero {
+                        0
+                    } else {
+                        (height - h_zero - 1) / k + 1
+                    };
+                    assert_eq!(
+                        before.epoch, expected_epoch,
+                        "P={p}, K={k}: cutoff-height convention"
+                    );
+                    assert_eq!(
+                        cp.is_rotation_checkpoint,
+                        before.epoch > before.last_rotation_epoch,
+                        "P={p}, K={k}, Bitcoin height {height}: provider rotation flag"
+                    );
+                    if cp.is_rotation_checkpoint {
+                        assert_eq!(
+                            cp.epoch, before.epoch,
+                            "P={p}, K={k}: late rotation's own epoch"
+                        );
+                    }
+                    if full_invariants {
+                        let destination = if cp.epoch == 0 {
+                            whitelist.clone()
+                        } else {
+                            assert_eq!(
+                                cp.next_configuration_number,
+                                configurations[&cp.epoch].configuration_number,
+                                "P={p}, K={k}: recorded change number (invariant 6)"
+                            );
+                            configurations[&cp.epoch].address_checked()
+                        };
+                        assert_eq!(
+                            tx.output.last().unwrap().script_pubkey,
+                            destination.script_pubkey(),
+                            "P={p}, K={k}, epoch {}: change multisig (invariant 3)",
+                            cp.epoch
+                        );
+                        let previous = if before.last_rotation_epoch == 0 {
+                            whitelist.clone()
+                        } else {
+                            before.committee.address_checked()
+                        };
+                        if cp.is_rotation_checkpoint && previous != destination {
+                            let spent: std::collections::BTreeSet<_> =
+                                tx.input.iter().map(|vin| vin.previous_output).collect();
+                            assert!(
+                                funds
+                                    .iter()
+                                    .any(|u| u.script_pub_key == previous.script_pubkey()),
+                                "P={p}, K={k}: sweep fixture must have previous funds"
+                            );
+                            assert!(
+                                funds
+                                    .iter()
+                                    .filter(|u| u.script_pub_key == previous.script_pubkey())
+                                    .all(|u| spent.contains(&OutPoint::new(u.txid, u.vout))),
+                                "P={p}, K={k}, epoch {}: previous funds swept (invariant 4)",
+                                cp.epoch
+                            );
+                        }
+                    }
+                    let stored = db
+                        .get_checkpoint(id, cp.checkpoint_number)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (stored.epoch, stored.is_rotation_checkpoint),
+                        (cp.epoch, cp.is_rotation_checkpoint)
+                    );
+                    recorded.push(cp);
+                    let mut txn = db.write_txn().unwrap();
+                    db.save_transaction(&mut txn, &tx).unwrap();
+                    txn.commit().unwrap();
+                    // Keep an actual UTXO set in the wallet stub, including the
+                    // change. Do not prescribe regular-checkpoint input selection.
+                    {
+                        let mut state = wallet.0.lock().unwrap();
+                        state.funds.retain(|u| {
+                            !tx.input
+                                .iter()
+                                .any(|vin| vin.previous_output == OutPoint::new(u.txid, u.vout))
+                        });
+                        let mut change = funds[0].clone();
+                        change.txid = tx.compute_txid();
+                        change.vout = (tx.output.len() - 1).try_into().unwrap();
+                        change.script_pub_key = tx.output.last().unwrap().script_pubkey.clone();
+                        change.address = parsed.change_address.clone();
+                        change.amount = tx.output.last().unwrap().value;
+                        state.funds.push(change);
+                    }
+                    // Carry the bootstrap/join pre-signatures through the monitor,
+                    // rather than inserting a slashable collateral into the DB.
+                    if let Some(reveal) = reveal {
+                        let (_, IpcMessage::BatchTransfer(mut batch)) =
+                            IpcMessage::from_reveal_inputs(&reveal)
+                                .into_iter()
+                                .next()
+                                .unwrap()
+                        else {
+                            panic!("batch reveal")
+                        };
+                        batch
+                            .process(db, height, hash, reveal.compute_txid())
+                            .unwrap();
+                    }
+                    request.slash_signatures.clear();
+                }
+
+                // No height is skipped: process_cutoffs observes every H_e.
+                for outcome in crate::epochs::process_cutoffs(db, height, hash).unwrap() {
+                    assert_eq!(outcome.subnet_id, id);
+                    let current = db
+                        .get_subnet_state(id)
+                        .unwrap()
+                        .unwrap()
+                        .latest_committee()
+                        .clone();
+                    if full_invariants {
+                        let changes = db.get_all_stake_changes(id).unwrap();
+                        let at_cutoff: Vec<_> = changes
+                            .iter()
+                            .filter(|c| c.block_height == height)
+                            .collect();
+                        let previous_number = configurations
+                            .values()
+                            .next_back()
+                            .map_or(0, |c: &SubnetCommittee| c.configuration_number);
+                        assert_eq!(
+                            current.configuration_number,
+                            at_cutoff
+                                .last()
+                                .map_or(previous_number, |c| c.configuration_number),
+                            "P={p}, K={k}, epoch {}: change number (invariant 6)",
+                            outcome.epoch
+                        );
+                        if !at_cutoff.is_empty() {
+                            assert!(current.configuration_number > previous_number);
+                        }
+                        let has_five = current.is_validator(&pubkey(5));
+                        let had_five = configurations
+                            .values()
+                            .next_back()
+                            .is_some_and(|c| c.is_validator(&pubkey(5)));
+                        if has_five != had_five {
+                            assert!(current.configuration_number > previous_number,
+                                "P={p}, K={k}: entry/departure increases change number (invariant 6)");
+                        }
+                        saw_departure |= saw_entry && !has_five;
+                        saw_entry |= has_five;
+                    }
+                    configurations.insert(outcome.epoch, current);
+                }
+                let last_recorded_rotation = recorded
+                    .iter()
+                    .rev()
+                    .find(|cp| cp.is_rotation_checkpoint)
+                    .map_or(0, |cp| cp.epoch);
+                assert_eq!(
+                    db.get_subnet_state(id)
+                        .unwrap()
+                        .unwrap()
+                        .last_rotation_epoch,
+                    last_recorded_rotation,
+                    "P={p}, K={k}, height {height}: a cutoff cannot invent a rotation"
+                );
+            }
+            let state = db.get_subnet_state(id).unwrap().unwrap();
+            assert_eq!(state.h_0, Some(h_zero), "P={p}, K={k}: activation fixture");
+            let mut empty_epochs = 0;
+            for epoch in 1..state.epoch {
+                let checkpoints: Vec<_> = recorded
+                    .iter()
+                    .filter(|cp| {
+                        h_zero + (epoch - 1) * k < cp.block_height
+                            && cp.block_height <= h_zero + epoch * k
+                    })
+                    .collect();
+                let rotations = checkpoints
+                    .iter()
+                    .filter(|cp| cp.is_rotation_checkpoint)
+                    .count();
+                assert!(
+                    rotations <= 1,
+                    "P={p}, K={k}, epoch {epoch}: never two rotations"
+                );
+                if checkpoints.is_empty() {
+                    empty_epochs += 1;
+                    assert_eq!(rotations, 0);
+                } else {
+                    assert!(
+                        checkpoints[0].is_rotation_checkpoint,
+                        "P={p}, K={k}, epoch {epoch}: next checkpoint rotates its own epoch"
+                    );
+                    assert!(checkpoints[1..].iter().all(|cp| !cp.is_rotation_checkpoint));
+                }
+                if full_invariants {
+                    assert_eq!(rotations, 1, "P={p}, K={k}, epoch {epoch}: invariant 1");
+                }
+            }
+            if full_invariants {
+                assert!(
+                    saw_entry && saw_departure,
+                    "P={p}, K={k}: exercise entry and departure"
+                );
+            } else if k < p {
+                assert!(
+                    empty_epochs > 0,
+                    "K<P fixture must exercise an epoch with no checkpoint"
+                );
+            }
+        }
     }
 
     // lifecycle.md, Epoch 0 / checkpoint.md, Before activation: a checkpoint of epoch 0 is a regular checkpoint of C_wlist and activates nothing.
