@@ -92,7 +92,6 @@ async fn main() {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_SYNC_BATCH_SIZE);
 
-    // The UE switch must agree with the blocks already processed
     collateral::check_ue_activation(&db, collateral::ue_activation_height())
         .unwrap_or_else(|e| panic!("{e}"));
 
@@ -560,13 +559,12 @@ where
         block_hash: BlockHash,
         block: Block,
     ) -> Result<(), MonitorError> {
-        for tx in block.txdata {
-            self.process_transaction(&tx, block_height, block_hash, block.header.time)
+        for tx in &block.txdata {
+            self.process_transaction(tx, block_height, block_hash, &block)
                 .await?;
         }
 
-        // After its transactions, a block that activates a subnet or is a cutoff computes the
-        // next configuration
+        // Activations and cutoffs take effect after the transactions of the Bitcoin block
         for outcome in epochs::process_cutoffs(&self.db, block_height, block_hash)? {
             info!(
                 "Subnet {} begins epoch {} at block {}",
@@ -590,7 +588,7 @@ where
         tx: &bitcoin::Transaction,
         block_height: u64,
         block_hash: BlockHash,
-        block_time: u32,
+        block: &Block,
     ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
@@ -602,17 +600,14 @@ where
             );
         }
 
-        // Inputs: one message per input that executes a data leaf, in input order
-
         for (_, ipc_message) in IpcMessage::from_reveal_inputs(tx) {
-            // join-ue is ignored while unilateral exit is not active
             if matches!(ipc_message, IpcMessage::JoinUe { .. }) && !self.ue_active(block_height) {
                 trace!("Skipping join-ue: unilateral exit is not active at this height");
                 continue;
             }
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -627,7 +622,7 @@ where
             let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -637,7 +632,7 @@ where
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -649,7 +644,7 @@ where
             let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -659,7 +654,7 @@ where
             let ipc_message = IpcMessage::StakeCollateral(msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -669,7 +664,7 @@ where
             let ipc_message = IpcMessage::UnstakeCollateral(msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -679,7 +674,7 @@ where
             let ipc_message = IpcMessage::KillSubnet(msg);
 
             match self
-                .process_ipc_msg(block_height, block_hash, block_time, tx, txid, ipc_message)
+                .process_ipc_msg(block_height, block_hash, block, tx, txid, ipc_message)
                 .await
             {
                 Ok(_) => {}
@@ -694,7 +689,7 @@ where
         &mut self,
         block_height: u64,
         block_hash: BlockHash,
-        block_time: u32,
+        block: &Block,
         tx: &bitcoin::Transaction,
         txid: bitcoin::Txid,
         msg: IpcMessage,
@@ -709,7 +704,7 @@ where
 
                 let (whitelist_addr, label) = subnet_genesis_info.whitelist_address_label();
 
-                self.import_watchonly_address(whitelist_addr, label, block_time);
+                self.import_watchonly_address(whitelist_addr, label, block.header.time);
 
                 info!(
                     "Processed CreateSubnet for Subnet ID: {}",
@@ -756,7 +751,7 @@ where
                 {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
-                    self.import_watchonly_address(committee_addr, label, block_time);
+                    self.import_watchonly_address(committee_addr, label, block.header.time);
                 }
 
                 info!(
@@ -870,24 +865,48 @@ where
             IpcMessage::JoinUe { input, msg } => {
                 debug!("Found IPC message in input {}: {:?}", input, msg);
 
-                // A commit in an older block needs bitcoind's -txindex
-                let commit_txid = tx.input[input].previous_output.txid;
-                let commit = self
-                    .rpc
-                    .get_raw_transaction(&commit_txid, Some(&block_hash))
-                    .or_else(|_| self.rpc.get_raw_transaction(&commit_txid, None))?;
+                let commit =
+                    bitcoin_utils::commit_transaction(&tx.input[input], &block.txdata, |txid| {
+                        self.rpc.get_raw_transaction(txid, None)
+                    })?;
                 let secp = bitcoin::secp256k1::Secp256k1::new();
                 let context = collateral::join_context(&self.db, msg.join.subnet_id)?;
                 let checked =
                     collateral::check_join_ue(&secp, tx, input, &commit, block_height, &context)
                         .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
+                let spent = bitcoin_utils::spent_before_reveal(
+                    &checked.outpoint,
+                    tx,
+                    block_height,
+                    &block.txdata,
+                    |txid| -> Result<u64, bitcoincore_rpc::Error> {
+                        let hash = self
+                            .rpc
+                            .get_raw_transaction_info(txid, None)?
+                            .blockhash
+                            .ok_or(bitcoincore_rpc::Error::UnexpectedStructure)?;
+                        Ok(self.rpc.get_block_header_info(&hash)?.height as u64)
+                    },
+                    |height| {
+                        self.rpc
+                            .get_block_hash(height)
+                            .and_then(|hash| self.rpc.get_block(&hash))
+                            .map(|block| block.txdata)
+                    },
+                )?;
+                if spent {
+                    return Err(MonitorError::IpcTxInvalid(format!(
+                        "Collateral UTXO {} is spent before the reveal transaction {txid}",
+                        checked.outpoint
+                    )));
+                }
 
                 if let Some(subnet) =
                     collateral::process_join_ue(&self.db, &checked, txid, block_height, block_hash)?
                 {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
-                    self.import_watchonly_address(committee_addr, label, block_time);
+                    self.import_watchonly_address(committee_addr, label, block.header.time);
                 }
 
                 let join = &checked.msg.join;

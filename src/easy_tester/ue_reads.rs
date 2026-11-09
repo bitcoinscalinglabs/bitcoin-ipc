@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use bitcoin::XOnlyPublicKey;
 
-use crate::collateral::is_ue_validator;
 use crate::db::{DatabaseCore, StakingChange};
 use crate::easy_tester::{error::EasyTesterError, model::OutputExpectTarget};
+use crate::epochs::is_ue_validator;
 use crate::SubnetId;
 
 /// Validator pubkey -> scenario name
@@ -31,9 +31,6 @@ fn db_err(e: impl std::fmt::Display) -> EasyTesterError {
     EasyTesterError::runtime(format!("db read failed: {e}"))
 }
 
-/// `read validators <subnet> [current]`. Fields: `count`, `names` (sorted, comma-separated),
-/// `waiting` (whether a waiting committee exists), and per validator `<name>.collateral`
-/// and `<name>.ue`.
 pub fn read_validators<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -77,8 +74,6 @@ pub fn read_validators<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
-/// `read subnet_state <subnet>`. Fields: `activated`, `epoch`, `h_0` (`none` before
-/// activation), `last_rotation_epoch`, `committee_number`, `pending_multisig_changes`.
 pub fn read_subnet_state<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -114,9 +109,6 @@ pub fn read_subnet_state<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
-/// `read subnet_genesis <subnet>`. Fields: `exists`, and when the subnet exists
-/// `bootstrapped`, `min_validators` and `genesis_validators` (the joins accepted before
-/// bootstrap).
 pub fn read_subnet_genesis<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -145,10 +137,6 @@ pub fn read_subnet_genesis<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
-/// `read ue_collaterals <subnet>`. Fields: `count`, `spent_count` (records whose outpoint a
-/// Bitcoin transaction spends), `slashable_count` (outputs recorded as slashable), and per
-/// validator `<name>.count` (records of that key) and, for its record with the largest
-/// timeout, `<name>.value`, `<name>.timeout`, `<name>.spent`, `<name>.slashable`.
 pub fn read_ue_collaterals<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -188,9 +176,7 @@ pub fn read_ue_collaterals<D: DatabaseCore>(
     Ok(UeRead { what, fields })
 }
 
-/// `read withdrawals <subnet>`: the Withdraw stake changes not yet confirmed by a
-/// checkpoint. Fields: `count` and per validator `<name>` (the withdrawn amount, summed).
-pub fn read_withdrawals<D: DatabaseCore>(
+pub fn read_pending_withdraw_changes<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
     subnet_name: &str,

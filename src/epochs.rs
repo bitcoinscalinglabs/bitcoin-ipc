@@ -1,28 +1,28 @@
-//! Epochs: the configuration `C_e` that the monitor computes at the cutoff block `H_{e-1}`,
-//! and the changes from `C_{e-1}` to `C_e` that the subnet applies at its rotation checkpoint.
+//! Computation of the configuration `C_e` at each cutoff and of the changes from `C_{e-1}` to it.
 
 use std::collections::BTreeMap;
 
 use bitcoin::{hashes::Hash, Amount, BlockHash, Txid, XOnlyPublicKey};
 use log::{info, warn};
 
-use crate::collateral::{epoch_committee_number, is_ue_validator};
 use crate::db::{
-    DatabaseCore, PendingMultisigChange, StakeChangeRequest, StakingChange, SubnetCommittee,
-    SubnetGenesisInfo, SubnetState, SubnetValidator,
+    DatabaseCore, DbError, PendingMultisigChange, StakeChangeRequest, StakingChange,
+    SubnetCommittee, SubnetGenesisInfo, SubnetState, SubnetValidator,
 };
 use crate::eth_utils::eth_addr_from_x_only_pubkey;
 use crate::ipc_lib::{IpcLibError, IpcValidateError, SubnetId};
 use crate::multisig::{MultisigError, MIN_CONFIGURATION_SIZE};
 
+/// The committee number of `C_wlist`.
+pub const WHITELIST_COMMITTEE_NUMBER: u64 = 0;
+
 /// What a cutoff did to one subnet.
 #[derive(Debug, Clone)]
 pub struct CutoffOutcome {
     pub subnet_id: SubnetId,
-    /// The epoch that begins at the cutoff
+    /// The epoch that begins at the cutoff.
     pub epoch: u64,
-    /// The configuration of that epoch with its committee number, when it differs from the
-    /// latest one
+    /// The new configuration with its committee number, when it differs from the latest one.
     pub new_committee: Option<(u64, SubnetCommittee)>,
 }
 
@@ -35,9 +35,32 @@ pub fn warn_if_small(subnet_id: SubnetId, epoch: u64, members: usize) {
     }
 }
 
-/// The multisig members of `committee`, those without a collateral record, once the pending
-/// joins, stakes and unstakes apply, by key. An unstake that leaves less than the minimum
-/// stake removes the member.
+/// The committee number of the configuration of epoch `epoch`.
+pub fn epoch_committee_number<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    epoch: u64,
+) -> Result<Option<u64>, DbError> {
+    if epoch == 0 {
+        return Ok(Some(WHITELIST_COMMITTEE_NUMBER));
+    }
+    db.get_epoch_committee_number(subnet_id, epoch)
+}
+
+/// Whether the member with `join_txid` and `pubkey` joined with `join-ue`.
+pub fn is_ue_validator<D: DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    join_txid: Txid,
+    pubkey: &XOnlyPublicKey,
+) -> Result<bool, DbError> {
+    Ok(db
+        .get_ue_collateral(subnet_id, join_txid, pubkey)?
+        .is_some())
+}
+
+/// The multisig members of `committee` (those without a collateral record) after the pending
+/// changes, by key.
 pub fn multisig_members_after<D: DatabaseCore>(
     db: &D,
     genesis_info: &SubnetGenesisInfo,
@@ -54,8 +77,7 @@ pub fn multisig_members_after<D: DatabaseCore>(
             continue;
         }
         let mut member = member.clone();
-        // A multisig member of `C_gen` has one unit of value there; from `C_1` on it has the
-        // value of its join collateral, as the members with a collateral record do
+        // In `C_gen` a multisig member has value 1, replaced here by its join collateral
         if committee.configuration_number == crate::db::GENESIS_COMMITTEE_CONF_NUM {
             if let Some(genesis) = genesis_info
                 .genesis_validators
@@ -105,10 +127,23 @@ pub fn multisig_members_after<D: DatabaseCore>(
     Ok(members)
 }
 
-/// The members of the configuration computed from the collaterals held at a cutoff: every
-/// validator with an unspent, slashable collateral that matures after `boundary`, with the
-/// power of its total value, and the multisig members of `base` with the `pending` changes
-/// applied. In ascending key order.
+/// The multisig members of the next configuration as filled so far: those of the current
+/// configuration after the pending changes.
+pub fn next_multisig_members<D: DatabaseCore>(
+    db: &D,
+    genesis_info: &SubnetGenesisInfo,
+    state: &SubnetState,
+) -> Result<BTreeMap<XOnlyPublicKey, SubnetValidator>, IpcLibError> {
+    multisig_members_after(
+        db,
+        genesis_info,
+        state.latest_committee(),
+        &state.pending_multisig_changes,
+    )
+}
+
+/// The members of the configuration at a cutoff, in ascending key order: validators with a
+/// qualifying collateral and the multisig members of `base` after `pending`.
 pub fn compute_configuration<D: DatabaseCore>(
     db: &D,
     genesis_info: &SubnetGenesisInfo,
@@ -162,9 +197,8 @@ pub fn compute_configuration<D: DatabaseCore>(
     Ok(seated.into_values().collect())
 }
 
-/// The changes from `base` to the configuration with members `target`, validator by validator
-/// in ascending key order, numbered from `first_number`, each with the committee after it. The
-/// last change's committee is the new configuration.
+/// The changes from `base` to `target`, one per validator in ascending key order from
+/// `first_number`, and the resulting committee.
 pub fn configuration_changes(
     subnet_id: SubnetId,
     base: &SubnetCommittee,
@@ -260,8 +294,7 @@ pub fn configuration_changes(
     Ok((committee, changes))
 }
 
-/// Whether the join collateral of every member of `C_gen` is spent or slashable: the
-/// condition that sets `H_0`.
+/// Whether the join collateral of every member of `C_gen` is spent or slashable.
 fn genesis_collaterals_slashable<D: DatabaseCore>(
     db: &D,
     state: &SubnetState,
@@ -277,12 +310,7 @@ fn genesis_collaterals_slashable<D: DatabaseCore>(
     Ok(true)
 }
 
-/// After the transactions of block `block_height`: for every bootstrapped subnet that this
-/// block activates (`H_0`, the first height at which every unspent `C_gen` collateral is
-/// slashable) or whose cutoff `H_{e-1}` this block is, computes `C_e` from the latest
-/// committee and the collaterals, records its changes, and begins epoch `e`. Whether or not
-/// the rotation checkpoint of epoch `e-1` has come: the funds stay under the last adopted
-/// configuration until the next one.
+/// Runs the cutoff of every subnet that Bitcoin block `block_height` activates or ends an epoch of.
 pub fn process_cutoffs<D: DatabaseCore>(
     db: &D,
     block_height: u64,
@@ -290,9 +318,6 @@ pub fn process_cutoffs<D: DatabaseCore>(
 ) -> Result<Vec<CutoffOutcome>, IpcLibError> {
     let mut outcomes = Vec::new();
     for mut state in db.get_all_subnets()? {
-        if state.is_killed() {
-            continue;
-        }
         let genesis_info = db.get_subnet_genesis_info(state.id)?.ok_or_else(|| {
             IpcValidateError::InvalidMsg(format!("Subnet {} not found.", state.id))
         })?;
@@ -324,8 +349,7 @@ pub fn process_cutoffs<D: DatabaseCore>(
     Ok(outcomes)
 }
 
-/// The cutoff `H_{e-1}` of one subnet: computes and records `C_e`. At `H_0` the subnet is
-/// activated: the epoch-0 deposits are credited, in their order on Bitcoin.
+/// Computes and records the configuration at one subnet's cutoff.
 fn process_cutoff<D: DatabaseCore>(
     db: &D,
     genesis_info: &SubnetGenesisInfo,
@@ -338,7 +362,7 @@ fn process_cutoff<D: DatabaseCore>(
     let params = &genesis_info.create_subnet_msg;
     let h_0 = state.h_0.expect("activated");
 
-    // The ending epoch still waits for its rotation checkpoint
+    // Warns when the ending epoch has no rotation checkpoint
     if state.last_rotation_epoch < state.epoch {
         warn!(
             "Subnet {subnet_id}: no rotation checkpoint of epoch {} by its cutoff block {block_height}",
@@ -355,8 +379,10 @@ fn process_cutoff<D: DatabaseCore>(
         &state.pending_multisig_changes,
         boundary,
     )?;
-    // A multisig needs a key: with no seated validator the configuration stays
-    if target.is_empty() {
+    // With no qualifying validator the configuration stays and the pending changes wait for the
+    // next cutoff
+    let qualifies = !target.is_empty();
+    if !qualifies {
         warn!(
             "Subnet {subnet_id}: no validator qualifies for epoch {epoch}, C_{epoch} stays C_{}",
             epoch - 1
@@ -375,8 +401,7 @@ fn process_cutoff<D: DatabaseCore>(
         block_hash,
     )?;
 
-    // Committee numbers continue from the configuration of the epoch that ends, adopted or
-    // not; in epoch 0 from `C_gen`, the number of `C_wlist` being 0
+    // Continues from the committee number of the ending epoch, or of `C_gen` in epoch 0
     let current_number = if state.epoch == 0 {
         state.committee_number
     } else {
@@ -390,7 +415,9 @@ fn process_cutoff<D: DatabaseCore>(
     };
 
     state.epoch = epoch;
-    state.pending_multisig_changes.clear();
+    if qualifies {
+        state.pending_multisig_changes.clear();
+    }
     if changed {
         state.waiting_committee = Some(committee.clone());
     }
@@ -419,6 +446,6 @@ fn process_cutoff<D: DatabaseCore>(
         new_committee: changed.then_some((committee_number, committee)),
     })
 }
+
 #[cfg(test)]
-#[path = "epochs_spec_tests.rs"]
-mod spec_tests;
+mod tests;

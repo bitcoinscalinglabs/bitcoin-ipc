@@ -5,7 +5,6 @@
 # 1. Single transfer exceeding balance is rejected
 # 2. Batch of transfers whose total exceeds balance is rejected (entire batch)
 # 3. Burn exceeding balance (when balance = 0) is rejected
-# Run with testers/db.txt or testers/monitor.txt.
 setup
 validator1
 validator2

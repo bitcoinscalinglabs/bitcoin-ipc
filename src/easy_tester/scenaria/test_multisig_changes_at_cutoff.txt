@@ -1,0 +1,109 @@
+# A multisig stake or unstake in the cutoff block H_1 is in C_2, one in H_1 + 1 or H_1 + 2 is in C_3, and C_e is C_{e-1} when every member unstakes its whole collateral.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+create subnet2
+
+block 110
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+join subnet2 validator1 100_000_000
+join subnet2 validator2 100_000_000
+join subnet2 validator3 100_000_000
+join subnet2 validator4 100_000_000
+
+# the rotation checkpoint of epoch 1
+block 114
+checkpoint subnet1 subnet2
+
+block 115
+read subnet_state subnet1
+expect result.h_0 = 110
+expect result.epoch = 1
+
+block 120
+stake subnet1 validator1 50_000_000 @raw
+unstake subnet1 validator2 10_000_000 @raw
+
+block 121
+stake subnet1 validator3 50_000_000 @raw
+
+block 122
+stake subnet1 validator4 50_000_000 @raw
+unstake subnet1 validator1 10_000_000 @raw
+
+block 123
+read subnet_state subnet1
+expect result.epoch = 2
+expect result.pending_multisig_changes = 3
+read validators subnet1
+expect result.waiting = true
+expect result.validator1.collateral = 150_000_000
+expect result.validator2.collateral = 90_000_000
+expect result.validator3.collateral = 100_000_000
+expect result.validator4.collateral = 100_000_000
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator2 = 10_000_000
+# the rotation checkpoint of epoch 2
+checkpoint subnet1 subnet2
+
+block 124
+read validators subnet1 current
+expect result.waiting = false
+expect result.validator1.collateral = 150_000_000
+expect result.validator2.collateral = 90_000_000
+expect result.validator3.collateral = 100_000_000
+expect result.validator4.collateral = 100_000_000
+
+block 131
+read validators subnet1
+expect result.validator1.collateral = 140_000_000
+expect result.validator2.collateral = 90_000_000
+expect result.validator3.collateral = 150_000_000
+expect result.validator4.collateral = 150_000_000
+read withdrawals subnet1
+expect result.validator1 = 10_000_000
+
+block 132
+unstake subnet2 validator1 100_000_000 @raw
+unstake subnet2 validator2 100_000_000 @raw
+unstake subnet2 validator3 100_000_000 @raw
+unstake subnet2 validator4 100_000_000 @raw
+
+block 133
+read subnet_state subnet2
+expect result.pending_multisig_changes = 4
+# the rotation checkpoint of epoch 3
+checkpoint subnet2
+
+# at the cutoff at 140 = H_3 no validator qualifies: C_4 is C_3
+block 141
+read subnet_state subnet2
+expect result.epoch = 4
+read validators subnet2
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+expect result.validator1.collateral = 100_000_000
+expect result.validator4.collateral = 100_000_000
+read withdrawals subnet2
+expect result.count = 0

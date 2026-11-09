@@ -1,6 +1,4 @@
-# The activation switch: join-ue in blocks below UE_ACTIVATION_HEIGHT (110 here) is ignored,
-# from block 110 on it is processed.
-# Run with testers/db-ue-activation-110.txt or testers/monitor-ue-activation-110.txt.
+# join-ue is ignored below UE_ACTIVATION_HEIGHT and processed from it.
 
 setup
 

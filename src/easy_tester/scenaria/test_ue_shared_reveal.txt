@@ -1,16 +1,4 @@
-# Several validators join with join-ue in one reveal transaction: one commitment input per
-# join, read on its own. The joins share the reveal txid and are recorded apart by key,
-# a rejected input leaves the others untouched, and each leaves at its own cutoff.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt.
-# A collateral with timeout T seats its validator in every configuration computed with a
-# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
-# Epochs are K = 10 Bitcoin blocks here. H_0 is the first Bitcoin block in which the join collateral
-# of every member of C_gen is slashable: the Bitcoin block of the first checkpoint, whose batch
-# transfer carries the slash pre-signatures. Until the next checkpoint, the rotation checkpoint of
-# epoch 1, the current configuration is C_gen.
-# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
-# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
-# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
+# Several join-ue in one reveal are recorded apart by key, a rejected input leaves the others untouched, and each leaves at its own cutoff.
 
 setup
 

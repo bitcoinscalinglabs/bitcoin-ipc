@@ -82,7 +82,7 @@ The validator, through its provider:
    2. `pk` is the key of an accepted join transaction of the subnet.
    3. Output 1 is locked under the collateral script of `pk`, the `pk_eots` of that join transaction, `T`, and the subnet's current or previous configuration.
    4. The collateral (output 1's value) is `≥ min_validator_stake`, and `T` satisfies join rule 2.6.
-   5. The validator limit of join rule 3.
+   5. The validator limit and the total power of join rule 3.
 3. The monitor rejects a stake transaction that fails any rule: it changes no subnet state. The collateral output stays locked under its script, and its owner spends it through the unilateral-exit leaf after `T`.
 4. State changes of an accepted stake transaction: the monitor records the collateral (outpoint = output 1, value, `T`, key, the backup address of the join transaction, stake txid) and, for a stake transaction with an EOTS nonce commitment, the commitment. The collateral seats the validator in the configurations computed at later cutoffs that it qualifies for ([C_e](../lifecycle.md#computing-configuration-c_e-for-e--2)). If input 0 spends an earlier collateral of the validator, that collateral seats the validator no more.
 5. The validators of the named configuration pre-sign the slash transaction of the new collateral, `C_wlist` in epoch 0, and a later checkpoint carries the pre-signatures ([slashing](../slashing.md#slash-pre-signatures)).

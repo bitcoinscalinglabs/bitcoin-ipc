@@ -25,6 +25,7 @@ services:
       # Bind-mount scripts for quick validator spin-up
       - ./scripts/spin_up_subnet_a_from_container.sh:/usr/local/bin/spin_up_subnet_a_from_container.sh:ro
       - ./scripts/spin_up_subnet_b_from_container.sh:/usr/local/bin/spin_up_subnet_b_from_container.sh:ro
+      - ./scripts/spin_up_peers.sh:/usr/local/bin/spin_up_peers.sh:ro
       # Bind-mount the unilateral-exit scenario (join-ue, removal, unstake-ue through ipc-cli)
       - ./src/easy_tester/ipc_tester/ue_scenario.sh:/usr/local/bin/ue_scenario.sh:ro
       # The next two mounts are: from container's /root/.ipc to host's $HOME/.ipc,

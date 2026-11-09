@@ -1,6 +1,4 @@
-# The monitor reads a create only from a reveal with exactly one input and one output: a
-# second input before or after the data input, or a second output, and the subnet does not
-# exist. Run with testers/db.txt or testers/monitor.txt.
+# The monitor reads a create only from a reveal with exactly one input and one output.
 
 setup
 validator1

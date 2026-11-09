@@ -1,7 +1,4 @@
-# The monitor reads a batch transfer from the input that spends a checkpoint's commitment
-# output: as the provider builds the reveal, with inputs that carry no message before and
-# after, with other outputs, and two checkpoints' batches in one reveal in either order.
-# Run with testers/db.txt or testers/monitor.txt.
+# The monitor reads a batch transfer from any input of a reveal that spends a checkpoint's commitment output.
 
 setup
 validator1

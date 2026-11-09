@@ -31,7 +31,7 @@ docker exec -e HOST_ADDR=<host address> bitcoin-ipc ue_scenario.sh --step subnet
 
 ## Checkpoint matrix
 
-`make checkpoint-matrix`, from `bitcoin-ipc`, runs the checkpoint steps for each period P in `PERIODS` (default `30 100`) and K = m·P + 15 for each m in `MULTIPLES` (default `1`), plus K = P when `EQUAL=1` (default). Each cell wipes the devnet, starts it with `BLOCK_INTERVAL=1 UE_ACTIVATION_HEIGHT=1`, waits past Bitcoin block 101 and until the providers of validators 1 to 6 and users 1 and 2 answer `getconfirmedcount` with a height above 101 (a cell that is not ready after 300 s fails), then runs `--group setup`, `--group deposits`, `--step join_v5`, `--step traffic`, `--step removal` and `--step checkpoint_invariants` with `UE_CHECK_PERIOD`=P, `UE_EPOCH_LENGTH`=K, `UE_STEP_TIMEOUT`=12·K + 900 and `UE_BUILD_IMAGE=0` (1 when `fendermint:latest` is missing). It copies `~/.ipc/logs`, the scenario state and the `docker logs` of every container to `OUT/P<period>-K<K>/`, goes on after a failure and writes one line per cell (period, K, multiple, the totals `PASS`, `FAIL`, `OUT_OF_SCOPE`, `DEFERRED`, exit code, duration) to `OUT/matrix.tsv`.
+`make checkpoint-matrix`, from `bitcoin-ipc`, runs `checkpoint_matrix.sh` on the host. It runs the checkpoint steps for each period P in `CHECKPOINT_PERIODS` (default `30 100`) and K = m·P + 15 for each m in `EPOCH_LENGTH_MULTIPLIERS` (default `1`), plus K = P when `INCLUDE_EQUAL_EPOCH_LENGTH=1` (default). Each cell empties its `ue_scenario.out`, wipes the devnet, starts it with `BLOCK_INTERVAL=1 UE_ACTIVATION_HEIGHT=1`, waits past Bitcoin block 101 and until the providers of validators 1 to 6 and users 1 and 2 answer `getconfirmedcount` with a height above 101 (a cell that is not ready after 300 s fails), then runs `--group setup`, `--group deposits`, `--step join_v5`, `--step traffic`, `--step removal` and `--step checkpoint_invariants` with `UE_CHECK_PERIOD`=P, `UE_EPOCH_LENGTH`=K, `UE_STEP_TIMEOUT`=12·K + 900 and `UE_BUILD_IMAGE=0` (1 when `fendermint:latest` is missing). It copies `~/.ipc/logs`, the scenario state and the `docker logs` of every container to `OUT/P<period>-K<K>/`, goes on after a failure and writes one line per cell (period, K, multiple, the totals `PASS`, `FAIL`, `OUT_OF_SCOPE`, `DEFERRED`, exit code, duration) to `OUT/matrix.tsv`. It exits non-zero when a cell has a non-zero exit code.
 
 Full matrix:
 
@@ -42,12 +42,12 @@ make checkpoint-matrix OUT=<folder> HOST_ADDR=<host address>
 One cell:
 
 ```
-make checkpoint-matrix PERIODS=30 MULTIPLES=1 EQUAL=0 OUT=<folder> HOST_ADDR=<host address>
+make checkpoint-matrix CHECKPOINT_PERIODS=30 EPOCH_LENGTH_MULTIPLIERS=1 INCLUDE_EQUAL_EPOCH_LENGTH=0 OUT=<folder> HOST_ADDR=<host address>
 ```
 
 ## Sign-record reader
 
-`spec_eots_sign_record.rs` is a cargo integration test (`[[test]] spec_eots_sign_record`) used as a read-only helper: it dumps the signed EOTS votes of a heed database (`EOTS_SIGN_RECORD_DB`, `EOTS_SIGN_RECORD_OUTPUT`). The step `provider_outage` runs it as `/tmp/spec-eots-sign-record` in the container, or as the executable that `UE_SIGN_RECORD_READER` names. The scenario does not build it, as the container has no source tree. A run that selects `provider_outage` stops before its first step when the reader is missing or does not start.
+`dump_eots_votes.rs` is a cargo integration test (`[[test]] dump_eots_votes`) used as a read-only helper: it dumps the signed EOTS votes of a heed database (`EOTS_SIGN_RECORD_DB`, `EOTS_SIGN_RECORD_OUTPUT`). The step `provider_outage` runs it as `/tmp/dump-eots-votes` in the container, or as the executable that `UE_SIGN_RECORD_READER` names. The scenario does not build it, as the container has no source tree. A run that selects `provider_outage` stops before its first step when the reader is missing or does not start.
 
 The caller builds it in the container after `make local-up`, from `bitcoin-ipc` on the host:
 
@@ -60,7 +60,7 @@ tar --exclude=./target --exclude=./venv -cf - . | docker exec -i bitcoin-ipc tar
 ```
 
 ```
-docker exec -w /tmp/bitcoin-ipc-src bitcoin-ipc sh -c 'cargo test --no-run --test spec_eots_sign_record --message-format=json | jq -r "select(.target.name == \"spec_eots_sign_record\") | .executable // empty" | xargs -I{} install -m 755 {} /tmp/spec-eots-sign-record'
+docker exec -w /tmp/bitcoin-ipc-src bitcoin-ipc sh -c 'cargo test --no-run --test dump_eots_votes --message-format=json | jq -r "select(.target.name == \"dump_eots_votes\") | .executable // empty" | xargs -I{} install -m 755 {} /tmp/dump-eots-votes'
 ```
 
 Built in the container, the reader needs only the container's libc, libm and libgcc_s. A build on the host links the host's glibc and does not start in the container when that glibc is newer: an Ubuntu 24.04 build (glibc 2.39) fails in the container (Debian bookworm, glibc 2.36) with `GLIBC_2.39 not found`. The container keeps `/tmp` until it is recreated. `docker cp` copies the built reader out and into a later container of the same image.

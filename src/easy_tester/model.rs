@@ -5,7 +5,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::{bitcoin_utils::RevealShape, ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
+use crate::{easy_tester::reveal::RevealShape, ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
 
 #[derive(Debug, Clone)]
 pub struct ValidatorSpec {
@@ -13,7 +13,6 @@ pub struct ValidatorSpec {
     pub secret_key: SecretKey,
     pub pubkey: XOnlyPublicKey,
     pub eots_secret_key: SecretKey,
-    /// The seed of the EOTS nonces the key commits to
     pub eots_seed: crate::eots::EotsSeed,
     pub default_ip: SocketAddr,
     pub default_backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
@@ -62,7 +61,9 @@ pub enum TesterConfig {
     },
     /// Fendermint tester — subnets come from the config file, issuers from
     /// the scenario file.
-    Fendermint { setup: FendermintSetup },
+    Fendermint {
+        setup: FendermintSetup,
+    },
 }
 
 // ── Fendermint-specific setup types ────────────────────────────────────
@@ -115,13 +116,15 @@ pub enum OutputDb {
 }
 
 /// One join of a `join-ue` line: the collateral matures at `timeout`. `subnet_name` is set
-/// when the join targets another subnet than the line's (`<subnet>:<validator>`)
+/// when the join targets another subnet than the line's (`<subnet>:<validator>`).
+/// `collateral_spent`: a transaction spends the collateral UTXO before the reveal transaction
 #[derive(Debug, Clone)]
 pub struct JoinUeSpec {
     pub subnet_name: Option<String>,
     pub validator_name: String,
     pub collateral_sats: u64,
     pub timeout: u64,
+    pub collateral_spent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,10 +136,12 @@ pub enum ScenarioCommand {
         subnet_name: String,
         shape: RevealShape,
     },
+    /// `raw`: the transaction is hand-built and submitted without the provider
     Join {
         subnet_name: String,
         validator_name: String,
         collateral_sats: u64,
+        raw: bool,
     },
     /// Join under the unilateral-exit script; several joins go in one reveal, in order
     JoinUe {
@@ -330,7 +335,6 @@ pub fn generate_validator(name: &str, ordinal: usize) -> ValidatorSpec {
     }
 }
 
-/// A queued `presign` line.
 #[derive(Debug, Clone)]
 pub struct PresignSpec {
     pub owner: String,

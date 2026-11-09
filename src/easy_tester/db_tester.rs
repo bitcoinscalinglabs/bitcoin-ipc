@@ -6,23 +6,24 @@ use rand::RngCore;
 use tempfile::TempDir;
 
 use crate::{
-    bitcoin_utils::{merge_reveals, reshape_reveal, unsigned_commit_reveal, RevealShape},
+    bitcoin_utils::unsigned_commit_reveal,
     collateral,
-    db::{DatabaseCore, DatabaseRewardExtensions, HeedDb, SubnetCheckpoint, SubnetCommittee},
+    db::{DatabaseCore, DatabaseRewardExtensions, HeedDb, SubnetCheckpoint},
     easy_tester::{
         error::EasyTesterError,
         model::{
-            build_create_subnet_msg, create_rand_blockhash, create_rand_txid, JoinUeSpec, OutputDb,
-            OutputExpectTarget, SetupSpec, ValidatorSpec,
+            build_create_subnet_msg, create_rand_blockhash, create_rand_txid,
+            JoinUeSpec, OutputDb, OutputExpectTarget, SetupSpec, ValidatorSpec,
         },
+        reveal::{merge_reveals, reshape_reveal, RevealShape},
         tester::Tester,
         ue_reads::{self, Names, UeRead},
     },
     eth_utils,
     ipc_lib::{
-        IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer,
-        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg,
-        IpcLibError, IpcMessage, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
+        CheckpointSigner, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg, IpcCrossSubnetErcTransfer,
+        IpcErcSupplyAdjustment, IpcErcTokenRegistration, IpcJoinSubnetMsg, IpcLibError,
+        IpcMessage, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate,
     },
     rewards::{RewardConfig, RewardTracker},
     SubnetId,
@@ -35,8 +36,8 @@ fn empty_reveal(secp: &Secp256k1<bitcoin::secp256k1::All>) -> Result<Transaction
         .map_err(|e| EasyTesterError::runtime(format!("filler reveal: {e}")))
 }
 
-/// A fund UTXO of the committee's multisig for the checkpoint transaction (no chain here)
-fn fund_utxo(committee: &SubnetCommittee) -> bitcoincore_rpc::json::ListUnspentResultEntry {
+/// A fund UTXO under `address` for the checkpoint transaction (no chain here)
+fn fund_utxo(address: &bitcoin::Address) -> bitcoincore_rpc::json::ListUnspentResultEntry {
     bitcoincore_rpc::json::ListUnspentResultEntry {
         txid: create_rand_txid(),
         vout: 0,
@@ -44,13 +45,23 @@ fn fund_utxo(committee: &SubnetCommittee) -> bitcoincore_rpc::json::ListUnspentR
         label: None,
         redeem_script: None,
         witness_script: None,
-        script_pub_key: committee.address_checked().script_pubkey(),
+        script_pub_key: address.script_pubkey(),
         amount: Amount::from_sat(10_000_000_000),
         confirmations: 10,
         spendable: true,
         solvable: true,
         descriptor: None,
         safe: true,
+    }
+}
+
+/// A refusal of a `raw` join, stake or unstake is logged, not fatal, so that the scenario can check it
+fn refusal(raw: bool, message: String) -> Result<(), EasyTesterError> {
+    if raw {
+        warn!("{message}");
+        Ok(())
+    } else {
+        Err(EasyTesterError::runtime(message))
     }
 }
 
@@ -171,6 +182,11 @@ impl DbTester {
             warn!("join-ue ignored: unilateral exit is not active at block {height}");
             return Ok(());
         }
+        if joins.iter().any(|spec| spec.collateral_spent) {
+            return Err(EasyTesterError::runtime(
+                "join-ue @collateral-spent needs the monitor tester",
+            ));
+        }
         let secp = Secp256k1::new();
         let mut commits = Vec::new();
         let mut reveals = Vec::new();
@@ -244,11 +260,11 @@ impl DbTester {
             let checked =
                 match collateral::check_join_ue(&secp, &reveal, input, commit, height, &context) {
                     Ok(checked) => checked,
-                Err(e) => {
-                    warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
+                        continue;
+                    }
+                };
             match collateral::process_join_ue(&self.db, &checked, join_txid, height, block_hash) {
                 Ok(_) => {
                     accepted += 1;
@@ -384,6 +400,7 @@ impl DbTester {
         subnet_name: &str,
         validator_name: &str,
         collateral_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let block_hash = self.block_hash(height);
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -412,14 +429,20 @@ impl DbTester {
             .db
             .get_subnet_state(subnet_id)
             .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
-        join_msg
-            .validate_for_subnet(&genesis_info, &subnet_state)
-            .map_err(|e| EasyTesterError::runtime(format!("join rejected: {e}")))?;
+        if let Err(e) = join_msg.validate_for_subnet(&genesis_info, &subnet_state) {
+            return refusal(
+                raw,
+                format!("join of '{validator_name}' at block {height} rejected: {e}"),
+            );
+        }
 
         let txid = create_rand_txid();
-        join_msg
-            .save_to_db(&self.db, height, block_hash, txid)
-            .map_err(|e| EasyTesterError::runtime(format!("join failed: {e}")))?;
+        if let Err(e) = join_msg.save_to_db(&self.db, height, block_hash, txid) {
+            return refusal(
+                raw,
+                format!("join of '{validator_name}' at block {height} failed: {e}"),
+            );
+        }
         info!(
             "Join: validator '{}' joined subnet '{}' with {} sats",
             validator_name, subnet_name, collateral_sats
@@ -433,6 +456,7 @@ impl DbTester {
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let block_hash = self.block_hash(height);
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -445,11 +469,8 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("stake msg invalid: {e}")))?;
-        let rejected = |e: &dyn std::fmt::Display| {
-            warn!("Stake: '{validator_name}' rejected at block {height}: {e}");
-        };
         if let Err(e) = collateral::refuse_ue_member(&self.db, subnet_id, &msg.pubkey) {
-            rejected(&e);
+            warn!("Stake: '{validator_name}' rejected at block {height}: {e}");
             return Ok(());
         }
         let subnet_state = self
@@ -462,17 +483,17 @@ impl DbTester {
                 ))
             })?;
         if let Err(e) = msg.validate_for_subnet(&subnet_state) {
-            rejected(&e);
-            return Ok(());
+            return refusal(
+                raw,
+                format!("stake of '{validator_name}' at block {height} rejected: {e}"),
+            );
         }
         let txid = create_rand_txid();
-        match msg.save_to_db(&self.db, height, block_hash, txid) {
-            Ok(()) => {}
-            Err(IpcLibError::IpcValidateError(e)) => {
-                rejected(&e);
-                return Ok(());
-            }
-            Err(e) => return Err(EasyTesterError::runtime(format!("stake failed: {e}"))),
+        if let Err(e) = msg.save_to_db(&self.db, height, block_hash, txid) {
+            return refusal(
+                raw,
+                format!("stake of '{validator_name}' at block {height} failed: {e}"),
+            );
         }
         info!(
             "Stake: validator '{}' staked {} sats to subnet '{}'",
@@ -487,6 +508,7 @@ impl DbTester {
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let block_hash = self.block_hash(height);
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
@@ -499,11 +521,8 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("unstake msg invalid: {e}")))?;
-        let rejected = |e: &dyn std::fmt::Display| {
-            warn!("Unstake: '{validator_name}' rejected at block {height}: {e}");
-        };
         if let Err(e) = collateral::refuse_ue_member(&self.db, subnet_id, &validator.pubkey) {
-            rejected(&e);
+            warn!("Unstake: '{validator_name}' rejected at block {height}: {e}");
             return Ok(());
         }
         let genesis_info = self
@@ -525,18 +544,18 @@ impl DbTester {
                 ))
             })?;
         if let Err(e) = msg.validate_for_subnet(&genesis_info, &subnet_state) {
-            rejected(&e);
-            return Ok(());
+            return refusal(
+                raw,
+                format!("unstake of '{validator_name}' at block {height} rejected: {e}"),
+            );
         }
 
         let txid = create_rand_txid();
-        match msg.save_to_db(&self.db, height, block_hash, txid) {
-            Ok(()) => {}
-            Err(IpcLibError::IpcValidateError(e)) => {
-                rejected(&e);
-                return Ok(());
-            }
-            Err(e) => return Err(EasyTesterError::runtime(format!("unstake failed: {e}"))),
+        if let Err(e) = msg.save_to_db(&self.db, height, block_hash, txid) {
+            return refusal(
+                raw,
+                format!("unstake of '{validator_name}' at block {height} failed: {e}"),
+            );
         }
         info!(
             "Unstake: validator '{}' unstaked {} sats from subnet '{}'",
@@ -566,9 +585,6 @@ impl DbTester {
             .ok_or_else(|| {
                 EasyTesterError::runtime(format!("subnet state missing for {subnet_id}"))
             })?;
-        // As the provider: the first checkpoint of an epoch is its rotation checkpoint. As the
-        // subnet: the last change number of the configuration whose changes it applies, 0 when
-        // none await it
         let is_rotation_checkpoint = subnet_state.last_rotation_epoch < subnet_state.epoch;
         let next_cfg = subnet_state
             .waiting_committee
@@ -579,6 +595,26 @@ impl DbTester {
             .entry(subnet_name.to_string())
             .and_modify(|h| *h += 1)
             .or_insert(1);
+        let fee_rate = crate::DEFAULT_BTC_FEE_RATE;
+        // `C_wlist` signs until the rotation checkpoint of epoch 1
+        let signer = if subnet_state.last_rotation_epoch == 0 {
+            let genesis_info = self
+                .db
+                .get_subnet_genesis_info(subnet_id)
+                .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+                .ok_or_else(|| {
+                    EasyTesterError::runtime(format!("genesis info missing for {subnet_id}"))
+                })?;
+            CheckpointSigner::of_configuration(&subnet_id, &genesis_info.whitelist_configuration())
+                .map_err(|e| EasyTesterError::runtime(format!("checkpoint signer: {e}")))?
+        } else {
+            CheckpointSigner::of_committee(&subnet_state.committee)
+        };
+        let change_address = if is_rotation_checkpoint {
+            subnet_state.latest_committee().address_checked()
+        } else {
+            signer.address.clone()
+        };
         let msg = IpcCheckpointSubnetMsg {
             subnet_id,
             checkpoint_hash: create_rand_checkpoint_hash(),
@@ -591,23 +627,20 @@ impl DbTester {
             token_transfers: erc_transfers,
             slash_signatures,
             unstakes: vec![],
-            change_address: None,
+            change_address: Some(change_address.as_unchecked().clone()),
             is_kill_checkpoint: false,
             is_rotation_checkpoint,
-            slash_pre_signature_count: None,
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint msg invalid: {e}")))?;
 
-        let fee_rate = crate::DEFAULT_BTC_FEE_RATE;
-        let committee = subnet_state.committee.clone();
-        let next_committee = subnet_state.latest_committee().clone();
         let psbt = msg
-            .to_checkpoint_psbt(
-                &committee,
-                &next_committee,
+            .build_checkpoint_psbt(
+                &signer,
+                &change_address,
+                change_address != signer.address,
                 fee_rate,
-                &[fund_utxo(&committee)],
+                &[fund_utxo(&signer.address)],
             )
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint transaction: {e}")))?;
         let checkpoint_tx = psbt.unsigned_tx;
@@ -631,7 +664,7 @@ impl DbTester {
             subnet_name, height
         );
         let reveal = msg
-            .make_reveal_batch_transfer_tx(txid, fee_rate, &committee.address_checked())
+            .make_reveal_batch_transfer_tx(txid, fee_rate, &signer.address)
             .map_err(|e| EasyTesterError::runtime(format!("batch transfer reveal: {e}")))?;
         Ok((checkpoint, reveal))
     }
@@ -798,9 +831,8 @@ impl DbTester {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let delta = alloy_primitives::I256::try_from(amount).map_err(|e| {
-            EasyTesterError::runtime(format!("mint amount too large for I256: {e}"))
-        })?;
+        let delta = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("mint amount too large for I256: {e}")))?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -811,10 +843,7 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!(
-            "Queued mint for token '{}' on subnet '{}', amount={}",
-            token_name, subnet_name, amount
-        );
+        info!("Queued mint for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
         Ok(())
     }
 
@@ -830,12 +859,10 @@ impl DbTester {
             EasyTesterError::runtime(format!("token '{}' not registered", token_name))
         })?;
 
-        let pos = alloy_primitives::I256::try_from(amount).map_err(|e| {
-            EasyTesterError::runtime(format!("burn amount too large for I256: {e}"))
-        })?;
-        let delta = pos.checked_neg().ok_or_else(|| {
-            EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string())
-        })?;
+        let pos = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
+        let delta = pos.checked_neg()
+            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
 
         let ems = IpcErcSupplyAdjustment {
             home_token_address: reg.home_token_address,
@@ -846,10 +873,7 @@ impl DbTester {
             .or_default()
             .push(ems);
 
-        info!(
-            "Queued burn for token '{}' on subnet '{}', amount={}",
-            token_name, subnet_name, amount
-        );
+        info!("Queued burn for token '{}' on subnet '{}', amount={}", token_name, subnet_name, amount);
         Ok(())
     }
 
@@ -969,8 +993,9 @@ impl Tester for DbTester {
         subnet_name: &str,
         validator_name: &str,
         collateral_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
-        self.join_subnet(height, subnet_name, validator_name, collateral_sats)
+        self.join_subnet(height, subnet_name, validator_name, collateral_sats, raw)
     }
 
     fn exec_join_ue(
@@ -983,16 +1008,16 @@ impl Tester for DbTester {
         self.join_ue(height, subnet_name, joins, shape)
     }
 
-    /// Every stake of the db tester is hand-built: `raw` changes nothing
+    /// Every stake of the db tester is hand-built: with `raw`, a refusal is logged, not fatal
     fn exec_stake_subnet(
         &mut self,
         height: u64,
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
-        _raw: bool,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
-        self.stake_subnet(height, subnet_name, validator_name, amount_sats)
+        self.stake_subnet(height, subnet_name, validator_name, amount_sats, raw)
     }
 
     fn exec_unstake_subnet(
@@ -1001,9 +1026,9 @@ impl Tester for DbTester {
         subnet_name: &str,
         validator_name: &str,
         amount_sats: u64,
-        _raw: bool,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
-        self.unstake_subnet(height, subnet_name, validator_name, amount_sats)
+        self.unstake_subnet(height, subnet_name, validator_name, amount_sats, raw)
     }
 
     fn exec_deposit(
@@ -1163,7 +1188,12 @@ impl Tester for DbTester {
                     OutputDb::UeCollaterals => {
                         ue_reads::read_ue_collaterals(&self.db, subnet_id, subnet_name, &names)?
                     }
-                    _ => ue_reads::read_withdrawals(&self.db, subnet_id, subnet_name, &names)?,
+                    _ => ue_reads::read_pending_withdraw_changes(
+                        &self.db,
+                        subnet_id,
+                        subnet_name,
+                        &names,
+                    )?,
                 };
                 self.last_ue = Some(read);
             }
@@ -1418,9 +1448,8 @@ impl Tester for DbTester {
             match parts.as_slice() {
                 ["balance"] => {
                     use crate::easy_tester::model::parse_u256_allow_underscores;
-                    let expected = parse_u256_allow_underscores(expected_value).map_err(|e| {
-                        EasyTesterError::runtime(format!("balance must be numeric: {e}"))
-                    })?;
+                    let expected = parse_u256_allow_underscores(expected_value)
+                        .map_err(|e| EasyTesterError::runtime(format!("balance must be numeric: {e}")))?;
                     if balance != expected {
                         return Err(EasyTesterError::runtime(format!(
                             "EXPECT failed (line {}): result.balance expected {}, got {}",

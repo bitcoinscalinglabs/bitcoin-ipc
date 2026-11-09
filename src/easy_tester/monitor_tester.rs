@@ -14,18 +14,17 @@ use log::{info, warn};
 use tempfile::TempDir;
 
 use crate::{
-    bitcoin_utils::{
-        create_commit_reveal_txs, merge_reveals, reshape_reveal, submit_to_mempool, RevealShape,
-    },
+    bitcoin_utils::{create_commit_reveal_txs, submit_to_mempool},
     collateral,
     db::{DatabaseCore, HeedDb},
     easy_tester::{
         error::EasyTesterError,
         model::{
-            build_create_subnet_msg, parse_u256_allow_underscores, JoinUeSpec, OutputDb,
-            OutputExpectTarget, SetupSpec, ValidatorSpec,
+            build_create_subnet_msg, JoinUeSpec, OutputDb, OutputExpectTarget,
+            parse_u256_allow_underscores, SetupSpec, ValidatorSpec,
         },
         provider_client::ProviderClient,
+        reveal::{merge_reveals, reshape_reveal, RevealShape},
         tester::Tester,
         ue_reads::{self, Names, UeRead},
     },
@@ -74,6 +73,72 @@ fn submit_reshaped(
     Ok(reveal)
 }
 
+/// A transaction spending the collateral UTXO at `outpoint` through the cooperative-exit leaf
+/// `X(pk, C)`, signed by the key of `pk` and by every member of `C` among `validators`.
+fn cooperative_exit_spend<'a>(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    script: &collateral::CollateralScript,
+    outpoint: bitcoin::OutPoint,
+    value: bitcoin::Amount,
+    validators: impl Iterator<Item = &'a ValidatorSpec> + Clone,
+    to: bitcoin::ScriptBuf,
+) -> Result<Transaction, EasyTesterError> {
+    use bitcoin::hashes::Hash;
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    let err =
+        |e: &dyn std::fmt::Display| EasyTesterError::runtime(format!("collateral spend: {e}"));
+    let secret_key = |key: &bitcoin::XOnlyPublicKey| {
+        validators
+            .clone()
+            .find(|v| v.pubkey == *key)
+            .map(|v| v.secret_key)
+            .ok_or_else(|| err(&format!("no validator has key {key}")))
+    };
+    let leaf = script.cooperative_exit_leaf().map_err(|e| err(&e))?;
+    let control_block = script.control_block(secp, &leaf).map_err(|e| err(&e))?;
+    let prevout = bitcoin::TxOut {
+        value,
+        script_pubkey: script.script_pubkey(secp).map_err(|e| err(&e))?,
+    };
+    let mut tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: outpoint,
+            sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        }],
+        output: vec![bitcoin::TxOut {
+            value: value
+                .checked_sub(COLLATERAL_SPEND_FEE)
+                .ok_or_else(|| err(&"the collateral is below the fee"))?,
+            script_pubkey: to,
+        }],
+    };
+    let sighash = SighashCache::new(&tx)
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&[prevout]),
+            leaf.tapscript_leaf_hash(),
+            TapSighashType::Default,
+        )
+        .map_err(|e| err(&e))?;
+    let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let sign = |secret_key: bitcoin::secp256k1::SecretKey| {
+        secp.sign_schnorr(&message, &secret_key.keypair(secp))
+            .serialize()
+    };
+    let mut witness = bitcoin::Witness::new();
+    for (key, _) in script.configuration.sorted_keys().iter().rev() {
+        witness.push(sign(secret_key(key)?));
+    }
+    witness.push(sign(secret_key(&script.pubkey)?));
+    witness.push(leaf.to_bytes());
+    witness.push(control_block.serialize());
+    tx.input[0].witness = witness;
+    Ok(tx)
+}
+
 // ── constants / defaults ──────────────────────────────────────────────────────
 
 const RPC_USER: &str = "user";
@@ -87,6 +152,7 @@ const BITCOIND_READY_TIMEOUT_SECS: u64 = 30;
 const PROVIDER_READY_TIMEOUT_SECS: u64 = 30;
 const MONITOR_POLL_INTERVAL: u64 = 1;
 const CONFIRM_POLL_TIMEOUT_SECS: u64 = 60;
+const COLLATERAL_SPEND_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(5_000);
 
 // ── helper: RAII guard that kills tracked PIDs on drop ───────────────────────
 //
@@ -304,10 +370,7 @@ struct JoinSubnetLocalRequest {
 struct FinalizeCheckpointLocalParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    signatures: Vec<(
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    )>,
+    signatures: Vec<(bitcoin::XOnlyPublicKey, Vec<bitcoin::secp256k1::schnorr::Signature>)>,
     batch_transfer_tx_hex: Option<String>,
 }
 
@@ -490,9 +553,8 @@ impl MonitorTester {
                 "ulimit -n 65536 2>/dev/null; exec bitcoind -datadir={} -daemon=0",
                 datadir.display()
             );
-            let bitcoind_log_stderr = bitcoind_log.try_clone().map_err(|e| {
-                EasyTesterError::runtime(format!("failed to clone bitcoind log fd: {e}"))
-            })?;
+            let bitcoind_log_stderr = bitcoind_log.try_clone()
+                .map_err(|e| EasyTesterError::runtime(format!("failed to clone bitcoind log fd: {e}")))?;
             let bitcoind = Command::new("sh")
                 .args(["-c", &bitcoind_cmd])
                 .stdout(Stdio::from(bitcoind_log))
@@ -673,7 +735,8 @@ impl MonitorTester {
         let mut validator_provider_urls = HashMap::new();
         let mut provider_pids = Vec::new();
         for (name, pid, port) in &started.providers {
-            validator_provider_urls.insert(name.clone(), format!("http://127.0.0.1:{port}/api"));
+            validator_provider_urls
+                .insert(name.clone(), format!("http://127.0.0.1:{port}/api"));
             provider_pids.push(*pid);
         }
         let default_provider_url = validator_provider_urls
@@ -730,7 +793,6 @@ impl MonitorTester {
         .map_err(|e| EasyTesterError::runtime(format!("bitcoind rpc client: {e}")))
     }
 
-    /// The monitor's database, read-only.
     fn open_db(&self) -> Result<HeedDb, EasyTesterError> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(HeedDb::new(&self.db_url, true))
@@ -785,12 +847,7 @@ impl MonitorTester {
         committee: &crate::db::SubnetCommittee,
     ) -> Result<String, EasyTesterError> {
         for cv in &committee.validators {
-            if let Some(v) = self
-                .setup
-                .validators
-                .values()
-                .find(|v| v.pubkey == cv.pubkey)
-            {
+            if let Some(v) = self.setup.validators.values().find(|v| v.pubkey == cv.pubkey) {
                 if self.validator_provider_urls.contains_key(&v.name) {
                     return Ok(v.name.clone());
                 }
@@ -857,12 +914,11 @@ impl MonitorTester {
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        let url = self
-            .validator_provider_urls
-            .get(validator_name)
-            .ok_or_else(|| {
-                EasyTesterError::runtime(format!("no provider for validator '{validator_name}'"))
-            })?;
+        let url = self.validator_provider_urls.get(validator_name).ok_or_else(|| {
+            EasyTesterError::runtime(format!(
+                "no provider for validator '{validator_name}'"
+            ))
+        })?;
         self.rpc_call_to(url, method, params)
     }
 
@@ -892,12 +948,9 @@ impl MonitorTester {
         }
         // Suppress logging for high-frequency polling calls to keep rpc_client.log readable.
         let silent = matches!(method, "getconfirmedcount");
-        let log_file = if silent {
-            None
-        } else {
-            Some(self.log_dir.join("rpc_client.log"))
-        };
-        ProviderClient::new(url.to_string(), AUTH_TOKEN.to_string(), log_file).call(method, params)
+        let log_file = if silent { None } else { Some(self.log_dir.join("rpc_client.log")) };
+        ProviderClient::new(url.to_string(), AUTH_TOKEN.to_string(), log_file)
+            .call(method, params)
     }
 
     /// Poll provider's `getconfirmedcount` until it reaches `target_height`.
@@ -971,19 +1024,12 @@ impl MonitorTester {
 
         let subnet_state: crate::db::SubnetState =
             self.rpc_call("getsubnet", SubnetIdParam { subnet_id })?;
-        // As the provider: the first checkpoint of an epoch is its rotation checkpoint. As the
-        // subnet: the last change number of the configuration whose changes it applies, 0 when
-        // none await it
         let is_rotation_checkpoint = subnet_state.last_rotation_epoch < subnet_state.epoch;
         let next_cfg = subnet_state
             .waiting_committee
             .as_ref()
             .map_or(0, |configuration| configuration.configuration_number);
 
-        // Route checkpoint RPCs to a provider whose validator signs the checkpoint and sign
-        // its inputs with that configuration's keys: the whitelist until the rotation
-        // checkpoint of epoch 1, which spends the whitelist multisig's funds, the current
-        // committee afterwards (the default provider's validator may have left).
         let (signer_name, secret_keys) = if subnet_state.last_rotation_epoch == 0 {
             (
                 self.find_whitelist_validator_name(subnet_name)?,
@@ -1011,7 +1057,6 @@ impl MonitorTester {
             change_address: None,
             is_kill_checkpoint: false,
             is_rotation_checkpoint,
-            slash_pre_signature_count: None,
         };
 
         let gen_resp: GenCheckpointPsbtResult =
@@ -1308,9 +1353,30 @@ impl Tester for MonitorTester {
         subnet_name: &str,
         validator_name: &str,
         collateral_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError> {
         let subnet_id = self.resolve_subnet_id(subnet_name)?;
         let v = self.resolve_validator(validator_name)?.clone();
+
+        if raw {
+            let rpc = self.wallet_client()?;
+            let multisig = self.multisig_address(subnet_id)?;
+            let msg = IpcJoinSubnetMsg {
+                subnet_id,
+                collateral: bitcoin::Amount::from_sat(collateral_sats),
+                ip: v.default_ip,
+                backup_address: v.default_backup_address.clone(),
+                pubkey: v.pubkey,
+            };
+            let txid = msg
+                .submit_to_bitcoin(&rpc, &multisig)
+                .map_err(|e| EasyTesterError::runtime(format!("raw join: {e}")))?;
+            info!(
+                "Submitted a hand-built join of {} sats for '{}' to subnet '{}': {}",
+                collateral_sats, validator_name, subnet_name, txid
+            );
+            return Ok(());
+        }
 
         let req = JoinSubnetLocalRequest {
             subnet_id,
@@ -1331,6 +1397,8 @@ impl Tester for MonitorTester {
 
     /// `join-ue`: one funded commit per join, each submitted as built, then one reveal for all
     /// of them, without the provider's own check so that every rejection is the monitor's.
+    /// With `collateral_spent`, a transaction spending the collateral UTXO follows its commit,
+    /// and both are mined one Bitcoin block before the reveal transaction.
     fn exec_join_ue(
         &mut self,
         _height: u64,
@@ -1374,12 +1442,10 @@ impl Tester for MonitorTester {
                         .whitelist_configuration()
                 }
             };
+            let script = msg.collateral_script(configuration);
             let collateral_output = bitcoin::TxOut {
                 value: collateral,
-                script_pubkey: msg
-                    .collateral_script(configuration)
-                    .script_pubkey(&secp)
-                    .map_err(|e| err(&e))?,
+                script_pubkey: script.script_pubkey(&secp).map_err(|e| err(&e))?,
             };
             let (commit_tx, reveal_tx) = crate::bitcoin_utils::create_commit_reveal_txs(
                 &rpc,
@@ -1390,8 +1456,30 @@ impl Tester for MonitorTester {
                 Some(collateral_output),
             )
             .map_err(|e| err(&e))?;
+            let outpoint =
+                bitcoin::OutPoint::new(commit_tx.compute_txid(), collateral::UE_COLLATERAL_VOUT);
             crate::bitcoin_utils::submit_to_mempool(&rpc, vec![commit_tx]).map_err(|e| err(&e))?;
+            if spec.collateral_spent {
+                let spend = cooperative_exit_spend(
+                    &secp,
+                    &script,
+                    outpoint,
+                    collateral,
+                    self.setup.validators.values(),
+                    return_address.script_pubkey(),
+                )?;
+                crate::bitcoin_utils::submit_to_mempool(&rpc, vec![spend.clone()])
+                    .map_err(|e| err(&e))?;
+                info!(
+                    "JoinUe: collateral UTXO {outpoint} of '{}' spent by {}",
+                    spec.validator_name,
+                    spend.compute_txid()
+                );
+            }
             reveals.push(reveal_tx);
+        }
+        if joins.iter().any(|spec| spec.collateral_spent) {
+            self.exec_mine_block(self.current_block + 1)?;
         }
         let reveal_tx = submit_reshaped(&rpc, merge_reveals(reveals), shape)?;
         let join_txid = reveal_tx.compute_txid();
@@ -1698,12 +1786,10 @@ impl Tester for MonitorTester {
         })?;
         let addr = *addr;
 
-        let pos = alloy_primitives::I256::try_from(amount).map_err(|e| {
-            EasyTesterError::runtime(format!("burn amount too large for I256: {e}"))
-        })?;
-        let delta = pos.checked_neg().ok_or_else(|| {
-            EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string())
-        })?;
+        let pos = alloy_primitives::I256::try_from(amount)
+            .map_err(|e| EasyTesterError::runtime(format!("burn amount too large for I256: {e}")))?;
+        let delta = pos.checked_neg()
+            .ok_or_else(|| EasyTesterError::runtime("burn amount overflow (I256::MIN)".to_string()))?;
 
         self.pending_supply_adjustments
             .entry(subnet_name.to_string())
@@ -1774,7 +1860,12 @@ impl Tester for MonitorTester {
                     OutputDb::UeCollaterals => {
                         ue_reads::read_ue_collaterals(&monitor_db, subnet_id, subnet_name, &names)?
                     }
-                    _ => ue_reads::read_withdrawals(&monitor_db, subnet_id, subnet_name, &names)?,
+                    _ => ue_reads::read_pending_withdraw_changes(
+                        &monitor_db,
+                        subnet_id,
+                        subnet_name,
+                        &names,
+                    )?,
                 };
                 self.last_ue = Some(read);
             }
@@ -1789,10 +1880,7 @@ impl Tester for MonitorTester {
                 for h in 1..=self.current_block {
                     let batch: Vec<RootnetMsgValue> = self.rpc_call(
                         "getrootnetmessages",
-                        SubnetBlockParam {
-                            subnet_id,
-                            block_height: h,
-                        },
+                        SubnetBlockParam { subnet_id, block_height: h },
                     )?;
                     msgs.extend(batch);
                 }
@@ -2109,14 +2197,10 @@ fn rootnet_msg_field(msg: &RootnetMsgValue, field: &str) -> Result<String, EasyT
         "nonce" => Ok(msg.nonce.to_string()),
         "tokenName" => json_nested_field(msg.registration.as_ref(), "name", "tokenName"),
         "tokenSymbol" => json_nested_field(msg.registration.as_ref(), "symbol", "tokenSymbol"),
-        "tokenDecimals" => {
-            json_nested_field(msg.registration.as_ref(), "decimals", "tokenDecimals")
-        }
+        "tokenDecimals" => json_nested_field(msg.registration.as_ref(), "decimals", "tokenDecimals"),
         "token" => json_nested_field(msg.registration.as_ref(), "home_token_address", "token"),
         "amount" => json_nested_field(msg.msg.as_ref(), "amount", "amount"),
-        other => Err(EasyTesterError::runtime(format!(
-            "unknown rootnet_msg field '{other}'"
-        ))),
+        other => Err(EasyTesterError::runtime(format!("unknown rootnet_msg field '{other}'"))),
     }
 }
 
@@ -2126,11 +2210,11 @@ fn json_nested_field(
     key: &str,
     display_field: &str,
 ) -> Result<String, EasyTesterError> {
-    let val = obj.and_then(|v| v.get(key)).ok_or_else(|| {
-        EasyTesterError::runtime(format!(
-            "field '{display_field}' not present in this message"
-        ))
-    })?;
+    let val = obj
+        .and_then(|v| v.get(key))
+        .ok_or_else(|| {
+            EasyTesterError::runtime(format!("field '{display_field}' not present in this message"))
+        })?;
     Ok(match val {
         serde_json::Value::String(s) => {
             // U256 and similar types serialize as "0x..." hex strings; convert to decimal.

@@ -165,12 +165,14 @@ fn run_scenario<T: Tester>(
                 subnet_name,
                 validator_name,
                 collateral_sats,
+                raw,
             } => {
                 tester.exec_join_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     collateral_sats,
+                    raw,
                 ).map_err(annotate)?;
             }
             ScenarioCommand::JoinUe {

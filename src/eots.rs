@@ -1,9 +1,9 @@
-//! EOTS: BIP340 signatures whose nonces are committed in advance, so that two signatures at
-//! one subnet height reveal the secret key. Nonce derivation from the validator's nonce seed,
-//! the RFC 6962 commitment tree with its audit paths, the vote message and the vote signature.
+//! EOTS nonce derivation, the nonce commitment tree with its audit paths, and vote signatures.
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{self, Message, Secp256k1, SecretKey, XOnlyPublicKey};
+#[cfg(test)]
+use bitcoin::secp256k1::{self, Message, XOnlyPublicKey};
+use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use hmac::{Hmac, Mac};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
@@ -11,13 +11,13 @@ use k256::{ProjectivePoint, Scalar};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ipc_lib::{tagged_sha256, SubnetId};
+use crate::bitcoin_utils::tagged_sha256;
+use crate::ipc_lib::SubnetId;
 
 /// Tag of the vote message digest.
 pub const VOTE_TAG: &[u8] = b"IPC/vote";
 
-/// The secret from which a validator derives every EOTS nonce: a random value kept like the
-/// EOTS secret key, since one nonce and its vote give the key.
+/// The secret from which every EOTS nonce is derived, kept like the EOTS secret key.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EotsSeed([u8; 32]);
 
@@ -94,10 +94,13 @@ pub struct EotsVote {
 pub enum EotsError {
     #[error("height {0} is outside the committed range")]
     HeightNotCommitted(u64),
+    #[cfg(test)]
     #[error("invalid EOTS key")]
     InvalidKey,
+    #[cfg(test)]
     #[error("invalid signature")]
     InvalidSignature,
+    #[cfg(test)]
     #[error("invalid audit path")]
     InvalidProof,
 }
@@ -153,8 +156,7 @@ pub fn secret_nonce(seed: &EotsSeed, subnet_id: &SubnetId, height: u64) -> (Scal
     }
 }
 
-/// The public nonces `R_start, …, R_{start+count-1}`, derived on every core: a nonce is one HMAC
-/// and one point multiplication, and a commitment holds up to millions of them.
+/// The public nonces for the heights `[start, start + count)`, derived in parallel.
 pub fn public_nonces(
     seed: &EotsSeed,
     subnet_id: &SubnetId,
@@ -227,8 +229,7 @@ fn split_point(n: usize) -> usize {
     1 << (usize::BITS - 1 - (n - 1).leading_zeros())
 }
 
-/// The RFC 6962 Merkle tree of a list of nonces, with the hashes of every perfect aligned
-/// subtree kept so that an audit path costs `O(log² n)`.
+/// The RFC 6962 Merkle tree of a list of nonces, with the subtree hashes cached.
 #[derive(Debug, Clone)]
 pub struct NonceTree {
     /// `layers[j][i]` is the hash of leaves `[i · 2^j, (i + 1) · 2^j)`
@@ -257,8 +258,7 @@ impl NonceTree {
         self.len() == 0
     }
 
-    /// The hash of leaves `[from, to)`, where `from` is a multiple of the largest power of two
-    /// below `to - from`, as every subtree of the RFC 6962 recursion is.
+    /// The hash of leaves `[from, to)`, with `from` aligned to the subtree size.
     fn range_hash(&self, from: usize, to: usize) -> [u8; 32] {
         let n = to - from;
         if n == 1 {
@@ -305,13 +305,9 @@ impl NonceTree {
     }
 }
 
-/// The RFC 6962 root of `leaves`.
-pub fn merkle_root(leaves: &[[u8; 32]]) -> Option<[u8; 32]> {
-    NonceTree::new(leaves).root()
-}
-
 /// Checks the RFC 6962 audit path `path` of `leaf` at `index` in a tree of `size` leaves against
 /// `root` (RFC 9162, section 2.1.3.2).
+#[cfg(test)]
 pub fn verify_audit_path(
     leaf: &[u8; 32],
     index: u64,
@@ -344,11 +340,6 @@ pub fn verify_audit_path(
     sn == 0 && r == *root
 }
 
-/// The x-only public key of `sk`.
-pub fn public_key(secp: &Secp256k1<secp256k1::All>, sk: &SecretKey) -> XOnlyPublicKey {
-    sk.x_only_public_key(secp).0
-}
-
 /// The BIP340 signature `R ‖ s` on `msg` under `sk` with the secret nonce `k`, whose public
 /// nonce has x coordinate `nonce_x` and an even y coordinate.
 pub fn sign_with_nonce(
@@ -378,6 +369,7 @@ fn challenge(rx: &[u8; 32], px: &[u8; 32], msg: &[u8; 32]) -> Scalar {
 }
 
 /// Verifies `signature` on `msg` under `pk_eots` as an ordinary BIP340 signature.
+#[cfg(test)]
 pub fn verify(
     pk_eots: &[u8; 32],
     msg: &[u8; 32],
@@ -413,7 +405,7 @@ pub fn sign_vote(
     let msg = vote_message(subnet_id, height, block_hash);
     let secp = Secp256k1::new();
     Ok(EotsVote {
-        pk_eots: public_key(&secp, sk).serialize(),
+        pk_eots: sk.x_only_public_key(&secp).0.serialize(),
         height,
         block_hash: *block_hash,
         signature: sign_with_nonce(sk, &k, &nonce_x, &msg),
@@ -423,6 +415,7 @@ pub fn sign_vote(
 }
 
 /// Checks a vote's proof against `commitment` and its signature under its key.
+#[cfg(test)]
 pub fn verify_vote(
     subnet_id: &SubnetId,
     vote: &EotsVote,
@@ -448,6 +441,7 @@ pub fn verify_vote(
 /// The secret key `d` from two votes of one key at one height for two different blocks:
 /// `d = (s − s') · (e − e')⁻¹`. Returns `None` when the votes do not share a nonce or sign the
 /// same message.
+#[cfg(test)]
 pub fn extract_secret_key(
     subnet_id: &SubnetId,
     pk_eots: &[u8; 32],
@@ -486,6 +480,7 @@ pub fn extract_secret_key(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use sha2::{Digest, Sha256};
 
     fn test_subnet() -> SubnetId {
         SubnetId::from_txid20(&[7u8; 20])
@@ -502,13 +497,16 @@ mod tests {
     #[test]
     fn rfc6962_root_of_seven_leaves_matches_the_recursion() {
         let leaves: Vec<[u8; 32]> = (0u8..7).map(|i| [i; 32]).collect();
-        assert_eq!(merkle_root(&leaves).unwrap(), recursive_root(&leaves));
+        assert_eq!(
+            NonceTree::new(&leaves).root().unwrap(),
+            recursive_root(&leaves)
+        );
     }
 
     #[test]
     fn single_leaf_root_is_its_leaf_hash() {
         let leaf = [9u8; 32];
-        assert_eq!(merkle_root(&[leaf]).unwrap(), leaf_hash(&leaf));
+        assert_eq!(NonceTree::new(&[leaf]).root().unwrap(), leaf_hash(&leaf));
         assert!(verify_audit_path(&leaf, 0, 1, &[], &leaf_hash(&leaf)));
         assert!(!verify_audit_path(
             &leaf,
@@ -556,14 +554,14 @@ mod tests {
         };
         let block = [0xabu8; 32];
         let vote = sign_vote(&sk, &seed, &subnet, &commitment, &tree, 17, &block).unwrap();
-        assert_eq!(vote.pk_eots, public_key(&secp, &sk).serialize());
+        assert_eq!(vote.pk_eots, sk.x_only_public_key(&secp).0.serialize());
         assert_eq!(vote.signature[0], nonces[12]);
         verify_vote(&subnet, &vote, &commitment).unwrap();
         // The signature verifies as an ordinary BIP340 signature with the bitcoin crate
         let sig = secp256k1::schnorr::Signature::from_slice(&signature_to_bytes(&vote.signature))
             .unwrap();
         let msg = Message::from_digest(vote_message(&subnet, 17, &block));
-        secp.verify_schnorr(&sig, &msg, &public_key(&secp, &sk))
+        secp.verify_schnorr(&sig, &msg, &sk.x_only_public_key(&secp).0)
             .unwrap();
         // Outside the range, or with a wrong start
         assert!(matches!(
@@ -583,8 +581,6 @@ mod tests {
 
     #[test]
     fn odd_y_keys_sign_valid_votes() {
-        // Keys of both parities must produce verifiable signatures
-        let secp = Secp256k1::new();
         let subnet = test_subnet();
         for seed in 1u8..12 {
             let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
@@ -607,7 +603,6 @@ mod tests {
             )
             .unwrap();
             verify_vote(&subnet, &vote, &commitment).unwrap();
-            let _ = &secp;
         }
     }
 
@@ -630,7 +625,10 @@ mod tests {
             let b =
                 sign_vote(&sk, &nonce_seed, &subnet, &commitment, &tree, 3, &[2u8; 32]).unwrap();
             let extracted = extract_secret_key(&subnet, &a.pk_eots, &a, &b).unwrap();
-            assert_eq!(public_key(&secp, &extracted), public_key(&secp, &sk));
+            assert_eq!(
+                extracted.x_only_public_key(&secp).0,
+                sk.x_only_public_key(&secp).0
+            );
             assert!(extract_secret_key(&subnet, &a.pk_eots, &a, &a).is_none());
         }
     }
@@ -653,7 +651,9 @@ mod tests {
         let again = public_nonces(&seed, &subnet, 1, 300);
         assert_eq!(public_nonces(&seed, &subnet, 1, 300), again);
         // Sequential derivation gives the same nonces as the parallel one, in the same order
-        let sequential: Vec<_> = (1..=300).map(|h| secret_nonce(&seed, &subnet, h).1).collect();
+        let sequential: Vec<_> = (1..=300)
+            .map(|h| secret_nonce(&seed, &subnet, h).1)
+            .collect();
         assert_eq!(sequential, again);
         // Another seed, another subnet or another height gives other nonces
         let other = EotsSeed::from_bytes([10u8; 32]);
@@ -701,16 +701,183 @@ mod tests {
         expected.extend_from_slice(&[5; 32]);
         expected.extend_from_slice(&[6; 32]);
         assert_eq!(bytes, expected);
-        let commitment = EotsNonceCommitment {
-            start: 1,
-            count: 2,
-            root: [7; 32],
-        };
-        let mut expected = vec![1u8, 2];
-        expected.extend_from_slice(&[7; 32]);
-        assert_eq!(postcard::to_stdvec(&commitment).unwrap(), expected);
+    }
+
+    fn range_commitment(start: u64, count: u32) -> EotsNonceCommitment {
+        EotsNonceCommitment {
+            start,
+            count,
+            root: std::array::from_fn(|i| i as u8),
+        }
+    }
+
+    #[test]
+    fn commitment_covers_the_half_open_range_from_start() {
+        const MAX: u64 = u64::MAX;
+        let cases: [(u64, u32, u64, bool); 14] = [
+            // first height, last height, end, and below start down to 0
+            (129, 17, 129, true),
+            (129, 17, 145, true),
+            (129, 17, 146, false),
+            (129, 17, 128, false),
+            (129, 17, 0, false),
+            // count 1
+            (1, 1, 1, true),
+            (1, 1, 0, false),
+            (1, 1, 2, false),
+            // heights past u32
+            (2, u32::MAX, 1 << 32, true),
+            (2, u32::MAX, (1 << 32) + 1, false),
+            // range ending at the largest height
+            (MAX - 1, 1, MAX - 2, false),
+            (MAX - 1, 1, MAX - 1, true),
+            (MAX - 1, 1, MAX, false),
+            (0, 1, 0, true),
+        ];
+        for (start, count, height, expected) in cases {
+            assert_eq!(
+                range_commitment(start, count).covers(height),
+                expected,
+                "start {start}, count {count}, height {height}"
+            );
+        }
+        for (start, count, end) in [
+            (129, 17, 146),
+            (2, u32::MAX, (1 << 32) + 1),
+            (MAX - 1, 1, MAX),
+        ] {
+            assert_eq!(range_commitment(start, count).end(), end);
+        }
+    }
+
+    #[test]
+    fn separate_commitments_do_not_fill_the_gap_between_them() {
+        let ranges = [range_commitment(1, 3), range_commitment(5, 2)];
+        assert!(!ranges.iter().any(|c| c.covers(4)));
+        assert_eq!(ranges.iter().filter(|c| c.covers(5)).count(), 1);
+    }
+
+    // encoding.md, EOTS nonce commitment and Postcard encoding
+    #[test]
+    fn commitment_has_a_literal_leb128_tuple_encoding() {
+        let mut expected = vec![0x81, 0x01, 0x80, 0x80, 0x01]; // 129, 16384
+        expected.extend(0_u8..32);
+        assert_eq!(
+            postcard::to_stdvec(&range_commitment(129, 16384)).unwrap(),
+            expected
+        );
+        let decoded: EotsNonceCommitment = postcard::from_bytes(&expected).unwrap();
+        assert_eq!(decoded, range_commitment(129, 16384));
+
+        let mut one_byte_each = vec![1, 2];
+        one_byte_each.extend(0_u8..32);
+        assert_eq!(
+            postcard::to_stdvec(&range_commitment(1, 2)).unwrap(),
+            one_byte_each
+        );
+    }
+
+    // encoding.md, Postcard encoding
+    #[test]
+    fn commitment_integer_widths_are_encoded_without_truncation() {
+        let mut expected = vec![0xff; 9];
+        expected.push(0x01);
+        expected.extend([0xff, 0xff, 0xff, 0xff, 0x0f]);
+        expected.extend(0_u8..32);
+        assert_eq!(
+            postcard::to_stdvec(&range_commitment(u64::MAX, u32::MAX)).unwrap(),
+            expected
+        );
+    }
+
+    fn reference_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        if leaves.len() == 1 {
+            return Sha256::digest([&[0u8][..], &leaves[0]].concat()).into();
+        }
+        let split = 1usize << ((usize::BITS - 1) - (leaves.len() - 1).leading_zeros());
+        Sha256::digest(
+            [
+                &[1u8][..],
+                &reference_root(&leaves[..split]),
+                &reference_root(&leaves[split..]),
+            ]
+            .concat(),
+        )
+        .into()
+    }
+
+    #[test]
+    fn overlapping_commitment_ranges_use_identical_nonces_for_the_same_heights() {
+        let seed = EotsSeed::from_bytes([0x91; 32]);
+        let subnet = SubnetId::from_txid20(&[0x32; 20]);
+        let all = public_nonces(&seed, &subnet, 125, 9);
+        let mut partitioned = public_nonces(&seed, &subnet, 125, 3);
+        partitioned.extend(public_nonces(&seed, &subnet, 128, 6));
+        assert_eq!(partitioned, all);
+        assert_eq!(public_nonces(&seed, &subnet, 127, 4), all[2..6]);
+    }
+
+    #[test]
+    fn a_restored_seed_rebuilds_an_uneven_tree_with_the_rfc6962_root() {
+        let subnet = SubnetId::from_txid20(&[0x53; 20]);
+        let seed = EotsSeed::from_bytes([0xa3; 32]);
+        let leaves = public_nonces(&seed, &subnet, 0x0102, 11);
+        let (commitment, original) = commit_nonces(&seed, &subnet, 0x0102, 11);
+        assert_eq!(commitment.root, reference_root(&leaves));
+        let restored = EotsSeed::from_bytes(*seed.as_bytes());
+        let rebuilt = nonce_tree(&restored, &subnet, &commitment);
+        assert_eq!(rebuilt.root(), Some(reference_root(&leaves)));
+        for i in 0..11 {
+            assert_eq!(rebuilt.audit_path(i), original.audit_path(i));
+        }
+    }
+
+    #[test]
+    fn changing_only_the_nonce_seed_invalidates_the_original_commitment() {
+        let subnet = SubnetId::from_txid20(&[0x53; 20]);
+        let seed = EotsSeed::from_bytes([0xa3; 32]);
+        let other = EotsSeed::from_bytes([0xa4; 32]);
+        let (commitment, tree) = commit_nonces(&seed, &subnet, 17, 5);
+        let sk = SecretKey::from_slice(&[7; 32]).unwrap();
+        let vote = sign_vote(&sk, &other, &subnet, &commitment, &tree, 19, &[0x29; 32]).unwrap();
+        assert_ne!(vote.signature[0], public_nonces(&seed, &subnet, 19, 1)[0]);
+        assert!(verify_vote(&subnet, &vote, &commitment).is_err());
+    }
+
+    #[test]
+    fn one_seed_nonce_signs_under_distinct_keys_with_independent_bip340_verification() {
+        let subnet = SubnetId::from_txid20(&[0x42; 20]);
+        let height = 0x0102_0304_0506_0708;
+        let block = [0x87; 32];
+        let seed = EotsSeed::from_bytes([0x73; 32]);
+        let (commitment, tree) = commit_nonces(&seed, &subnet, height, 3);
+        let mut payload = vec![0x42; 20];
+        payload.extend(height.to_le_bytes());
+        payload.extend(block);
+        let tag = Sha256::digest(b"IPC/vote");
+        let digest: [u8; 32] = Sha256::digest([&tag[..], &tag[..], &payload].concat()).into();
+        let secp = Secp256k1::new();
+        let mut nonces = vec![];
+        for key_bytes in [[7; 32], [8; 32]] {
+            let sk = SecretKey::from_slice(&key_bytes).unwrap();
+            let vote = sign_vote(&sk, &seed, &subnet, &commitment, &tree, height, &block).unwrap();
+            let pk = sk.x_only_public_key(&secp).0;
+            let signature = secp256k1::schnorr::Signature::from_slice(
+                &[vote.signature[0], vote.signature[1]].concat(),
+            )
+            .unwrap();
+            secp.verify_schnorr(&signature, &Message::from_digest(digest), &pk)
+                .unwrap();
+            let wrong = SecretKey::from_slice(&[9; 32])
+                .unwrap()
+                .x_only_public_key(&secp)
+                .0;
+            assert!(secp
+                .verify_schnorr(&signature, &Message::from_digest(digest), &wrong)
+                .is_err());
+            assert_eq!(vote.proof, tree.audit_path(0).unwrap());
+            nonces.push(vote.signature[0]);
+        }
+        assert_eq!(nonces[0], nonces[1]);
     }
 }
-#[cfg(test)]
-#[path = "eots_spec_tests.rs"]
-mod spec_tests;

@@ -1,19 +1,4 @@
-# Slash pre-signatures. A genesis collateral names C_gen, the whitelist, with threshold
-# floor(2 * min_validators / 3) + 1 = 3; a join after activation names C_1 (here the same four
-# members, one unit of power each, threshold 3). A collateral is slashable once a checkpoint's batch
-# transfer carries pre-signatures of the named configuration's members reaching its
-# threshold, and a cutoff seats only slashable collaterals. H_0 is the first Bitcoin L1
-# height at which every C_gen collateral is slashable; until the rotation checkpoint of
-# epoch 1 the current configuration is C_gen.
-# lifecycle.md, Configuration C_0; slashing.md, Slashable outputs.
-#
-# Run with testers/db-ue.txt or testers/monitor-ue.txt.
-# A collateral with timeout T seats its validator in every configuration computed with a
-# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
-# Epochs are K = 10 blocks here.
-# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
-# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
-# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
+# A collateral is slashable once a checkpoint's batch transfer carries pre-signatures that reach the threshold of its named configuration.
 
 setup
 
@@ -101,13 +86,14 @@ expect result.validator1.collateral = 100_000
 expect result.waiting = false
 # a corrupted signature fails the whole batch transfer, the valid entry with it
 presign subnet1 validator5 by validator1 validator2 validator3 bad
-presign subnet1 validator5 by validator1 validator2 validator3
+presign subnet1 validator6 by validator1 validator2 validator3
 checkpoint subnet1
 
 block 120
 read ue_collaterals subnet1
 expect result.slashable_count = 4
 expect result.validator5.slashable = false
+expect result.validator6.slashable = false
 # Three members reach the threshold for the later join.
 presign subnet1 validator5 by validator1 validator2 validator3
 checkpoint subnet1

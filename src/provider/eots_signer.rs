@@ -1,44 +1,35 @@
-//! The validator's EOTS signer: signs one vote per subnet height with the committed nonce and
-//! keeps every vote it signed in a database next to the key file, so that no height is ever
-//! signed twice. A vote is committed to disk before it is returned, and old votes stay on disk:
-//! neither memory nor the start time grows with the history.
+//! The validator's EOTS signer: one vote per subnet height, every vote kept in a database next
+//! to the key file.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 
 use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
 use heed::types::{SerdeBincode, Str};
 use heed::{Database, Env, EnvOpenOptions};
-use log::{info, warn};
-use serde::{Deserialize, Serialize};
 
 use crate::eots::{self, EotsNonceCommitment, EotsSeed, EotsVote, NonceTree};
 use crate::ipc_lib::SubnetId;
 
-/// One line of the sign record file that preceded the database, `<key file>.votes`.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct SignedVoteRecord {
-    subnet_id: SubnetId,
-    vote: EotsVote,
-}
-
-/// Address space reserved for the vote database: the file only holds the votes written, about
-/// 60 MB a day at one subnet block per second.
+/// Address space reserved for the vote database, the file only holds the votes written.
 const MAP_SIZE: usize = 128 * 1024 * 1024 * 1024;
 const VOTES_DB: &str = "votes";
 
-/// The database key of a vote: string order equals height order within a subnet.
+/// The database key of a vote, ordered by height within a subnet.
 fn vote_key(subnet_id: SubnetId, height: u64) -> String {
     format!("{subnet_id}:{height:020}")
 }
 
-/// The keys of one subnet from a height on: the standard ranges cannot bound unsized `str` keys.
+/// The keys of one subnet from a height on, as the standard ranges cannot bound `str` keys.
+#[cfg(test)]
 struct KeyRange {
     first: String,
     last: String,
 }
 
+#[cfg(test)]
 impl RangeBounds<str> for KeyRange {
     fn start_bound(&self) -> Bound<&str> {
         Bound::Included(self.first.as_str())
@@ -51,13 +42,11 @@ impl RangeBounds<str> for KeyRange {
 
 pub struct EotsSigner {
     secret_key: SecretKey,
-    /// The seed of every nonce the key commits to
     seed: EotsSeed,
     pk_eots: XOnlyPublicKey,
     env: Env,
-    /// Every vote signed, by subnet and height
     votes: Database<Str, SerdeBincode<EotsVote>>,
-    /// The nonce trees of the commitments signed so far, by subnet and start
+    /// By subnet and start of the commitment
     trees: BTreeMap<(SubnetId, u64), NonceTree>,
 }
 
@@ -67,19 +56,16 @@ pub enum EotsSignerError {
     DoubleVote { subnet_id: SubnetId, height: u64 },
     #[error("no EOTS nonce commitment of this validator covers height {0}")]
     NotCommitted(u64),
-    #[error("sign record: {0}")]
+    #[error("vote database directory: {0}")]
     Io(#[from] std::io::Error),
     #[error("vote database: {0}")]
     Db(#[from] heed::Error),
-    #[error("sign record line: {0}")]
-    Record(String),
     #[error(transparent)]
     Eots(#[from] eots::EotsError),
 }
 
 impl EotsSigner {
-    /// Opens the vote database next to the key file, `<key file>.votes.db`, and imports the
-    /// sign record file `<key file>.votes` of an earlier version if one is present.
+    /// Opens the vote database next to the key file, `<key file>.votes.db`.
     pub fn load(
         secret_key: SecretKey,
         seed: EotsSeed,
@@ -97,64 +83,14 @@ impl EotsSigner {
         let votes = env.create_database(&mut txn, Some(VOTES_DB))?;
         txn.commit()?;
         let secp = Secp256k1::new();
-        let signer = Self {
+        Ok(Self {
             pk_eots: secret_key.x_only_public_key(&secp).0,
             secret_key,
             seed,
             env,
             votes,
             trees: BTreeMap::new(),
-        };
-        signer.import_record_file(&PathBuf::from(format!("{}.votes", key_path.display())))?;
-        Ok(signer)
-    }
-
-    /// Imports every vote of the record file into the database in one transaction, then renames
-    /// the file to `<file>.imported`. A partial last line is a write that a crash cut before the
-    /// vote left the provider: it is skipped. A vote that differs from the database at its height
-    /// is an error, as is any other malformed line.
-    fn import_record_file(&self, path: &Path) -> Result<(), EotsSignerError> {
-        if !path.exists() {
-            return Ok(());
-        }
-        let text = std::fs::read_to_string(path)?;
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let mut txn = self.env.write_txn()?;
-        let mut imported = 0usize;
-        for (i, line) in lines.iter().enumerate() {
-            let record: SignedVoteRecord = match serde_json::from_str(line) {
-                Ok(record) => record,
-                Err(e) if i + 1 == lines.len() && !text.ends_with('\n') => {
-                    warn!(
-                        "sign record {}: partial last line skipped: {e}",
-                        path.display()
-                    );
-                    break;
-                }
-                Err(e) => return Err(EotsSignerError::Record(e.to_string())),
-            };
-            let key = vote_key(record.subnet_id, record.vote.height);
-            match self.votes.get(&txn, &key)? {
-                Some(stored) if stored != record.vote => {
-                    return Err(EotsSignerError::Record(format!(
-                        "height {} of subnet {} differs from the vote database",
-                        record.vote.height, record.subnet_id
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    self.votes.put(&mut txn, &key, &record.vote)?;
-                    imported += 1;
-                }
-            }
-        }
-        txn.commit()?;
-        std::fs::rename(path, format!("{}.imported", path.display()))?;
-        info!(
-            "sign record {}: {imported} votes imported into the vote database",
-            path.display()
-        );
-        Ok(())
+        })
     }
 
     pub fn pk_eots(&self) -> XOnlyPublicKey {
@@ -165,7 +101,10 @@ impl EotsSigner {
         self.seed
     }
 
-    /// Whether the tree of `commitment` on `subnet_id` is built.
+    pub fn secret_key(&self) -> SecretKey {
+        self.secret_key
+    }
+
     pub fn has_tree(&self, subnet_id: SubnetId, commitment: &EotsNonceCommitment) -> bool {
         self.trees.contains_key(&(subnet_id, commitment.start))
     }
@@ -175,7 +114,6 @@ impl EotsSigner {
         self.trees.insert((subnet_id, start), tree);
     }
 
-    /// The vote signed at `height`, if any.
     pub fn signed(
         &self,
         subnet_id: SubnetId,
@@ -186,6 +124,7 @@ impl EotsSigner {
     }
 
     /// The votes of `subnet_id` from `from_height` on, in height order, at most `limit`.
+    #[cfg(test)]
     pub fn signed_from(
         &self,
         subnet_id: SubnetId,
@@ -206,10 +145,8 @@ impl EotsSigner {
         Ok(votes)
     }
 
-    /// Signs the vote for `(height, block_hash)` with the nonce committed in the commitment of
-    /// `commitments` whose range holds `height`. A height already signed for the same block
-    /// gives the stored vote again, for another block an error. The vote is committed to the
-    /// database before it is returned.
+    /// Signs the vote for `(height, block_hash)`. A height already signed for the same block
+    /// gives the stored vote, for another block an error.
     pub fn sign(
         &mut self,
         subnet_id: SubnetId,
@@ -218,7 +155,7 @@ impl EotsSigner {
         block_hash: &[u8; 32],
     ) -> Result<EotsVote, EotsSignerError> {
         let key = vote_key(subnet_id, height);
-        // The check and the write share one transaction, so no second vote can slip in between
+        // One transaction for the check and the write
         let mut txn = self.env.write_txn()?;
         if let Some(vote) = self.votes.get(&txn, &key)? {
             if vote.block_hash == *block_hash {
@@ -251,7 +188,6 @@ impl EotsSigner {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use std::process::Command;
 
     use super::*;
@@ -270,14 +206,6 @@ mod tests {
         // Vote records are keyed by SubnetId's string form, which depends on this process-global.
         crate::eth_utils::set_fvm_network();
         EotsSigner::load(secret_key(), seed(), &dir.join("eots.sk")).unwrap()
-    }
-
-    fn record_line(subnet_id: SubnetId, vote: &EotsVote) -> String {
-        serde_json::to_string(&SignedVoteRecord {
-            subnet_id,
-            vote: vote.clone(),
-        })
-        .unwrap()
     }
 
     #[test]
@@ -319,11 +247,16 @@ mod tests {
             signer.sign(subnet, &[commitment], 12, &[2u8; 32]),
             Err(EotsSignerError::DoubleVote { height: 12, .. })
         ));
+        // The first and the last committed height
+        let first = signer.sign(subnet, &[commitment], 10, &[3u8; 32]).unwrap();
+        let last = signer.sign(subnet, &[commitment], 14, &[4u8; 32]).unwrap();
         // Outside the committed range
-        assert!(matches!(
-            signer.sign(subnet, &[commitment], 15, &[1u8; 32]),
-            Err(EotsSignerError::NotCommitted(15))
-        ));
+        for height in [9, 15] {
+            assert!(matches!(
+                signer.sign(subnet, &[commitment], height, &[1u8; 32]),
+                Err(EotsSignerError::NotCommitted(h)) if h == height
+            ));
+        }
         // Another subnet at the same height is independent
         let other = SubnetId::from_txid20(&[5u8; 20]);
         let (other_commitment, _) = eots::commit_nonces(&signer.seed, &other, 1, 20);
@@ -331,20 +264,61 @@ mod tests {
             .sign(other, &[other_commitment], 12, &[9u8; 32])
             .unwrap();
         assert_eq!(signer.signed(other, 13).unwrap(), None);
+        let record = vec![first.clone(), vote.clone(), last.clone()];
+        assert_eq!(signer.signed_from(subnet, 0, usize::MAX).unwrap(), record);
 
-        // After a restart the database still refuses the second block
+        // After a restart the database still refuses another block at every signed height
         drop(signer);
         let mut reloaded = signer_in(dir.path());
-        assert_eq!(reloaded.signed(subnet, 12).unwrap(), Some(vote.clone()));
-        assert!(matches!(
-            reloaded.sign(subnet, &[commitment], 12, &[2u8; 32]),
-            Err(EotsSignerError::DoubleVote { height: 12, .. })
-        ));
+        for signed in &record {
+            assert_eq!(
+                reloaded.signed(subnet, signed.height).unwrap(),
+                Some(signed.clone())
+            );
+            assert!(matches!(
+                reloaded.sign(subnet, &[commitment], signed.height, &[2u8; 32]),
+                Err(EotsSignerError::DoubleVote { subnet_id, height })
+                    if subnet_id == subnet && height == signed.height
+            ));
+            // The stored proof suffices when a retry supplies no commitment
+            assert_eq!(
+                reloaded
+                    .sign(subnet, &[commitment], signed.height, &signed.block_hash)
+                    .unwrap(),
+                *signed
+            );
+            assert_eq!(
+                reloaded
+                    .sign(subnet, &[], signed.height, &signed.block_hash)
+                    .unwrap(),
+                *signed
+            );
+        }
+        // Heights outside the committed range stay refused
+        for height in [9, 15] {
+            assert!(matches!(
+                reloaded.sign(subnet, &[commitment], height, &[2u8; 32]),
+                Err(EotsSignerError::NotCommitted(h)) if h == height
+            ));
+            assert!(reloaded.signed(subnet, height).unwrap().is_none());
+        }
+        assert_eq!(reloaded.signed_from(subnet, 0, usize::MAX).unwrap(), record);
+
+        // A new height after the restart keeps the earlier votes
+        let new = reloaded
+            .sign(subnet, &[commitment], 13, &[5u8; 32])
+            .unwrap();
+        let extended = vec![first, vote, new, last];
         assert_eq!(
-            reloaded
-                .sign(subnet, &[commitment], 12, &[1u8; 32])
+            reloaded.signed_from(subnet, 0, usize::MAX).unwrap(),
+            extended
+        );
+        drop(reloaded);
+        assert_eq!(
+            signer_in(dir.path())
+                .signed_from(subnet, 0, usize::MAX)
                 .unwrap(),
-            vote
+            extended
         );
     }
 
@@ -374,10 +348,76 @@ mod tests {
             vec![7, 8]
         );
         assert_eq!(
+            heights(signer.signed_from(subnet, 10, 1).unwrap()),
+            vec![12]
+        );
+        assert_eq!(
+            heights(signer.signed_from(subnet, 20, 1).unwrap()),
+            vec![20]
+        );
+        assert_eq!(
             heights(signer.signed_from(subnet, 21, 10).unwrap()),
             Vec::<u64>::new()
         );
+        assert!(signer.signed_from(subnet, 0, 0).unwrap().is_empty());
         assert_eq!(heights(signer.signed_from(other, 0, 10).unwrap()), vec![10]);
+
+        // The listed votes are the complete stored votes, also after a restart
+        let listed = signer.signed_from(subnet, 0, usize::MAX).unwrap();
+        for vote in &listed {
+            eots::verify_vote(&subnet, vote, &commitment).unwrap();
+        }
+        drop(signer);
+        assert_eq!(
+            signer_in(dir.path())
+                .signed_from(subnet, 0, usize::MAX)
+                .unwrap(),
+            listed
+        );
+    }
+
+    #[test]
+    fn restart_reconstructs_the_commitment_tree_for_a_previously_unsigned_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let subnet = SubnetId::from_txid20(&[3u8; 20]);
+        let mut signer = signer_in(dir.path());
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 11, 4);
+        signer.sign(subnet, &[commitment], 11, &[1; 32]).unwrap();
+        let expected_tree = eots::nonce_tree(&signer.seed, &subnet, &commitment);
+        drop(signer);
+        let mut restarted = signer_in(dir.path());
+        let vote = restarted.sign(subnet, &[commitment], 13, &[3; 32]).unwrap();
+        assert_eq!(
+            vote.signature[0],
+            eots::public_nonces(&restarted.seed, &subnet, 13, 1)[0]
+        );
+        assert_eq!(vote.proof, expected_tree.audit_path(2).unwrap());
+        eots::verify_vote(&subnet, &vote, &commitment).unwrap();
+        assert!(restarted.has_tree(subnet, &commitment));
+    }
+
+    #[test]
+    fn separate_key_stores_rebuild_the_same_seed_commitment_without_sharing_vote_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let subnet = SubnetId::from_txid20(&[3u8; 20]);
+        let mut a = signer_in(dir.path());
+        let mut b = EotsSigner::load(
+            SecretKey::from_slice(&[8; 32]).unwrap(),
+            seed(),
+            &other_dir.path().join("other.sk"),
+        )
+        .unwrap();
+        let (commitment, _) = eots::commit_nonces(&a.seed, &subnet, 11, 4);
+        let first = a.sign(subnet, &[commitment], 12, &[5; 32]).unwrap();
+        let second = b.sign(subnet, &[commitment], 12, &[6; 32]).unwrap();
+        assert_eq!(first.signature[0], second.signature[0]);
+        assert_eq!(first.proof, second.proof);
+        assert_ne!(first.pk_eots, second.pk_eots);
+        eots::verify_vote(&subnet, &first, &commitment).unwrap();
+        eots::verify_vote(&subnet, &second, &commitment).unwrap();
+        assert_eq!(a.signed_from(subnet, 0, 10).unwrap(), vec![first]);
+        assert_eq!(b.signed_from(subnet, 0, 10).unwrap(), vec![second]);
     }
 
     /// The child of `a_crash_between_writes_loses_no_committed_vote`: signs the heights given
@@ -452,78 +492,6 @@ mod tests {
         signer.sign(subnet, &[commitment], 51, &[51u8; 32]).unwrap();
     }
 
-    #[test]
-    fn imports_the_record_file_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let subnet = SubnetId::from_txid20(&[3u8; 20]);
-        let sk = secret_key();
-        let (commitment, _) = eots::commit_nonces(&seed(), &subnet, 1, 10);
-        // Votes signed by an earlier version into the record file, through a signer in another
-        // directory
-        let other_dir = tempfile::tempdir().unwrap();
-        let mut old = signer_in(other_dir.path());
-        let votes: Vec<EotsVote> = [2u64, 3, 5]
-            .iter()
-            .map(|h| {
-                old.sign(subnet, &[commitment], *h, &[*h as u8; 32])
-                    .unwrap()
-            })
-            .collect();
-        let record_path = dir.path().join("eots.sk.votes");
-        let mut file = std::fs::File::create(&record_path).unwrap();
-        for vote in &votes {
-            writeln!(file, "{}", record_line(subnet, vote)).unwrap();
-        }
-        writeln!(file).unwrap();
-        // A line cut by a crash during the last write
-        write!(file, "{{\"subnet_id\":\"").unwrap();
-        drop(file);
-
-        let mut signer = signer_in(dir.path());
-        assert!(
-            !record_path.exists(),
-            "the record file is renamed after the import"
-        );
-        assert!(dir.path().join("eots.sk.votes.imported").exists());
-        for vote in &votes {
-            assert_eq!(
-                signer.signed(subnet, vote.height).unwrap().as_ref(),
-                Some(vote)
-            );
-            assert!(matches!(
-                signer.sign(subnet, &[commitment], vote.height, &[0xffu8; 32]),
-                Err(EotsSignerError::DoubleVote { .. })
-            ));
-        }
-        assert_eq!(signer.signed(subnet, 4).unwrap(), None);
-        signer.sign(subnet, &[commitment], 4, &[4u8; 32]).unwrap();
-
-        // A second start finds no record file and keeps everything
-        drop(signer);
-        let reloaded = signer_in(dir.path());
-        assert_eq!(reloaded.signed_from(subnet, 0, 10).unwrap().len(), 4);
-
-        // A record file whose vote differs from the database is refused
-        let mut conflicting = old.sign(subnet, &[commitment], 4, &[4u8; 32]).unwrap();
-        conflicting.block_hash = [9u8; 32];
-        std::fs::write(
-            &record_path,
-            format!("{}\n", record_line(subnet, &conflicting)),
-        )
-        .unwrap();
-        drop(reloaded);
-        assert!(matches!(
-            EotsSigner::load(sk, seed(), &dir.path().join("eots.sk")),
-            Err(EotsSignerError::Record(_))
-        ));
-        // A malformed line that is not the last one is refused
-        std::fs::write(&record_path, "{\"subnet_id\":\n\n").unwrap();
-        assert!(matches!(
-            EotsSigner::load(sk, seed(), &dir.path().join("eots.sk")),
-            Err(EotsSignerError::Record(_))
-        ));
-    }
-
     fn sign_history(signer: &mut EotsSigner, subnet: SubnetId, count: u64) {
         const RANGE: u32 = 1000;
         let mut start = 1;
@@ -569,23 +537,4 @@ mod tests {
         sign_history(&mut signer_in(dir.path()), subnet, count);
         check_history(dir.path(), subnet, count);
     }
-
-    /// A day of votes at one block per second: `cargo test --lib a_day_of_votes -- --ignored`.
-    #[test]
-    #[ignore]
-    fn a_day_of_votes() {
-        let dir = tempfile::tempdir().unwrap();
-        let subnet = SubnetId::from_txid20(&[3u8; 20]);
-        let count = 86_400;
-        sign_history(&mut signer_in(dir.path()), subnet, count);
-        let started = std::time::Instant::now();
-        check_history(dir.path(), subnet, count);
-        println!(
-            "restart and lookups after {count} votes: {:?}",
-            started.elapsed()
-        );
-    }
 }
-#[cfg(test)]
-#[path = "eots_signer_spec_tests.rs"]
-mod spec_tests;

@@ -1,10 +1,7 @@
 #!/bin/bash
-# Writes the ipc-cli config of a validator for subnet B: `subnet-b.config.toml` next to
-# `config.toml`, identical except that the Bitcoin parent entry points at the validator's
-# subnet B provider (port 3130 + n - 1) instead of its subnet A provider (port 3030 + n - 1).
-# ipc-cli takes the provider of the parent entry, shared by both subnets, so a join to subnet B
-# with `--config-path .../config.toml` would reach the subnet A provider and its EOTS key.
-# Derived from `config.toml` on every call: run again after appending entries to it.
+# Writes `subnet-b.config.toml` next to `config.toml`, with the Bitcoin parent entry pointing at the
+# subnet B provider (port 3130 + n - 1) instead of the subnet A provider (port 3030 + n - 1).
+# Run again after appending entries to `config.toml`.
 #
 # Usage: subnet_b_config.sh <n> [ipc-dir]    (ipc-dir defaults to /root/.ipc)
 set -e

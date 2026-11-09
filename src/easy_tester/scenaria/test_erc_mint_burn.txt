@@ -5,7 +5,6 @@
 # 2. Mint increases S_home balance
 # 3. Burn decreases S_home balance
 # 4. Multi-token isolation: mint/burn on TokenB does not affect TokenA
-# Run with testers/db.txt or testers/monitor.txt.
 setup
 validator1
 validator2

@@ -21,10 +21,9 @@ VAL2_API_URL="http://${API_HOST}:${VAL2_PORT}/api"
 VAL3_API_URL="http://${API_HOST}:${VAL3_PORT}/api"
 VAL4_API_URL="http://${API_HOST}:${VAL4_PORT}/api"
 
-# join-ue: the collateral seats the validator for this many epochs of EPOCH_LENGTH blocks,
-# about 11 days at one block per 20 s, longer than a devnet run
+# join-ue: epochs of EPOCH_LENGTH Bitcoin blocks that the collateral seats the validator
 EPOCHS=533
-# The EOTS nonce commitment covers L2 heights 1 to this count, about 6 days at one L2 block per second
+# EOTS nonce commitment covers subnet block heights 1 to this count
 EOTS_NONCE_COUNT=500000
 
 # Fixed collateral amounts

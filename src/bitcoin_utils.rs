@@ -21,7 +21,7 @@ use bitcoin::{
     script::{Instruction, PushBytes},
     secp256k1::Secp256k1,
     taproot::{LeafVersion, TaprootBuilder},
-    Address, Amount, Block, BlockHash, FeeRate, Network, ScriptBuf, Weight, XOnlyPublicKey,
+    Address, Amount, Block, BlockHash, FeeRate, Network, ScriptBuf, Txid, Weight, XOnlyPublicKey,
 };
 
 use bitcoincore_rpc::json::{EstimateMode, EstimateSmartFeeResult};
@@ -189,8 +189,7 @@ pub fn unspenable_internal_key() -> XOnlyPublicKey {
         .expect("Should not error creating an unspendable key")
 }
 
-/// One entry of the `testmempoolaccept` result. In a package result Bitcoin Core omits
-/// `allowed` for a transaction it did not validate because another one failed first.
+/// An entry of `testmempoolaccept`, `allowed` is absent for a transaction not validated after a failure
 #[derive(Debug, serde::Deserialize)]
 struct MempoolAcceptEntry {
     txid: String,
@@ -232,7 +231,7 @@ fn mempool_rejection(entries: &[MempoolAcceptEntry]) -> Option<String> {
 }
 
 /// Tests `txs` for mempool acceptance, as one package (parents first) when there are several,
-/// and if all are accepted sends them to the mempool in order. The error names Bitcoin Core's
+/// and if all are accepted sends them to the mempool in order. The error names the node's
 /// reject reason.
 pub fn submit_to_mempool(
     rpc: &Client,
@@ -340,8 +339,7 @@ pub fn create_commit_reveal_txs(
         commit_spend_info.merkle_root(),
     );
 
-    // The reveal forwards this value to final_address, so both outputs must clear Bitcoin Core's
-    // dust limit at its default dust relay fee, whatever the current fee rate
+    // Both outputs must clear the node's default dust limit, whatever the current fee rate
     let commit_output_value = commit_script_pubkey
         .minimal_non_dust_custom(fee_rate)
         .max(commit_script_pubkey.minimal_non_dust())
@@ -576,7 +574,6 @@ pub fn convert_bytes_to_push_bytes(data: &[u8]) -> &PushBytes {
     unsafe { &*(data as *const [u8] as *const PushBytes) }
 }
 
-/// A reveal input: the data leaf it executes, its control block and the data the leaf pushes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevealInput<'a> {
     pub leaf: &'a [u8],
@@ -584,8 +581,7 @@ pub struct RevealInput<'a> {
     pub data: Vec<u8>,
 }
 
-/// The leaf script and control block of a script-path spend (BIP341: the last two witness
-/// elements, after an optional annex). `None` for a key-path spend or an empty witness.
+/// The leaf and control block of a script-path spend (after an optional annex), else `None`
 pub fn script_path_leaf(input: &TxIn) -> Option<(&[u8], &[u8])> {
     let witness: Vec<&[u8]> = input.witness.iter().collect();
     let annex = witness.len() >= 2 && witness[witness.len() - 1].first() == Some(&0x50);
@@ -596,8 +592,7 @@ pub fn script_path_leaf(input: &TxIn) -> Option<(&[u8], &[u8])> {
 }
 
 impl RevealInput<'_> {
-    /// Checks the input is exactly as specified: a 33-byte control block (a single-leaf
-    /// commitment) and a leaf that is the data leaf script of its data.
+    /// A 33-byte control block (a single leaf) and a leaf that is the data leaf script of its data
     pub fn check_exact(&self) -> Result<(), BitcoinUtilsError> {
         if self.control_block.len() != 33 {
             return Err(BitcoinUtilsError::NotASingleLeaf);
@@ -609,8 +604,7 @@ impl RevealInput<'_> {
     }
 }
 
-/// The message data of a reveal input: the pushes of the leaf it executes. `None` when the
-/// input is not a script-path spend or its leaf is not a data script.
+/// `None` when the input is not a script-path spend or its leaf is not a data script
 pub fn reveal_input(input: &TxIn) -> Option<RevealInput<'_>> {
     let (leaf, control_block) = script_path_leaf(input)?;
     let data = concatenate_op_push_data(leaf).ok()?;
@@ -619,6 +613,61 @@ pub fn reveal_input(input: &TxIn) -> Option<RevealInput<'_>> {
         control_block,
         data,
     })
+}
+
+/// The commit transaction whose output `input` spends: taken from `block_txs`, the transactions of
+/// the reveal transaction's Bitcoin block, otherwise from `fetch`.
+pub fn commit_transaction<E>(
+    input: &TxIn,
+    block_txs: &[Transaction],
+    fetch: impl FnOnce(&Txid) -> Result<Transaction, E>,
+) -> Result<Transaction, E> {
+    let commit_txid = input.previous_output.txid;
+    match block_txs.iter().find(|t| t.compute_txid() == commit_txid) {
+        Some(commit) => Ok(commit.clone()),
+        None => fetch(&commit_txid),
+    }
+}
+
+/// Whether `outpoint`, an output of a commit transaction, is spent by an input of the reveal
+/// transaction `reveal`, by a transaction before `reveal` in `block_txs` (the transactions of its
+/// Bitcoin block, at `block_height`), or by a transaction in the Bitcoin blocks from the commit
+/// transaction's up to the one before `reveal`'s. Only when the commit transaction is in an
+/// earlier Bitcoin block, `commit_height` gives the height of its Bitcoin block and `block_at` the
+/// transactions of the Bitcoin block at a height.
+pub fn spent_before_reveal<E>(
+    outpoint: &OutPoint,
+    reveal: &Transaction,
+    block_height: u64,
+    block_txs: &[Transaction],
+    commit_height: impl FnOnce(&Txid) -> Result<u64, E>,
+    mut block_at: impl FnMut(u64) -> Result<Vec<Transaction>, E>,
+) -> Result<bool, E> {
+    let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *outpoint);
+    if spends(reveal) {
+        return Ok(true);
+    }
+    let reveal_txid = reveal.compute_txid();
+    let mut commit_in_block = false;
+    for tx in block_txs {
+        let txid = tx.compute_txid();
+        if txid == reveal_txid {
+            break;
+        }
+        if spends(tx) {
+            return Ok(true);
+        }
+        commit_in_block |= txid == outpoint.txid;
+    }
+    if commit_in_block {
+        return Ok(false);
+    }
+    for height in commit_height(&outpoint.txid)?..block_height {
+        if block_at(height)?.iter().any(spends) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// An unsigned commit and reveal pair for `data`: the commit spends a dummy outpoint and
@@ -670,124 +719,7 @@ pub fn unsigned_commit_reveal(
     Ok((commit, reveal))
 }
 
-/// One reveal with the inputs and the outputs of `reveals`, in order.
-pub fn merge_reveals(reveals: impl IntoIterator<Item = Transaction>) -> Transaction {
-    let mut merged = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: Vec::new(),
-        output: Vec::new(),
-    };
-    for reveal in reveals {
-        merged.input.extend(reveal.input);
-        merged.output.extend(reveal.output);
-    }
-    merged
-}
-
-/// A rebuilding of a reveal: other inputs, another input order or other outputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevealShape {
-    AsBuilt,
-    /// A reveal that carries no message merged before it
-    InputBefore,
-    /// A reveal that carries no message merged after it
-    InputAfter,
-    /// One before and one after
-    InputsAround,
-    /// The inputs in reverse order
-    Reversed,
-    /// Every output paying another script
-    OtherOutput,
-    /// Output 0 split in two, the second paying another script
-    ExtraOutput,
-}
-
-impl RevealShape {
-    pub const NAMES: [&'static str; 7] = [
-        "as-built",
-        "input-before",
-        "input-after",
-        "inputs-around",
-        "reversed",
-        "other-output",
-        "extra-output",
-    ];
-}
-
-impl std::str::FromStr for RevealShape {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        Ok(match s {
-            "as-built" => Self::AsBuilt,
-            "input-before" => Self::InputBefore,
-            "input-after" => Self::InputAfter,
-            "inputs-around" => Self::InputsAround,
-            "reversed" => Self::Reversed,
-            "other-output" => Self::OtherOutput,
-            "extra-output" => Self::ExtraOutput,
-            _ => {
-                return Err(format!(
-                    "unknown reveal shape '{s}', expected one of {}",
-                    Self::NAMES.join(", ")
-                ))
-            }
-        })
-    }
-}
-
-impl std::fmt::Display for RevealShape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(Self::NAMES[*self as usize])
-    }
-}
-
-/// `reveal` rebuilt in `shape`. `filler()` gives a reveal that carries no message (an
-/// empty-data commit-reveal pair), `other_output` the script every output pays instead.
-pub fn reshape_reveal<E>(
-    reveal: Transaction,
-    shape: RevealShape,
-    mut filler: impl FnMut() -> Result<Transaction, E>,
-    other_output: &ScriptBuf,
-) -> Result<Transaction, E> {
-    Ok(match shape {
-        RevealShape::AsBuilt => reveal,
-        RevealShape::InputBefore => merge_reveals([filler()?, reveal]),
-        RevealShape::InputAfter => merge_reveals([reveal, filler()?]),
-        RevealShape::InputsAround => {
-            let before = filler()?;
-            let after = filler()?;
-            merge_reveals([before, reveal, after])
-        }
-        RevealShape::Reversed => {
-            let mut reveal = reveal;
-            reveal.input.reverse();
-            reveal
-        }
-        RevealShape::OtherOutput => {
-            let mut reveal = reveal;
-            for output in &mut reveal.output {
-                output.script_pubkey = other_output.clone();
-            }
-            reveal
-        }
-        RevealShape::ExtraOutput => {
-            let mut reveal = reveal;
-            let half = reveal.output[0].value / 2;
-            reveal.output[0].value -= half;
-            reveal.output.push(TxOut {
-                value: half,
-                script_pubkey: other_output.clone(),
-            });
-            reveal
-        }
-    })
-}
-
-/// The data of a data leaf script: the concatenation of the chunks that the pushes followed
-/// by `OP_DROP` push, `OP_1`…`OP_16` and `OP_1NEGATE` included. The final `OP_TRUE` is not
-/// data. Any non-minimal push or other instruction makes the script not a data leaf.
+/// The data of a data leaf script, the concatenation of its pushes (`OP_1`…`OP_1NEGATE` included)
 pub fn concatenate_op_push_data(leaf: &[u8]) -> Result<Vec<u8>, BitcoinUtilsError> {
     let script = ScriptBuf::from(leaf.to_vec());
     let mut data = Vec::with_capacity(leaf.len());
@@ -901,9 +833,37 @@ pub enum BitcoinUtilsError {
     NotTheDataScript,
 }
 
+/// A BIP340-style tagged hash
+pub fn tagged_sha256(tag: &[u8], data: &[u8]) -> [u8; 32] {
+    use bitcoin::hashes::{sha256, HashEngine};
+    let tag_hash = sha256::Hash::hash(tag);
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(data);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
+
+pub fn verify_schnorr_bytes(
+    signature: &[u8; 64],
+    digest: [u8; 32],
+    key: &bitcoin::XOnlyPublicKey,
+) -> Result<(), String> {
+    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(signature)
+        .map_err(|e| e.to_string())?;
+    bitcoin::secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(
+            &signature,
+            &bitcoin::secp256k1::Message::from_digest(digest),
+            key,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn mempool_rejection_reads_a_package_result_without_allowed() {
@@ -1082,4 +1042,199 @@ mod tests {
             Err(BitcoinUtilsError::NotTheDataScript)
         ));
     }
+
+    #[test]
+    fn commit_transaction_is_taken_from_the_block_before_the_lookup() {
+        let secp = Secp256k1::new();
+        let (commit, reveal) = unsigned_commit_reveal(&secp, b"IPCXYZ data", vec![]).unwrap();
+        let (other, _) = unsigned_commit_reveal(&secp, b"IPCXYZ other", vec![]).unwrap();
+        let input = &reveal.input[0];
+
+        let found = commit_transaction(input, &[other.clone(), commit.clone()], |_| {
+            Err::<Transaction, _>("looked up")
+        });
+        assert_eq!(found, Ok(commit.clone()));
+
+        let mut looked_up = None;
+        let found = commit_transaction(input, &[other], |txid| {
+            looked_up = Some(*txid);
+            Ok::<_, &str>(commit.clone())
+        });
+        assert_eq!(found, Ok(commit.clone()));
+        assert_eq!(looked_up, Some(commit.compute_txid()));
+
+        assert_eq!(
+            commit_transaction(input, &[], |_| Err::<Transaction, _>("not found")),
+            Err("not found")
+        );
+    }
+
+    /// The commit transaction, its reveal transaction, a transaction spending its output 1 and
+    /// an unrelated transaction.
+    fn collateral_spends() -> (Transaction, Transaction, Transaction, Transaction) {
+        let secp = Secp256k1::new();
+        let collateral = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let (commit, reveal) =
+            unsigned_commit_reveal(&secp, b"IPCXYZ data", vec![collateral]).unwrap();
+        let (other, _) = unsigned_commit_reveal(&secp, b"IPCXYZ other", vec![]).unwrap();
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(commit.compute_txid(), 1),
+                ..Default::default()
+            }],
+            output: vec![],
+        };
+        (commit, reveal, spend, other)
+    }
+
+    #[test]
+    fn spent_before_reveal_counts_spends_up_to_the_reveal_transaction() {
+        let (commit, reveal, spend, other) = collateral_spends();
+        let outpoint = OutPoint::new(commit.compute_txid(), 1);
+        let mut reveal_spending = reveal.clone();
+        reveal_spending.input.push(spend.input[0].clone());
+        // The reveal transaction is at height 10. The commit transaction is at height 7 when it
+        // is not among the transactions of the reveal transaction's Bitcoin block.
+        let cases: Vec<(
+            &str,
+            &Transaction,
+            Vec<Transaction>,
+            Vec<(u64, Vec<Transaction>)>,
+            bool,
+            Vec<u64>,
+        )> = vec![
+            (
+                "another input of the reveal transaction",
+                &reveal_spending,
+                vec![commit.clone(), reveal_spending.clone()],
+                vec![],
+                true,
+                vec![],
+            ),
+            (
+                "an earlier transaction in the same Bitcoin block",
+                &reveal,
+                vec![commit.clone(), spend.clone(), reveal.clone()],
+                vec![],
+                true,
+                vec![],
+            ),
+            (
+                "the commit transaction's Bitcoin block",
+                &reveal,
+                vec![other.clone(), reveal.clone()],
+                vec![(7, vec![commit.clone(), spend.clone()])],
+                true,
+                vec![7],
+            ),
+            (
+                "a Bitcoin block in between",
+                &reveal,
+                vec![reveal.clone()],
+                vec![(7, vec![commit.clone()]), (8, vec![spend.clone()])],
+                true,
+                vec![7, 8],
+            ),
+            (
+                "a later transaction in the same Bitcoin block",
+                &reveal,
+                vec![commit.clone(), reveal.clone(), spend.clone()],
+                vec![],
+                false,
+                vec![],
+            ),
+            (
+                "a later Bitcoin block",
+                &reveal,
+                vec![reveal.clone(), other.clone()],
+                vec![(7, vec![commit.clone()]), (11, vec![spend.clone()])],
+                false,
+                vec![7, 8, 9],
+            ),
+        ];
+        for (case, reveal, block_txs, chain, spent, heights) in cases {
+            let mut commit_asked = None;
+            let mut asked = vec![];
+            let result = spent_before_reveal(
+                &outpoint,
+                reveal,
+                10,
+                &block_txs,
+                |txid| {
+                    commit_asked = Some(*txid);
+                    Ok::<_, &str>(7)
+                },
+                |height| {
+                    asked.push(height);
+                    Ok(chain
+                        .iter()
+                        .find(|(h, _)| *h == height)
+                        .map(|(_, txs)| txs.clone())
+                        .unwrap_or_default())
+                },
+            );
+            assert_eq!(result, Ok(spent), "{case}");
+            assert_eq!(asked, heights, "{case}");
+            let commit_lookup = (!heights.is_empty()).then(|| commit.compute_txid());
+            assert_eq!(commit_asked, commit_lookup, "{case}");
+        }
+    }
+
+    #[test]
+    fn spent_before_reveal_returns_lookup_errors() {
+        let (commit, reveal, _, _) = collateral_spends();
+        let outpoint = OutPoint::new(commit.compute_txid(), 1);
+        let block_txs = [reveal.clone()];
+        assert_eq!(
+            spent_before_reveal(
+                &outpoint,
+                &reveal,
+                10,
+                &block_txs,
+                |_| Err("no commit"),
+                |_| Ok(vec![])
+            ),
+            Err("no commit")
+        );
+        assert_eq!(
+            spent_before_reveal(
+                &outpoint,
+                &reveal,
+                10,
+                &block_txs,
+                |_| Ok(7),
+                |height| {
+                    if height == 8 {
+                        Err("no Bitcoin block")
+                    } else {
+                        Ok(vec![])
+                    }
+                }
+            ),
+            Err("no Bitcoin block")
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn reveal_input_never_panics(
+            elements in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..600), 0..5),
+        ) {
+            let _ = reveal_input(&input_with_witness(&elements));
+        }
+
+        #[test]
+        fn reveal_input_reads_back_any_data(data in prop::collection::vec(any::<u8>(), 0..1500)) {
+            let input = input_with_witness(&[make_push_data_script(&data).to_bytes(), vec![0xc0u8; 33]]);
+            prop_assert_eq!(reveal_input(&input).unwrap().data, data);
+        }
+    }
+
 }

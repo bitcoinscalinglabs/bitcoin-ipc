@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # With <subnet_id> only: starts validators 1-4 for Subnet A.
 # With <subnet_id> validator5: adds validator 5 (requires CometBftID, ResolverAddress from prior run,
-# and that run's logs of validators 2-4 in /root/.ipc/logs).
+# and the nodes of validators 2-4 running).
 # With <subnet_id> validator6: adds validator 6 (requires CometBftID, ResolverAddress from prior run). Not supported yet.
 
 cleanup() {
@@ -22,6 +22,8 @@ cleanup() {
 }
 
 trap cleanup SIGINT SIGTERM
+
+source "$(dirname "${BASH_SOURCE[0]}")/spin_up_peers.sh"
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <subnet_id> [validator5|validator6]" >&2
@@ -146,56 +148,14 @@ CMT_RPC_5="27057"
 ETHAPI_5="8945"
 RESOLVER_5="27055"
 
-# Peer lists of the next validator to start: all validators started so far. A validator dials its
-# CometBFT persistent peers at start and redials them when a connection drops, so every pair
-# connects at once. Once all are up, write_full_peer_lists gives each validator the whole list.
-COMETBFT_PEERS=""
-RESOLVER_PEERS=""
-
-# Read a node's ids from the output of its child-validator run
-cometbft_id_in() { grep "CometBFT node ID:" -A 1 | tail -n 1 | tr -d ' ' | xargs; }
-resolver_id_in() { grep -o '/ip4/0.0.0.0/tcp/[0-9]*/p2p/[a-zA-Z0-9]*' | cut -d'/' -f7 | xargs; }
-
-add_peer() {
-    local validator_num=$1
-    local resolver_port=$2
-    local cometbft_id=$3
-    local resolver_id=$4
-
-    if [ -z "$cometbft_id" ] || [ -z "$resolver_id" ]; then
-        echo "Error: no node ids found for validator $validator_num." >&2
-        exit 1
-    fi
-    COMETBFT_PEERS="${COMETBFT_PEERS:+$COMETBFT_PEERS,}${cometbft_id}@validator-${validator_num}-cometbft:26656"
-    RESOLVER_PEERS="${RESOLVER_PEERS:+$RESOLVER_PEERS,}/dns/validator-${validator_num}-fendermint/tcp/${resolver_port}/p2p/${resolver_id}"
-}
-
-add_peer_from_log() {
-    local log="/root/.ipc/logs/spin-up-subnet-a-validator-$1.log"
-    add_peer "$1" "$2" "$(cometbft_id_in < "$log")" "$(resolver_id_in < "$log")"
-}
-
-# Write the full list of the other validators into the CometBFT config of each validator given.
-# A running CometBFT reads it at its next start. Until then every pair stays connected, because
-# the later validator of the pair already has the earlier one.
-write_full_peer_lists() {
-    local n
-    for n in "$@"; do
-        cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
-            --env NODE_NAME="validator-${n}" \
-            --env SUBNET_ID="$SUBNET_ID" \
-            --env HOME="$HOST_HOME_DIR" \
-            --env PERSISTENT_PEERS="$(echo "$COMETBFT_PEERS" | tr ',' '\n' | grep -v "@validator-${n}-cometbft:" | paste -sd, -)" \
-            set-persistent-peers > /dev/null 2>&1 \
-            || { echo "Error: failed to write the peer list of validator $n." >&2; exit 1; }
-    done
-}
+NODE_NAME_SUFFIX=""
+CARGO_MAKE=(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" --env HOME="$HOST_HOME_DIR")
 
 if [ "$ADD_VALIDATOR" = "validator5" ]; then
     add_peer 1 26655 "$CometBftID" "$ResolverAddress"
-    add_peer_from_log 2 26755
-    add_peer_from_log 3 26855
-    add_peer_from_log 4 26955
+    add_node_peer 2 26755
+    add_node_peer 3 26855
+    add_node_peer 4 26955
 
     echo "Starting validator 5..."
     cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
@@ -217,7 +177,7 @@ if [ "$ADD_VALIDATOR" = "validator5" ]; then
         child-validator
     echo "Validator 5 started!"
 
-    COMETBFT_PEERS="$COMETBFT_PEERS,$(docker exec validator-5-cometbft cometbft show-node-id)@validator-5-cometbft:26656"
+    add_node_peer 5 "$RESOLVER_5"
     write_full_peer_lists 1 2 3 4
     exit 0
 fi
@@ -249,8 +209,8 @@ if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" 
 fi
 
 # Extract bootstrap information
-COMETBFT_ID=$(echo "$VALIDATOR1_OUTPUT" | cometbft_id_in)
-RESOLVER_ADDR=$(echo "$VALIDATOR1_OUTPUT" | resolver_id_in)
+COMETBFT_ID=$(cometbft_node_id 1)
+RESOLVER_ADDR=$(resolver_node_id 1)
 
 echo "Bootstrap information:"
 echo "CometBFT ID: $COMETBFT_ID"
@@ -317,7 +277,7 @@ do
         echo "Aborting." >&2
         exit 1
     fi
-    add_peer_from_log "$validator_num" "$5"
+    add_node_peer "$validator_num" "$5"
 done
 write_full_peer_lists 1 2 3 4
 

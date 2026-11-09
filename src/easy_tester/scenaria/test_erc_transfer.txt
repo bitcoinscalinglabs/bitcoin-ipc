@@ -7,7 +7,6 @@
 # - subnet1 queues an ERC transfer to subnet2 → checkpoint includes ETX
 # - ETX appears as ErcTransfer rootnet message on subnet2 only
 # - Nonce ordering: ErcRegistration < ErcTransfer on same destination
-# Run with testers/db.txt or testers/monitor.txt.
 
 setup
 validator1

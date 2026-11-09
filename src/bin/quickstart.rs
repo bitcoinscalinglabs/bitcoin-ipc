@@ -267,7 +267,7 @@ fn process_env_files(dir: &Path, home_dir: &str) -> io::Result<()> {
             // Process .env file
             let content = fs::read_to_string(&path)?;
             let mut updated_content = content.replace("$HOME", home_dir);
-            // A validator gets an EOTS key and the seed of its nonces next to its validator key
+            // A validator gets an EOTS key and the seed of its nonces
             if updated_content.contains("VALIDATOR_SK_PATH=") {
                 if !updated_content.contains("EOTS_SK_PATH=") {
                     let eots_path = write_eots_secret(&path, "eots.sk", "EOTS key")?;
@@ -287,9 +287,7 @@ fn process_env_files(dir: &Path, home_dir: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Writes 32 fresh random bytes (an EOTS secret key or the seed of its nonces) in hex as
-/// `file_name` next to the `.env` at `env_path`, unless the file is there already, and returns
-/// its path.
+/// Writes 32 random bytes in hex as `file_name` next to `env_path`, unless it exists.
 fn write_eots_secret(
     env_path: &Path,
     file_name: &str,

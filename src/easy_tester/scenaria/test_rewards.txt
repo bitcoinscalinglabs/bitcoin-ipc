@@ -1,10 +1,5 @@
 # each snapshot is 10 blocks long
 # snapshot 0: blocks 101-110, snapshot 1: blocks 111-120, etc
-#
-# The first checkpoint activates the subnet with H_0 = 107, so the cutoffs are at 117, 127,
-# 137, ...: a join, stake or unstake takes effect at the cutoff after it, and the rotation
-# checkpoint in the block after the cutoff adopts the configuration.
-# Run with testers/db.txt or testers/monitor.txt.
 
 setup
 
@@ -69,6 +64,7 @@ join subnet1 validator7 700_000_000 # takes effect at the cutoff 147
 unstake subnet1 validator2 100_000_000
 
 block 141
+
 read reward_results 3 # snapshot 3: blocks 131-140
 expect result.total_rewarded_collateral = 1_500_000_000
 expect result.rewards_list.validator2 = 200_000_000 # the unstake takes effect at 147
@@ -79,10 +75,12 @@ block 148
 checkpoint subnet1
 
 block 151
+
 read reward_results 4 # snapshot 4: blocks 141-150
 expect result.rewards_list.validator2 = 100_000_000 # validator2's minimum collateral across the snapshot
 expect result.rewards_list.validator6 = 600_000_000 # validator6 in subnet for whole snapshot
 expect result.rewards_list.validator7 = 0 # validator7 joined at block 147, within the snapshot
+
 stake subnet1 validator4 400_000_000 # takes effect at the cutoff 157
 
 block 158
@@ -103,6 +101,7 @@ block 171
 read reward_results 6 # snapshot 6: blocks 161-170
 expect result.rewards_list.validator1 = 0
 expect result.rewards_list.validator4 = 800_000_000
+
 unstake subnet1 validator2 100_000_000 # remaining stake 0, leaves at the cutoff 177
 
 block 178

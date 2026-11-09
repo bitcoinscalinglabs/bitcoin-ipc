@@ -1,18 +1,4 @@
-# Unilateral exit end to end: a checkpoint after a cutoff dropped the collateral, the key
-# refused when it joins again after that checkpoint, and `unstake-ue` spending the matured
-# collateral.
-#
-# Monitor tester only (testers/monitor-ue.txt): the exit spends real outputs and
-# `spent_count` reads the chain.
-# A collateral with timeout T seats its validator in every configuration computed with a
-# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
-# Epochs are K = 10 Bitcoin blocks here. H_0 is the first Bitcoin block in which the join collateral
-# of every member of C_gen is slashable: the Bitcoin block of the first checkpoint, whose batch
-# transfer carries the slash pre-signatures. Until the next checkpoint, the rotation checkpoint of
-# epoch 1, the current configuration is C_gen.
-# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
-# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
-# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
+# Unilateral exit end to end: a dropped collateral, a refused second join and unstake-ue spending the matured collateral.
 
 setup
 

@@ -1,11 +1,9 @@
 # Code map
 
-Where the code lives, the interfaces between its parts, and how to split development along them.
+Where the code lives and the interfaces between its parts.
 Paths are relative to the directory that holds the `ipc` and `bitcoin-ipc` repositories. Function names, not line numbers: line numbers drift.
 
 ## Interfaces
-
-Work splits cleanly at these boundaries. A change that spans one fixes the interface first.
 
 1. **Bitcoin L1 → monitor:** transaction encoding (OP_RETURN tags, postcard witness data) in
    `bitcoin-ipc/src/ipc_lib.rs`. The spec `bitcoin-ipc/docs/specs/encoding.md` and
@@ -33,8 +31,6 @@ with a key the provider holds (validator key, EOTS key). The calls are in
 
 ## Areas
 
-Each area is one unit of work with its own checks.
-
 **A. bitcoin-ipc library and monitor** (`bitcoin-ipc/src/`)
 - `ipc_lib.rs`: message types, wire formats, `validate`/`process`/`save_to_db` per message.
   Batch transfer: `BatchTransferWireData`, `IpcBatchTransferMsg`; checkpoint: `IpcCheckpointSubnetMsg`
@@ -42,8 +38,7 @@ Each area is one unit of work with its own checks.
 - `collateral.rs`: unilateral-exit collateral script, `check_join_ue` (with the `JoinContext`
   of rule 2.6), `process_join_ue`, `record_collateral_spends`.
 - `epochs.rs`: the cutoff pass (`process_cutoffs`: sets `H_0` at the first Bitcoin height at which
-  `genesis_collaterals_slashable`, computes `C_1`, releases the configuration updates, activates, credits the
-  `SubnetState.epoch_zero_deposits`), `compute_configuration` (the configuration of an epoch from
+  `genesis_collaterals_slashable`, computes `C_1`, releases the configuration updates, activates), `compute_configuration` (the configuration of an epoch from
   the slashable collaterals and the multisig members), `configuration_changes`.
 - `multisig.rs`: configuration multisig scripts, PSBT signing and finalizing.
 - `eots.rs`, `slash.rs`: EOTS nonces and Merkle tree, slash transaction and its pre-signatures.
@@ -114,11 +109,3 @@ Each area is one unit of work with its own checks.
   `bitcoin-ipc/src/easy_tester/scenaria/`, tester configs in `testers/`, format in its `README.md`.
 - The db tester drives the monitor logic on the database. The monitor tester runs bitcoind,
   monitors and providers. Neither runs Fendermint.
-
-## Splitting a feature
-
-- One work item per area, serially, in the order the data flows: A → B → D → E → C/F. A later item
-  takes the interface of the earlier one as given.
-- Keep areas A and B together when the change is small: they share the build and the checks.
-- C and D are coupled through the bindings. E consumes both.
-- A change to the structure above updates this file.

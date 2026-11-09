@@ -1,13 +1,4 @@
-# The monitor reads a join-ue from any input of a reveal: the data input first, last, in the
-# middle, with inputs that carry no message before and after, several joins in one reveal for
-# one subnet and for two, a duplicate key inside one reveal, and a reveal with other outputs.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt.
-# A collateral with timeout T seats its validator in every configuration computed with a
-# boundary below T: C_e, computed at the cutoff H_{e-1} = H_0 + (e-1)K, needs T > H_0 + (e+2)K.
-# Epochs are K = 10 blocks here, and the first checkpoint sets H_0 to the block before it.
-# Rule 2.6: before activation a timeout is in epochs 4 to 1003 from the join's block (at block
-# 110, T > 140); after it, in epochs e+4 to e+1003 from H_0.
-# `block N` means what follows goes into block N; a cutoff at block H is visible at `block H+1`.
+# The monitor reads a join-ue from any input of a reveal, and several joins from one reveal.
 
 setup
 
@@ -94,7 +85,6 @@ expect result.count = 8
 expect result.validator8.count = 1
 expect result.validator5.count = 1
 expect result.validator7.count = 1
-# join.md, Verifying 2.7 and 5: fresh EOTS keys let subnet2 bootstrap in this reveal.
 # One reveal for two subnets: subnet2 bootstraps and validator9 joins subnet1
 join-ue subnet2 validator10 100_000 400 validator11 100_000 400 subnet1:validator9 100_000 400 validator12 100_000 400 validator13 100_000 400 @inputs-around
 

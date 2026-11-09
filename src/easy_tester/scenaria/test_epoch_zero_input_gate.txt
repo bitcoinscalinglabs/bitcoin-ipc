@@ -1,5 +1,5 @@
-# join.md, Verifying 3: a join that completes bootstrap closes admission even for a later input of the same reveal.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt. No existing generic join/cutoff case is repeated.
+# A join that completes bootstrap closes admission, also for a later input of the same reveal.
+
 setup
 validator1
 validator2
@@ -29,10 +29,9 @@ expect result.validator1.collateral = 10000
 expect result.validator2.collateral = 10000
 read ue_collaterals subnet_a
 expect result.count = 2
-# join.md, Verifying 4: another block in epoch 0 also rejects a whitelisted key without recording it.
+# Another Bitcoin block in epoch 0 also rejects a whitelisted key without recording it.
 join-ue subnet_a validator4 140000 2000
-# deposit.md, Verifying 4: the monitor records this deposit in its own Bitcoin block;
-# L2 credit follows parent finality, including before H_0 (the db tester's deposit is a no-op).
+# The db tester's deposit is a no-op; the monitor records it in its own Bitcoin block.
 deposit subnet_a validator1 1000000
 presign subnet_a validator1 by validator1 validator2
 presign subnet_a validator2 by validator1 validator2
@@ -48,7 +47,7 @@ expect result.epoch = 1
 read validators subnet_a
 expect result.validator1.collateral = 100000
 expect result.validator2.collateral = 120000
-# join.md, Verifying 4: an epoch-zero refusal consumes neither the validator nor EOTS identity.
+# The refused join leaves the validator and the EOTS identity unused.
 join-ue subnet_a validator3 130000 2000
 block 107
 read ue_collaterals subnet_a

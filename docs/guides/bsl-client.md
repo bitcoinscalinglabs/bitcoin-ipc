@@ -11,7 +11,7 @@ The image is built from [`docker-build-client/`](../../docker-build-client/). It
 ## Requirements
 
 - Docker.
-- A Bitcoin Core full node of the chosen network (mainnet, testnet or regtest) with `txindex=1`, whose RPC the container reaches.
+- A full node of the chosen network (mainnet, testnet or regtest) that serves any transaction by its txid (Bitcoin Core: `txindex=1`), whose RPC the container reaches.
 - A funded wallet on that node, named by `FUND_WALLET`. It pays the fees, and for a validator also the collateral. The client loads the wallet but does not create it.
 - For a validator: a validator key in the client ([validator key](#validator-key)).
 

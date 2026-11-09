@@ -174,7 +174,6 @@ fn calc_checkpoint_size(
         checkpoint_height: 50,
         next_committee_configuration_number: 30, // arbitrary test number
         is_kill_checkpoint: false,
-        slash_pre_signature_count: None,
         is_rotation_checkpoint: false,
     };
 

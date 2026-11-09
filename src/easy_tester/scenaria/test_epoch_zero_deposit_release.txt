@@ -1,6 +1,5 @@
-# deposit.md, Verifying 4 / user decision: record deposits immediately, in Bitcoin order, with continuing nonces.
-# This monitor-only scenario checks message availability, not L2 minting; credit follows each deposit's own Bitcoin block.
-# MONITOR ONLY: testers/monitor-ue.txt (the db tester's deposit command is a no-op).
+# Deposits in epoch 0 are recorded immediately, in Bitcoin order, with continuing nonces.
+
 setup
 validator1
 validator2
@@ -18,7 +17,6 @@ block 103
 join-ue subnet_a validator1 100000 2000 validator2 120000 2000
 block 104
 deposit subnet_a validator1 1000000
-# lifecycle.md, Processing Bitcoin L1 blocks: separate blocks make the deposit order deterministic.
 block 105
 deposit subnet_a validator2 777
 block 106

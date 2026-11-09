@@ -1,5 +1,5 @@
-# join.md, Verifying the transaction 2.7: EOTS identities cannot be reused across subnets.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt. No bootstrap/epoch rules are exercised.
+# An EOTS identity cannot be reused across subnets.
+
 setup
 validator1
 validator2
@@ -47,7 +47,7 @@ expect result.genesis_validators = 1
 read subnet_genesis subnet_b
 expect result.genesis_validators = 1
 
-# join.md, Verifying the transaction 4: rejected joins must not prevent a fresh identity's join.
+# A fresh identity joins after the rejected joins.
 join-ue subnet_a validator3 100000 1200
 
 block 106

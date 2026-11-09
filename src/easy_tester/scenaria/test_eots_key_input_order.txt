@@ -1,5 +1,5 @@
-# lifecycle.md, Processing Bitcoin L1 blocks (Order), and join.md 2.7: first accepted EOTS identity wins.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt; the tester holds one EOTS key per validator.
+# The first accepted EOTS identity wins when a reveal carries several join-ue messages.
+
 setup
 validator1
 validator2

@@ -1,5 +1,5 @@
-# lifecycle.md, Epochs / Processing Bitcoin L1 blocks: admission uses the ending epoch, then the cutoff sees that block's quorums.
-# Run with testers/db-ue.txt or testers/monitor-ue.txt.
+# A join is admitted in the epoch that a cutoff ends, and the cutoff then sees the quorums of that Bitcoin block.
+
 setup
 validator1
 validator2
@@ -16,8 +16,7 @@ create subnet_a
 block 103
 join-ue subnet_a validator1 100000 2000 validator2 120000 2000
 block 104
-# deposit.md, Verifying 4: record the deposit at its own Bitcoin block; L2 credit follows parent finality, in epoch 0 too.
-# The db tester's deposit is a no-op.
+# The db tester's deposit is a no-op; the monitor records it in its own Bitcoin block.
 deposit subnet_a validator1 1000000
 presign subnet_a validator1 by validator1 validator2
 presign subnet_a validator2 by validator1 validator2
@@ -52,7 +51,6 @@ expect result.names = validator1,validator2,validator3
 expect result.waiting = true
 read validators subnet_a current
 expect result.names = validator1,validator2
-# slashing.md, After activation: a late quorum cannot give a seat retroactively in C_2.
 presign subnet_a validator4 by validator1 validator2
 checkpoint subnet_a
 block 117

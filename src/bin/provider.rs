@@ -61,27 +61,21 @@ async fn main() -> std::io::Result<()> {
     let btc_rpc = Arc::new(bitcoin_utils::make_rpc_client_from_env());
     let btc_watchonly_rpc = Arc::new(bitcoin_utils::make_watchonly_rpc_client_from_env());
 
-    // Set correct fvm network, before anything parses a subnet id (the EOTS sign record holds them)
+    // Set correct fvm network, before the vote database parses subnet ids
 
     eth_utils::set_fvm_network();
 
     // Load validator secret key
     let validator = load_validator()?;
-    let eots = match load_secret_key("EOTS_SK_PATH", "EOTS")? {
+    let eots_signer = match load_secret_key("EOTS_SK_PATH", "EOTS")? {
         Some(sk) => {
             let Some(seed) = load_hex32("EOTS_SEED_PATH", "EOTS nonce seed")? else {
                 error!("EOTS_SEED_PATH is empty: an EOTS key needs the seed of its nonces");
                 return Err(std::io::Error::other("EOTS_SEED_PATH is empty"));
             };
-            Some((sk, bitcoin_ipc::eots::EotsSeed::from_bytes(seed)))
-        }
-        None => None,
-    };
-    let eots_signer = match eots {
-        Some((sk, seed)) => {
             let signer = provider::eots_signer::EotsSigner::load(
                 sk,
-                seed,
+                bitcoin_ipc::eots::EotsSeed::from_bytes(seed),
                 &PathBuf::from(std::env::var("EOTS_SK_PATH").expect("set above")),
             )
             .map_err(|e| std::io::Error::other(format!("EOTS sign record: {e}")))?;
@@ -101,7 +95,6 @@ async fn main() -> std::io::Result<()> {
         btc_rpc,
         btc_watchonly_rpc,
         validator,
-        eots,
         eots_signer,
     });
 
@@ -110,9 +103,7 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
-/// Builds, in the background, the nonce tree of every commitment of the signer's key that the
-/// monitor has recorded, so that the first vote after a start does not wait for it. A vote at a
-/// commitment whose tree is not built yet builds it itself.
+/// Builds in the background the nonce tree of every recorded commitment of the signer's key.
 fn build_nonce_trees(
     db: Arc<HeedDb>,
     signer: Arc<std::sync::Mutex<provider::eots_signer::EotsSigner>>,
@@ -167,8 +158,7 @@ fn load_validator(
     Ok(Some((validator_pk, validator_sk)))
 }
 
-/// The secp256k1 secret key in the hex file named by the environment variable `var`, `None`
-/// when the variable is unset or empty.
+/// The secret key in the hex file named by `var`, `None` when `var` is unset or empty.
 fn load_secret_key(
     var: &str,
     what: &str,
@@ -183,8 +173,7 @@ fn load_secret_key(
     Ok(Some(sk))
 }
 
-/// The 32 bytes in the hex file named by the environment variable `var`, `None` when the
-/// variable is unset or empty.
+/// The 32 bytes in the hex file named by `var`, `None` when `var` is unset or empty.
 fn load_hex32(var: &str, what: &str) -> Result<Option<[u8; 32]>, std::io::Error> {
     let path = match std::env::var(var) {
         Ok(path) if !path.is_empty() => PathBuf::from(path),

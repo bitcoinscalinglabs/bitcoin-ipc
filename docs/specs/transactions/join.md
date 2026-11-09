@@ -57,7 +57,7 @@ The validator's subnet address needs an account on the subnet before the validat
    2. The message decodes, `signature` verifies under `pubkey`, `nonce_commitment_signature` verifies under `pk_eots`, `pk_eots ≠ pubkey`, and the EOTS nonce commitment has `start ≥ 1` and `count ≥ 1`.
    3. The commit transaction has 2 or 3 outputs.
    4. Output 1 is locked under the collateral script of the message's `pubkey`, `pk_eots` and `T`, naming the configuration required above.
-   5. Output 1 is unspent, the collateral (output 1's value) is `> 0`, the backup address is valid for the network, and `T < 500,000,000`.
+   5. Output 1 is unspent at the reveal transaction: neither another input of the reveal transaction nor a transaction before the reveal transaction spends it, where the transactions before it are those before it in its Bitcoin block and those in the Bitcoin blocks from the commit transaction's on. Spends after the reveal transaction do not count. The collateral (output 1's value) is `> 0`, the backup address is valid for the network, and `T < 500,000,000`.
    6. `block height + 1 < T`, and the epoch `E_T` that contains `T` satisfies `e + min_timeout + 3 ≤ E_T ≤ e + max_timeout + 3`, where `e` is the subnet's current epoch and `E_T = ⌈(T − H_0) / K⌉` ([epochs](../lifecycle.md#epochs)). Before activation, `e = 0` and the height of the block that includes the join transaction takes the place of `H_0`.
    7. No earlier accepted join transaction carries `pk_eots`, and no earlier accepted join transaction of the subnet carries `pubkey`: a validator key joins a subnet at most once. Afterwards the validator adds collateral with a [stake transaction](stake.md).
 3. Then the admission rules:

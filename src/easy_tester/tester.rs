@@ -1,4 +1,4 @@
-use crate::bitcoin_utils::RevealShape;
+use crate::easy_tester::reveal::RevealShape;
 use crate::easy_tester::{
     model::{JoinUeSpec, OutputExpectTarget},
     EasyTesterError, OutputDb,
@@ -22,12 +22,14 @@ pub trait Tester {
         shape: RevealShape,
     ) -> Result<(), EasyTesterError>;
 
+    /// `raw`: hand-built and submitted without the provider
     fn exec_join_subnet(
         &mut self,
         height: u64,
         subnet_name: &str,
         validator_name: &str,
         collateral_sats: u64,
+        raw: bool,
     ) -> Result<(), EasyTesterError>;
 
     /// The joins of one `join-ue` line go in one reveal transaction, in order, rebuilt in `shape`
@@ -73,7 +75,6 @@ pub trait Tester {
         ))
     }
 
-    /// One checkpoint per subnet; their batch transfers go in one reveal, rebuilt in `shape`
     fn exec_presign(
         &mut self,
         _height: u64,
@@ -85,6 +86,7 @@ pub trait Tester {
         ))
     }
 
+    /// One checkpoint per subnet; their batch transfers go in one reveal, rebuilt in `shape`
     fn exec_checkpoint(
         &mut self,
         height: u64,

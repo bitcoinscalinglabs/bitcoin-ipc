@@ -8,7 +8,6 @@
 # 5. Multi-token isolation (token A balance doesn't affect token B)
 # 6. Burn exactly equal to balance succeeds
 # 7. Non-home subnet forwards tokens
-# Run with testers/db.txt or testers/monitor.txt.
 setup
 validator1
 validator2

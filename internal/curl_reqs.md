@@ -327,6 +327,7 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
+# checkpoint with withdrawals and transfers
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \

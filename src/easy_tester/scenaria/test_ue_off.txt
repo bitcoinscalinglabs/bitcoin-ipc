@@ -1,6 +1,4 @@
-# Without ue_activation_height in the tester config (UE_ACTIVATION_HEIGHT unset for the
-# monitor) every join-ue is ignored and the subnet never bootstraps.
-# Run with testers/db.txt or testers/monitor.txt.
+# Without ue_activation_height every join-ue is ignored and the subnet never bootstraps.
 
 setup
 

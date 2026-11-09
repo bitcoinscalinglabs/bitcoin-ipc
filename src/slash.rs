@@ -4,36 +4,28 @@ use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::{Keypair, Secp256k1},
-    secp256k1::{self, Message, SecretKey},
+    secp256k1::{self, Message},
     sighash::{Prevouts, SighashCache, TapSighashType},
     transaction::{self, Transaction, TxIn, TxOut},
-    Amount, OutPoint, ScriptBuf, Sequence, Txid, Witness,
+    Amount, OutPoint, ScriptBuf, Sequence, Txid,
 };
+#[cfg(test)]
+use bitcoin::{secp256k1::SecretKey, Witness};
 use serde::{Deserialize, Serialize};
 
+use crate::bitcoin_utils::verify_schnorr_bytes;
 use crate::collateral::{CollateralError, CollateralScript};
 use crate::eots::{signature_from_bytes, signature_to_bytes, Signature64};
-use crate::ipc_lib::verify_schnorr_bytes;
 
 /// The pay-to-anchor output script `51 02 4e 73`.
 pub const ANCHOR_SCRIPT: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 
-/// The slash pre-signatures of one output, as a batch transfer carries them: the outpoint
-/// (txid in internal byte order) and the signatures by the signer's index in the ascending
-/// order of the named configuration's keys. In JSON, the txid is in its usual hex form and
-/// the signatures are `{index, signature}` objects with the signature in hex.
+/// The slash pre-signatures of one collateral output, each with its signer's index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashSignatureEntry {
     pub txid: [u8; 32],
     pub vout: u32,
     pub signatures: Vec<(u16, Signature64)>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SlashSignatureEntryWire {
-    txid: [u8; 32],
-    vout: u32,
-    signatures: Vec<(u16, Signature64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,12 +58,7 @@ impl Serialize for SlashSignatureEntry {
             }
             .serialize(serializer)
         } else {
-            SlashSignatureEntryWire {
-                txid: self.txid,
-                vout: self.vout,
-                signatures: self.signatures.clone(),
-            }
-            .serialize(serializer)
+            (&self.txid, self.vout, &self.signatures).serialize(serializer)
         }
     }
 }
@@ -97,11 +84,11 @@ impl<'de> Deserialize<'de> for SlashSignatureEntry {
                 signatures,
             })
         } else {
-            let wire = SlashSignatureEntryWire::deserialize(deserializer)?;
+            let (txid, vout, signatures) = Deserialize::deserialize(deserializer)?;
             Ok(Self {
-                txid: wire.txid,
-                vout: wire.vout,
-                signatures: wire.signatures,
+                txid,
+                vout,
+                signatures,
             })
         }
     }
@@ -120,8 +107,7 @@ impl SlashSignatureEntry {
         OutPoint::new(Txid::from_byte_array(self.txid), self.vout)
     }
 
-    /// The entries are in ascending `(txid, vout)` order, each with its signatures in
-    /// ascending index order, at most one per index.
+    /// Checks that entries and their signature indexes are in strictly ascending order.
     pub fn check_order(entries: &[Self]) -> Result<(), String> {
         for pair in entries.windows(2) {
             if (pair[0].txid, pair[0].vout) >= (pair[1].txid, pair[1].vout) {
@@ -206,38 +192,37 @@ pub fn sign_slash(
     Ok((index, signature_from_bytes(&signature.serialize())))
 }
 
-/// Verifies a pre-signature by the member at `index` of the configuration the output names.
-pub fn verify_slash_signature(
+/// Splits the pre-signatures of the output into the valid ones and the indexes of the others,
+/// with the total power of the valid signers in the configuration the output names.
+pub fn check_slash_signatures(
     secp: &Secp256k1<secp256k1::All>,
     script: &CollateralScript,
     outpoint: OutPoint,
     value: Amount,
-    index: u16,
-    signature: &Signature64,
-) -> Result<(), CollateralError> {
+    signatures: &[(u16, Signature64)],
+) -> Result<(Vec<(u16, Signature64)>, Vec<u16>, u64), CollateralError> {
     let keys = script.configuration.sorted_keys();
-    let (key, _) = keys.get(usize::from(index)).ok_or_else(|| {
-        CollateralError::InvalidSlash(format!(
-            "index {index} is outside the configuration of {} keys",
-            keys.len()
-        ))
-    })?;
     let digest = slash_sighash(secp, script, outpoint, value)?;
-    verify_schnorr_bytes(&signature_to_bytes(signature), digest, key)
-        .map_err(|e| CollateralError::InvalidSlash(format!("signature {index}: {e}")))
-}
-
-/// The total power of the signers of `signatures` in the configuration, for the threshold.
-pub fn signed_power(script: &CollateralScript, signatures: &[(u16, Signature64)]) -> u64 {
-    signatures
-        .iter()
-        .filter_map(|(index, _)| script.configuration.power_at(*index))
-        .map(u64::from)
-        .sum()
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    let mut power = 0;
+    for (index, signature) in signatures {
+        match keys.get(usize::from(*index)) {
+            Some((key, key_power))
+                if verify_schnorr_bytes(&signature_to_bytes(signature), digest, key).is_ok() =>
+            {
+                valid.push((*index, *signature));
+                power += u64::from(*key_power);
+            }
+            _ => invalid.push(*index),
+        }
+    }
+    Ok((valid, invalid, power))
 }
 
 /// The slash transaction with its witness: the members' pre-signatures and the EOTS signature
-/// under `eots_secret_key`. Anyone who holds the EOTS secret key completes it this way.
+/// under `eots_secret_key`.
+#[cfg(test)]
 pub fn complete_slash_transaction(
     secp: &Secp256k1<secp256k1::All>,
     script: &CollateralScript,
@@ -345,12 +330,11 @@ mod tests {
         // Members 4 (power 2) and 5 (power 1) reach the threshold 3
         let sig4 = sign_slash(&secp, &script, outpoint, value, &keypair(4)).unwrap();
         let sig5 = sign_slash(&secp, &script, outpoint, value, &keypair(5)).unwrap();
-        for (index, signature) in [&sig4, &sig5] {
-            verify_slash_signature(&secp, &script, outpoint, value, *index, signature).unwrap();
-        }
+        let (valid, invalid, power) =
+            check_slash_signatures(&secp, &script, outpoint, value, &[sig4, sig5]).unwrap();
+        assert_eq!((valid, invalid, power), (vec![sig4, sig5], vec![], 3));
         let sorted = script.configuration.sorted_keys();
         assert_eq!(sorted[usize::from(sig4.0)].0, xonly(4));
-        assert_eq!(signed_power(&script, &[sig4, sig5]), 3);
         let eots_sk = SecretKey::from_slice(&[2; 32]).unwrap();
         let tx =
             complete_slash_transaction(&secp, &script, outpoint, value, &[sig4, sig5], &eots_sk)
@@ -367,20 +351,21 @@ mod tests {
             complete_slash_transaction(&secp, &script, outpoint, value, &[sig4, sig5], &wrong_key)
                 .unwrap();
         assert!(verify_with_consensus(&wrong, &prevout).is_err());
-        assert!(verify_slash_signature(&secp, &script, outpoint, value, sig5.0, &sig4.1).is_err());
-        assert!(verify_slash_signature(&secp, &script, outpoint, value, 7, &sig4.1).is_err());
-        // Not a member
-        assert!(sign_slash(&secp, &script, outpoint, value, &keypair(6)).is_err());
-        // A signature for another value does not verify
-        assert!(verify_slash_signature(
+        let (_, invalid, _) = check_slash_signatures(
             &secp,
             &script,
             outpoint,
-            Amount::from_sat(1),
-            sig4.0,
-            &sig4.1
+            value,
+            &[(sig5.0, sig4.1), (7, sig4.1)],
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(invalid, vec![sig5.0, 7]);
+        // Not a member
+        assert!(sign_slash(&secp, &script, outpoint, value, &keypair(6)).is_err());
+        // A signature for another value does not verify
+        let (_, invalid, _) =
+            check_slash_signatures(&secp, &script, outpoint, Amount::from_sat(1), &[sig4]).unwrap();
+        assert_eq!(invalid, vec![sig4.0]);
     }
 
     #[test]
@@ -440,7 +425,71 @@ mod tests {
         };
         assert!(SlashSignatureEntry::check_order(&[dup]).is_err());
     }
+
+    fn wire_entry(vout: u32, index: u16, count: usize) -> SlashSignatureEntry {
+        SlashSignatureEntry {
+            txid: [0x12; 32],
+            vout,
+            signatures: (0..count)
+                .map(|i| (index + i as u16, [[0x23; 32], [0x45; 32]]))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn slash_entry_vout_uses_the_full_u32_varint_width() {
+        for (vout, varint) in [
+            (128, vec![0x80, 0x01]),
+            (16384, vec![0x80, 0x80, 0x01]),
+            (u32::MAX, vec![0xff, 0xff, 0xff, 0xff, 0x0f]),
+        ] {
+            let mut expected = vec![0x12; 32];
+            expected.extend(varint);
+            expected.extend([1, 0]); // one signature at index zero
+            expected.extend([0x23; 32]);
+            expected.extend([0x45; 32]);
+            assert_eq!(
+                postcard::to_stdvec(&wire_entry(vout, 0, 1)).unwrap(),
+                expected
+            );
+            let parsed: SlashSignatureEntry = postcard::from_bytes(&expected).unwrap();
+            assert_eq!(parsed.vout, vout);
+        }
+    }
+
+    #[test]
+    fn slash_entry_index_uses_the_full_u16_varint_width() {
+        for (index, varint) in [
+            (128, vec![0x80, 0x01]),
+            (16384, vec![0x80, 0x80, 0x01]),
+            (u16::MAX, vec![0xff, 0xff, 0x03]),
+        ] {
+            let mut expected = vec![0x12; 32];
+            expected.extend([0, 1]); // vout zero, one signature
+            expected.extend(varint);
+            expected.extend([0x23; 32]);
+            expected.extend([0x45; 32]);
+            assert_eq!(
+                postcard::to_stdvec(&wire_entry(0, index, 1)).unwrap(),
+                expected
+            );
+            let parsed: SlashSignatureEntry = postcard::from_bytes(&expected).unwrap();
+            assert_eq!(parsed.signatures[0].0, index);
+        }
+    }
+
+    #[test]
+    fn slash_entry_signature_count_crosses_the_single_byte_varint_boundary() {
+        let mut expected = vec![0x12; 32];
+        expected.extend([0, 0x80, 0x01]); // vout zero, 128 signatures
+        for index in 0..128_u8 {
+            expected.push(index);
+            expected.extend([0x23; 32]);
+            expected.extend([0x45; 32]);
+        }
+        assert_eq!(
+            postcard::to_stdvec(&wire_entry(0, 0, 128)).unwrap(),
+            expected
+        );
+    }
 }
-#[cfg(test)]
-#[path = "slash_spec_tests.rs"]
-mod spec_tests;

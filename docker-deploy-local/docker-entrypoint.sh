@@ -111,10 +111,7 @@ for id in $ids; do
     provider_ids+=("$id")
 done
 
-# A provider holds one EOTS key and an EOTS key joins once across subnets, so each validator has
-# a second provider for subnet B, with its own key, nonce seed and sign record. The key and the
-# seed are kept across restarts.
-# `subnet-b.config.toml` is the ipc-cli config that reaches this provider (see subnet_b_config.sh).
+# Second provider per validator for subnet B, with its own EOTS key and seed (kept across restarts); `subnet-b.config.toml` reaches it.
 for n in 1 2 3 4 5 6; do
     dir="/root/.ipc/validator${n}"
     id="validator${n}-subnet-b"

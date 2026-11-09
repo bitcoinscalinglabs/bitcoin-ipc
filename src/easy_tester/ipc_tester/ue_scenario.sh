@@ -2,40 +2,7 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit
 
-# Unilateral-exit scenario on the local devnet. Run INSIDE the bitcoin-ipc container, on a fresh
-# devnet started with 1 s blocks and UE_ACTIVATION_HEIGHT=1:
-#
-#   make local-delete-data && make local-build && BLOCK_INTERVAL=1 UE_ACTIVATION_HEIGHT=1 make local-up
-#   docker exec -it bitcoin-ipc ue_scenario.sh
-#
-# Every protocol command goes through ipc-cli; the miner produces one block per second (the block
-# counts and timeouts below assume it) and bitcoin-cli reads the chain. Each step prints the
-# commands it runs and the checks it makes, and records failures per step. Independent steps
-# continue; unmet prerequisites are reported.
-# Run `ue_scenario.sh --help` for groups, individual steps and saved-fixture reruns.
-# Steps (functions at the bottom):
-#   1 create       the subnet, from validator1, with validators 1-6 whitelisted
-#   2 bootstrap    validators 1-4 join with join-ue (--epochs EPOCHS_BOOTSTRAP); invalid epochs refused;
-#                  the L2 accounts of validators 1-5 are funded (a validator signs from its L2 account)
-#   3 spin_up      build fendermint once; start validators 1-4 and validator 5's syncing node
-#   4 deposits     users 1 and 2 deposit; credit follows each deposit's Bitcoin block
-#     outages      validator4's provider stops and restarts with its sign record; its monitor
-#                  pauses and resumes
-#   5 join_v5      validator 5 joins with join-ue (--epochs EPOCHS_V5) and is rotated in
-#   6 traffic      a withdrawal and a deposit go through a checkpoint; unstake and unstake-ue refused
-#   7 removal      validator 5's removal is recorded at T5-3K; its rotation pays no collateral
-#   8 exit         from tip T5 unstake-ue pays the backup address
-#   9 rejoin       validator 5 is refused when it joins again (a key joins a subnet once)
-#  10 steady       two more checkpoints and a deposit
-#     l2_replay    validator1 crashes and restarts with its existing data
-# Additional spec checks: provider key ownership; exact EOTS commitment queries before/after
-# a collateral spend; finality from genesis; and the documented unstake-ue stdout.
-# Epoch checks wait for H_0, C_1 and epoch 1's rotation checkpoint on Bitcoin L1.
-# Duration includes EPOCHS_V5 plus three epochs to maturity, and bounded recovery waits.
-# A second devnet checks both bootstrap helpers and supplies the transfer-test fixture:
-#   docker exec -e HOST_ADDR=<host address> bitcoin-ipc ue_scenario.sh bootstrap-pair
-# Once subnet B's L2 runs and its monitor has set H_0, on the same devnet and state:
-#   docker exec -e HOST_ADDR=<host address> bitcoin-ipc ue_scenario.sh --step subnet_b_cli_routing
+# Unilateral-exit integration scenario for the local devnet.
 
 EPOCH_LENGTH=${UE_EPOCH_LENGTH:-90} # K, Bitcoin blocks; also exercise K=P in the matrix
 EPOCHS_BOOTSTRAP=107  # epochs: the block duration scales with K (9630 blocks at the default)
@@ -82,7 +49,7 @@ PAIR_A=""
 PAIR_B=""
 STATE_DIR=${UE_STATE_DIR:-/root/.ipc/test-round/ue}
 STEP_CHECKS=""
-SIGN_RECORD_READER=${UE_SIGN_RECORD_READER:-/tmp/spec-eots-sign-record}
+SIGN_RECORD_READER=${UE_SIGN_RECORD_READER:-/tmp/dump-eots-votes}
 
 # ---------------------------------------------------------------- helpers
 
@@ -207,7 +174,6 @@ wait_checkpoints() {
   done
   echo "   checkpoint $target recorded at tip $(tip)"
 }
-# checkpoint.md:102: identify a rotation by its flag and epoch, independently of change numbers.
 # wait_rotation <epoch> <cp_before> <deadline>: wait for that epoch's flagged checkpoint.
 wait_rotation() {
   wait_for "rotation of epoch $1" "$3" rotation_recorded "$1" "$2"
@@ -333,7 +299,6 @@ restore_outage_components() {
   return "$restored"
 }
 
-# lifecycle.md, Power and thresholds: the three validators left online must hold a quorum.
 quorum_without() {
   local address
   address=$(comet_result "$1" status | jq -er '.validator_info.address') || return 1
@@ -357,7 +322,7 @@ peers_connected() {
   done
 }
 
-# slashing.md, Finality in blocks: the affected node waits alive, while the remaining quorum advances.
+# Observe the affected node staying alive while the remaining nodes advance.
 observe_outage() {
   local label="$1" cp_before="$2" waited=0 stable=0 last=-1 height reference start
   start=$(comet_height 1)
@@ -428,7 +393,7 @@ check_recovered_node() {
   wait_for "$label: validator$n retains carried EOTS finality through $recorded" 0 recorded_height_reached "$n" "$recorded"
 }
 
-# The reader is the spec_eots_sign_record test executable (src/easy_tester/ipc_tester/spec_eots_sign_record.rs),
+# The reader is the dump_eots_votes test executable (src/easy_tester/ipc_tester/dump_eots_votes.rs),
 # which the caller builds in the container and installs as SIGN_RECORD_READER (README, Sign-record reader).
 sign_record_reader_ok() {
   local out
@@ -454,7 +419,7 @@ sign_record_ready() {
     "$LOGS/provider-outage-votes-ready.json" >/dev/null
 }
 
-# slashing.md, EOTS key and EOTS nonce commitments: every complete old vote survives, with one record per height.
+# Check that every complete old vote is still present, with one record per height.
 sign_record_extended() {
   sign_record_snapshot "$LOGS/provider-outage-votes-after.json" || return 1
   python3 - "$LOGS/provider-outage-votes-before.json" "$LOGS/provider-outage-votes-after.json" "$SUBNET" <<'PY'
@@ -519,7 +484,7 @@ collateral_spent() {
   [ -z "$output" ] || [ "$output" = null ]
 }
 
-# join.md, Transaction format: read the committed fields independently of the Rust encoders.
+# Read the committed fields from the chain without the Rust encoders.
 join_commitment_from_chain() {
   local n="$1"
   python3 - "${JOIN_TXID[$n]}" "$SUBNET" "${BACKUP[$n]}" "$(xonly "$n")" <<'PY'
@@ -606,7 +571,6 @@ print(json.dumps(dict(pubkey=pubkey, pk_eots=pk_eots, start=start, count=count,
 PY
 }
 
-# slashing.md, EOTS key and EOTS nonce commitments: query the exact tuple recorded from L1.
 check_commitment_query() {
   local expected keys commitments eots
   expected=$(join_commitment_from_chain "$1") || return 1
@@ -619,7 +583,6 @@ check_commitment_query() {
     '.result | length == 1 and .[0] == ($e | {start, count, root, block_height})' >/dev/null
 }
 
-# slashing.md, Slashable outputs: accepted, unspent collateral needs an L1 quorum entry.
 v5_is_slashable() {
   [ "$(tip)" -lt "$V5_REMOVAL" ] && collateral_unspent 5 || return 1
   rpc getunslashableoutputs "{\"subnet_id\":\"$SUBNET\"}" \
@@ -627,7 +590,6 @@ v5_is_slashable() {
       '(.result | type == "array") and all(.result[]; .txid != $txid or .vout != 1)' >/dev/null
 }
 
-# join.md, Transaction format: use the independently decoded L1 timeout, not a log message.
 timeout_of() { join_commitment_from_chain "$1" | jq -er '.timeout'; }
 
 has_join_key() {
@@ -677,7 +639,6 @@ step_create() {
   wait_blocks 1
   # the subnet state exists only once bootstrapped; before that the monitor holds the genesis info
   check "subnet $SUBNET known to the monitor" rpc getgenesisinfo "{\"subnet_id\":\"$SUBNET\"}"
-  # ipc-cli.md, Create a subnet / lifecycle.md, State kept by the monitor: every new flag survives CLI, RPC and L1 encoding.
   local genesis; genesis=$(rpc getgenesisinfo "{\"subnet_id\":\"$SUBNET\"}")
   check "all seven epoch flags reach the monitor with their requested values" \
     jq -e --argjson p "$POWER_UNIT_EXPONENT" --argjson k "$EPOCH_LENGTH" \
@@ -690,11 +651,9 @@ step_create() {
 
 step_bootstrap() {
   say "2. bootstrap: validators 1-4 join with join-ue, seat for $EPOCHS_BOOTSTRAP epochs"
-  # join.md, Creating the transaction 4: --from must identify the provider's own validator key.
   expect_fail "join-ue refuses another validator's --from key" cli 1 subnet join-ue --from "$(evm 5)" \
     --subnet "$SUBNET" --collateral "$COLLATERAL" --ip "${IP_PREFIX}4" \
     --backup-address "$(new_btc_address)" --epochs "$EPOCHS_BOOTSTRAP"
-  # join.md, Creating 5: test both epoch limits while the subnet is still open for bootstrap joins.
   for epochs in 0 "$((MAX_TIMEOUT + 1))"; do
     expect_fail "join-ue with out-of-range --epochs $epochs refused" cli 5 subnet join-ue --from "$(evm 5)" --subnet "$SUBNET" \
       --collateral "$COLLATERAL" --ip "${IP_PREFIX}4" --backup-address "$(new_btc_address)" --epochs "$epochs"
@@ -744,7 +703,7 @@ step_deposits() {
   touch "$STATE_DIR/deposits_sent.ready"
   wait_deposit "$IPC_ADDRESS_OF_USER_1" "$before1" "$DEPOSIT"
   wait_deposit "$IPC_ADDRESS_OF_USER_2" "$before2" "$DEPOSIT"
-  # deposit.md, Verifying 4: use the deposit's own Bitcoin block, including in epoch 0.
+  # Check the deposit is recorded in its own Bitcoin block, including in epoch 0.
   python3 - "${HOST_ADDR:-host.docker.internal}" "$GATEWAY" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" \
     "$SUBNET" "$bitcoin_from" "$subnet_from" "$IPC_ADDRESS_OF_USER_1" "$IPC_ADDRESS_OF_USER_2" \
     "$before1" "$before2" "$DEPOSIT" <<'PY'
@@ -827,7 +786,6 @@ provider_height_reached() {
   provider_reply "$1" getconfirmedcount null | jq -e --argjson h "$2" '.error == null and .result >= $h' >/dev/null
 }
 
-# slashing.md, EOTS key and EOTS nonce commitments / Finality in blocks: restart retains the record and resumes execution.
 step_provider_outage() {
   say "4b. provider4 stops; its node waits alive, the quorum advances, and provider4 restarts with its votes"
   local pid restarted cp_before from since
@@ -860,7 +818,6 @@ step_provider_outage() {
   capture_node_logs 4 "$since" provider-outage
 }
 
-# slashing.md, Finality in blocks: a reachable provider with a lagging monitor cannot return stale agreed state.
 step_monitor_outage() {
   say "4c. monitor4 pauses; future-height checkpoint queries refuse stale state and the node waits"
   local frozen requested response cp_before from since number selector
@@ -900,7 +857,6 @@ step_monitor_outage() {
   capture_node_logs 4 "$since" monitor-outage
 }
 
-# slashing.md, Accepting an EOTS vote / Finality in blocks: a restarted node reconstructs the same blocks and state.
 step_l2_replay() {
   say "4d. validator1 crashes and restarts with its block, application, WAL and EOTS data intact"
   local cp_before from since reference svc
@@ -943,12 +899,10 @@ step_join_v5() {
   [ -n "$T5" ] || fail "validator5's join did not carry a timeout"
   V5_REMOVAL=$((T5 - 3 * EPOCH_LENGTH))
   local h_zero; h_zero=$(getsubnet | jq -er '.result.h_0')
-  # join.md, Creating 5: the provider chooses the final block of a timeout epoch.
   check "validator5 timeout is a cutoff relative to H_0" [ "$(((T5 - h_zero) % EPOCH_LENGTH))" -eq 0 ]
   echo "   T5 = $T5 (exit from tip $T5)"
   touch "$STATE_DIR/v5_context.ready"
   wait_for "validator5's join recorded with its exact EOTS commitment" "$V5_REMOVAL" check_commitment_query 5
-  # join.md, Verifying 5-6 / slashing.md, After activation: a reveal alone gives no seat.
   wait_for "validator5's collateral made slashable on L1" "$V5_REMOVAL" v5_is_slashable
   wait_for "committee contains validators 1-5" "$V5_REMOVAL" committee_is 1 2 3 4 5
   local entry_epoch; entry_epoch=$(getsubnet | jq -er '.result.last_rotation_epoch')
@@ -975,13 +929,10 @@ step_traffic() {
 
 step_removal() {
   say "7. validator 5's removal precedes maturity; check its later adoption checkpoint"
-  # lifecycle.md, Maturity of a collateral: a collateral stops seating its owner before maturity.
-  # lifecycle.md, Maturity of a collateral: the first cutoff with T<=cutoff+3K removes the collateral.
   local changes key h_zero removal_epoch; key=$(xonly 5)
   h_zero=$(getsubnet | jq -er '.result.h_0')
   removal_epoch=$(((V5_REMOVAL - h_zero) / EPOCH_LENGTH + 1))
   wait_block "$V5_REMOVAL"
-  # lifecycle.md, Maturity of a collateral: the preceding block cannot record the departure.
   changes=$(rpc getstakechanges "{\"subnet_id\":\"$SUBNET\",\"block_height\":$((V5_REMOVAL - 1))}")
   check "no validator5 withdrawal one block before its removal cutoff" \
     jq -e --arg key "$key" '.result | all(.validator_xpk != $key or .change.withdraw == null)' <<< "$changes"
@@ -1011,7 +962,6 @@ step_removal() {
 step_exit() {
   say "8. exit from tip T5 = $T5: unstake-ue pays the backup address"
   wait_block "$T5"
-  # lifecycle.md, Changes / Maturity of a collateral: subsequent cutoffs do not withdraw the value twice.
   local cutoff changes key; key=$(xonly 5)
   for cutoff in "$((V5_REMOVAL + EPOCH_LENGTH))" "$((V5_REMOVAL + 2 * EPOCH_LENGTH))" "$T5"; do
     changes=$(rpc getstakechanges "{\"subnet_id\":\"$SUBNET\",\"block_height\":$cutoff}")
@@ -1021,7 +971,6 @@ step_exit() {
   local out txid tx paid
   out=$(cli 5 subnet unstake-ue --subnet "$SUBNET") || { echo "$out"; fail "unstake-ue of validator5"; }
   echo "$out"
-  # ipc-cli.md, Exit with the matured collateral: the documented result is on stdout.
   check "unstake-ue stdout identifies the txid, collateral amount and backup address" \
     grep -Ex "unstake-ue transaction submitted: txid [0-9a-f]{64}; $COLLATERAL sats of collateral spent, paid minus the fee to ${BACKUP[5]}" <<< "$out"
   txid=$(sed -n 's/^unstake-ue transaction submitted: txid \([0-9a-f]\{64\}\);.*/\1/p' <<< "$out")
@@ -1029,7 +978,6 @@ step_exit() {
   touch "$STATE_DIR/exit_spent.ready"
   check "collateral output of validator5 spent" collateral_spent 5
   tx=$(bitcoin-cli getrawtransaction "$txid" 1)
-  # exit.md, Transaction format: one collateral in this scenario, one payout, and CLTV at T5.
   check "exit spends the collateral through a timelocked input and pays only the backup address" \
     jq -e --arg commit "${COMMIT_TXID[5]}" --arg backup "${BACKUP[5]}" --argjson timeout "$T5" \
       '.version == 2 and .locktime == $timeout and (.vin | length == 1)
@@ -1042,7 +990,6 @@ step_exit() {
   echo "   backup address ${BACKUP[5]} received $paid sats, fee $((COLLATERAL - paid)) sats"
 }
 
-# slashing.md, EOTS key and EOTS nonce commitments: only actual joiners are returned, not all whitelist keys.
 step_commitment_queries() {
   say "2d. all four joined EOTS identities and exact commitments are queryable before L2 startup"
   local n keys
@@ -1054,7 +1001,6 @@ step_commitment_queries() {
   done
 }
 
-# slashing.md, Final blocks and Finality in blocks: the genesis power table must finalize a prefix.
 eots_prefix_final() {
   local n port status
   for n in 1 2 3 4; do
@@ -1074,7 +1020,6 @@ step_eots_finality() {
   wait_for "EOTS final and recorded heights reach $CHECK_PERIOD on validators 1-4" 0 eots_prefix_final
 }
 
-# lifecycle.md, State kept by the monitor (Validators/EOTS nonce commitments): a spend does not erase accepted join metadata.
 step_spent_commitment_queries() {
   say "8b. validator5's EOTS identity and commitment remain queryable after its collateral is spent"
   check "validator5 commitment remains recorded after exit" check_commitment_query 5
@@ -1105,7 +1050,6 @@ step_steady() {
   check "validators 1-4 remain seated" committee_is 1 2 3 4
 }
 
-# Devnet A/B setup / join.md, Verifying 2.7: every subnet/validator pair has its own provider and EOTS key.
 step_provider_key_isolation() {
   say "provider isolation: twelve independent validator EOTS keys and both sets of six RPC endpoints"
   local n subnet distinct f files=()
@@ -1123,7 +1067,6 @@ step_provider_key_isolation() {
   check "all twelve EOTS key files are distinct" [ "$distinct" -eq 12 ]
 }
 
-# join.md, Transaction format / slashing.md, EOTS key and EOTS nonce commitments: both helpers use collateral joins.
 step_bootstrap_a() {
   bootstrap_subnet_a_from_container.sh | tee "$LOGS/spec-bootstrap-a.log"
   PAIR_A=$(sed -n 's/^export SUBNET_ID="\([^"]*\)"$/\1/p' "$LOGS/spec-bootstrap-a.log" | tail -1)
@@ -1152,7 +1095,6 @@ step_bootstrap_pair() {
 
 subnet_b_active() { provider_reply 1 getsubnet "{\"subnet_id\":\"$PAIR_B\"}" b | jq -e '.result.h_0 != null' >/dev/null; }
 
-# docker-deploy-local/README.md, Unilateral exit and EOTS keys: the child uses its config's parent provider.
 step_subnet_b_cli_routing() {
   say "subnet B CLI routing: observe the request on 3130 and check a join through 3030 is refused"
   local log_a="$LOGS/provider-validator1.log" log_b="$LOGS/provider-validator1-subnet-b.log"
@@ -1178,7 +1120,7 @@ PY
   if grep -F "getsubnet: $PAIR_B" "$LOGS/spec-subnet-b-cli-provider-a.log"; then
     fail "ipc-cli's subnet B query also reached provider 3030"
   fi
-  # join.md, Creating 1: in epoch 0 every join is refused before the key rule, so subnet B must be active.
+  # Subnet B must be active for the join to reach the key check.
   CHECKPOINT_TIMEOUT=$((3 * EPOCH_LENGTH)) wait_for "subnet B's monitor has set H_0" 0 subnet_b_active
   before=$(provider_reply 1 geteotskeys "{\"subnet_id\":\"$PAIR_B\"}" b | jq -ceS '.result | sort_by(.pubkey)')
   backup=$(new_btc_address)
@@ -1187,7 +1129,6 @@ PY
     --ip "${IP_PREFIX}0" --backup-address "$backup" --epochs "$EPOCHS_BOOTSTRAP" \
     > "$LOGS/spec-subnet-b-join-via-3030.log" 2>&1 || rc=$?
   check "provider 3030 refuses the subnet B join" test "$rc" -ne 0
-  # join.md, Creating 1 / Verifying 2.7: a validator key joins each subnet at most once.
   check "the refusal rejects a validator key that already joined subnet B" \
     grep -iE 'already joined|already registered in subnet|joins.*once|joined.*before|registered.*before|earlier.*join' "$LOGS/spec-subnet-b-join-via-3030.log"
   [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || fail "the join timed out instead of being refused"
@@ -1217,8 +1158,7 @@ verify_bootstrap_subnet() {
 step_bootstrap_a_queries() { verify_bootstrap_subnet "$PAIR_A" a; }
 step_bootstrap_b_queries() { verify_bootstrap_subnet "$PAIR_B" b; }
 
-# slashing.md, EOTS key and EOTS nonce commitments: seeds are separate persistent random secrets.
-step_epoch_genesis() {
+step_eots_nonce_seeds() {
   say "3c. inspect persistent nonce seeds"
   python3 - <<'PY'
 import pathlib
@@ -1266,7 +1206,7 @@ epoch_one_configuration_ready() {
          and all(.validators[]; .collateral == $amount and .power == ($amount / $unit | floor))' >/dev/null
 }
 
-# lifecycle.md, Activation / Computing C_1; checkpoint.md, Checkpoints of epoch 0: only check that epoch 1 starts.
+# Checks only that epoch 1 starts.
 step_epoch_checkpoint_timing() {
   say "3d. H_0 and C_1 are recorded; epoch 1's rotation reaches Bitcoin L1"
   local h_zero c_one keys rotation whitelist
@@ -1288,7 +1228,7 @@ import sys
 rotation, c_one, whitelist = (json.loads(value) for value in sys.argv[1:4])
 boot = int(sys.argv[4])
 keys = [bytes.fromhex(k) for k in whitelist]
-# encoding.md, Configuration multisig: C_wlist has unit powers and threshold floor(2*boot/3)+1.
+# C_wlist has unit powers and threshold floor(2*boot/3)+1.
 threshold = 2 * boot // 3 + 1
 whitelist_script = b"\x00" + b"".join(b"\x7c\x20" + k + b"\xac\x63\x51\x93\x68" for k in keys) + bytes([0x50 + threshold, 0xa2])
 # The second leaf binds this multisig to this subnet, even when another subnet has the same whitelist.
@@ -1305,7 +1245,6 @@ def spends_whitelist(vin):
 tx = json.loads(subprocess.check_output(["bitcoin-cli", "getrawtransaction", rotation["txid"], "1"], text=True))
 assert tx.get("confirmations", 0) > 0, "epoch 1's rotation is not on Bitcoin L1"
 assert tx["vin"] and all(spends_whitelist(v) for v in tx["vin"]), "epoch 1's rotation must spend this subnet's C_wlist fund UTXOs"
-# checkpoint.md:66,102: the flag decides rotation even before L2 applies C_1's updates.
 assert rotation["epoch"] == 1 and rotation["is_rotation_checkpoint"], "checkpoint is not epoch 1's flagged rotation"
 assert tx["vout"][-1]["scriptPubKey"].get("address") == c_one["multisig_address"], "rotation change must pay MS(C_1)"
 print(f"epoch 1 rotation {rotation['txid']} is mined, spends C_wlist funds and pays its change to MS(C_1)")
@@ -1378,7 +1317,7 @@ def query(method, **params):
 def eth(method, params):
     return rpc(f"http://{host}:8545/", method, params)
 
-# encoding.md:75-77,107-114: derive the unit-power whitelist/genesis script
+# Derive the unit-power whitelist/genesis script
 # independently, including the subnet-binding leaf. Later configurations come
 # from the cutoff's committee_after_change, never from a checkpoint's change.
 field = 2**256 - 2**32 - 977
@@ -1457,9 +1396,8 @@ def main():
             if match and 1 <= int(match[1]) < current and int(match[2]) <= processed:
                 missing.add(int(match[1]))
     logged_missing = missing.copy()
-    # The recorded history is also authoritative when a monitor log has been
-    # rotated away. A closed epoch without its rotation is the stated limit,
-    # regardless of P/K; the brief classifies it OUT_OF_SCOPE in every cell.
+    # A closed epoch without its rotation checkpoint in the recorded history is
+    # OUT_OF_SCOPE in every cell, also when the monitor log has been rotated away.
     missing.update(epoch for epoch in range(1, current)
                    if not any(cp["is_rotation_checkpoint"] and cp["epoch"] == epoch
                               and cp["block_height"] <= h0 + epoch*k for cp in checkpoints))
@@ -1493,8 +1431,7 @@ def main():
     scripts, numbers, members = {0: whitelist}, {0: 0}, {0: genesis_keys}
     changes_by_epoch = {}
     previous_script = cgen
-    # lifecycle.md:134,170: a cutoff's transactions belong to its ending epoch;
-    # the configuration update becomes current only AFTER those transactions.
+    # A cutoff's transactions are applied before the configuration update becomes current.
     for epoch in range(1, current + 1):
         cutoff = h0 + (epoch-1)*k
         changes = sorted(query("getstakechanges", block_height=cutoff), key=lambda c: c["configuration_number"])
@@ -1704,7 +1641,7 @@ sys.exit(1 if totals["FAIL"] else 0)
 PY
 }
 
-ALL_STEPS="create bootstrap commitment_queries spin_up eots_finality epoch_genesis epoch_checkpoint_timing deposits provider_outage monitor_outage join_v5 traffic removal exit spent_commitment_queries rejoin steady l2_replay"
+ALL_STEPS="create bootstrap commitment_queries spin_up eots_finality eots_nonce_seeds epoch_checkpoint_timing deposits provider_outage monitor_outage join_v5 traffic removal exit spent_commitment_queries rejoin steady l2_replay"
 FIXTURE_STEPS="checkpoint_fixture checkpoint_invariants"
 PAIR_STEPS="provider_key_isolation bootstrap_a bootstrap_b bootstrap_a_queries bootstrap_b_queries bootstrap_pair"
 # Needs subnet B active: run with --step after subnet B's monitor has set H_0.
@@ -1722,7 +1659,7 @@ Bitcoin chain. The selected steps always run. Logs, checks and summary.tsv are u
 A fresh devnet is required to repeat create, bootstrap, spin_up, join_v5, exit or a bootstrap helper.
 Outages run after the deposits, before the lifecycle; the crash runs last. Each step restores
 its interrupted services. Each step has its own timeout; UE_STEP_TIMEOUT=<seconds> sets all.
-UE_BUILD_IMAGE=0 reuses a fendermint image explicitly built by the round runner.
+UE_BUILD_IMAGE=0 reuses an existing fendermint image.
 UE_EPOCH_LENGTH=90 and UE_CHECK_PERIOD=30 select K (Bitcoin blocks) and P (subnet blocks).
 Both persist in the scenario state; use a fresh state/devnet for a different (P,K).
 The matrix runs --step checkpoint_invariants last; this step is excluded from group all.
@@ -1754,7 +1691,7 @@ dependencies() {
   case "$1" in
     bootstrap) echo create ;;
     commitment_queries|spin_up) echo bootstrap ;;
-    eots_finality|epoch_genesis|epoch_checkpoint_timing|deposits|steady|checkpoint_fixture|checkpoint_invariants) echo spin_up ;;
+    eots_finality|eots_nonce_seeds|epoch_checkpoint_timing|deposits|steady|checkpoint_fixture|checkpoint_invariants) echo spin_up ;;
     join_v5) echo 'deposits_sent epoch_checkpoint_timing' ;;
     provider_outage|monitor_outage|l2_replay) echo checkpoint_fixture ;;
     traffic) echo 'join_v5 deposits_sent' ;;
@@ -1784,6 +1721,11 @@ finish_step() {
     status=1
   fi
   save_state || status=1
+  if [ "$status" -eq 0 ]; then
+    touch "$STATE_DIR/$internal.ready"
+  else
+    rm -f "$STATE_DIR/$internal.ready"
+  fi
   printf '%s\n' "${CHECKS[@]}"
   [ "$interrupted" -eq 0 ] || exit "$interrupted"
   exit "$status"
@@ -1812,7 +1754,7 @@ done
 if [ -z "$selected$internal" ]; then
   case "$group" in
     all) selected="$ALL_STEPS" ;;
-    setup) selected='create bootstrap commitment_queries spin_up eots_finality epoch_genesis epoch_checkpoint_timing' ;;
+    setup) selected='create bootstrap commitment_queries spin_up eots_finality eots_nonce_seeds epoch_checkpoint_timing' ;;
     deposits) selected=deposits ;;
     lifecycle) selected='join_v5 traffic removal exit spent_commitment_queries rejoin steady' ;;
     steady) selected=steady ;;
@@ -1854,7 +1796,6 @@ if [ -n "$internal" ]; then
   trap 'exit 130' INT
   trap 'exit 143' TERM
   "step_$internal"
-  touch "$STATE_DIR/$internal.ready"
   exit 0
 fi
 

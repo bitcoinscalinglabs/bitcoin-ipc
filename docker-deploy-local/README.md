@@ -82,8 +82,6 @@ docker exec -e HOST_ADDR=10.0.0.4 bitcoin-ipc spin_up_subnet_a_from_container.sh
 The published ports then also answer on that interface; keep them closed to other machines with
 the host firewall.
 
-
-
 ## Unilateral exit and EOTS keys
 
 The stack starts with `UE_ACTIVATION_HEIGHT=1`, and `bootstrap_subnet_{a,b}_from_container.sh` join validators 1-4 with join-ue. The monitor refuses to start when the height differs from the one stored in its database, so data of a stack started with another value needs `make local-delete-data`.
