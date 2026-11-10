@@ -16,15 +16,13 @@ Building blocks shared by the transaction documents in `transactions/`. [lifecyc
 | `txid20(id)` | the 20 bytes inside a subnet id (see [Subnet id](#subnet-id)) |
 | `MS(C)` | the multisig address of configuration `C` (see [Configuration multisig](#configuration-multisig)) |
 | sat | satoshi, 10⁻⁸ BTC. On the subnet, 1 sat is 10¹⁰ of the subnet's smallest unit (1 BTC = 10¹⁸) |
-| EOTS | extractable one-time signature: a BIP340 signature whose nonce is fixed in advance, so that two signatures with the same nonce reveal the secret key ([slashing](slashing.md)) |
+| EOTS | extractable one-time signature: a BIP340 signature whose public nonce is fixed in advance, so that two signatures with the same public nonce reveal the secret key ([slashing](slashing.md)) |
 
 Integers in OP_RETURN layouts are little-endian unless the layout says otherwise.
 
 ## Fee rate
 
-Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (the create subnet, prefund, join, stake, deposit and fee top-up transactions) may use any fee its wallet chooses (fee top-up transaction **unimplemented**). `r` fixes the values that the protocol computes itself: commitment outputs, the outputs of reveal transactions, configuration multisig spends and the exit transaction.
-
-Each provider uses its own estimate for a checkpoint, so two providers can build different transactions for the same checkpoint.
+Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (the create subnet, prefund, join, stake, deposit and fee top-up transactions) may use any fee its wallet chooses (fee top-up transaction **unimplemented**). `r` fixes the values that the protocol computes itself: commitment outputs, the outputs of reveal transactions, configuration multisig spends and the exit transaction. Each provider uses its own estimate for a checkpoint ([checkpoint](transactions/checkpoint.md#creating-the-transaction)).
 
 ## Identifiers
 
@@ -115,13 +113,13 @@ A spend of `MS(C)` has, for every input, the witness `[s_n, …, s_1, M(C), cb]`
 
 ### Collateral script
 
-The collateral of a validator with key `pk`, EOTS key `pk_eots` and timeout `T`, naming configuration `C`, is a P2TR output with internal key `K_NUMS` and three leaves (leaf version `0xc0`):
+The collateral UTXO of a validator with key `pk`, EOTS key `pk_eots` and timeout `T`, naming configuration `C`, is a P2TR output with internal key `K_NUMS` and three leaves (leaf version `0xc0`):
 
-- **Unilateral-exit leaf** `U(pk, T)`: `<T> OP_CHECKLOCKTIMEVERIFY OP_DROP OP_PUSHBYTES_32 pk OP_CHECKSIG` (`num(T) ‖ b1 75 20 ‖ pk ‖ ac`). Only `pk` can spend it, and only in a transaction with nLockTime `≥ T`, that is from block `T + 1` on.
+- **Unilateral-exit leaf** `U(pk, T)`: `<T> OP_CHECKLOCKTIMEVERIFY OP_DROP OP_PUSHBYTES_32 pk OP_CHECKSIG` (`num(T) ‖ b1 75 20 ‖ pk ‖ ac`). Only `pk` can spend it, and only in a transaction with nLockTime `≥ T`, that is from Bitcoin block `T + 1` on.
 - **Slash leaf** `L(pk_eots, C)`: `OP_PUSHBYTES_32 pk_eots OP_CHECKSIGVERIFY`, then the weighted multisig `M(C)` (`20 ‖ pk_eots ‖ ad ‖ M(C)`). The [slash](transactions/slash.md) transaction spends it.
-- **Cooperative-exit leaf** `X(pk, C)`: `OP_PUSHBYTES_32 pk OP_CHECKSIGVERIFY`, then `M(C)` (`20 ‖ pk ‖ ad ‖ M(C)`). A checkpoint spends the collateral through this leaf to [refresh](lifecycle.md#collateral-refresh) it.
+- **Cooperative-exit leaf** `X(pk, C)`: `OP_PUSHBYTES_32 pk OP_CHECKSIGVERIFY`, then `M(C)` (`20 ‖ pk ‖ ad ‖ M(C)`). A checkpoint spends the collateral UTXO through this leaf to [refresh](lifecycle.md#collateral-refresh) it.
 
-`T` is a block height: `T < 500,000,000`. `pk_eots ≠ pk`, so the slash leaf and the cooperative-exit leaf differ.
+`T` is a Bitcoin block height: `T < 500,000,000`. `pk_eots ≠ pk`, so the slash leaf and the cooperative-exit leaf differ.
 
 The tree has `X(pk, C)` at depth 1, and `U(pk, T)` and `L(pk_eots, C)` at depth 2. Its Merkle root is the TapBranch hash of `TapLeaf(X)` and `TapBranch(TapLeaf(U), TapLeaf(L))`, where every TapBranch orders its two children as BIP341 does. The control block of a spend, after `(0xc0 | parity) ‖ K_NUMS`, holds:
 
@@ -137,14 +135,14 @@ A spend through `U(pk, T)` has the witness `[σ, U(pk, T), cb]`. A spend through
 
 The unbonding output of a validator with key `pk` and EOTS key `pk_eots`, naming configuration `C`, is a P2TR output with internal key `K_NUMS` and two leaves at depth 1 (leaf version `0xc0`):
 
-- **Unilateral-unbonding leaf** `B(pk)`: `<3K> OP_CHECKSEQUENCEVERIFY OP_DROP OP_PUSHBYTES_32 pk OP_CHECKSIG` (`num(3K) ‖ b2 75 20 ‖ pk ‖ ac`), with `K` the subnet's epoch length. Only `pk` can spend it, and only in a transaction of version `≥ 2` whose input has nSequence `3K`, that is from `3K` blocks after the block that includes the unbonding output on.
+- **Unilateral-unbonding leaf** `B(pk)`: `<3K> OP_CHECKSEQUENCEVERIFY OP_DROP OP_PUSHBYTES_32 pk OP_CHECKSIG` (`num(3K) ‖ b2 75 20 ‖ pk ‖ ac`), with `K` the subnet's epoch length. Only `pk` can spend it, and only in a transaction of version `≥ 2` whose input has nSequence `3K`, that is from `3K` Bitcoin blocks after the Bitcoin block that includes the unbonding output on.
 - **Slash leaf** `L(pk_eots, C)`, as in the [collateral script](#collateral-script).
 
 The control block of a spend is `(0xc0 | parity) ‖ K_NUMS ‖` the TapLeaf hash of the other leaf (65 bytes). The witnesses are those of the collateral script: `[σ, B(pk), cb]` and `[s_n, …, s_1, σ, L(pk_eots, C), cb]`.
 
 ### EOTS nonce commitment
 
-An EOTS nonce commitment `(start, count, root)` commits an EOTS key to one public nonce for each subnet height `h` with `start ≤ h < start + count`, where `start ≥ 1` and `count ≥ 1`. The public nonce `R_h` is the 32-byte x-only key of `k_h · G`, where `G` is the secp256k1 generator and `k_h` the validator's secret nonce. The validator chooses `k_h` so that `k_h · G` has an even y coordinate, as BIP340 requires of a signature nonce.
+An EOTS nonce commitment `(start, count, root)` commits an EOTS key to one public nonce for each subnet height `h` with `start ≤ h < start + count`, where `start ≥ 1` and `count ≥ 1`. The public nonce `R_h` is the 32-byte x-only key of `k_h · G`, where `G` is the secp256k1 generator and `k_h` the validator's secret nonce. The validator chooses `k_h` so that `k_h · G` has an even y coordinate, as BIP340 requires.
 
 `root` is the RFC 6962 Merkle tree hash, with SHA-256, of the list `R_start, …, R_{start+count−1}`. A list of one element `x` hashes to `sha256(0x00 ‖ x)`. A list of `n > 1` elements splits after its first `k` elements, where `k` is the largest power of two smaller than `n`, and hashes to `sha256(0x01 ‖ left ‖ right)`. The proof of `R_h` is its RFC 6962 audit path in that tree, for the leaf index `h − start`.
 
@@ -152,4 +150,4 @@ In a message, an EOTS nonce commitment is the postcard tuple `(start: u64, count
 
 ### EOTS vote
 
-An EOTS vote ([slashing](slashing.md#the-vote)) is the postcard tuple `(pk_eots: 32 bytes, h: u64, b: 32 bytes, signature: 64 bytes, start: u64, proof: list of 32 bytes)`: the EOTS key, the subnet height, the subnet block hash, the BIP340 signature `R_h ‖ s`, the `start` of the EOTS nonce commitment whose range holds `h`, and the audit path of `R_h` in that commitment's tree, from the leaf up. On the subnet it travels inside the signed vote envelope of the top-down finality votes (`VoteRecord`), as its content, signed with the validator key.
+An EOTS vote ([slashing](slashing.md#the-vote)) is the postcard tuple `(pk_eots: 32 bytes, h: u64, b: 32 bytes, signature: 64 bytes, start: u64, proof: list of 32 bytes)`: the EOTS key, the subnet height, the subnet block hash, the BIP340 signature `R_h ‖ s`, the `start` of the EOTS nonce commitment whose range holds `h`, and the audit path of `R_h` in that commitment's tree, from the leaf up. It travels as the content of the signed vote envelope (`VoteRecord`) of the top-down finality votes.

@@ -47,7 +47,7 @@ flowchart LR
   VL -->|"refresh(), votes_to_cast(), mark_cast()"| TAL
   VL -->|"signeotsvote()"| PRV
   VL -->|"publish_vote()"| GOS
-  TAL -->|"getsubnetcheckpoint(), geteotskeys(), geteotscommitments()"| PRV
+  TAL -->|"geteotsrecords()"| PRV
   PRV -->|"listunspent(), estimatesmartfee(), testmempoolaccept(), sendrawtransaction()"| BTC
   REL -->|"QuorumReached events, getCheckpointSignatureBundle(), getBitcoinCheckpointSignatures()"| GW
   REL -->|"getsubnetcheckpoint(), finalizecheckpointpsbt()"| PRV
@@ -94,8 +94,8 @@ flowchart LR
   CMT -->|"deliver_tx()"| DT
   CMT -->|"end_block()"| EB
   CMT -->|"commit()"| CO
-  PP -->|"getsubnetcheckpoint(), geteotskeys(), geteotscommitments()"| PRV
-  PR -->|"getsubnetcheckpoint(), geteotskeys(), geteotscommitments()"| PRV
+  PP -->|"geteotsrecords()"| PRV
+  PR -->|"geteotsrecords()"| PRV
   EB -->|"getunslashableoutputs(), signslash(), gencheckpointpsbt()"| PRV
 
   subgraph Legend
@@ -113,7 +113,7 @@ flowchart LR
 ```
 
 - The ABCI hooks in `app.rs` call `prepare()`, `process()`, `deliver()` and `end()` of `chain.rs`. `end()` of `chain.rs` calls `end()` of `exec.rs` first.
-- `agreed_state()` calls `getsubnetcheckpoint()`, and `refresh()` for a new Bitcoin height, which calls `geteotskeys()` and `geteotscommitments()`. `agreed_state_wait()` calls `agreed_state()` again until the provider answers, so `process()` waits for the monitor.
+- `agreed_state()` calls `geteotsrecords()` once: the answer holds the EOTS keys, their EOTS nonce commitments and the latest checkpoint at one Bitcoin height. `agreed_state_wait()` calls `agreed_state()` again until the provider answers, so `process()` waits for the monitor.
 - `end()` of `exec.rs` does not wait for the spawned tasks. They submit their gateway calls through `fevm_invoke()`.
 
 ## 3. One checkpoint
@@ -162,8 +162,8 @@ sequenceDiagram
   MON->>MON: process_block() records the checkpoint of h
   APP->>PRV: launch_polling_syncer() task: getblockhash(), getstakechanges(), getrootnetmessages()
   CMT->>APP: deliver_tx(): TopDownExec, commitParentFinality()
-  TAL->>PRV: getsubnetcheckpoint()
-  PRV-->>TAL: the checkpoint of h
+  TAL->>PRV: geteotsrecords()
+  PRV-->>TAL: the EOTS keys, their EOTS nonce commitments and the checkpoint of h
 ```
 
 `should_create_checkpoint()` also creates a checkpoint at a subnet height that is not a multiple of `bottomup_check_period`: a height where `commitBottomUpMsg()` of the gateway cut a full `BottomUpMsgBatch` (`maxMsgsPerBottomUpBatch` messages).
@@ -172,5 +172,7 @@ sequenceDiagram
 - `checkpoints_to_resign()` reads `getIncompleteCheckpoints()`, `getCheckpointSignatureBundle()` (`checkpoint_signatories()`) and `hasBitcoinCheckpointSignature()` of the gateway, and `agreed_checkpointed_height()` of the EOTS tally.
 - `broadcast_bitcoin_signature()` passes the slash pre-signatures of `getSlashPreSignatures()` to `gencheckpointpsbt()`. `post_slash_pre_signatures()` calls `getunslashableoutputs()` and `signslash()`, then submits `addSlashPreSignature()` through `fevm_invoke()`.
 - The relayer (`submit_next_epoch()`) reads the gateway up to `finalized_epoch()`. `submit_checkpoint()` calls `finalizecheckpointpsbt()`, and the provider sends the checkpoint and its batch-transfer transaction through `submit_to_mempool()`.
-- `agreed_state()` of the EOTS tally calls `getsubnetcheckpoint()` with the parent finality as `max_block_height`.
+- `agreed_state()` of the EOTS tally calls `geteotsrecords()` with the parent finality as `max_block_height`.
+- The EOTS tally deletes the EOTS votes, the subnet block hashes and the superseded power tables at or below the subnet final height. The finality query answers the subnet final height and the conflict height only. The provider deletes its EOTS signer records at or below the latest checkpointed height in `signeotsvote()`.
+- `vote_loop()` publishes each EOTS vote once, records the greatest subnet height it voted at, and continues from there after a restart. Evidence of double votes is not published on the vote gossip. The EOTS tally keeps at most two EOTS votes per EOTS key and height, and a proposal carries at most one evidence per EOTS key; a proposal with more is invalid.
 - Epoch 0 uses the same modules and calls ([epoch 0](../specs/lifecycle.md#epoch-0)).
