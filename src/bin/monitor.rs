@@ -1,17 +1,20 @@
+use std::any::Any;
 use std::env;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
+use futures::FutureExt;
 use log::{debug, error, info, trace, warn};
 use thiserror::Error;
 use tokio::signal;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use bitcoin::{Block, BlockHash};
+use bitcoin::{script::Instruction, Block, BlockHash};
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcValidate, IpcValidateError};
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcTag, IpcValidate, IpcValidateError};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
@@ -539,8 +542,18 @@ where
         block: Block,
     ) -> Result<(), MonitorError> {
         for tx in block.txdata {
-            self.process_transaction(&tx, block_height, block_hash, block.header.time)
-                .await?;
+            let processing =
+                self.process_transaction(&tx, block_height, block_hash, block.header.time);
+            // A panic on a transaction's content skips the transaction. A database write
+            // transaction still open at the panic is dropped, which aborts it.
+            match AssertUnwindSafe(processing).catch_unwind().await {
+                Ok(result) => result?,
+                Err(panic) => warn!(
+                    "Skipping transaction {}: panic while processing it: {}",
+                    tx.compute_txid(),
+                    panic_message(panic.as_ref())
+                ),
+            }
         }
 
         Ok(())
@@ -569,11 +582,19 @@ where
                     }
                 };
 
+                let tag = IpcTag::from_payload(&witness_data);
                 let ipc_message = IpcMessage::from_witness(witness_data);
                 let ipc_message = match ipc_message {
                     Ok(msg) => msg,
                     Err(e) => {
-                        trace!("Error deserializing IPC message: {:?}", e);
+                        match tag {
+                            // The other IPC tags are handled from the outputs below
+                            Some(tag @ (IpcTag::CreateSubnet | IpcTag::JoinSubnet)) => warn!(
+                                "Skipping IPC message in transaction {txid}: cannot parse {}: {e}",
+                                tag.as_str()
+                            ),
+                            _ => trace!("Error deserializing IPC message: {:?}", e),
+                        }
                         continue;
                     }
                 };
@@ -583,7 +604,7 @@ where
                     .await
                 {
                     Ok(_) => {}
-                    Err(e) => self.handle_ipc_msg_error(e)?,
+                    Err(e) => self.handle_ipc_msg_error(txid, e)?,
                 }
             }
         }
@@ -599,7 +620,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
@@ -609,7 +630,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(checkpoint_msg) =
             ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, tx)
@@ -621,7 +642,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx) {
             let ipc_message = IpcMessage::BatchTransfer(msg);
@@ -631,7 +652,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcStakeCollateralMsg::from_tx(&self.db, tx) {
             let ipc_message = IpcMessage::StakeCollateral(msg);
@@ -641,7 +662,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcUnstakeCollateralMsg::from_tx(&self.db, tx) {
             let ipc_message = IpcMessage::UnstakeCollateral(msg);
@@ -651,7 +672,7 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcKillSubnetMsg::from_tx(&self.db, tx) {
             let ipc_message = IpcMessage::KillSubnet(msg);
@@ -661,11 +682,49 @@ where
                 .await
             {
                 Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(e)?,
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
+        } else if let Some(e) = self.output_parse_error(tx) {
+            warn!("Skipping IPC message in transaction {txid}: {e}");
         }
 
         Ok(())
+    }
+
+    /// The parse error of the IPC message whose tag is in the first push of the first output,
+    /// or else in the first witness item of the first input; `None` without such a tag.
+    /// The tag is read with non-minimal pushes allowed, so that the parsers' rejection of
+    /// a non-minimal push is reported too.
+    fn output_parse_error(&self, tx: &bitcoin::Transaction) -> Option<IpcLibError> {
+        let output_tag = tx.output.first().and_then(|output| {
+            output
+                .script_pubkey
+                .instructions()
+                .find_map(|ins| match ins {
+                    Ok(Instruction::PushBytes(data)) => Some(IpcTag::from_payload(data.as_bytes())),
+                    _ => None,
+                })
+                .flatten()
+        });
+        let witness_tag = || {
+            let witness = tx.input.first()?.witness.nth(0)?;
+            IpcTag::from_payload(&bitcoin_utils::concatenate_op_push_data(witness).ok()?)
+        };
+        match output_tag.or_else(witness_tag)? {
+            IpcTag::PrefundSubnet => ipc_lib::IpcPrefundSubnetMsg::from_tx(tx).err(),
+            IpcTag::FundSubnet => ipc_lib::IpcFundSubnetMsg::from_tx(tx).err(),
+            IpcTag::CheckpointSubnet => {
+                ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, tx).err()
+            }
+            IpcTag::BatchTransfer => ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, tx).err(),
+            IpcTag::StakeCollateral => ipc_lib::IpcStakeCollateralMsg::from_tx(&self.db, tx).err(),
+            IpcTag::UnstakeCollateral => {
+                ipc_lib::IpcUnstakeCollateralMsg::from_tx(&self.db, tx).err()
+            }
+            IpcTag::KillSubnet => ipc_lib::IpcKillSubnetMsg::from_tx(&self.db, tx).err(),
+            // Parsed from the witness in `process_transaction`
+            IpcTag::CreateSubnet | IpcTag::JoinSubnet => None,
+        }
     }
 
     async fn process_ipc_msg(
@@ -904,19 +963,22 @@ where
     }
 
     /// Helper function to handle IPC message processing errors
-    fn handle_ipc_msg_error(&self, error: MonitorError) -> Result<(), MonitorError> {
+    fn handle_ipc_msg_error(
+        &self,
+        txid: bitcoin::Txid,
+        error: MonitorError,
+    ) -> Result<(), MonitorError> {
         match error {
-            // Ignorable errors
-            MonitorError::IpcMsgInvalid(e) => {
-                error!("Invalid IPC message: {:?}", e);
-                Ok(())
-            }
-            MonitorError::IpcTxInvalid(e) => {
-                error!("Invalid IPC message transaction: {:?}", e);
-                Ok(())
-            }
-            MonitorError::IpcMsgProcessingError(IpcLibError::IpcValidateError(e)) => {
-                error!("Invalid IPC message: {:?}", e);
+            // Ignorable errors: caused by the message's content
+            MonitorError::IpcMsgInvalid(_)
+            | MonitorError::IpcTxInvalid(_)
+            | MonitorError::IpcMsgProcessingError(
+                IpcLibError::IpcValidateError(_)
+                | IpcLibError::MsgParseError(..)
+                | IpcLibError::MultisigError(_)
+                | IpcLibError::DbError(db::DbError::InvalidChange(_)),
+            ) => {
+                warn!("Skipping IPC message in transaction {txid}: {error}");
                 Ok(())
             }
             // Propagate all other errors
@@ -925,6 +987,16 @@ where
                 Err(e)
             }
         }
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message
+    } else {
+        "unknown panic payload"
     }
 }
 
@@ -944,7 +1016,8 @@ pub enum MonitorError {
     /// Returned when there was an error processing
     /// an IPC message
     ///
-    /// All variants of this error are fatal, except for `IpcValidateError`
+    /// Fatal, except for the variants caused by the message's content
+    /// (see `handle_ipc_msg_error`)
     #[error(transparent)]
     IpcMsgProcessingError(#[from] IpcLibError),
 
@@ -959,4 +1032,406 @@ pub enum MonitorError {
 
     #[error("Invalid configuration: {0}")]
     ConfigError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::script::PushBytesBuf;
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    use bitcoin::{
+        absolute, transaction, Address, Amount, CompactTarget, OutPoint, ScriptBuf, Transaction,
+        TxIn, TxMerkleNode, TxOut, Txid, Witness, XOnlyPublicKey,
+    };
+    use bitcoin_ipc::ipc_lib::{IpcCreateSubnetMsg, IpcJoinSubnetMsg, SubnetId};
+    use tempfile::TempDir;
+
+    async fn test_monitor() -> (Monitor<HeedDb>, TempDir) {
+        eth_utils::set_fvm_network();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HeedDb::new(dir.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        // Processing a Bitcoin block makes no RPC call, so the clients never connect
+        let rpc = || {
+            bitcoincore_rpc::Client::new("http://127.0.0.1:1", bitcoincore_rpc::Auth::None).unwrap()
+        };
+        let monitor = Monitor::new(
+            db,
+            rpc(),
+            rpc(),
+            1,
+            Duration::from_secs(1),
+            CancellationToken::new(),
+        );
+        (monitor, dir)
+    }
+
+    /// LMDB writes its data file only when a write transaction commits
+    fn db_data_file(dir: &TempDir) -> Vec<u8> {
+        std::fs::read(dir.path().join("data.mdb")).unwrap()
+    }
+
+    fn bitcoin_block(txdata: Vec<Transaction>) -> Block {
+        Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: CompactTarget::from_consensus(0),
+                nonce: 0,
+            },
+            txdata,
+        }
+    }
+
+    /// Transaction carrying `data` in its input witness, as a reveal transaction does.
+    /// The spent outpoint is derived from `data`, so different data gives different txids.
+    fn reveal_tx(data: &[u8], output: Vec<TxOut>) -> Transaction {
+        let previous_output = OutPoint {
+            txid: Txid::from_byte_array(sha256::Hash::hash(data).to_byte_array()),
+            vout: 0,
+        };
+        let script = bitcoin_utils::make_push_data_script(data);
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                witness: Witness::from_slice(&[script.to_bytes()]),
+                ..Default::default()
+            }],
+            output,
+        }
+    }
+
+    /// Transaction carrying `data` in an OP_RETURN output, followed by a payment output
+    fn op_return_tx(data: &[u8]) -> Transaction {
+        let op_return = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin_utils::make_op_return_script(
+                PushBytesBuf::try_from(data.to_vec()).unwrap(),
+            ),
+        };
+        let mut tx = reveal_tx(data, vec![op_return, payment(10_000)]);
+        tx.input[0].witness.clear();
+        tx
+    }
+
+    fn payment(sat: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(sat),
+            script_pubkey: ScriptBuf::new(),
+        }
+    }
+
+    /// `tag` followed by `len` bytes
+    fn tagged(tag: &str, len: usize) -> Vec<u8> {
+        [tag.as_bytes(), &vec![1; len]].concat()
+    }
+
+    fn pubkey(seed: u8) -> XOnlyPublicKey {
+        let secret = SecretKey::from_slice(&[seed; 32]).unwrap();
+        Keypair::from_secret_key(&Secp256k1::new(), &secret)
+            .x_only_public_key()
+            .0
+    }
+
+    fn create_subnet_msg(
+        min_validator_stake: Amount,
+        whitelist: Vec<XOnlyPublicKey>,
+    ) -> IpcCreateSubnetMsg {
+        IpcCreateSubnetMsg {
+            min_validator_stake,
+            min_validators: whitelist.len() as u16,
+            bottomup_check_period: 10,
+            active_validators_limit: 20,
+            min_cross_msg_fee: Amount::from_sat(50),
+            whitelist,
+        }
+    }
+
+    /// Processes the `malformed` transactions in a Bitcoin block and checks that none of them
+    /// writes to the database; then processes them again, followed by a valid create-subnet
+    /// transaction in the same Bitcoin block, and checks that the valid one is handled.
+    async fn assert_skipped(
+        monitor: &mut Monitor<HeedDb>,
+        dir: &TempDir,
+        malformed: Vec<Transaction>,
+    ) {
+        let before = db_data_file(dir);
+        monitor
+            .process_block_data(2, BlockHash::all_zeros(), bitcoin_block(malformed.clone()))
+            .await
+            .unwrap();
+        assert!(
+            db_data_file(dir) == before,
+            "a skipped transaction wrote to the database"
+        );
+
+        let msg = create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(9)]);
+        let valid = reveal_tx(&msg.to_bytes().unwrap(), vec![]);
+        let subnet_id = SubnetId::from_txid(&valid.compute_txid());
+        let mut txdata = malformed;
+        txdata.push(valid);
+        monitor
+            .process_block_data(3, BlockHash::all_zeros(), bitcoin_block(txdata))
+            .await
+            .unwrap();
+        assert!(monitor
+            .db
+            .get_subnet_genesis_info(subnet_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_create_subnet() {
+        let (mut monitor, dir) = test_monitor().await;
+        let msg = create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(1), pubkey(2)]);
+        let bytes = msg.to_bytes().unwrap();
+
+        // A create-subnet message with a `power_unit_exponent` field after the stake and
+        // epoch, timeout, deposit and kill fields after the whitelist
+        let with_extra_fields = postcard::to_stdvec(&(
+            1_000u64,
+            4u8,
+            2u16,
+            10u64,
+            20u16,
+            50u64,
+            vec![pubkey(1), pubkey(2)],
+            100u64,
+            10u32,
+            100u32,
+            1_000u64,
+            10u64,
+            10u64,
+        ))
+        .unwrap();
+
+        let mut unknown_tag = bytes.clone();
+        unknown_tag[..6].copy_from_slice(b"IPCXXX");
+
+        let mut invalid = msg.clone();
+        invalid.min_validators = 0;
+
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                reveal_tx(&bytes[..bytes.len() / 2], vec![]),
+                reveal_tx(&[b"IPCCRT".as_slice(), &with_extra_fields].concat(), vec![]),
+                reveal_tx(&[bytes.as_slice(), &[0]].concat(), vec![]),
+                reveal_tx(&unknown_tag, vec![]),
+                reveal_tx(&invalid.to_bytes().unwrap(), vec![]),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_join_subnet() {
+        let (mut monitor, dir) = test_monitor().await;
+        // A minimum stake of 1 sat admits validators with power 0
+        let msg = create_subnet_msg(Amount::from_sat(1), vec![pubkey(1)]);
+        let create = reveal_tx(&msg.to_bytes().unwrap(), vec![]);
+        let subnet_id = SubnetId::from_txid(&create.compute_txid());
+        monitor
+            .process_block_data(1, BlockHash::all_zeros(), bitcoin_block(vec![create]))
+            .await
+            .unwrap();
+
+        let join = |subnet_id: SubnetId| {
+            IpcJoinSubnetMsg {
+                subnet_id,
+                collateral: Amount::ZERO,
+                ip: "127.0.0.1:26656".parse().unwrap(),
+                backup_address: Address::p2tr(
+                    &Secp256k1::new(),
+                    pubkey(1),
+                    None,
+                    bitcoin_ipc::NETWORK,
+                )
+                .into_unchecked(),
+                pubkey: pubkey(1),
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        let bytes = join(subnet_id);
+
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                reveal_tx(&bytes[..bytes.len() / 2], vec![payment(20_000)]),
+                reveal_tx(
+                    &join(SubnetId::from_txid(&Txid::all_zeros())),
+                    vec![payment(20_000)],
+                ),
+                // Bootstraps the subnet with total power 0, which has no multisig: a panic
+                reveal_tx(&bytes, vec![payment(5_000)]),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_prefund_subnet() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCPFD", 10)),
+                op_return_tx(&tagged("IPCPFD", 40)),
+                op_return_tx(&tagged("IPCZZZ", 40)),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_fund_subnet() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCFND", 10)),
+                op_return_tx(&tagged("IPCFND", 40)),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_checkpoint() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCCPT", 10)),
+                op_return_tx(&tagged("IPCCPT", 72)),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_batch_transfer() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                reveal_tx(&tagged("IPCTFR", 0), vec![payment(10_000)]),
+                reveal_tx(&tagged("IPCTFR", 40), vec![payment(10_000)]),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_stake_collateral() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCSTK", 10)),
+                op_return_tx(&tagged("IPCSTK", 32)),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_unstake_collateral() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCUST", 10)),
+                op_return_tx(&tagged("IPCUST", 72)),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_skips_malformed_kill_subnet() {
+        let (mut monitor, dir) = test_monitor().await;
+        assert_skipped(
+            &mut monitor,
+            &dir,
+            vec![
+                op_return_tx(&tagged("IPCKIL", 10)),
+                op_return_tx(&tagged("IPCKIL", 64)),
+            ],
+        )
+        .await;
+    }
+
+    /// Warnings logged by the tests of this module; the first call installs the logger
+    fn warnings() -> &'static std::sync::Mutex<Vec<String>> {
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    if let Ok(mut warnings) = warnings().lock() {
+                        warnings.push(record.args().to_string());
+                    }
+                }
+            }
+            fn flush(&self) {}
+        }
+        static WARNINGS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+            std::sync::OnceLock::new();
+        WARNINGS.get_or_init(|| {
+            log::set_logger(&Capture).unwrap();
+            log::set_max_level(log::LevelFilter::Warn);
+            std::sync::Mutex::new(Vec::new())
+        })
+    }
+
+    #[tokio::test]
+    async fn test_warns_on_unparsable_ipc_payload() {
+        warnings();
+        let (mut monitor, _dir) = test_monitor().await;
+        let mut non_minimal_push = op_return_tx(b"IPCPFD");
+        // OP_RETURN OP_PUSHDATA1 0x06 "IPCPFD"
+        non_minimal_push.output[0].script_pubkey =
+            bitcoin::ScriptBuf::from_bytes([&[0x6a, 0x4c, 0x06][..], b"IPCPFD"].concat());
+        let tagged = vec![
+            reveal_tx(&[b"IPCCRT".as_slice(), &[0xff; 3]].concat(), vec![]),
+            op_return_tx(&[b"IPCPFD".as_slice(), &[0xff; 3]].concat()),
+            reveal_tx(&[b"IPCTFR".as_slice(), &[0xff; 3]].concat(), vec![]),
+            non_minimal_push,
+        ];
+        let ordinary = op_return_tx(b"not an IPC message");
+        let mut txdata = tagged.clone();
+        txdata.push(ordinary.clone());
+
+        monitor
+            .process_block_data(2, BlockHash::all_zeros(), bitcoin_block(txdata))
+            .await
+            .unwrap();
+
+        let warnings = warnings().lock().unwrap().clone();
+        let warned = |tx: &Transaction| {
+            let txid = tx.compute_txid().to_string();
+            warnings.iter().any(|w| w.contains(&txid))
+        };
+        assert!(tagged.iter().all(warned));
+        assert!(!warned(&ordinary));
+    }
 }

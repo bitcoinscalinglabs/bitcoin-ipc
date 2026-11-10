@@ -6,7 +6,7 @@ use crate::{
     SubnetId,
 };
 use heed::RwTxn;
-use log::{info, trace};
+use log::{info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
@@ -296,35 +296,46 @@ impl RewardTracker {
             info!("End of snapshot {snapshot} at block height {end_height}.");
             let candidates = db.iter_reward_candidate_info(snapshot)?;
 
-            let mut rewards_total: std::collections::HashMap<
+            let mut rewards_total: std::collections::BTreeMap<
                 bitcoin::XOnlyPublicKey,
                 bitcoin::Amount,
-            > = std::collections::HashMap::new();
+            > = std::collections::BTreeMap::new();
+            let mut overflow = false;
 
             for (subnet_id, info) in candidates {
                 let rewards_in_subnet =
                     self.get_or_init_reward_amounts(db, subnet_id, &info, block_height)?;
 
                 for (pk, amt) in rewards_in_subnet {
-                    rewards_total
-                        .entry(pk)
-                        .and_modify(|a| *a += amt)
-                        .or_insert(amt);
+                    let total = rewards_total.entry(pk).or_insert(bitcoin::Amount::ZERO);
+                    match total.checked_add(amt) {
+                        Some(sum) => *total = sum,
+                        None => overflow = true,
+                    }
                 }
             }
 
             let rewards_list = rewards_total.into_iter().collect::<Vec<_>>();
-            let total_rewarded_collateral = rewards_list.iter().map(|(_, a)| *a).sum();
+            let total_rewarded_collateral = rewards_list
+                .iter()
+                .try_fold(bitcoin::Amount::ZERO, |sum, (_, a)| sum.checked_add(*a));
 
-            let mut wtxn = db.write_txn()?;
-            db.put_snapshot_result(
-                &mut wtxn,
-                snapshot,
-                &crate::db::SnapshotResult {
+            let snapshot_result = match total_rewarded_collateral {
+                Some(total_rewarded_collateral) if !overflow => crate::db::SnapshotResult {
                     rewards_list,
                     total_rewarded_collateral,
                 },
-            )?;
+                _ => {
+                    warn!("Reward amount overflow in snapshot {snapshot}, no rewards published for this snapshot");
+                    crate::db::SnapshotResult {
+                        rewards_list: Vec::new(),
+                        total_rewarded_collateral: bitcoin::Amount::ZERO,
+                    }
+                }
+            };
+
+            let mut wtxn = db.write_txn()?;
+            db.put_snapshot_result(&mut wtxn, snapshot, &snapshot_result)?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
             info!("Updated reward bookkeeping after block {block_height}.");
         }
@@ -457,9 +468,9 @@ mod tests {
     use crate::{
         db::{
             DatabaseCore, DatabaseRewardExtensions, SubnetGenesisInfo, SubnetKillState,
-            SubnetValidator,
+            SubnetRewardInfo, SubnetValidator,
         },
-        rewards::RewardConfig,
+        rewards::{RewardConfig, RewardTracker},
         test_utils::create_test_db,
         IpcCreateSubnetMsg, SubnetId,
     };
@@ -635,5 +646,73 @@ mod tests {
             cfg.snapshot_boundaries_from_height(105).unwrap(),
             Some((1, 105, 109))
         );
+    }
+
+    #[test]
+    fn test_snapshot_end_reward_overflow_publishes_no_rewards() {
+        let db = create_test_db();
+        let mut pks = crate::test_utils::generate_xonly_pubkeys(3);
+        pks.sort();
+        let half = Amount::from_sat(u64::MAX / 2 + 1);
+        // Snapshot 0: the sum of one validator overflows. Snapshot 1: only the
+        // total overflows. Snapshot 2: no overflow.
+        let candidates = [
+            (0, vec![(pks[0], half), (pks[1], Amount::from_sat(10))]),
+            (0, vec![(pks[0], half), (pks[2], Amount::from_sat(20))]),
+            (1, vec![(pks[0], half), (pks[1], Amount::from_sat(10))]),
+            (1, vec![(pks[2], half)]),
+            (
+                2,
+                vec![
+                    (pks[2], Amount::from_sat(30)),
+                    (pks[0], Amount::from_sat(10)),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (pks[1], Amount::from_sat(20)),
+                    (pks[0], Amount::from_sat(5)),
+                ],
+            ),
+        ];
+        let mut wtxn = db.write_txn().unwrap();
+        for (snapshot, amounts) in candidates {
+            db.put_reward_candidate_info(
+                &mut wtxn,
+                snapshot,
+                crate::test_utils::generate_subnet_id(),
+                &SubnetRewardInfo {
+                    most_recent_committee_number: 0,
+                    rewarded_amounts: Some(amounts),
+                },
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let mut tracker = RewardTracker::new_with_config(RewardConfig {
+            activation_height: 100,
+            snapshot_length: 5,
+        });
+        for end_height in [104, 109, 114] {
+            tracker.update_after_block(&db, end_height).unwrap();
+        }
+
+        for snapshot in [0, 1] {
+            let result = db.get_snapshot_result(snapshot).unwrap().unwrap();
+            assert!(result.rewards_list.is_empty());
+            assert_eq!(result.total_rewarded_collateral, Amount::ZERO);
+        }
+        let result = db.get_snapshot_result(2).unwrap().unwrap();
+        assert_eq!(
+            result.rewards_list,
+            vec![
+                (pks[0], Amount::from_sat(15)),
+                (pks[1], Amount::from_sat(20)),
+                (pks[2], Amount::from_sat(30)),
+            ]
+        );
+        assert_eq!(result.total_rewarded_collateral, Amount::from_sat(65));
     }
 }

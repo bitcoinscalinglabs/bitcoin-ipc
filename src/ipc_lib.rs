@@ -221,6 +221,12 @@ impl IpcTag {
             Self::KillSubnet => IPC_KILL_SUBNET_TAG,
         }
     }
+
+    /// The IPC tag that `data` starts with, if any
+    pub fn from_payload(data: &[u8]) -> Option<Self> {
+        let tag = std::str::from_utf8(data.get(..IPC_TAG_LENGTH)?).ok()?;
+        Self::from_str(tag).ok()
+    }
 }
 
 impl std::str::FromStr for IpcTag {
@@ -256,6 +262,16 @@ pub enum IpcSerializeError {
     SerializationError(String),
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
+}
+
+/// Decodes a postcard value that uses all of `bytes`; bytes left over, as in a message of a
+/// newer version, are an error
+fn postcard_from_all_bytes<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, String> {
+    let (value, rest) = postcard::take_from_bytes(bytes).map_err(|e| e.to_string())?;
+    if !rest.is_empty() {
+        return Err(format!("{} bytes left over after the message", rest.len()));
+    }
+    Ok(value)
 }
 
 pub trait IpcSerialize {
@@ -356,8 +372,8 @@ impl IpcCreateSubnetMsg {
             ));
         }
 
-        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
-            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+        postcard_from_all_bytes(&data[IPC_TAG_LENGTH..])
+            .map_err(IpcSerializeError::DeserializationError)
     }
 
     /// Submits the create subnet message to the Bitcoin network
@@ -495,8 +511,8 @@ impl IpcJoinSubnetMsg {
             ));
         }
 
-        postcard::from_bytes(&data[IPC_TAG_LENGTH..])
-            .map_err(|e| IpcSerializeError::DeserializationError(e.to_string()))
+        postcard_from_all_bytes(&data[IPC_TAG_LENGTH..])
+            .map_err(IpcSerializeError::DeserializationError)
     }
 
     /// Validates the join subnet message, for the given genesis info
@@ -2820,7 +2836,7 @@ impl IpcBatchTransferMsg {
         }
 
         let wire_data: BatchTransferWireData =
-            postcard::from_bytes(&witness_data[IPC_TRANSFER_TAG.len()..]).map_err(|e| {
+            postcard_from_all_bytes(&witness_data[IPC_TRANSFER_TAG.len()..]).map_err(|e| {
                 IpcLibError::MsgParseError(
                     IPC_TRANSFER_TAG,
                     format!("Failed to deserialize batch transfer data: {}", e),
@@ -5058,6 +5074,9 @@ mod tests {
         assert_eq!(params.active_validators_limit, 20);
         assert_eq!(params.min_cross_msg_fee, Amount::from_sat(50));
         assert_eq!(params.whitelist, vec![validator1, validator2]);
+
+        let with_trailing_byte = [serialized.as_slice(), &[0]].concat();
+        assert!(IpcCreateSubnetMsg::from_bytes(&with_trailing_byte).is_err());
     }
 
     #[test]
@@ -5199,6 +5218,9 @@ mod tests {
 
         // It should be invalid because it's missing collateral and subnet_id
         assert!(deserialized.validate().is_err());
+
+        let with_trailing_byte = [serialized.as_slice(), &[0]].concat();
+        assert!(IpcJoinSubnetMsg::from_bytes(&with_trailing_byte).is_err());
     }
 
     #[test]
@@ -6158,6 +6180,9 @@ mod checkpoint_msg_tests {
         let serialized = checkpoint_msg.make_batched_transfer_data().unwrap();
 
         let wire_data = IpcBatchTransferMsg::witness_to_wire_data(&serialized).unwrap();
+
+        let with_trailing_byte = [serialized.as_slice(), &[0]].concat();
+        assert!(IpcBatchTransferMsg::witness_to_wire_data(&with_trailing_byte).is_err());
 
         // One subnet for native transfers
         assert_eq!(1, wire_data.transfers.len());
