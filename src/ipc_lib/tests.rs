@@ -358,7 +358,7 @@ fn the_batches_the_checkpoint_pays_are_credited_to_its_own_record() {
     let batches = transfer_batches(&msg.transfers);
     assert_eq!(batches.len(), 2);
     for (i, (txid20, total)) in batches.iter().enumerate() {
-        let output = &tx.output[IpcCheckpointSubnetMsg::transfer_output_index(0, i)];
+        let output = &tx.output[msg.checkpoint_outputs().transfer(i)];
         assert_eq!(output.value, *total);
         let destination = if *txid20 == a.id.txid20() { &a } else { &b };
         assert_eq!(
@@ -369,7 +369,7 @@ fn the_batches_the_checkpoint_pays_are_credited_to_its_own_record() {
     let reveal = reveal_of(&msg, &tx);
     assert_eq!(
         reveal.input[0].previous_output.vout as usize,
-        IpcCheckpointSubnetMsg::commit_output_index(0)
+        msg.checkpoint_outputs().commitment()
     );
     assert!(
         tx.output[1].script_pubkey.is_p2tr(),
@@ -511,7 +511,7 @@ fn a_batch_whose_sums_exceed_the_checkpoint_outputs_is_rejected() {
     // The data says 5_000 sats, the output pays 1_000
     let msg = checkpoint_msg(&source, 1, vec![], vec![transfer(&a, 5_000)]);
     let mut tx = checkpoint_tx(&msg, &source);
-    let output = IpcCheckpointSubnetMsg::transfer_output_index(0, 0);
+    let output = msg.checkpoint_outputs().transfer(0);
     assert_eq!(tx.output[output].value, Amount::from_sat(5_000));
     tx.output[output].value = Amount::from_sat(1_000);
     record_checkpoint(&db, &msg, &tx);
@@ -903,7 +903,6 @@ fn create_msg_validity_conditions() {
             Box::new(|m| m.power_unit_exponent = 4),
         ),
         ("min_validators", Box::new(|m| m.min_validators = 0)),
-        ("min_validators", Box::new(|m| m.min_validators = 91)),
         ("whitelist", Box::new(|m| m.whitelist = vec![key1, key1])),
         ("whitelist", Box::new(|m| m.whitelist = vec![key1])),
         (
@@ -944,6 +943,25 @@ fn create_msg_validity_conditions() {
     largest.epoch_length = 21_845;
     largest.active_validators_limit = 350;
     largest.validate().unwrap();
+}
+
+#[test]
+fn create_msg_accepts_more_than_90_boot_validators() {
+    set_test_fvm_network();
+    let secp = Secp256k1::new();
+    let keys: Vec<XOnlyPublicKey> = (1..=91u8)
+        .map(|seed| {
+            SecretKey::from_slice(&[seed; 32])
+                .unwrap()
+                .x_only_public_key(&secp)
+                .0
+        })
+        .collect();
+    let mut msg = spec_example_create_msg(keys[0], keys[1]);
+    msg.min_validators = 91;
+    msg.active_validators_limit = 91;
+    msg.whitelist = keys;
+    msg.validate().unwrap();
 }
 
 fn spec_example_keys() -> (XOnlyPublicKey, XOnlyPublicKey) {
@@ -1107,17 +1125,6 @@ fn distinct_keys(count: u16) -> Vec<XOnlyPublicKey> {
                 .0
         })
         .collect()
-}
-
-#[test]
-fn first_checkpoint_capacity_limits_bootstrap_to_ninety() {
-    let mut p = create_parameters();
-    p.whitelist = distinct_keys(91);
-    p.active_validators_limit = 91;
-    p.min_validators = 90;
-    assert!(p.validate().is_ok());
-    p.min_validators = 91;
-    assert!(p.validate().is_err());
 }
 
 #[test]
@@ -4766,4 +4773,155 @@ fn i256_sign_preserved() {
     let neg = I256::try_from(-1_000_000i64).unwrap();
     assert!(rt_i256(pos) > I256::ZERO);
     assert!(rt_i256(neg) < I256::ZERO);
+}
+
+fn withdrawal_of(sats: u64) -> IpcWithdrawal {
+    IpcWithdrawal {
+        amount: Amount::from_sat(sats),
+        address: bitcoin::Address::from_str("bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n")
+            .unwrap(),
+    }
+}
+
+fn unstake_of(source: &db::SubnetState, validator: usize, sats: u64) -> IpcUnstake {
+    let validator = &source.committee.validators[validator];
+    IpcUnstake {
+        amount: Amount::from_sat(sats),
+        address: validator.backup_address.clone(),
+        pubkey: validator.pubkey,
+    }
+}
+
+/// Builds the checkpoint that `build` returns for a source and a destination subnet, parses it
+/// back and runs the reveal check of its batch transfer
+fn assert_checkpoint_parses_back(
+    build: impl FnOnce(&db::SubnetState, &db::SubnetState) -> IpcCheckpointSubnetMsg,
+) {
+    set_test_fvm_network();
+    let db = create_test_db();
+    let source = test_utils::generate_subnet(3);
+    let destination = test_utils::generate_subnet(3);
+    save_subnets(&db, &[&source, &destination]);
+    let msg = build(&source, &destination);
+    let tx = checkpoint_tx(&msg, &source);
+
+    let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &tx).unwrap();
+    let withdrawals = |m: &IpcCheckpointSubnetMsg| {
+        m.withdrawals
+            .iter()
+            .map(|w| (w.amount, w.address.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(withdrawals(&parsed), withdrawals(&msg));
+    let unstakes = |m: &IpcCheckpointSubnetMsg| {
+        m.unstakes
+            .iter()
+            .map(|u| (u.address.clone(), u.pubkey))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unstakes(&parsed), unstakes(&msg));
+    // A kill checkpoint adds its remainder to the unstake outputs
+    if !msg.is_kill_checkpoint {
+        let amounts =
+            |m: &IpcCheckpointSubnetMsg| m.unstakes.iter().map(|u| u.amount).collect::<Vec<_>>();
+        assert_eq!(amounts(&parsed), amounts(&msg));
+    }
+    assert_eq!(parsed.change_address, msg.change_address);
+
+    if msg.has_batch_data() {
+        let reveal = reveal_of(&msg, &tx);
+        let batch = IpcMessage::from_reveal_inputs(&reveal)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                IpcMessage::BatchTransfer(batch) => Some(batch),
+                _ => None,
+            })
+            .expect("a batch transfer in the reveal");
+        batch.validate_for_checkpoint(&db, &tx).unwrap();
+    }
+}
+
+#[test]
+fn a_checkpoint_with_withdrawals_transfers_and_unstakes_parses_back() {
+    assert_checkpoint_parses_back(|source, destination| {
+        let mut msg = checkpoint_msg(
+            source,
+            10,
+            vec![withdrawal_of(10_000)],
+            vec![transfer(destination, 10_000)],
+        );
+        // The validators of a generated subnet share one backup address
+        msg.unstakes = vec![unstake_of(source, 0, 10_000), unstake_of(source, 0, 20_000)];
+        msg
+    });
+}
+
+#[test]
+fn a_checkpoint_with_withdrawals_and_transfers_parses_back() {
+    assert_checkpoint_parses_back(|source, destination| {
+        checkpoint_msg(
+            source,
+            10,
+            vec![withdrawal_of(10_000)],
+            vec![transfer(destination, 10_000)],
+        )
+    });
+}
+
+#[test]
+fn a_checkpoint_with_erc20_records_and_unstakes_parses_back() {
+    assert_checkpoint_parses_back(|source, _| {
+        let mut msg = checkpoint_msg(source, 10, vec![withdrawal_of(10_000)], vec![]);
+        msg.token_registrations = vec![test_utils::create_rand_erc_token_registration()];
+        msg.unstakes = vec![unstake_of(source, 0, 10_000)];
+        msg
+    });
+}
+
+#[test]
+fn a_checkpoint_with_erc20_records_parses_back() {
+    assert_checkpoint_parses_back(|source, _| {
+        let mut msg = checkpoint_msg(source, 10, vec![withdrawal_of(10_000)], vec![]);
+        msg.token_registrations = vec![test_utils::create_rand_erc_token_registration()];
+        msg
+    });
+}
+
+#[test]
+fn a_checkpoint_with_slash_signatures_and_unstakes_parses_back() {
+    assert_checkpoint_parses_back(|source, _| {
+        let mut msg = checkpoint_msg(source, 10, vec![withdrawal_of(10_000)], vec![]);
+        msg.slash_signatures = vec![SlashSignatureEntry {
+            txid: [1u8; 32],
+            vout: 1,
+            signatures: vec![],
+        }];
+        msg.unstakes = vec![unstake_of(source, 0, 10_000)];
+        msg
+    });
+}
+
+#[test]
+fn a_checkpoint_with_slash_signatures_parses_back() {
+    assert_checkpoint_parses_back(|source, _| {
+        let mut msg = checkpoint_msg(source, 10, vec![withdrawal_of(10_000)], vec![]);
+        msg.slash_signatures = vec![SlashSignatureEntry {
+            txid: [1u8; 32],
+            vout: 1,
+            signatures: vec![],
+        }];
+        msg
+    });
+}
+
+#[test]
+fn a_kill_checkpoint_with_erc20_records_and_unstakes_parses_back() {
+    assert_checkpoint_parses_back(|source, _| {
+        let mut msg = checkpoint_msg(source, 10, vec![], vec![]);
+        msg.token_registrations = vec![test_utils::create_rand_erc_token_registration()];
+        msg.unstakes = vec![unstake_of(source, 0, 10_000)];
+        msg.is_kill_checkpoint = true;
+        msg.change_address = None;
+        msg
+    });
 }

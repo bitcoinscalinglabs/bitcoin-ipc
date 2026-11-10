@@ -419,30 +419,53 @@ sign_record_ready() {
     "$LOGS/provider-outage-votes-ready.json" >/dev/null
 }
 
-# Check that every complete old vote is still present, with one record per height.
+# Check that every complete old vote above the latest checkpointed height is still present, with one
+# record per height. The provider deletes its records at or below that height (docs/specs/slashing.md).
+# The checkpointed height is read before and after the snapshot; a sample whose two reads differ is
+# retried. A lost or changed record, or a duplicate, fails at once; only a missing new height is retried.
 sign_record_extended() {
+  local first checkpointed rc
+  first=$(provider_reply 4 getsubnetcheckpoint "{\"subnet_id\":\"$SUBNET\"}" \
+    | jq -er '.result.checkpoint_height') || return 1
   sign_record_snapshot "$LOGS/provider-outage-votes-after.json" || return 1
-  python3 - "$LOGS/provider-outage-votes-before.json" "$LOGS/provider-outage-votes-after.json" "$SUBNET" <<'PY'
+  checkpointed=$(provider_reply 4 getsubnetcheckpoint "{\"subnet_id\":\"$SUBNET\"}" \
+    | jq -er '.result.checkpoint_height') || return 1
+  [ "$first" = "$checkpointed" ] || return 1
+  rc=0
+  python3 - "$LOGS/provider-outage-votes-before.json" "$LOGS/provider-outage-votes-after.json" "$SUBNET" \
+    "$checkpointed" <<'PY' || rc=$?
 import json
 import pathlib
 import sys
 
 old, records = (json.loads(pathlib.Path(p).read_text()) for p in sys.argv[1:3])
-assert old, "no own votes existed before the provider stopped"
+RETRY, FINAL = 1, 3
+if not old:
+    print("no own votes existed before the provider stopped")
+    sys.exit(FINAL)
 seen = set()
 for record in records:
     key = (json.dumps(record["subnet_id"], sort_keys=True), record["vote"]["height"])
-    assert key not in seen, f"a height has a second signed record: {key}"
+    if key in seen:
+        print(f"a height has a second signed record: {key}")
+        sys.exit(FINAL)
     seen.add(key)
 by_key = {(r["subnet_id"], r["vote"]["height"]): r for r in records}
 for record in old:
     key = (record["subnet_id"], record["vote"]["height"])
-    assert by_key.get(key) == record, f"a complete old signed vote was lost or changed: {key}"
+    deletable = record["subnet_id"] == sys.argv[3] and record["vote"]["height"] <= int(sys.argv[4])
+    if (key in by_key or not deletable) and by_key.get(key) != record:
+        print(f"a complete old signed vote was lost or changed: {key}")
+        sys.exit(FINAL)
 before = [r["vote"]["height"] for r in old if r["subnet_id"] == sys.argv[3]]
-assert before, "no own votes existed before the provider stopped"
-assert any(r["subnet_id"] == sys.argv[3] and r["vote"]["height"] > max(before)
-           for r in records), "the restarted provider has not signed a new height"
+if not before:
+    print("no own votes existed before the provider stopped")
+    sys.exit(FINAL)
+if not any(r["subnet_id"] == sys.argv[3] and r["vote"]["height"] > max(before) for r in records):
+    sys.exit(RETRY)  # the restarted provider has not signed a new height yet
 PY
+  [ "$rc" -ne 3 ] || fail "provider4 vote records: see the message above"
+  return "$rc"
 }
 
 capture_node_logs() {
@@ -812,7 +835,8 @@ step_provider_outage() {
   wait_for "provider4 restarted with its existing key and non-empty record" 0 provider_restarted "$restarted"
   STOPPED_PROVIDER_ENV=""
   check_recovered_node 4 1 "$from" provider-outage
-  wait_for "provider4 preserves every old vote and signs new heights without duplicates" 0 sign_record_extended
+  wait_for "provider4 keeps every old vote above the latest checkpointed height and signs new heights without duplicates" \
+    0 sign_record_extended
   check "provider outage and recovery did not restart either L2 process" \
     node_processes_unchanged 4 "$LOGS/provider-outage-processes-before.txt"
   capture_node_logs 4 "$since" provider-outage

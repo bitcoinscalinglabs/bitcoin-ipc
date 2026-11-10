@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bitcoin::hashes::Hash;
 use bitcoincore_rpc::{Client, RpcApi};
 use jsonrpc_v2::{Data, Error as JsonRpcError, ErrorLike, MapRouter, Params};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1476,10 +1476,8 @@ pub async fn dev_multisign_psbt(
 pub struct FinalizeCheckpointPsbtParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    signatures: Vec<(
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    )>,
+    /// Each signer's x-only key with one signature per input, in hex, as posted to the subnet.
+    signatures: Vec<(String, Vec<String>)>,
     batch_transfer_tx_hex: Option<String>,
 }
 
@@ -1496,30 +1494,6 @@ pub async fn finalize_checkpoint_psbt(
     Params(params): Params<FinalizeCheckpointPsbtParams>,
 ) -> Result<FinalizeCheckpointPsbtResponse, JsonRpcError> {
     info!("finalize_checkpoint_psbt for subnet {}", params.subnet_id);
-
-    // Check subnet exists and get committee info
-    let subnet = data
-        .db
-        .get_subnet_state(params.subnet_id)
-        .map_err(|e| {
-            error!("Error getting subnet info from Db: {}", e);
-            RpcError::DbError(e)
-        })?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            params.subnet_id
-        )))?;
-
-    let genesis_info = data
-        .db
-        .get_subnet_genesis_info(params.subnet_id)
-        .map_err(RpcError::DbError)?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            params.subnet_id
-        )))?;
-    let signer = signing_configuration(&genesis_info, &subnet)?;
-    let (committee_keys, committee_threshold) = (signer.keys, signer.threshold);
 
     let batch_transfer_tx: Option<bitcoin::Transaction> = match params.batch_transfer_tx_hex {
         Some(hex) => {
@@ -1562,53 +1536,23 @@ pub async fn finalize_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    // Create a map of provided signatures indexed by public key
-    let signatures_map: std::collections::HashMap<
-        bitcoin::XOnlyPublicKey,
-        Vec<bitcoin::secp256k1::schnorr::Signature>,
-    > = params.signatures.into_iter().collect();
+    // A malformed key drops its signer, a malformed signature counts as missing for its input
+    let signatures: Vec<_> = params
+        .signatures
+        .iter()
+        .filter_map(|(key, sigs)| {
+            let key = key.parse::<bitcoin::XOnlyPublicKey>().ok()?;
+            let sigs = sigs.iter().map(|sig| sig.parse().ok()).collect::<Vec<_>>();
+            Some((key, sigs))
+        })
+        .collect();
 
-    // Prepare signature sets in the same order as committee keys
-    let mut signature_sets: Vec<&[bitcoin::secp256k1::schnorr::Signature]> =
-        Vec::with_capacity(committee_keys.len());
-
-    // Check if any unrecognized public keys were provided
-    for pubkey in signatures_map.keys() {
-        if !committee_keys
-            .iter()
-            .any(|(committee_key, _)| committee_key == pubkey)
-        {
-            error!("Unrecognized public key in signatures: {}", pubkey);
-            return Err(RpcError::InvalidParams(format!(
-                "Unrecognized public key in signatures: {}",
-                pubkey
-            ))
-            .into());
-        }
-    }
-
-    // For each committee key, get the corresponding signatures or use empty set
-    for (pubkey, _) in &committee_keys {
-        let sigs = match signatures_map.get(pubkey) {
-            Some(sigs) => sigs.as_slice(),
-            None => &[],
-        };
-        signature_sets.push(sigs);
-    }
-
-    // Finalize the PSBT using multisig::finalize_spend_psbt_from_sigs
-    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(
-        &secp,
-        &params.subnet_id,
-        &committee_keys,
-        committee_threshold,
-        &unsigned_psbt,
-        &signature_sets,
-    )
-    .map_err(|e| {
-        error!("Error finalizing PSBT: {}", e);
-        RpcError::InternalError(e.to_string())
-    })?;
+    // Nothing is posted while the valid signatures of an input stay below its threshold
+    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(&secp, &unsigned_psbt, &signatures)
+        .map_err(|e| {
+            error!("Error finalizing PSBT: {}", e);
+            RpcError::InternalError(e.to_string())
+        })?;
 
     // Convert transaction to hex
     let tx_hex = hex::encode(bitcoin::consensus::serialize(&finalized_tx));
@@ -2306,14 +2250,107 @@ pub async fn get_eots_commitments(
         .db
         .get_eots_commitments(params.subnet_id, &params.pk_eots)
         .map_err(RpcError::DbError)?
-        .into_iter()
-        .map(|r| EotsCommitmentEntry {
+        .iter()
+        .map(EotsCommitmentEntry::from)
+        .collect())
+}
+
+impl From<&db::EotsCommitmentRecord> for EotsCommitmentEntry {
+    fn from(r: &db::EotsCommitmentRecord) -> Self {
+        Self {
             start: r.commitment.start,
             count: r.commitment.count,
             root: hex::encode(r.commitment.root),
             block_height: r.block_height,
-        })
-        .collect())
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetEotsRecordsParams {
+    pub subnet_id: SubnetId,
+    /// The Bitcoin height up to which the caller holds the records; without it, none
+    #[serde(default)]
+    pub after_block_height: Option<u64>,
+    /// With it, the answer at this Bitcoin height
+    #[serde(default)]
+    pub max_block_height: Option<u64>,
+}
+
+/// An EOTS key with its commitments recorded in the asked range of Bitcoin heights
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EotsKeyRecords {
+    pub pubkey: bitcoin::XOnlyPublicKey,
+    pub pk_eots: bitcoin::XOnlyPublicKey,
+    pub commitments: Vec<EotsCommitmentEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetEotsRecordsResponse {
+    /// The Bitcoin height of the answer
+    pub block_height: u64,
+    pub eots_keys: Vec<EotsKeyRecords>,
+    pub checkpoint: Option<db::SubnetCheckpoint>,
+}
+
+/// `geteotsrecords`: from one state of the monitor, the EOTS keys and EOTS nonce commitments
+/// recorded in Bitcoin blocks above `after_block_height`, and the latest checkpoint, at
+/// `max_block_height` or at the last processed Bitcoin height.
+pub async fn get_eots_records(
+    data: Data<Arc<ServerData>>,
+    Params(params): Params<GetEotsRecordsParams>,
+) -> Result<GetEotsRecordsResponse, JsonRpcError> {
+    debug!(
+        "geteotsrecords: {} after_block_height={:?} max_block_height={:?}",
+        params.subnet_id, params.after_block_height, params.max_block_height
+    );
+    Ok(eots_records_at(
+        &data.db,
+        params.subnet_id,
+        params.after_block_height,
+        params.max_block_height,
+    )?)
+}
+
+/// The answer of `geteotsrecords`. A Bitcoin height the monitor has not processed is refused
+/// with `RpcError::MonitorBehind`, also before the monitor holds a state of the subnet.
+pub fn eots_records_at(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    after_block_height: Option<u64>,
+    max_block_height: Option<u64>,
+) -> Result<GetEotsRecordsResponse, RpcError> {
+    let (processed, records) = db
+        .get_eots_records(subnet_id, after_block_height, max_block_height)
+        .map_err(|e| {
+            error!("Error getting EOTS records from Db: {}", e);
+            RpcError::DbError(e)
+        })?;
+    if let Some(requested) = max_block_height.filter(|h| *h > processed) {
+        warn!(
+            "geteotsrecords: {} asks for Bitcoin height {requested}, monitor at {processed}",
+            subnet_id
+        );
+        return Err(RpcError::MonitorBehind {
+            requested,
+            processed,
+        });
+    }
+    let records = records
+        .ok_or_else(|| RpcError::InvalidParams(format!("Subnet {} not found.", subnet_id)))?;
+    Ok(GetEotsRecordsResponse {
+        block_height: records.block_height,
+        eots_keys: records
+            .keys
+            .iter()
+            .map(|(pubkey, pk_eots, commitments)| EotsKeyRecords {
+                pubkey: *pubkey,
+                pk_eots: *pk_eots,
+                commitments: commitments.iter().map(EotsCommitmentEntry::from).collect(),
+            })
+            .collect(),
+        checkpoint: records.checkpoint,
+    })
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -2388,6 +2425,11 @@ pub async fn sign_eots_vote(
             error!("signeotsvote refused at height {}: {e}", params.height);
             JsonRpcError::from(RpcError::InvalidParams(e))
         })?;
+        if let Some(checkpoint) = latest {
+            signer
+                .delete_up_to(params.subnet_id, checkpoint.checkpoint_height)
+                .map_err(|e| RpcError::InternalError(e.to_string()))?;
+        }
     }
     let commitments = data
         .db
@@ -2527,7 +2569,8 @@ pub async fn get_unslashable_outputs(
 }
 
 /// The posted slash pre-signature entries a checkpoint carries: invalid signatures are dropped,
-/// an entry is kept only when the valid ones reach the threshold and the output is not slashable.
+/// an entry is kept only when the valid ones reach the threshold, with the valid ones in ascending
+/// order of index until their powers reach it.
 pub(crate) fn carried_slash_entries<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -2549,7 +2592,7 @@ pub(crate) fn carried_slash_entries<D: DatabaseCore>(
                 checked.invalid
             );
         }
-        if checked.slashable || !checked.reaches_threshold() {
+        if !checked.reaches_threshold() {
             continue;
         }
         let join_height = match collateral::join_block_height(db, &checked.record) {
@@ -2561,7 +2604,10 @@ pub(crate) fn carried_slash_entries<D: DatabaseCore>(
         };
         entries.push((
             join_height,
-            crate::slash::SlashSignatureEntry::new(entry.outpoint(), checked.valid),
+            crate::slash::SlashSignatureEntry::new(
+                entry.outpoint(),
+                checked.signatures_to_threshold(),
+            ),
         ));
     }
     entries.sort_by_key(|(height, e)| (*height, e.txid, e.vout));
@@ -2619,6 +2665,7 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("unstakeue", unstake_ue)
         .with_method("geteotskeys", get_eots_keys)
         .with_method("geteotscommitments", get_eots_commitments)
+        .with_method("geteotsrecords", get_eots_records)
         .with_method("signeotsvote", sign_eots_vote)
         .with_method("signslash", sign_slash)
         .with_method("getunslashableoutputs", get_unslashable_outputs)

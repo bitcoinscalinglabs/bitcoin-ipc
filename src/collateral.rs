@@ -623,6 +623,12 @@ pub fn process_join_ue<D: DatabaseCore>(
             if !existed {
                 let mut wtxn = db.write_txn()?;
                 db.delete_ue_collateral(&mut wtxn, join.subnet_id, join_txid, &join.pubkey)?;
+                db.delete_eots_commitment(
+                    &mut wtxn,
+                    join.subnet_id,
+                    &checked.msg.pk_eots,
+                    checked.msg.nonce_commitment.start,
+                )?;
                 wtxn.commit()?;
             }
             Err(e)

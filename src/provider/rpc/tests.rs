@@ -77,6 +77,140 @@ fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
 }
 
 #[test]
+fn eots_records_hold_what_was_recorded_above_a_height_and_at_or_below_the_answer_height() {
+    let db = create_test_db();
+    let mut subnet = generate_subnet(3);
+    subnet.last_checkpoint_number = Some(0);
+    let subnet_id = subnet.id;
+    let checkpoint = db::SubnetCheckpoint {
+        checkpoint_number: 0,
+        checkpoint_hash: bitcoin::hashes::sha256::Hash::all_zeros(),
+        checkpoint_height: 10,
+        block_height: 21,
+        txid: create_rand_txid(),
+        batch_transfer_txid: None,
+        batch_transfer_block_height: None,
+        signed_committee_number: 0,
+        next_committee_number: 0,
+        next_configuration_number: 0,
+        is_kill_checkpoint: false,
+        epoch: 1,
+        is_rotation_checkpoint: false,
+    };
+    let mut wtxn = db.write_txn().unwrap();
+    db.save_subnet_state(&mut wtxn, subnet_id, &subnet).unwrap();
+    db.save_checkpoint(&mut wtxn, subnet_id, &checkpoint, 0)
+        .unwrap();
+    // Validators 1 to 3 join at Bitcoin heights 21 to 23
+    for n in 1..=3u8 {
+        let join_txid = create_rand_txid();
+        db.add_ue_collateral(
+            &mut wtxn,
+            &UeCollateral {
+                subnet_id,
+                pubkey: pubkey(n),
+                outpoint: bitcoin::OutPoint::new(join_txid, 1),
+                value: bitcoin::Amount::from_sat(1_000_000),
+                timeout: 1_000,
+                pk_eots: pubkey(20 + n),
+                committee_number: 0,
+                ip: "127.0.0.1:8080".parse().unwrap(),
+                backup_address: crate::test_utils::create_rand_addr().into_unchecked(),
+                join_txid,
+                spent: false,
+            },
+        )
+        .unwrap();
+        db.add_eots_commitment(
+            &mut wtxn,
+            &db::EotsCommitmentRecord {
+                subnet_id,
+                pk_eots: pubkey(20 + n),
+                commitment: crate::eots::EotsNonceCommitment {
+                    start: 1,
+                    count: 100,
+                    root: [n; 32],
+                },
+                block_height: 20 + u64::from(n),
+                txid: join_txid,
+            },
+        )
+        .unwrap();
+    }
+    wtxn.commit().unwrap();
+    // The join at 23 is written, its Bitcoin block not processed yet
+    db.set_last_processed_block(22).unwrap();
+
+    let at =
+        |after: Option<u64>, max: Option<u64>| eots_records_at(&db, subnet_id, after, max).unwrap();
+    let validators = |records: &GetEotsRecordsResponse| {
+        records
+            .eots_keys
+            .iter()
+            .map(|k| k.pubkey)
+            .collect::<Vec<_>>()
+    };
+    let all = at(None, None);
+    assert_eq!(all.block_height, 22);
+    let mut expected = vec![pubkey(1), pubkey(2)];
+    expected.sort();
+    assert_eq!(validators(&all), expected);
+    assert_eq!(all.checkpoint.unwrap().checkpoint_number, 0);
+    let second = all
+        .eots_keys
+        .iter()
+        .find(|k| k.pubkey == pubkey(2))
+        .unwrap();
+    assert_eq!(second.pk_eots, pubkey(22));
+    assert_eq!(second.commitments.len(), 1);
+    assert_eq!(second.commitments[0].block_height, 22);
+    assert_eq!(second.commitments[0].root, hex::encode([2u8; 32]));
+
+    assert_eq!(validators(&at(Some(21), None)), [pubkey(2)]);
+    assert!(at(Some(22), None).eots_keys.is_empty());
+    let earlier = at(None, Some(21));
+    assert_eq!(earlier.block_height, 21);
+    assert_eq!(validators(&earlier), [pubkey(1)]);
+    assert!(earlier.checkpoint.is_some());
+    assert!(at(None, Some(20)).checkpoint.is_none());
+}
+
+#[test]
+fn eots_records_at_a_bitcoin_height_wait_for_the_monitor() {
+    let db = create_test_db();
+    let subnet = generate_subnet(3);
+    db.set_last_processed_block(125).unwrap();
+    // The monitor holds no state of the subnet yet: a lagging monitor, not a missing subnet
+    assert!(matches!(
+        eots_records_at(&db, subnet.id, None, Some(126)),
+        Err(RpcError::MonitorBehind {
+            requested: 126,
+            processed: 125
+        })
+    ));
+    assert!(matches!(
+        eots_records_at(&db, subnet.id, None, Some(125)),
+        Err(RpcError::InvalidParams(_))
+    ));
+    let mut wtxn = db.write_txn().unwrap();
+    db.save_subnet_state(&mut wtxn, subnet.id, &subnet).unwrap();
+    wtxn.commit().unwrap();
+    assert!(matches!(
+        eots_records_at(&db, subnet.id, None, Some(126)),
+        Err(RpcError::MonitorBehind {
+            requested: 126,
+            processed: 125
+        })
+    ));
+    assert_eq!(
+        eots_records_at(&db, subnet.id, None, Some(125))
+            .unwrap()
+            .block_height,
+        125
+    );
+}
+
+#[test]
 fn carried_entries_keep_complete_valid_ones_only() {
     use crate::collateral::{self, CollateralScript};
     use crate::slash::{sign_slash, SlashSignatureEntry};
@@ -153,7 +287,7 @@ fn carried_entries_keep_complete_valid_ones_only() {
     assert_eq!(carried[0].signatures, vec![s0, s1]);
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, bad])];
     assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
-    // An unknown output is left out; a slashable one too
+    // An unknown output is left out; a slashable one is carried again, the monitor ignores it
     let mut unknown = SlashSignatureEntry::new(record.outpoint, vec![s0, s1]);
     unknown.vout = 3;
     assert!(carried_slash_entries(&db, subnet_id, &[unknown]).is_empty());
@@ -171,7 +305,7 @@ fn carried_entries_keep_complete_valid_ones_only() {
     .unwrap();
     wtxn.commit().unwrap();
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1])];
-    assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
+    assert_eq!(carried_slash_entries(&db, subnet_id, &posted).len(), 1);
 
     // A second collateral whose join is in an earlier block comes first, whatever its outpoint
     let older = UeCollateral {
@@ -644,6 +778,74 @@ async fn provider_checkpoint_and_reveal(
         .as_str()
         .map(|raw| bitcoin::consensus::deserialize(&hex::decode(raw).unwrap()).unwrap());
     (bitcoin::Psbt::deserialize(&bytes).unwrap(), reveal)
+}
+
+/// An unsigned checkpoint transaction of the epoch zero fixture, with the posted form of the
+/// signatures of the whitelist keys `signers`.
+async fn checkpoint_to_finalize(
+    signers: &[u8],
+) -> (
+    tempfile::TempDir,
+    WalletRpc,
+    Arc<ServerData>,
+    FinalizeCheckpointPsbtParams,
+    Vec<(String, Vec<String>)>,
+) {
+    let f = EpochZeroFixture::new([9000; 4]).await;
+    let id = f.id;
+    let mut request = f.message(&[]);
+    request.change_address = None;
+    let wallet = WalletRpc::default();
+    wallet.0.lock().unwrap().funds = fund_utxos(&f.signer().address, 3);
+    let (dir, data) = provider(f, &wallet);
+    let psbt = provider_checkpoint(&data, request).await;
+    let secp = Secp256k1::new();
+    let posted = signers
+        .iter()
+        .map(|n| {
+            let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &secret(*n));
+            let (_, sigs) = multisig::sign_spend_psbt(&secp, psbt.clone(), keypair).unwrap();
+            (
+                pubkey(*n).to_string(),
+                sigs.iter().map(|sig| sig.to_string()).collect(),
+            )
+        })
+        .collect();
+    let params = FinalizeCheckpointPsbtParams {
+        subnet_id: id,
+        unsigned_psbt_base64: base64::engine::general_purpose::STANDARD.encode(psbt.serialize()),
+        signatures: vec![],
+        batch_transfer_tx_hex: None,
+    };
+    (dir, wallet, data, params, posted)
+}
+
+#[tokio::test]
+async fn finalize_checkpoint_psbt_drops_a_malformed_key_and_signature_and_still_finalizes() {
+    let (_dir, wallet, data, mut params, posted) = checkpoint_to_finalize(&[1, 2, 3]).await;
+    let inputs = posted[0].1.len();
+    params.signatures = posted;
+    params
+        .signatures
+        .push(("not a key".to_string(), vec!["00".to_string(); inputs]));
+    params
+        .signatures
+        .push((pubkey(4).to_string(), vec!["zz".to_string(); inputs]));
+    finalize_checkpoint_psbt(Data::new(data), Params(params))
+        .await
+        .unwrap_or_else(|e| panic!("finalize failed: {}", serde_json::to_string(&e).unwrap()));
+    assert_eq!(wallet.0.lock().unwrap().submitted.len(), 1);
+}
+
+#[tokio::test]
+async fn finalize_checkpoint_psbt_with_a_malformed_signature_below_the_threshold_submits_nothing() {
+    let (_dir, wallet, data, mut params, mut posted) = checkpoint_to_finalize(&[1, 2, 3]).await;
+    posted[2].1 = vec!["zz".to_string(); posted[2].1.len()];
+    params.signatures = posted;
+    assert!(finalize_checkpoint_psbt(Data::new(data), Params(params))
+        .await
+        .is_err());
+    assert!(wallet.0.lock().unwrap().submitted.is_empty());
 }
 
 #[tokio::test]

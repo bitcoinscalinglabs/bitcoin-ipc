@@ -481,6 +481,21 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
+# get the EOTS keys, their EOTS nonce commitments above a Bitcoin height, and the latest checkpoint, at a Bitcoin height
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "geteotsrecords",
+    "params": {
+        "subnet_id": "/b4/t420fluns5gbn747yx4niyqwmfvsessium7psci7w7lld7omo3n2hrutp3ayv2y",
+        "after_block_height": 100,
+        "max_block_height": 120
+    },
+    "id": 1
+}' | jq
+
 
 # get rewarded collaterals for all validators for a past snapshot
 curl -X POST http://localhost:3030/api \

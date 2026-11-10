@@ -201,19 +201,29 @@ fn calc_checkpoint_size(
     let num_inputs = unsigned_psbt.inputs.len();
 
     let signature_sets = create_threshold_signatures(&committee_keys, threshold, num_inputs);
-    // Convert to the format expected by finalize_spend_psbt_from_sigs
-    let signature_refs: Vec<&[bitcoin::secp256k1::schnorr::Signature]> =
-        signature_sets.iter().map(|sigs| sigs.as_slice()).collect();
+    // The signatures are dummies, so they are placed without verification
+    let leaf_hash = multisig::create_multisig_script(&committee_keys, threshold)
+        .unwrap()
+        .tapscript_leaf_hash();
+    let mut signed_psbt = unsigned_psbt.clone();
+    for ((key, _), sigs) in committee_keys.iter().zip(&signature_sets) {
+        for (input, signature) in signed_psbt.inputs.iter_mut().zip(sigs) {
+            let signature = bitcoin::taproot::Signature {
+                signature: *signature,
+                sighash_type: bitcoin::sighash::TapSighashType::Default,
+            };
+            input.tap_script_sigs.insert((*key, leaf_hash), signature);
+        }
+    }
 
     // Make the final checkpoint transaction
 
-    let checkpoint_tx = multisig::finalize_spend_psbt_from_sigs(
+    let checkpoint_tx = multisig::finalize_spend_psbt(
         &secp,
         &subnet.id,
         &subnet.committee.validator_weighted_keys(),
         subnet.committee.threshold,
-        &unsigned_psbt,
-        &signature_refs,
+        &signed_psbt,
     )
     .unwrap();
     // dbg!(&checkpoint_tx);

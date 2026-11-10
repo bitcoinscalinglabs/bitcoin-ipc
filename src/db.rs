@@ -148,6 +148,10 @@ fn eots_commitment_key(subnet_id: SubnetId, pk_eots: &XOnlyPublicKey, start: u64
     format!("{EOTS_COMMITMENTS_KEY}:{}:{}:{:020}", subnet_id, pk_eots, start)
 }
 
+fn eots_commitments_subnet_prefix(subnet_id: SubnetId) -> String {
+    format!("{EOTS_COMMITMENTS_KEY}:{}:", subnet_id)
+}
+
 fn slash_presigs_prefix(subnet_id: SubnetId) -> String {
     format!("{SLASH_PRESIGS_KEY}:{}:", subnet_id)
 }
@@ -879,6 +883,18 @@ pub struct EotsCommitmentRecord {
     pub txid: Txid,
 }
 
+/// The EOTS records of a subnet at one Bitcoin height, read from one state of the database.
+#[derive(Debug, Clone)]
+pub struct EotsRecords {
+    /// The Bitcoin height of the answer
+    pub block_height: u64,
+    /// Validator key, EOTS key and the key's commitments recorded in the asked range, by
+    /// validator key
+    pub keys: Vec<(XOnlyPublicKey, XOnlyPublicKey, Vec<EotsCommitmentRecord>)>,
+    /// The latest checkpoint recorded at or below `block_height`
+    pub checkpoint: Option<SubnetCheckpoint>,
+}
+
 /// The slash pre-signatures that made a collateral output slashable.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SlashPresigRecord {
@@ -1392,6 +1408,25 @@ pub trait DatabaseCore {
         txn: &mut RwTxn,
         record: &EotsCommitmentRecord,
     ) -> Result<(), DbError>;
+
+    fn delete_eots_commitment(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        pk_eots: &XOnlyPublicKey,
+        start: u64,
+    ) -> Result<(), DbError>;
+
+    /// In one read transaction: the last processed Bitcoin height `P`, and, when the subnet has
+    /// a state, its EOTS records at `min(max_block_height, P)`: the EOTS keys with the
+    /// commitments recorded in a Bitcoin block above `after_block_height` and at or below that
+    /// height, and the latest checkpoint recorded at or below it.
+    fn get_eots_records(
+        &self,
+        subnet_id: SubnetId,
+        after_block_height: Option<u64>,
+        max_block_height: Option<u64>,
+    ) -> Result<(u64, Option<EotsRecords>), DbError>;
 
     /// The commitments of `pk_eots` in `subnet_id`, in ascending `start` order
     fn get_eots_commitments(
@@ -2116,6 +2151,86 @@ impl DatabaseCore for HeedDb {
         let key = eots_commitment_key(record.subnet_id, &record.pk_eots, record.commitment.start);
         db.put(txn, &key, record)?;
         Ok(())
+    }
+
+    fn delete_eots_commitment(
+        &self,
+        txn: &mut RwTxn,
+        subnet_id: SubnetId,
+        pk_eots: &XOnlyPublicKey,
+        start: u64,
+    ) -> Result<(), DbError> {
+        self.eots_commitments_db
+            .delete(txn, &eots_commitment_key(subnet_id, pk_eots, start))?;
+        Ok(())
+    }
+
+    fn get_eots_records(
+        &self,
+        subnet_id: SubnetId,
+        after_block_height: Option<u64>,
+        max_block_height: Option<u64>,
+    ) -> Result<(u64, Option<EotsRecords>), DbError> {
+        let txn = self.env.read_txn()?;
+        let processed = self
+            .monitor_info
+            .get(&txn, LAST_PROCESSED_BLOCK_KEY)?
+            .map_or(0, |info| info.last_processed_block);
+        let Some(state) = self.subnet_db.get(&txn, &subnet_state_key(subnet_id))? else {
+            return Ok((processed, None));
+        };
+        let block_height = max_block_height.map_or(processed, |max| max.min(processed));
+
+        let mut checkpoint = None;
+        if let Some(mut number) = state.last_checkpoint_number {
+            loop {
+                match self
+                    .checkpoints_db
+                    .get(&txn, &checkpoints_key(subnet_id, number))?
+                {
+                    Some(c) if c.block_height <= block_height => {
+                        checkpoint = Some(c);
+                        break;
+                    }
+                    _ if number == 0 => break,
+                    _ => number -= 1,
+                }
+            }
+        }
+
+        // Every EOTS key is recorded with its first commitment: no new commitment, no new key
+        let mut keys = Vec::new();
+        if after_block_height.is_none_or(|after| after < block_height) {
+            let mut commitments: std::collections::BTreeMap<_, Vec<EotsCommitmentRecord>> =
+                std::collections::BTreeMap::new();
+            let prefix = eots_commitments_subnet_prefix(subnet_id);
+            for item in self.eots_commitments_db.prefix_iter(&txn, &prefix)? {
+                let (_key, record): (_, EotsCommitmentRecord) = item?;
+                if after_block_height.is_none_or(|after| record.block_height > after)
+                    && record.block_height <= block_height
+                {
+                    commitments.entry(record.pk_eots).or_default().push(record);
+                }
+            }
+            if !commitments.is_empty() {
+                let prefix = ue_collaterals_prefix(subnet_id);
+                for item in self.ue_collaterals_db.prefix_iter(&txn, &prefix)? {
+                    let (_key, collateral): (_, UeCollateral) = item?;
+                    if let Some(records) = commitments.remove(&collateral.pk_eots) {
+                        keys.push((collateral.pubkey, collateral.pk_eots, records));
+                    }
+                }
+                keys.sort_by_key(|(pubkey, _, _)| *pubkey);
+            }
+        }
+        Ok((
+            processed,
+            Some(EotsRecords {
+                block_height,
+                keys,
+                checkpoint,
+            }),
+        ))
     }
 
     fn get_eots_commitments(

@@ -292,8 +292,6 @@ pub trait IpcValidate {
 pub const MAX_POWER_UNIT_EXPONENT: u8 = 15;
 /// The most whitelisted keys and the largest `active_validators_limit`.
 pub const MAX_WHITELIST_SIZE: usize = 350;
-/// The most genesis validators.
-pub const MAX_BOOT_VALIDATORS: u16 = 90;
 pub const MAX_RELATIVE_TIMELOCK: u64 = 65_535;
 pub const P2TR_DUST_LIMIT: Amount = Amount::from_sat(330);
 
@@ -343,9 +341,6 @@ impl IpcValidate for IpcCreateSubnetMsg {
         }
         if self.min_validators == 0 {
             return Err(field("min_validators", "Must be greater than 0"));
-        }
-        if self.min_validators > MAX_BOOT_VALIDATORS {
-            return Err(field("min_validators", "Must be at most 90"));
         }
         let mut keys = self.whitelist.clone();
         keys.sort();
@@ -793,14 +788,17 @@ impl IpcJoinSubnetMsg {
         let subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
         let power = genesis_info.create_subnet_msg.power_of(&self.collateral)?;
-        crate::collateral::refuse_excess_power(
-            db,
-            &genesis_info,
-            subnet_state.as_ref(),
-            block_height,
-            None,
-            self.collateral,
-        )?;
+        // A join with unilateral exit passed this check before its collateral was recorded
+        if !crate::epochs::is_ue_validator(db, self.subnet_id, txid, &self.pubkey)? {
+            crate::collateral::refuse_excess_power(
+                db,
+                &genesis_info,
+                subnet_state.as_ref(),
+                block_height,
+                None,
+                self.collateral,
+            )?;
+        }
 
         let new_validator = db::SubnetValidator {
             pubkey: self.pubkey,
@@ -1969,6 +1967,43 @@ impl IpcValidate for IpcCheckpointSubnetMsg {
     }
 }
 
+/// Output indices of a checkpoint transaction: the OP_RETURN output, the withdrawals, the
+/// commitment output if the checkpoint has batch data, the transfer batches, the unstakes, then
+/// the change. The builder, the parser and the batch transfer reveal check all use it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CheckpointOutputs {
+    pub withdrawals: usize,
+    pub has_commitment: bool,
+    pub batches: usize,
+    pub unstakes: usize,
+}
+
+impl CheckpointOutputs {
+    pub(crate) fn withdrawal(&self, i: usize) -> usize {
+        1 + i
+    }
+
+    /// Index of the batch transfer commitment output, if the checkpoint has one
+    pub(crate) fn commitment(&self) -> usize {
+        self.withdrawal(self.withdrawals)
+    }
+
+    /// Index of the output that pays transfer batch `i` (the batches in ascending `txid20`
+    /// order of their destinations)
+    pub(crate) fn transfer(&self, i: usize) -> usize {
+        self.commitment() + usize::from(self.has_commitment) + i
+    }
+
+    pub(crate) fn unstake(&self, i: usize) -> usize {
+        self.transfer(self.batches) + i
+    }
+
+    /// Index of the change output, if the checkpoint has one: the number of outputs before it
+    pub(crate) fn change(&self) -> usize {
+        self.unstake(self.unstakes)
+    }
+}
+
 impl IpcCheckpointSubnetMsg {
     // Length of the withdrawal + transfer + unstake markers, 1 byte each
     const MARKERS_LEN: usize = 3;
@@ -2093,16 +2128,13 @@ impl IpcCheckpointSubnetMsg {
         Ok((withdrawal_count, transfer_count, unstake_count, killed))
     }
 
-    /// Index of the batch transfer commitment output: after the OP_RETURN output and the
-    /// `withdrawals` withdrawal outputs.
-    pub(crate) fn commit_output_index(withdrawals: usize) -> usize {
-        1 + withdrawals
-    }
-
-    /// Index of the output that pays transfer batch `batch` (the batches in ascending `txid20`
-    /// order of their destinations): the batches follow the commitment output.
-    pub(crate) fn transfer_output_index(withdrawals: usize, batch: usize) -> usize {
-        Self::commit_output_index(withdrawals) + 1 + batch
+    pub(crate) fn checkpoint_outputs(&self) -> CheckpointOutputs {
+        CheckpointOutputs {
+            withdrawals: self.withdrawals.len(),
+            has_commitment: self.has_batch_data(),
+            batches: transfer_batches(&self.transfers).len(),
+            unstakes: self.unstakes.len(),
+        }
     }
 
     /// Whether the checkpoint carries batch transfer data, and so a commitment output
@@ -2305,7 +2337,7 @@ impl IpcCheckpointSubnetMsg {
     fn batch_transfer_commit_outpoint(&self, txid: bitcoin::Txid) -> Option<bitcoin::OutPoint> {
         self.has_batch_data().then(|| bitcoin::OutPoint {
             txid,
-            vout: Self::commit_output_index(self.withdrawals.len()) as u32,
+            vout: self.checkpoint_outputs().commitment() as u32,
         })
     }
 
@@ -2414,11 +2446,9 @@ impl IpcCheckpointSubnetMsg {
 
         //
         //
+        let outputs = self.checkpoint_outputs();
         if self.has_batch_data() {
-            debug_assert_eq!(
-                tx_outs.len(),
-                Self::commit_output_index(self.withdrawals.len())
-            );
+            debug_assert_eq!(tx_outs.len(), outputs.commitment());
             let (commit_tx_out, _, _) = self.make_batched_transfer(fee_rate, &signer.address)?;
             tx_outs.push(commit_tx_out);
 
@@ -2458,6 +2488,7 @@ impl IpcCheckpointSubnetMsg {
                     .script_pubkey(),
             });
         }
+        debug_assert_eq!(tx_outs.len(), outputs.change());
 
         //
         // Create the checkpoint unsigned transaction
@@ -2501,14 +2532,10 @@ impl IpcCheckpointSubnetMsg {
             let total_unstake_amount: Amount = self.unstakes.iter().map(|u| u.amount).sum();
 
             if total_unstake_amount > Amount::ZERO {
-                // Modify the last N tx_outs which are the unstake outputs
-                let num_unstakes = self.unstakes.len();
-                let unstake_start_index = tx_outs.len() - num_unstakes;
-
                 // Distribute the change proportionally among unstake outputs
                 let mut distributed_amount = Amount::ZERO;
                 for (i, unstake) in self.unstakes.iter().enumerate() {
-                    let output_index = unstake_start_index + i;
+                    let output_index = outputs.unstake(i);
                     if output_index < tx_outs.len() {
                         let proportion =
                             unstake.amount.to_sat() as f64 / total_unstake_amount.to_sat() as f64;
@@ -2531,7 +2558,7 @@ impl IpcCheckpointSubnetMsg {
 
                 debug!(
                     "Redistributed {} change among {} unstake outputs",
-                    change_amount, num_unstakes
+                    change_amount, outputs.unstakes
                 );
 
                 // Reconstruct the transaction with updated tx_outs
@@ -2581,7 +2608,8 @@ impl IpcCheckpointSubnetMsg {
     ///    [checkpoint tag | 20-byte subnet ID txid | 32-byte checkpoint hash | 8-byte checkpoint height | 1-byte withdrawal count | 1-byte transfer batch count | 1-byte unstake count | 8-byte committee configuration number | 1-byte killed flag]
     /// 2. Withdrawal outputs for each withdrawal
     /// 3. The batch transfer commitment output, if the checkpoint has batch data
-    /// 4. One transfer output per destination subnet (`commit_output_index`, `transfer_output_index`)
+    /// 4. One transfer output per destination subnet
+    /// 5. Unstake outputs, then the change ([`CheckpointOutputs`])
     ///
     /// Returns an error if the transaction doesn't match the expected format.
     pub fn from_checkpoint_tx<D: db::DatabaseCore>(
@@ -2663,12 +2691,21 @@ impl IpcCheckpointSubnetMsg {
         let kill_checkpoint = flags & Self::FLAG_KILL != 0;
         let rotation_checkpoint = flags & Self::FLAG_ROTATION != 0;
 
-        // Check if we have enough outputs for all the withdrawals, unstakes and transfers
-        let expected_outputs = 1 + // metadata
-               withdrawals_count + // withdrawals
-               unstakes_count + // unstakes
-               (if batch_transfers_count > 0 { 1 } else { 0 }) + // batch transfer commit (if needed)
-               batch_transfers_count; // transfers
+        // Without transfer batches, the output count tells whether there is a commitment output.
+        // Only a kill checkpoint with unstakes has no change: they take its remainder.
+        let without_commitment = CheckpointOutputs {
+            withdrawals: withdrawals_count,
+            has_commitment: false,
+            batches: batch_transfers_count,
+            unstakes: unstakes_count,
+        };
+        let has_change = !(kill_checkpoint && unstakes_count > 0);
+        let outputs = CheckpointOutputs {
+            has_commitment: batch_transfers_count > 0
+                || tx.output.len() > without_commitment.change() + usize::from(has_change),
+            ..without_commitment
+        };
+        let expected_outputs = outputs.change();
 
         if tx.output.len() < expected_outputs {
             return Err(err(format!(
@@ -2685,13 +2722,13 @@ impl IpcCheckpointSubnetMsg {
         // Parse withdrawals
         let mut withdrawals = Vec::with_capacity(withdrawals_count);
         for i in 0..withdrawals_count {
-            let txout = &tx.output[1 + i]; // 1-based index (after metadata)
+            let txout = &tx.output[outputs.withdrawal(i)];
             let amount = txout.value;
             let address =
                 bitcoin::Address::from_script(&txout.script_pubkey, NETWORK).map_err(|_| {
                     err(format!(
                         "Could not parse address from withdrawal output {}",
-                        1 + i
+                        outputs.withdrawal(i)
                     ))
                 })?;
             let address = address.into_unchecked();
@@ -2702,13 +2739,13 @@ impl IpcCheckpointSubnetMsg {
         // Parse unstakes
         let mut unstakes = Vec::with_capacity(unstakes_count);
         for i in 0..unstakes_count {
-            let txout = &tx.output[1 + withdrawals_count + i]; // After metadata and withdrawals
+            let txout = &tx.output[outputs.unstake(i)];
             let amount = txout.value;
             let address =
                 bitcoin::Address::from_script(&txout.script_pubkey, NETWORK).map_err(|_| {
                     err(format!(
                         "Could not parse address from unstake output {}",
-                        1 + withdrawals_count + i
+                        outputs.unstake(i)
                     ))
                 })?;
             let address = address.into_unchecked();
@@ -2736,7 +2773,7 @@ impl IpcCheckpointSubnetMsg {
 
         if batch_transfers_count > 0 {
             for i in 0..batch_transfers_count {
-                let transfer_output_index = Self::transfer_output_index(withdrawals_count, i);
+                let transfer_output_index = outputs.transfer(i);
                 let txout = &tx.output[transfer_output_index];
 
                 // For transfers, we can only extract the multisig address from the output
@@ -2773,7 +2810,7 @@ impl IpcCheckpointSubnetMsg {
 
         // Extract the change address if present (should be the last output)
         let change_address = if tx.output.len() > expected_outputs {
-            let change_output = &tx.output[tx.output.len() - 1];
+            let change_output = &tx.output[outputs.change()];
             let addr = bitcoin::Address::from_script(&change_output.script_pubkey, NETWORK)
                 .map_err(|_| err("Could not parse change address from last output".to_string()))?;
             let addr = addr.into_unchecked();
@@ -3417,12 +3454,17 @@ impl IpcBatchTransferMsg {
             .output
             .first()
             .ok_or_else(|| invalid("Checkpoint transaction has no outputs".to_string()))?;
-        let (withdrawals, batch_count, _, _) =
+        let (withdrawals, batch_count, unstakes, _) =
             IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(metadata_tx_out)
                 .map_err(|e| invalid(format!("Failed to extract counts from checkpoint: {e}")))?;
-        let withdrawals = withdrawals as usize;
+        let outputs = CheckpointOutputs {
+            withdrawals: withdrawals as usize,
+            has_commitment: true,
+            batches: batch_count as usize,
+            unstakes: unstakes as usize,
+        };
 
-        let commit_index = IpcCheckpointSubnetMsg::commit_output_index(withdrawals);
+        let commit_index = outputs.commitment();
         if self.checkpoint_vout as usize != commit_index {
             return Err(invalid(format!(
                 "Reveal spends checkpoint output {}, the commitment output is {}",
@@ -3443,10 +3485,7 @@ impl IpcBatchTransferMsg {
             let destination_subnet_id = SubnetId::from_txid20(txid20);
             let output = checkpoint_tx
                 .output
-                .get(IpcCheckpointSubnetMsg::transfer_output_index(
-                    withdrawals,
-                    i,
-                ))
+                .get(outputs.transfer(i))
                 .ok_or_else(|| {
                     invalid(format!(
                         "Checkpoint has no output for destination {destination_subnet_id}"
@@ -3791,6 +3830,25 @@ pub struct CheckedSlashEntry {
 impl CheckedSlashEntry {
     pub fn reaches_threshold(&self) -> bool {
         self.power >= u64::from(self.script.configuration.threshold)
+    }
+
+    /// The valid signatures in ascending order of index, until their powers reach the threshold.
+    pub fn signatures_to_threshold(&self) -> Vec<(u16, Signature64)> {
+        let keys = self.script.configuration.sorted_keys();
+        let threshold = u64::from(self.script.configuration.threshold);
+        let mut valid = self.valid.clone();
+        valid.sort_by_key(|(index, _)| *index);
+        let mut power = 0;
+        valid
+            .into_iter()
+            .take_while(|(index, _)| {
+                let below = power < threshold;
+                power += keys
+                    .get(usize::from(*index))
+                    .map_or(0, |(_, p)| u64::from(*p));
+                below
+            })
+            .collect()
     }
 }
 

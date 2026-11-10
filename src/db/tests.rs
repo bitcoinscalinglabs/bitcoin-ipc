@@ -1281,6 +1281,37 @@ async fn commitment_query_does_not_drop_gapped_ranges_or_mix_keys_and_subnets() 
 }
 
 #[tokio::test]
+async fn deleted_eots_commitment_is_no_longer_returned_and_other_keys_remain() {
+    let (_dir, db) = database().await;
+    let id = subnet(1);
+    let mut txn = db.write_txn().unwrap();
+    for eots in [20, 21] {
+        db.add_eots_commitment(
+            &mut txn,
+            &EotsCommitmentRecord {
+                subnet_id: id,
+                pk_eots: pubkey(eots),
+                commitment: EotsNonceCommitment {
+                    start: 1,
+                    count: 2,
+                    root: [eots; 32],
+                },
+                block_height: 102,
+                txid: Txid::from_byte_array([eots; 32]),
+            },
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.delete_eots_commitment(&mut txn, id, &pubkey(20), 1)
+        .unwrap();
+    txn.commit().unwrap();
+    assert!(db.get_eots_commitments(id, &pubkey(20)).unwrap().is_empty());
+    assert_eq!(db.get_eots_commitments(id, &pubkey(21)).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn whitelist_configuration_threshold_does_not_grow_with_unused_whitelist_keys() {
     let (_dir, db) = database().await;
     let id = subnet(1);

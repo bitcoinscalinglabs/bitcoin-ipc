@@ -94,6 +94,37 @@ pub fn create_multisig_script(
         .into_script())
 }
 
+/// The keys with their powers and the threshold of a leaf built by `create_multisig_script`,
+/// `None` for any other script.
+pub fn parse_multisig_script(script: &bitcoin::Script) -> Option<(Vec<WeightedKey>, Power)> {
+    use bitcoin::script::Instruction;
+    let ops: Vec<Instruction> = script.instructions().collect::<Result<_, _>>().ok()?;
+    let is_op = |i: &Instruction, op: opcodes::Opcode| matches!(i, Instruction::Op(o) if *o == op);
+    let num = |i: &Instruction| i.script_num().and_then(|n| Power::try_from(n).ok());
+
+    let (first, rest) = ops.split_first()?;
+    let (body, end) = rest.split_at(rest.len().checked_sub(2)?);
+    if num(first) != Some(0) || body.len() % 7 != 0 || !is_op(&end[1], opcodes::all::OP_GREATERTHANOREQUAL)
+    {
+        return None;
+    }
+    let threshold = num(&end[0])?;
+    let keys = body
+        .chunks(7)
+        .map(|b| {
+            let key = XOnlyPublicKey::from_slice(b[1].push_bytes()?.as_bytes()).ok()?;
+            let shape = is_op(&b[0], opcodes::all::OP_SWAP)
+                && is_op(&b[2], opcodes::all::OP_CHECKSIG)
+                && is_op(&b[3], opcodes::all::OP_IF)
+                && is_op(&b[5], opcodes::all::OP_ADD)
+                && is_op(&b[6], opcodes::all::OP_ENDIF);
+            shape.then_some((key, num(&b[4])?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // Only the exact script of these keys and threshold, in ascending key order
+    (create_multisig_script(&keys, threshold).ok()?.as_script() == script).then_some((keys, threshold))
+}
+
 /// Creates an unspendable script that includes the subnet id
 /// This is to ensure that the multisig is unique per subnet regardless
 /// of the validator public keys.
@@ -741,61 +772,92 @@ pub fn finalize_spend_psbt(
     Ok(finalized_tx)
 }
 
+/// Builds the witness of every input from the posted signatures: each signer's key with one
+/// signature per input, in input order, `None` for a missing or malformed one. A signature counts
+/// for an input if its key is in the input's leaf (`tap_scripts`), no earlier signature of that key
+/// counted for the input, and it verifies; every other signature is dropped. Fails with
+/// `SignaturesMissing` while the counted powers of an input stay below the leaf's threshold.
 pub fn finalize_spend_psbt_from_sigs(
     secp: &Secp256k1<All>,
-    subnet_id: &SubnetId,
-    committee_keys: &[WeightedKey],
-    committee_threshold: Power,
     psbt: &bitcoin::Psbt,
-    signature_sets: &[&[bitcoin::secp256k1::schnorr::Signature]],
+    signatures: &[(XOnlyPublicKey, Vec<Option<bitcoin::secp256k1::schnorr::Signature>>)],
 ) -> Result<Transaction, MultisigError> {
-    let mut signed_psbt = psbt.clone();
+    let all_witness_utxos: Vec<TxOut> = psbt
+        .iter_funding_utxos()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MultisigError::PsbtError(format!("Failed to collect UTXOs: {}", e)))?
+        .into_iter()
+        .cloned()
+        .collect();
+    let prevouts = bitcoin::sighash::Prevouts::All(&all_witness_utxos);
+    let mut sighash_cache = bitcoin::sighash::SighashCache::new(&psbt.unsigned_tx);
 
-    let mut key_sig_pairs: Vec<(WeightedKey, &[bitcoin::secp256k1::schnorr::Signature])> =
-        committee_keys
-            .iter()
-            .cloned()
-            .zip(signature_sets.iter().cloned())
-            .collect();
+    let mut finalized_psbt = psbt.clone();
+    let mut missing = Vec::new();
+    for (input_index, input) in finalized_psbt.inputs.iter_mut().enumerate() {
+        let (control_block, (script, _leaf_version)) =
+            input.tap_scripts.iter().next().ok_or_else(|| {
+                MultisigError::PsbtError(format!("input {} has no leaf", input_index))
+            })?;
+        let (keys, threshold) = parse_multisig_script(script).ok_or_else(|| {
+            MultisigError::PsbtError(format!("input {} has no multisig leaf", input_index))
+        })?;
 
-    // Sort by public key - same ordering as in create_multisig_script
-    key_sig_pairs.sort_by(|(key_a, _), (key_b, _)| key_a.0.cmp(&key_b.0));
+        let sighash = sighash_cache.taproot_script_spend_signature_hash(
+            input_index,
+            &prevouts,
+            script.tapscript_leaf_hash(),
+            bitcoin::sighash::TapSighashType::Default,
+        )?;
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(sighash.as_ref())
+            .map_err(|e| MultisigError::SigningError(e.to_string()))?;
 
-    let script = create_multisig_script(committee_keys, committee_threshold).unwrap();
-    let leaf_hash = script.tapscript_leaf_hash();
-
-    for ((xonly_pubkey, _power), signatures) in key_sig_pairs {
-        // For each input this signer has signed
-        for (input_idx, signature) in signatures.iter().enumerate() {
-            debug!(
-                "finalize_spend_psbt_from_sigs xpk={} input_idx={} sig={}",
-                xonly_pubkey, input_idx, signature
-            );
-
-            // Make sure we don't go out of bounds
-            if input_idx < signed_psbt.inputs.len() {
-                let taproot_sig = bitcoin::taproot::Signature {
-                    signature: *signature,
-                    sighash_type: bitcoin::sighash::TapSighashType::Default,
-                };
-
-                // Add the signature to the PSBT
-                signed_psbt.inputs[input_idx]
-                    .tap_script_sigs
-                    .insert((xonly_pubkey, leaf_hash), taproot_sig);
+        let mut counted: Vec<Option<bitcoin::secp256k1::schnorr::Signature>> = vec![None; keys.len()];
+        for (key, sigs) in signatures {
+            let (Some(position), Some(Some(sig))) = (
+                keys.iter().position(|(k, _)| k == key),
+                sigs.get(input_index),
+            ) else {
+                continue;
+            };
+            if counted[position].is_none() && secp.verify_schnorr(sig, &msg, key).is_ok() {
+                counted[position] = Some(*sig);
+            } else {
+                debug!("input {} drops a signature of {}", input_index, key);
             }
         }
+
+        let power: u64 = keys
+            .iter()
+            .zip(&counted)
+            .filter(|(_, sig)| sig.is_some())
+            .map(|((_, power), _)| u64::from(*power))
+            .sum();
+        if power < u64::from(threshold) {
+            missing.push((input_index, power, threshold));
+            continue;
+        }
+
+        let mut witness = Witness::new();
+        for sig in counted.iter().rev() {
+            match sig {
+                Some(sig) => witness.push(sig.serialize()),
+                None => witness.push([]),
+            }
+        }
+        witness.push(script.to_bytes());
+        witness.push(control_block.serialize());
+        input.final_script_witness = Some(witness);
+        input.tap_script_sigs.clear();
+        input.tap_scripts.clear();
+    }
+    if !missing.is_empty() {
+        return Err(MultisigError::SignaturesMissing(missing));
     }
 
-    let finalized_psbt = finalize_spend_psbt(
-        secp,
-        subnet_id,
-        committee_keys,
-        committee_threshold,
-        &signed_psbt,
-    )?;
-
-    Ok(finalized_psbt)
+    finalized_psbt
+        .extract_tx()
+        .map_err(|e| MultisigError::PsbtError(format!("Failed to extract transaction: {}", e)))
 }
 
 #[derive(Error, Debug)]
@@ -817,6 +879,15 @@ pub enum MultisigError {
 
     #[error("signing error: {0}")]
     SigningError(String),
+
+    #[error(
+        "signatures missing: {}",
+        .0.iter()
+            .map(|(input, power, threshold)| format!("input {input} power {power} of {threshold}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    SignaturesMissing(Vec<(usize, u64, Power)>),
 
     #[error("psbt error: {0}")]
     PsbtError(String),

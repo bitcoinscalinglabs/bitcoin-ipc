@@ -1298,14 +1298,15 @@ fn test_parallel_signing_and_spending() {
     assert_eq!(sigs1.len(), 2, "First signer should sign both inputs");
     assert_eq!(sigs2.len(), 2, "Second signer should sign both inputs");
 
+    let posted = |key: usize, sigs: &Vec<bitcoin::secp256k1::schnorr::Signature>| {
+        (committee_pubkeys[key].0, sigs.iter().copied().map(Some).collect::<Vec<_>>())
+    };
+
     // Create a fresh PSBT and manually add all signatures
     let finalized_tx = finalize_spend_psbt_from_sigs(
         &secp,
-        &subnet_id,
-        &committee_pubkeys,
-        threshold,
         &unsigned_psbt,
-        &[&sigs1, &sigs2, &[]],
+        &[posted(0, &sigs1), posted(1, &sigs2)],
     )
     .expect("should finalize");
 
@@ -1330,16 +1331,11 @@ fn test_parallel_signing_and_spending() {
         verify_result
     );
 
-    let committe_pubkeys_reverse = committee_pubkeys.iter().rev().cloned().collect::<Vec<_>>();
-
     // Create a fresh PSBT and manually add all signatures
     let finalized_tx = finalize_spend_psbt_from_sigs(
         &secp,
-        &subnet_id,
-        &committe_pubkeys_reverse,
-        threshold,
         &unsigned_psbt,
-        &[&[], &sigs2, &sigs1],
+        &[posted(1, &sigs2), posted(0, &sigs1)],
     )
     .expect("should finalize");
 
@@ -1829,4 +1825,96 @@ fn test_exhaust_unspent() {
         multi_change_output_amount < total_input_amount - total_outputs,
         "Multi-output change amount should be less than total input minus all outputs"
     );
+}
+
+#[test]
+fn parse_multisig_script_reads_keys_powers_and_threshold() {
+    let keys: Vec<WeightedKey> = generate_keypairs(4)
+        .iter()
+        .zip([1, 16, 17, 300])
+        .map(|(kp, power)| (kp.x_only_public_key().0, power))
+        .collect();
+    let script = create_multisig_script(&keys, 200).unwrap();
+    let (parsed, threshold) = parse_multisig_script(&script).unwrap();
+    assert_eq!(threshold, 200);
+    assert_eq!(parsed, sort_committee_keys(&keys));
+    let subnet_id_script = create_unspendable_subnet_id_script(&generate_subnet_id());
+    assert!(parse_multisig_script(&subnet_id_script).is_none());
+}
+
+#[test]
+fn finalize_from_sigs_counts_valid_signatures_up_to_the_threshold() {
+    let secp = Secp256k1::new();
+    let keypairs = generate_keypairs(4);
+    let keys: Vec<WeightedKey> = keypairs
+        .iter()
+        .map(|kp| (kp.x_only_public_key().0, 1))
+        .collect();
+    let subnet_id = generate_subnet_id();
+    let address = create_subnet_multisig_address(&secp, &subnet_id, &keys, 3, NETWORK).unwrap();
+    let funding = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(70_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let utxo = ListUnspentResultEntry {
+        txid: funding.compute_txid(),
+        vout: 0,
+        address: None,
+        label: None,
+        redeem_script: None,
+        witness_script: None,
+        script_pub_key: address.script_pubkey(),
+        amount: Amount::from_sat(70_000),
+        confirmations: 1,
+        spendable: true,
+        solvable: true,
+        descriptor: None,
+        safe: true,
+    };
+    let tx_out = TxOut {
+        value: Amount::from_sat(30_000),
+        script_pubkey: address.script_pubkey(),
+    };
+    let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let psbt = construct_spend_psbt(
+        &secp, &subnet_id, &keys, 3, &address, &[utxo], false, &[tx_out], &fee_rate, 0,
+    )
+    .unwrap();
+    let posted = |i: usize| {
+        let (_, sigs) = sign_spend_psbt(&secp, psbt.clone(), keypairs[i]).unwrap();
+        (keys[i].0, sigs.into_iter().map(Some).collect::<Vec<_>>())
+    };
+    let (other, _) = generate_keypairs(1)[0].x_only_public_key();
+    let (_, foreign) = sign_spend_psbt(&secp, psbt.clone(), generate_keypairs(1)[0]).unwrap();
+
+    // two valid signatures, a key outside the leaf, a malformed one and a signature of another key
+    let mut signatures = vec![
+        posted(0),
+        posted(1),
+        (other, foreign.iter().copied().map(Some).collect()),
+        (keys[2].0, vec![None]),
+        (keys[3].0, foreign.iter().copied().map(Some).collect()),
+    ];
+    match finalize_spend_psbt_from_sigs(&secp, &psbt, &signatures) {
+        Err(MultisigError::SignaturesMissing(missing)) => assert_eq!(missing, vec![(0, 2, 3)]),
+        other => panic!("expected missing signatures, got {:?}", other.map(|tx| tx.compute_txid())),
+    }
+
+    // the valid signature of key 3 after its invalid one reaches the threshold
+    signatures.push(posted(3));
+    let tx = finalize_spend_psbt_from_sigs(&secp, &psbt, &signatures).unwrap();
+    verify_transaction(&tx, |outpoint| {
+        (outpoint.txid == funding.compute_txid()).then(|| funding.output[0].clone())
+    })
+    .unwrap();
 }

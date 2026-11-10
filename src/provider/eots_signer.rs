@@ -1,8 +1,7 @@
-//! The validator's EOTS signer: one vote per subnet height, every vote kept in a database next
-//! to the key file.
+//! The validator's EOTS signer: one vote per subnet height, the votes above the latest
+//! checkpointed height kept in a database next to the key file.
 
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 
@@ -22,14 +21,12 @@ fn vote_key(subnet_id: SubnetId, height: u64) -> String {
     format!("{subnet_id}:{height:020}")
 }
 
-/// The keys of one subnet from a height on, as the standard ranges cannot bound `str` keys.
-#[cfg(test)]
+/// The keys of one subnet between two heights, as the standard ranges cannot bound `str` keys.
 struct KeyRange {
     first: String,
     last: String,
 }
 
-#[cfg(test)]
 impl RangeBounds<str> for KeyRange {
     fn start_bound(&self) -> Bound<&str> {
         Bound::Included(self.first.as_str())
@@ -121,6 +118,18 @@ impl EotsSigner {
     ) -> Result<Option<EotsVote>, EotsSignerError> {
         let txn = self.env.read_txn()?;
         Ok(self.votes.get(&txn, &vote_key(subnet_id, height))?)
+    }
+
+    /// Deletes the votes of `subnet_id` at or below `height`, where the provider signs no vote.
+    pub fn delete_up_to(&self, subnet_id: SubnetId, height: u64) -> Result<(), EotsSignerError> {
+        let range = KeyRange {
+            first: vote_key(subnet_id, 0),
+            last: vote_key(subnet_id, height),
+        };
+        let mut txn = self.env.write_txn()?;
+        self.votes.delete_range(&mut txn, &range)?;
+        txn.commit()?;
+        Ok(())
     }
 
     /// The votes of `subnet_id` from `from_height` on, in height order, at most `limit`.
@@ -373,6 +382,26 @@ mod tests {
                 .signed_from(subnet, 0, usize::MAX)
                 .unwrap(),
             listed
+        );
+    }
+
+    #[test]
+    fn delete_up_to_removes_votes_at_or_below_the_height_and_keeps_other_subnets() {
+        let dir = tempfile::tempdir().unwrap();
+        let subnet = SubnetId::from_txid20(&[3u8; 20]);
+        let other = SubnetId::from_txid20(&[4u8; 20]);
+        let mut signer = signer_in(dir.path());
+        sign_history(&mut signer, subnet, 10);
+        sign_history(&mut signer, other, 10);
+        signer.delete_up_to(subnet, 6).unwrap();
+        let heights = |votes: Vec<EotsVote>| votes.iter().map(|v| v.height).collect::<Vec<_>>();
+        assert_eq!(
+            heights(signer.signed_from(subnet, 0, usize::MAX).unwrap()),
+            vec![7, 8, 9, 10]
+        );
+        assert_eq!(
+            heights(signer.signed_from(other, 0, usize::MAX).unwrap()),
+            (1..=10).collect::<Vec<u64>>()
         );
     }
 

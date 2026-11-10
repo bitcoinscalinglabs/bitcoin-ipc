@@ -1298,6 +1298,24 @@ fn multisig_unstake_of_the_only_member_withdraws_its_whole_collateral() {
 }
 
 #[test]
+fn a_join_before_activation_counts_its_collateral_once_against_the_total_power_limit() {
+    let secp = setup();
+    let db = create_test_db();
+    let keys = generate_keypairs(1);
+    let subnet_id = subnet_with_whitelist(&db, vec![keys[0].x_only_public_key().0], 10);
+    // Power p with p <= MAX_TOTAL_POWER < 2p
+    let power = u64::from(crate::multisig::MAX_TOTAL_POWER / 2 + 1);
+    let collateral = Amount::from_sat(power * UNIT.to_sat());
+    let (checked, join_txid) = checked_join_with(&secp, &keys[0], subnet_id, TIMEOUT, collateral);
+    assert!(
+        process_join_ue(&db, &checked, join_txid, BLOCK, BlockHash::all_zeros())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 1);
+}
+
+#[test]
 fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
     let secp = setup();
     let db = create_test_db();
