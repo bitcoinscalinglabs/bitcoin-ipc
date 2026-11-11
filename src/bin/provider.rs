@@ -129,19 +129,32 @@ fn build_nonce_trees(
                 continue;
             }
             let started = std::time::Instant::now();
-            let tree = bitcoin_ipc::eots::nonce_tree(&seed, &record.subnet_id, &record.commitment);
+            let tree =
+                match bitcoin_ipc::eots::nonce_tree(&seed, &record.subnet_id, &record.commitment) {
+                    Ok(tree) => tree,
+                    Err(e) => {
+                        warn!(
+                            "EOTS nonce tree of subnet {} not built: {e}",
+                            record.subnet_id
+                        );
+                        continue;
+                    }
+                };
             signer.lock().expect("EOTS signer lock").insert_tree(
                 record.subnet_id,
                 record.commitment.start,
                 tree,
             );
-            info!(
-                "EOTS nonce tree of subnet {} heights {}..{} built in {:.1} s",
-                record.subnet_id,
-                record.commitment.start,
-                record.commitment.end(),
-                started.elapsed().as_secs_f64()
-            );
+            match record.commitment.end() {
+                Ok(end) => info!(
+                    "EOTS nonce tree of subnet {} heights {}..{} built in {:.1} s",
+                    record.subnet_id,
+                    record.commitment.start,
+                    end,
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => warn!("EOTS nonce tree of subnet {} built: {e}", record.subnet_id),
+            }
         }
     });
 }

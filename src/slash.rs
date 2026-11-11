@@ -20,6 +20,73 @@ use crate::eots::{signature_from_bytes, signature_to_bytes, Signature64};
 /// The pay-to-anchor output script `51 02 4e 73`.
 pub const ANCHOR_SCRIPT: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 
+/// The slash pre-signatures of one collateral output as posted on the subnet: signatures only,
+/// without their signers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedSlashSignatures {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub signatures: Vec<Signature64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PostedSlashSignaturesJson {
+    txid: Txid,
+    vout: u32,
+    signatures: Vec<String>,
+}
+
+impl Serialize for PostedSlashSignatures {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        PostedSlashSignaturesJson {
+            txid: Txid::from_byte_array(self.txid),
+            vout: self.vout,
+            signatures: self
+                .signatures
+                .iter()
+                .map(|signature| hex::encode(signature_to_bytes(signature)))
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PostedSlashSignatures {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let json = PostedSlashSignaturesJson::deserialize(deserializer)?;
+        let signatures = json
+            .signatures
+            .iter()
+            .map(|signature| {
+                let bytes: [u8; 64] = hex::decode(signature)
+                    .map_err(serde::de::Error::custom)?
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("a signature has 64 bytes"))?;
+                Ok(signature_from_bytes(&bytes))
+            })
+            .collect::<Result<Vec<_>, D::Error>>()?;
+        Ok(Self {
+            txid: json.txid.to_byte_array(),
+            vout: json.vout,
+            signatures,
+        })
+    }
+}
+
+impl PostedSlashSignatures {
+    pub fn new(outpoint: OutPoint, signatures: Vec<Signature64>) -> Self {
+        Self {
+            txid: outpoint.txid.to_byte_array(),
+            vout: outpoint.vout,
+            signatures,
+        }
+    }
+
+    pub fn outpoint(&self) -> OutPoint {
+        OutPoint::new(Txid::from_byte_array(self.txid), self.vout)
+    }
+}
+
 /// The slash pre-signatures of one collateral output, each with its signer's index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashSignatureEntry {
@@ -220,6 +287,43 @@ pub fn check_slash_signatures(
     Ok((valid, invalid, power))
 }
 
+/// Resolves posted pre-signatures of the output to the keys of the configuration it names: each
+/// signature with the index of the key for which it verifies, the first one per key, in ascending
+/// order of index, with the total power of those keys and the number of signatures that verify
+/// for no key without an earlier signature. A signature is checked only against the keys without
+/// an earlier signature, and none once every key has one.
+pub fn resolve_slash_signatures(
+    secp: &Secp256k1<secp256k1::All>,
+    script: &CollateralScript,
+    outpoint: OutPoint,
+    value: Amount,
+    signatures: &[Signature64],
+) -> Result<(Vec<(u16, Signature64)>, u64, usize), CollateralError> {
+    let keys = script.configuration.sorted_keys();
+    let msg = Message::from_digest(slash_sighash(secp, script, outpoint, value)?);
+    let mut resolved: Vec<(u16, Signature64)> = Vec::new();
+    let mut signed = vec![false; keys.len()];
+    let mut power = 0;
+    let mut unresolved = 0;
+    for signature in signatures {
+        if resolved.len() == keys.len() {
+            break;
+        }
+        let sig = secp256k1::schnorr::Signature::from_slice(&signature_to_bytes(signature))
+            .map_err(|e| CollateralError::InvalidSlash(e.to_string()))?;
+        match crate::multisig::signer_of(secp, &keys, &msg, &sig, |i| signed[i]) {
+            Some(i) => {
+                signed[i] = true;
+                resolved.push((i as u16, *signature));
+                power += u64::from(keys[i].1);
+            }
+            None => unresolved += 1,
+        }
+    }
+    resolved.sort_by_key(|(index, _)| *index);
+    Ok((resolved, power, unresolved))
+}
+
 /// The slash transaction with its witness: the members' pre-signatures and the EOTS signature
 /// under `eots_secret_key`.
 #[cfg(test)]
@@ -366,6 +470,25 @@ mod tests {
         let (_, invalid, _) =
             check_slash_signatures(&secp, &script, outpoint, Amount::from_sat(1), &[sig4]).unwrap();
         assert_eq!(invalid, vec![sig4.0]);
+    }
+
+    #[test]
+    fn posted_signatures_resolve_to_their_keys() {
+        let secp = Secp256k1::new();
+        let script = script();
+        let outpoint = OutPoint::new(Txid::from_byte_array([9; 32]), 1);
+        let value = Amount::from_sat(50_000);
+        let mut signed: Vec<_> = [3, 4, 5]
+            .map(|seed| sign_slash(&secp, &script, outpoint, value, &keypair(seed)).unwrap())
+            .to_vec();
+        signed.sort_by_key(|(index, _)| *index);
+        let bad = [[7; 32], [7; 32]];
+        // In descending order of index, with a copy and a signature of no key; once every key has
+        // a signature, the last one is not checked
+        let posted = [signed[2].1, signed[1].1, bad, signed[2].1, signed[0].1, bad];
+        let (resolved, power, unresolved) =
+            resolve_slash_signatures(&secp, &script, outpoint, value, &posted).unwrap();
+        assert_eq!((resolved, power, unresolved), (signed, 4, 2));
     }
 
     #[test]

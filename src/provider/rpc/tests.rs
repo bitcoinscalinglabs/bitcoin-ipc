@@ -213,7 +213,7 @@ fn eots_records_at_a_bitcoin_height_wait_for_the_monitor() {
 #[test]
 fn carried_entries_keep_complete_valid_ones_only() {
     use crate::collateral::{self, CollateralScript};
-    use crate::slash::{sign_slash, SlashSignatureEntry};
+    use crate::slash::{sign_slash, PostedSlashSignatures};
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let db = create_test_db();
     let subnet_id = generate_subnet_id();
@@ -280,15 +280,23 @@ fn carried_entries_keep_complete_valid_ones_only() {
     let (s0, s1) = (sign(&keys[0]), sign(&keys[1]));
     let mut bad = sign(&keys[2]);
     bad.1[1][0] ^= 1;
-    // Two valid of three: carried with the valid ones only; one valid: left out
-    let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1, bad])];
+    // Posted without their signers, in any order: each resolves to the key it verifies for.
+    // Two valid of three: carried with the valid ones only, in index order; one valid: left out
+    let posted = vec![PostedSlashSignatures::new(
+        record.outpoint,
+        vec![s1.1, bad.1, s0.1, s1.1],
+    )];
     let carried = carried_slash_entries(&db, subnet_id, &posted);
     assert_eq!(carried.len(), 1);
     assert_eq!(carried[0].signatures, vec![s0, s1]);
-    let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, bad])];
+    assert!(s0.0 < s1.0);
+    let posted = vec![PostedSlashSignatures::new(
+        record.outpoint,
+        vec![s0.1, bad.1],
+    )];
     assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
     // An unknown output is left out; a slashable one is carried again
-    let mut unknown = SlashSignatureEntry::new(record.outpoint, vec![s0, s1]);
+    let mut unknown = PostedSlashSignatures::new(record.outpoint, vec![s0.1, s1.1]);
     unknown.vout = 3;
     assert!(carried_slash_entries(&db, subnet_id, &[unknown]).is_empty());
     let mut wtxn = db.write_txn().unwrap();
@@ -304,7 +312,10 @@ fn carried_entries_keep_complete_valid_ones_only() {
     )
     .unwrap();
     wtxn.commit().unwrap();
-    let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1])];
+    let posted = vec![PostedSlashSignatures::new(
+        record.outpoint,
+        vec![s0.1, s1.1],
+    )];
     assert_eq!(carried_slash_entries(&db, subnet_id, &posted).len(), 1);
 
     // A second collateral whose join is in an earlier block comes first, whatever its outpoint
@@ -355,9 +366,10 @@ fn carried_entries_keep_complete_valid_ones_only() {
                     &k.keypair(&secp),
                 )
                 .unwrap()
+                .1
             })
             .collect();
-        SlashSignatureEntry::new(collateral.outpoint, signatures)
+        PostedSlashSignatures::new(collateral.outpoint, signatures)
     };
     let posted = vec![entry_of(&newer), entry_of(&older)];
     let carried = carried_slash_entries(&db, subnet_id, &posted);
@@ -762,7 +774,20 @@ async fn provider_checkpoint_and_reveal(
     data: &Arc<ServerData>,
     msg: IpcCheckpointSubnetMsg,
 ) -> (bitcoin::Psbt, Option<bitcoin::Transaction>) {
-    let response = gen_checkpoint_psbt(Data::new(data.clone()), Params(msg))
+    // The slash pre-signatures go to the handler as posted on the subnet, without their signers
+    let posted: Vec<_> = msg
+        .slash_signatures
+        .iter()
+        .map(|e| {
+            crate::slash::PostedSlashSignatures::new(
+                e.outpoint(),
+                e.signatures.iter().map(|(_, s)| *s).collect(),
+            )
+        })
+        .collect();
+    let mut params = serde_json::to_value(&msg).unwrap();
+    params["slash_pre_signatures"] = serde_json::to_value(&posted).unwrap();
+    let response = gen_checkpoint_psbt(Data::new(data.clone()), Params(params))
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -895,6 +920,23 @@ async fn finalize_checkpoint_psbt_with_a_malformed_signature_below_the_threshold
         .await
         .is_err());
     assert!(wallet.0.lock().unwrap().submitted.is_empty());
+}
+
+#[tokio::test]
+async fn checkpoint_carrying_slash_pre_signatures_without_them_is_rejected() {
+    let f = EpochZeroFixture::new([9000; 4]).await;
+    let request = f.message(&[]);
+    let wallet = WalletRpc::default();
+    let (_dir, data) = provider(f, &wallet);
+    let mut params = serde_json::to_value(&request).unwrap();
+    params["slash_pre_signature_count"] = 2.into();
+    let err = gen_checkpoint_psbt(Data::new(data), Params(params))
+        .await
+        .err()
+        .expect("a checkpoint without the slash pre-signatures it carries was accepted");
+    assert!(serde_json::to_string(&err)
+        .unwrap()
+        .contains("slash_pre_signatures missing"));
 }
 
 #[tokio::test]
@@ -1552,6 +1594,6 @@ async fn join_ue_takes_the_eots_key_and_nonces_from_the_eots_signer() {
     assert_eq!(msg.pk_eots, pubkey(21));
     assert_eq!(
         msg.nonce_commitment,
-        crate::eots::commit_nonces(&seed, &id, 7, 50).0
+        crate::eots::commit_nonces(&seed, &id, 7, 50).unwrap().0
     );
 }

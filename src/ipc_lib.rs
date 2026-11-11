@@ -17,7 +17,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use crate::eots::{signature_from_bytes, signature_to_bytes, EotsNonceCommitment, Signature64};
-use crate::slash::SlashSignatureEntry;
+use crate::slash::{PostedSlashSignatures, SlashSignatureEntry};
 use crate::bitcoin_utils::get_fee_rate;
 use crate::bitcoin_utils::{self, submit_to_mempool, tagged_sha256, verify_schnorr_bytes};
 use crate::db;
@@ -3852,13 +3852,12 @@ impl CheckedSlashEntry {
     }
 }
 
-/// Checks a slash pre-signature entry against the configuration named by the collateral script.
-pub fn check_slash_entry<D: db::DatabaseCore>(
+/// The collateral output of `subnet_id` at `outpoint` with its script.
+fn slash_collateral_of<D: db::DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
-    entry: &SlashSignatureEntry,
-) -> Result<CheckedSlashEntry, IpcLibError> {
-    let outpoint = entry.outpoint();
+    outpoint: bitcoin::OutPoint,
+) -> Result<(db::UeCollateral, crate::collateral::CollateralScript), IpcLibError> {
     let record = db
         .get_ue_collateral_by_outpoint(&outpoint)?
         .filter(|r| r.subnet_id == subnet_id)
@@ -3868,6 +3867,49 @@ pub fn check_slash_entry<D: db::DatabaseCore>(
             ))
         })?;
     let script = crate::collateral::collateral_script_of(db, &record)?;
+    Ok((record, script))
+}
+
+/// Checks the posted slash pre-signatures of an output against the configuration named by the
+/// collateral script, resolving each to the key for which it verifies; `invalid` stays empty and
+/// the second value is the number of signatures that verify for no key without an earlier signature.
+pub fn check_posted_slash_signatures<D: db::DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    posted: &PostedSlashSignatures,
+) -> Result<(CheckedSlashEntry, usize), IpcLibError> {
+    let outpoint = posted.outpoint();
+    let (record, script) = slash_collateral_of(db, subnet_id, outpoint)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (valid, power, unresolved) = crate::slash::resolve_slash_signatures(
+        &secp,
+        &script,
+        outpoint,
+        record.value,
+        &posted.signatures,
+    )?;
+    let slashable = db.get_slash_presigs(subnet_id, &outpoint)?.is_some();
+    Ok((
+        CheckedSlashEntry {
+            record,
+            script,
+            valid,
+            invalid: vec![],
+            power,
+            slashable,
+        },
+        unresolved,
+    ))
+}
+
+/// Checks a slash pre-signature entry against the configuration named by the collateral script.
+pub fn check_slash_entry<D: db::DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    entry: &SlashSignatureEntry,
+) -> Result<CheckedSlashEntry, IpcLibError> {
+    let outpoint = entry.outpoint();
+    let (record, script) = slash_collateral_of(db, subnet_id, outpoint)?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (valid, invalid, power) = crate::slash::check_slash_signatures(
         &secp,
