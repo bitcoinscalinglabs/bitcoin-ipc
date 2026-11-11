@@ -56,8 +56,13 @@ impl EotsNonceCommitment {
         height >= self.start && height - self.start < u64::from(self.count)
     }
 
-    pub fn end(&self) -> u64 {
-        self.start + u64::from(self.count)
+    pub fn end(&self) -> Result<u64, EotsError> {
+        self.start
+            .checked_add(u64::from(self.count))
+            .ok_or(EotsError::RangeEndOverflow {
+                start: self.start,
+                count: self.count,
+            })
     }
 }
 
@@ -94,6 +99,10 @@ pub struct EotsVote {
 pub enum EotsError {
     #[error("height {0} is outside the committed range")]
     HeightNotCommitted(u64),
+    #[error("the end of the range [{start}, {start} + {count}) does not fit in u64")]
+    RangeEndOverflow { start: u64, count: u32 },
+    #[error("an EOTS nonce commitment needs count >= 1")]
+    ZeroCount,
     #[cfg(test)]
     #[error("invalid EOTS key")]
     InvalidKey,
@@ -162,24 +171,27 @@ pub fn public_nonces(
     subnet_id: &SubnetId,
     start: u64,
     count: u32,
-) -> Vec<[u8; 32]> {
+) -> Result<Vec<[u8; 32]>, EotsError> {
+    let Some(offset) = count.checked_sub(1) else {
+        return Ok(Vec::new());
+    };
+    let last = start
+        .checked_add(u64::from(offset))
+        .ok_or(EotsError::RangeEndOverflow { start, count })?;
     let count = count as usize;
-    if count == 0 {
-        return Vec::new();
-    }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let chunk = count.div_ceil(threads);
     let mut nonces = vec![[0u8; 32]; count];
     std::thread::scope(|scope| {
-        for (c, slot) in nonces.chunks_mut(chunk).enumerate() {
+        for (slot, first) in nonces.chunks_mut(chunk).zip((start..=last).step_by(chunk)) {
             scope.spawn(move || {
-                for (i, nonce) in slot.iter_mut().enumerate() {
-                    *nonce = secret_nonce(seed, subnet_id, start + (c * chunk + i) as u64).1;
+                for (nonce, height) in slot.iter_mut().zip(first..=last) {
+                    *nonce = secret_nonce(seed, subnet_id, height).1;
                 }
             });
         }
     });
-    nonces
+    Ok(nonces)
 }
 
 /// The tree of `commitment` on `subnet_id`, rebuilt from `seed`.
@@ -187,13 +199,13 @@ pub fn nonce_tree(
     seed: &EotsSeed,
     subnet_id: &SubnetId,
     commitment: &EotsNonceCommitment,
-) -> NonceTree {
-    NonceTree::new(&public_nonces(
+) -> Result<NonceTree, EotsError> {
+    Ok(NonceTree::new(&public_nonces(
         seed,
         subnet_id,
         commitment.start,
         commitment.count,
-    ))
+    )?))
 }
 
 /// The commitment of `seed` to the heights `[start, start + count)` on `subnet_id`, with its
@@ -203,10 +215,10 @@ pub fn commit_nonces(
     subnet_id: &SubnetId,
     start: u64,
     count: u32,
-) -> (EotsNonceCommitment, NonceTree) {
-    let tree = NonceTree::new(&public_nonces(seed, subnet_id, start, count));
-    let root = tree.root().expect("count >= 1");
-    (EotsNonceCommitment { start, count, root }, tree)
+) -> Result<(EotsNonceCommitment, NonceTree), EotsError> {
+    let tree = NonceTree::new(&public_nonces(seed, subnet_id, start, count)?);
+    let root = tree.root().ok_or(EotsError::ZeroCount)?;
+    Ok((EotsNonceCommitment { start, count, root }, tree))
 }
 
 fn leaf_hash(leaf: &[u8; 32]) -> [u8; 32] {
@@ -545,7 +557,7 @@ mod tests {
         let seed = EotsSeed::from_bytes([30u8; 32]);
         let subnet = test_subnet();
         let commitment_start = 5;
-        let nonces = public_nonces(&seed, &subnet, commitment_start, 20);
+        let nonces = public_nonces(&seed, &subnet, commitment_start, 20).unwrap();
         let tree = NonceTree::new(&nonces);
         let commitment = EotsNonceCommitment {
             start: commitment_start,
@@ -585,7 +597,7 @@ mod tests {
         for seed in 1u8..12 {
             let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
             let nonce_seed = EotsSeed::from_bytes([seed; 32]);
-            let nonces = public_nonces(&nonce_seed, &subnet, 1, 3);
+            let nonces = public_nonces(&nonce_seed, &subnet, 1, 3).unwrap();
             let tree = NonceTree::new(&nonces);
             let commitment = EotsNonceCommitment {
                 start: 1,
@@ -613,7 +625,7 @@ mod tests {
         for seed in 1u8..6 {
             let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
             let nonce_seed = EotsSeed::from_bytes([seed.wrapping_mul(7); 32]);
-            let nonces = public_nonces(&nonce_seed, &subnet, 1, 4);
+            let nonces = public_nonces(&nonce_seed, &subnet, 1, 4).unwrap();
             let tree = NonceTree::new(&nonces);
             let commitment = EotsNonceCommitment {
                 start: 1,
@@ -648,8 +660,8 @@ mod tests {
     fn nonces_come_from_the_seed_alone() {
         let subnet = test_subnet();
         let seed = EotsSeed::from_bytes([9u8; 32]);
-        let again = public_nonces(&seed, &subnet, 1, 300);
-        assert_eq!(public_nonces(&seed, &subnet, 1, 300), again);
+        let again = public_nonces(&seed, &subnet, 1, 300).unwrap();
+        assert_eq!(public_nonces(&seed, &subnet, 1, 300).unwrap(), again);
         // Sequential derivation gives the same nonces as the parallel one, in the same order
         let sequential: Vec<_> = (1..=300)
             .map(|h| secret_nonce(&seed, &subnet, h).1)
@@ -657,15 +669,24 @@ mod tests {
         assert_eq!(sequential, again);
         // Another seed, another subnet or another height gives other nonces
         let other = EotsSeed::from_bytes([10u8; 32]);
-        assert_ne!(public_nonces(&other, &subnet, 1, 300), again);
+        assert_ne!(public_nonces(&other, &subnet, 1, 300).unwrap(), again);
         let other_subnet = SubnetId::from_txid20(&[77u8; 20]);
-        assert_ne!(public_nonces(&seed, &other_subnet, 1, 300), again);
-        assert_ne!(&public_nonces(&seed, &subnet, 2, 300)[..299], &again[..299]);
-        assert_eq!(&public_nonces(&seed, &subnet, 2, 299)[..], &again[1..]);
-        assert!(public_nonces(&seed, &subnet, 1, 0).is_empty());
+        assert_ne!(public_nonces(&seed, &other_subnet, 1, 300).unwrap(), again);
+        assert_ne!(
+            &public_nonces(&seed, &subnet, 2, 300).unwrap()[..299],
+            &again[..299]
+        );
+        assert_eq!(
+            &public_nonces(&seed, &subnet, 2, 299).unwrap()[..],
+            &again[1..]
+        );
+        assert!(public_nonces(&seed, &subnet, 1, 0).unwrap().is_empty());
         // The commitment and the rebuilt tree agree
-        let (commitment, tree) = commit_nonces(&seed, &subnet, 1, 300);
-        assert_eq!(nonce_tree(&seed, &subnet, &commitment).root(), tree.root());
+        let (commitment, tree) = commit_nonces(&seed, &subnet, 1, 300).unwrap();
+        assert_eq!(
+            nonce_tree(&seed, &subnet, &commitment).unwrap().root(),
+            tree.root()
+        );
     }
 
     #[test]
@@ -746,8 +767,50 @@ mod tests {
             (2, u32::MAX, (1 << 32) + 1),
             (MAX - 1, 1, MAX),
         ] {
-            assert_eq!(range_commitment(start, count).end(), end);
+            assert_eq!(range_commitment(start, count).end().ok(), Some(end));
         }
+    }
+
+    #[test]
+    fn end_past_the_largest_height_is_an_error() {
+        assert!(matches!(
+            range_commitment(u64::MAX, 1).end(),
+            Err(EotsError::RangeEndOverflow {
+                start: u64::MAX,
+                count: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn public_nonces_past_the_largest_height_are_an_error() {
+        let seed = EotsSeed::from_bytes([5u8; 32]);
+        assert!(matches!(
+            public_nonces(&seed, &test_subnet(), u64::MAX, 2),
+            Err(EotsError::RangeEndOverflow {
+                start: u64::MAX,
+                count: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn public_nonce_at_the_largest_height() {
+        let seed = EotsSeed::from_bytes([5u8; 32]);
+        let nonces = public_nonces(&seed, &test_subnet(), u64::MAX, 1).unwrap();
+        assert_eq!(
+            nonces,
+            vec![secret_nonce(&seed, &test_subnet(), u64::MAX).1]
+        );
+    }
+
+    #[test]
+    fn commit_nonces_with_count_zero_is_an_error() {
+        let seed = EotsSeed::from_bytes([5u8; 32]);
+        assert!(matches!(
+            commit_nonces(&seed, &test_subnet(), 10, 0),
+            Err(EotsError::ZeroCount)
+        ));
     }
 
     #[test]
@@ -810,22 +873,22 @@ mod tests {
     fn overlapping_commitment_ranges_use_identical_nonces_for_the_same_heights() {
         let seed = EotsSeed::from_bytes([0x91; 32]);
         let subnet = SubnetId::from_txid20(&[0x32; 20]);
-        let all = public_nonces(&seed, &subnet, 125, 9);
-        let mut partitioned = public_nonces(&seed, &subnet, 125, 3);
-        partitioned.extend(public_nonces(&seed, &subnet, 128, 6));
+        let all = public_nonces(&seed, &subnet, 125, 9).unwrap();
+        let mut partitioned = public_nonces(&seed, &subnet, 125, 3).unwrap();
+        partitioned.extend(public_nonces(&seed, &subnet, 128, 6).unwrap());
         assert_eq!(partitioned, all);
-        assert_eq!(public_nonces(&seed, &subnet, 127, 4), all[2..6]);
+        assert_eq!(public_nonces(&seed, &subnet, 127, 4).unwrap(), all[2..6]);
     }
 
     #[test]
     fn a_restored_seed_rebuilds_an_uneven_tree_with_the_rfc6962_root() {
         let subnet = SubnetId::from_txid20(&[0x53; 20]);
         let seed = EotsSeed::from_bytes([0xa3; 32]);
-        let leaves = public_nonces(&seed, &subnet, 0x0102, 11);
-        let (commitment, original) = commit_nonces(&seed, &subnet, 0x0102, 11);
+        let leaves = public_nonces(&seed, &subnet, 0x0102, 11).unwrap();
+        let (commitment, original) = commit_nonces(&seed, &subnet, 0x0102, 11).unwrap();
         assert_eq!(commitment.root, reference_root(&leaves));
         let restored = EotsSeed::from_bytes(*seed.as_bytes());
-        let rebuilt = nonce_tree(&restored, &subnet, &commitment);
+        let rebuilt = nonce_tree(&restored, &subnet, &commitment).unwrap();
         assert_eq!(rebuilt.root(), Some(reference_root(&leaves)));
         for i in 0..11 {
             assert_eq!(rebuilt.audit_path(i), original.audit_path(i));
@@ -837,10 +900,13 @@ mod tests {
         let subnet = SubnetId::from_txid20(&[0x53; 20]);
         let seed = EotsSeed::from_bytes([0xa3; 32]);
         let other = EotsSeed::from_bytes([0xa4; 32]);
-        let (commitment, tree) = commit_nonces(&seed, &subnet, 17, 5);
+        let (commitment, tree) = commit_nonces(&seed, &subnet, 17, 5).unwrap();
         let sk = SecretKey::from_slice(&[7; 32]).unwrap();
         let vote = sign_vote(&sk, &other, &subnet, &commitment, &tree, 19, &[0x29; 32]).unwrap();
-        assert_ne!(vote.signature[0], public_nonces(&seed, &subnet, 19, 1)[0]);
+        assert_ne!(
+            vote.signature[0],
+            public_nonces(&seed, &subnet, 19, 1).unwrap()[0]
+        );
         assert!(verify_vote(&subnet, &vote, &commitment).is_err());
     }
 
@@ -850,7 +916,7 @@ mod tests {
         let height = 0x0102_0304_0506_0708;
         let block = [0x87; 32];
         let seed = EotsSeed::from_bytes([0x73; 32]);
-        let (commitment, tree) = commit_nonces(&seed, &subnet, height, 3);
+        let (commitment, tree) = commit_nonces(&seed, &subnet, height, 3).unwrap();
         let mut payload = vec![0x42; 20];
         payload.extend(height.to_le_bytes());
         payload.extend(block);

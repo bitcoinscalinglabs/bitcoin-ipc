@@ -414,7 +414,8 @@ pub fn join_ue_msg(
         &join.subnet_id,
         1,
         TEST_EOTS_NONCE_COUNT,
-    );
+    )
+    .expect("heights 1..=TEST_EOTS_NONCE_COUNT are a valid EOTS nonce range");
     crate::ipc_lib::IpcJoinUeMsg::new_signed(
         secp,
         join,

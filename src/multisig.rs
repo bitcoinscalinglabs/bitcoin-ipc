@@ -811,6 +811,22 @@ fn leaf_sighashes(
         .collect()
 }
 
+/// The position in `keys` of the key for which `sig` verifies on `msg`, if any, among the
+/// positions for which `skip` is false.
+pub fn signer_of(
+    secp: &Secp256k1<All>,
+    keys: &[WeightedKey],
+    msg: &bitcoin::secp256k1::Message,
+    sig: &bitcoin::secp256k1::schnorr::Signature,
+    skip: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    keys.iter()
+        .enumerate()
+        .filter(|(i, _)| !skip(*i))
+        .find(|(_, (key, _))| secp.verify_schnorr(sig, msg, key).is_ok())
+        .map(|(i, _)| i)
+}
+
 /// The posted signatures grouped by key: each signature goes to the key of its input's leaf
 /// (`tap_scripts`) for which it verifies, at its input's position, the first one per input and
 /// key. One entry per key, `None` where the key has no signature. A signature that verifies for no
@@ -833,11 +849,7 @@ pub fn signers_of_spend_psbt(
             let Some(Some(sig)) = sigs.get(input_index) else {
                 continue;
             };
-            let Some(key) = keys
-                .iter()
-                .map(|(key, _)| *key)
-                .find(|key| secp.verify_schnorr(sig, msg, key).is_ok())
-            else {
+            let Some(key) = signer_of(secp, keys, msg, sig, |_| false).map(|i| keys[i].0) else {
                 debug!(
                     "input {} drops a signature of no key of its leaf",
                     input_index

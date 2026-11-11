@@ -345,7 +345,8 @@ fn join_subnet_ue(
             "the EOTS nonce range needs start >= 1 and count >= 1, got start {start} count {count}"
         )));
     }
-    let (commitment, _) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count);
+    let (commitment, _) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count)
+        .map_err(|e| invalid(e.to_string()))?;
     let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk, &eots_sk, commitment);
     msg.validate().map_err(|e| invalid(e.to_string()))?;
     {
@@ -365,7 +366,7 @@ fn join_subnet_ue(
         "joinsubnet (join-ue): timeout {timeout} for {epochs} epochs from epoch {} (origin {origin}, tip {tip}), EOTS key {} nonces {start}..{}",
         context.epoch,
         msg.pk_eots,
-        start + u64::from(count)
+        u128::from(start) + u128::from(count)
     );
     msg.submit_to_bitcoin(&data.btc_rpc, &context)
         .map_err(|e| JsonRpcError::internal(e.to_string()))
@@ -1029,9 +1030,33 @@ pub struct GenCheckpointPsbtResponse {
 
 pub async fn gen_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
-    Params(mut msg): Params<IpcCheckpointSubnetMsg>,
+    Params(mut params): Params<serde_json::Value>,
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
-    info!("gen_checkpoint_psbt: {:?}", msg);
+    // The slash pre-signatures that the checkpoint carries, as posted on the subnet
+    let carried = params
+        .get("slash_pre_signature_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let posted: Vec<crate::slash::PostedSlashSignatures> = match params
+        .as_object_mut()
+        .and_then(|params| params.remove("slash_pre_signatures"))
+    {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|e| RpcError::InvalidParams(format!("slash_pre_signatures: {e}")))?,
+        None if carried > 0 => {
+            return Err(RpcError::InvalidParams(format!(
+                "slash_pre_signatures missing, the checkpoint carries {carried}"
+            ))
+            .into())
+        }
+        None => vec![],
+    };
+    let mut msg: IpcCheckpointSubnetMsg =
+        serde_json::from_value(params).map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    info!(
+        "gen_checkpoint_psbt: {:?} slash pre-signatures of {:?}",
+        msg, posted
+    );
 
     let (validator_xonly_pubkey, validator_sk) = match data.validator {
         Some(validator) => validator,
@@ -1055,7 +1080,7 @@ pub async fn gen_checkpoint_psbt(
     }
     msg.slash_signatures = {
         let txn = data.db.read_txn().map_err(RpcError::DbError)?;
-        carried_slash_entries(&*data.db, &txn, msg.subnet_id, &msg.slash_signatures)
+        carried_slash_entries(&*data.db, &txn, msg.subnet_id, &posted)
     };
     fit_slash_entries(&mut msg).map_err(|e| RpcError::InternalError(e.to_string()))?;
 
@@ -2627,22 +2652,22 @@ pub(crate) fn carried_slash_entries<D: DatabaseCore>(
     db: &D,
     txn: &heed::RoTxn,
     subnet_id: SubnetId,
-    posted: &[crate::slash::SlashSignatureEntry],
+    posted: &[crate::slash::PostedSlashSignatures],
 ) -> Vec<crate::slash::SlashSignatureEntry> {
     let mut entries = Vec::new();
     for entry in posted {
-        let checked = match ipc_lib::check_slash_entry(db, txn, subnet_id, entry) {
-            Ok(checked) => checked,
-            Err(e) => {
-                warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());
-                continue;
-            }
-        };
-        if !checked.invalid.is_empty() {
+        let (checked, unresolved) =
+            match ipc_lib::check_posted_slash_signatures(db, txn, subnet_id, entry) {
+                Ok(checked) => checked,
+                Err(e) => {
+                    warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());
+                    continue;
+                }
+            };
+        if unresolved > 0 {
             warn!(
-                "Slash pre-signatures of {} with invalid signatures {:?} left out",
-                entry.outpoint(),
-                checked.invalid
+                "{unresolved} slash pre-signatures of {} verify for no key of its configuration without an earlier signature, left out",
+                entry.outpoint()
             );
         }
         if !checked.reaches_threshold() {

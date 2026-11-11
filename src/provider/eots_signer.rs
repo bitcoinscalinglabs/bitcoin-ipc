@@ -1,6 +1,7 @@
 //! The validator's EOTS signer: one vote per subnet height, the votes above the latest
 //! checkpointed height kept in a database next to the key file.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -176,10 +177,12 @@ impl EotsSigner {
             .iter()
             .find(|c| c.covers(height))
             .ok_or(EotsSignerError::NotCommitted(height))?;
-        let tree = self
-            .trees
-            .entry((subnet_id, commitment.start))
-            .or_insert_with(|| eots::nonce_tree(&self.seed, &subnet_id, commitment));
+        let tree = match self.trees.entry((subnet_id, commitment.start)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                entry.insert(eots::nonce_tree(&self.seed, &subnet_id, commitment)?)
+            }
+        };
         let vote = eots::sign_vote(
             &self.secret_key,
             &self.seed,
@@ -230,7 +233,7 @@ mod tests {
             "regtest subnet ids are testnet addresses: {subnet}"
         );
         let mut signer = signer_in(dir.path());
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 5);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 5).unwrap();
         let vote = signer.sign(subnet, &[commitment], 3, &[1u8; 32]).unwrap();
         assert!(dir.path().join("eots.sk.votes.db").is_dir());
 
@@ -244,7 +247,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let mut signer = signer_in(dir.path());
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 10, 5);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 10, 5).unwrap();
         let vote = signer.sign(subnet, &[commitment], 12, &[1u8; 32]).unwrap();
         eots::verify_vote(&subnet, &vote, &commitment).unwrap();
         // The same block again gives the same vote, another block is refused
@@ -268,7 +271,7 @@ mod tests {
         }
         // Another subnet at the same height is independent
         let other = SubnetId::from_txid20(&[5u8; 20]);
-        let (other_commitment, _) = eots::commit_nonces(&signer.seed, &other, 1, 20);
+        let (other_commitment, _) = eots::commit_nonces(&signer.seed, &other, 1, 20).unwrap();
         signer
             .sign(other, &[other_commitment], 12, &[9u8; 32])
             .unwrap();
@@ -337,8 +340,8 @@ mod tests {
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let other = SubnetId::from_txid20(&[4u8; 20]);
         let mut signer = signer_in(dir.path());
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 5, 20);
-        let (other_commitment, _) = eots::commit_nonces(&signer.seed, &other, 5, 20);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 5, 20).unwrap();
+        let (other_commitment, _) = eots::commit_nonces(&signer.seed, &other, 5, 20).unwrap();
         for height in [9, 7, 12, 8, 20] {
             signer
                 .sign(subnet, &[commitment], height, &[height as u8; 32])
@@ -410,15 +413,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let mut signer = signer_in(dir.path());
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 11, 4);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 11, 4).unwrap();
         signer.sign(subnet, &[commitment], 11, &[1; 32]).unwrap();
-        let expected_tree = eots::nonce_tree(&signer.seed, &subnet, &commitment);
+        let expected_tree = eots::nonce_tree(&signer.seed, &subnet, &commitment).unwrap();
         drop(signer);
         let mut restarted = signer_in(dir.path());
         let vote = restarted.sign(subnet, &[commitment], 13, &[3; 32]).unwrap();
         assert_eq!(
             vote.signature[0],
-            eots::public_nonces(&restarted.seed, &subnet, 13, 1)[0]
+            eots::public_nonces(&restarted.seed, &subnet, 13, 1).unwrap()[0]
         );
         assert_eq!(vote.proof, expected_tree.audit_path(2).unwrap());
         eots::verify_vote(&subnet, &vote, &commitment).unwrap();
@@ -437,7 +440,7 @@ mod tests {
             &other_dir.path().join("other.sk"),
         )
         .unwrap();
-        let (commitment, _) = eots::commit_nonces(&a.seed, &subnet, 11, 4);
+        let (commitment, _) = eots::commit_nonces(&a.seed, &subnet, 11, 4).unwrap();
         let first = a.sign(subnet, &[commitment], 12, &[5; 32]).unwrap();
         let second = b.sign(subnet, &[commitment], 12, &[6; 32]).unwrap();
         assert_eq!(first.signature[0], second.signature[0]);
@@ -461,7 +464,7 @@ mod tests {
         crate::eth_utils::set_fvm_network();
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let mut signer = signer_in(Path::new(&dir));
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 100);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 100).unwrap();
         for height in 1..=50 {
             let vote = signer
                 .sign(subnet, &[commitment], height, &[height as u8; 32])
@@ -503,7 +506,7 @@ mod tests {
         crate::eth_utils::set_fvm_network();
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let mut signer = signer_in(dir.path());
-        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 100);
+        let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, 1, 100).unwrap();
         for (height, s) in &signed {
             let vote = signer
                 .signed(subnet, *height)
@@ -525,7 +528,7 @@ mod tests {
         const RANGE: u32 = 1000;
         let mut start = 1;
         while start <= count {
-            let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, start, RANGE);
+            let (commitment, _) = eots::commit_nonces(&signer.seed, &subnet, start, RANGE).unwrap();
             for height in start..(start + u64::from(RANGE)).min(count + 1) {
                 signer
                     .sign(
