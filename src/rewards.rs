@@ -5,8 +5,8 @@ use crate::{
     },
     SubnetId,
 };
-use heed::RwTxn;
-use log::{info, trace};
+use heed::{RoTxn, RwTxn};
+use log::{info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
@@ -17,13 +17,23 @@ impl DatabaseRewardExtensions for HeedDb {
         height_from: u64,
         height_to: u64,
     ) -> Result<Vec<SubnetState>, DbError> {
-        let all = self.get_all_subnets()?;
+        let txn = self.env.read_txn()?;
+        self.get_all_active_subnets_txn(&txn, height_from, height_to)
+    }
+
+    fn get_all_active_subnets_txn(
+        &self,
+        txn: &RoTxn,
+        height_from: u64,
+        height_to: u64,
+    ) -> Result<Vec<SubnetState>, DbError> {
+        let all = self.get_all_subnets_txn(txn)?;
         let mut active = Vec::new();
 
         for subnet_state in all {
             use crate::db::SubnetKillState;
 
-            let genesis = match self.get_subnet_genesis_info(subnet_state.id)? {
+            let genesis = match self.get_subnet_genesis_info_txn(txn, subnet_state.id)? {
                 Some(g) => g,
                 None => continue,
             };
@@ -57,9 +67,18 @@ impl DatabaseRewardExtensions for HeedDb {
         snapshot: u64,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetRewardInfo>, DbError> {
-        let key = reward_candidate_key(snapshot, subnet_id);
         let txn = self.env.read_txn()?;
-        Ok(self.reward_candidates_db.get(&txn, &key)?)
+        self.get_reward_candidate_info_txn(&txn, snapshot, subnet_id)
+    }
+
+    fn get_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetRewardInfo>, DbError> {
+        let key = reward_candidate_key(snapshot, subnet_id);
+        Ok(self.reward_candidates_db.get(txn, &key)?)
     }
 
     fn put_reward_candidate_info(
@@ -90,9 +109,17 @@ impl DatabaseRewardExtensions for HeedDb {
         snapshot: u64,
     ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
         let txn = self.env.read_txn()?;
+        self.iter_reward_candidate_info_txn(&txn, snapshot)
+    }
+
+    fn iter_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
         let prefix = reward_candidates_prefix(snapshot);
         let mut out = Vec::new();
-        for res in self.reward_candidates_db.prefix_iter(&txn, &prefix)? {
+        for res in self.reward_candidates_db.prefix_iter(txn, &prefix)? {
             let (k, v) = res?;
             // key format: "reward_candidates:<snapshot>:<subnet_id>"
             let subnet_id_str = k.rsplit(':').next().ok_or_else(|| {
@@ -260,6 +287,7 @@ impl RewardTracker {
     pub fn update_after_block(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &mut RwTxn,
         block_height: u64,
     ) -> Result<(), RewardTrackerError> {
         let Some((snapshot, start_height, end_height)) = self
@@ -274,9 +302,9 @@ impl RewardTracker {
         // 1. Start of snapshot: store candidate subnets.
         if block_height == start_height {
             info!("Start of snapshot {snapshot} at block height {start_height}.");
-            let active_subnets = db.get_all_active_subnets(start_height, end_height)?;
+            let active_subnets = db.get_all_active_subnets_txn(txn, start_height, end_height)?;
 
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             for subnet in active_subnets {
                 db.put_reward_candidate_info(
                     &mut wtxn,
@@ -294,37 +322,48 @@ impl RewardTracker {
         // 2. End of snapshot: finalize rewards.
         if block_height == end_height {
             info!("End of snapshot {snapshot} at block height {end_height}.");
-            let candidates = db.iter_reward_candidate_info(snapshot)?;
+            let candidates = db.iter_reward_candidate_info_txn(txn, snapshot)?;
 
-            let mut rewards_total: std::collections::HashMap<
+            let mut rewards_total: std::collections::BTreeMap<
                 bitcoin::XOnlyPublicKey,
                 bitcoin::Amount,
-            > = std::collections::HashMap::new();
+            > = std::collections::BTreeMap::new();
+            let mut overflow = false;
 
             for (subnet_id, info) in candidates {
                 let rewards_in_subnet =
-                    self.get_or_init_reward_amounts(db, subnet_id, &info, block_height)?;
+                    self.get_or_init_reward_amounts(db, txn, subnet_id, &info, block_height)?;
 
                 for (pk, amt) in rewards_in_subnet {
-                    rewards_total
-                        .entry(pk)
-                        .and_modify(|a| *a += amt)
-                        .or_insert(amt);
+                    let total = rewards_total.entry(pk).or_insert(bitcoin::Amount::ZERO);
+                    match total.checked_add(amt) {
+                        Some(sum) => *total = sum,
+                        None => overflow = true,
+                    }
                 }
             }
 
             let rewards_list = rewards_total.into_iter().collect::<Vec<_>>();
-            let total_rewarded_collateral = rewards_list.iter().map(|(_, a)| *a).sum();
+            let total_rewarded_collateral = rewards_list
+                .iter()
+                .try_fold(bitcoin::Amount::ZERO, |sum, (_, a)| sum.checked_add(*a));
 
-            let mut wtxn = db.write_txn()?;
-            db.put_snapshot_result(
-                &mut wtxn,
-                snapshot,
-                &crate::db::SnapshotResult {
+            let snapshot_result = match total_rewarded_collateral {
+                Some(total_rewarded_collateral) if !overflow => crate::db::SnapshotResult {
                     rewards_list,
                     total_rewarded_collateral,
                 },
-            )?;
+                _ => {
+                    warn!("Reward amount overflow in snapshot {snapshot}, no rewards published for this snapshot");
+                    crate::db::SnapshotResult {
+                        rewards_list: Vec::new(),
+                        total_rewarded_collateral: bitcoin::Amount::ZERO,
+                    }
+                }
+            };
+
+            let mut wtxn = db.nested_write_txn(txn)?;
+            db.put_snapshot_result(&mut wtxn, snapshot, &snapshot_result)?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
             info!("Updated reward bookkeeping after block {block_height}.");
         }
@@ -337,6 +376,7 @@ impl RewardTracker {
     pub fn update_after_checkpoint(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &mut RwTxn,
         block_height: u64,
         subnet_id: SubnetId,
         checkpoint: &crate::db::SubnetCheckpoint,
@@ -357,7 +397,7 @@ impl RewardTracker {
 
         // 1. Kill checkpoint: remove subnet from candidates.
         if checkpoint.is_kill_checkpoint {
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             db.delete_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id)?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
             return Ok(());
@@ -369,7 +409,9 @@ impl RewardTracker {
         }
 
         // Only update if subnet is still a candidate for this snapshot.
-        let Some(mut cand_info) = db.get_reward_candidate_info(current_snapshot, subnet_id)? else {
+        let Some(mut cand_info) =
+            db.get_reward_candidate_info_txn(txn, current_snapshot, subnet_id)?
+        else {
             return Ok(());
         };
 
@@ -381,10 +423,10 @@ impl RewardTracker {
 
         // 2. Rotation checkpoint: update the min-collateral accumulator.
         let mut rewards_in_subnet =
-            self.get_or_init_reward_amounts(db, subnet_id, &cand_info, block_height)?;
+            self.get_or_init_reward_amounts(db, txn, subnet_id, &cand_info, block_height)?;
 
         let new_committee = db
-            .get_committee(subnet_id, checkpoint.next_committee_number)?
+            .get_committee_txn(txn, subnet_id, checkpoint.next_committee_number)?
             .ok_or_else(|| {
                 RewardTrackerError::IpcTxInvalid(format!(
                     "could not get committee {} for subnet {} at block height {}",
@@ -413,7 +455,7 @@ impl RewardTracker {
         cand_info.most_recent_committee_number = checkpoint.next_committee_number;
         cand_info.rewarded_amounts = Some(rewards_in_subnet);
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         db.put_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
         wtxn.commit().map_err(crate::db::DbError::from)?;
 
@@ -423,6 +465,7 @@ impl RewardTracker {
     fn get_or_init_reward_amounts(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &RoTxn,
         subnet_id: SubnetId,
         info: &crate::db::SubnetRewardInfo,
         block_height: u64,
@@ -432,7 +475,7 @@ impl RewardTracker {
                 v.clone()
             } else {
                 let committee = db
-                    .get_committee(subnet_id, info.most_recent_committee_number)?
+                    .get_committee_txn(txn, subnet_id, info.most_recent_committee_number)?
                     .ok_or_else(|| {
                         RewardTrackerError::IpcTxInvalid(format!(
                             "could not get committee {} for subnet {} at block height {}",
@@ -457,9 +500,9 @@ mod tests {
     use crate::{
         db::{
             DatabaseCore, DatabaseRewardExtensions, SubnetGenesisInfo, SubnetKillState,
-            SubnetValidator,
+            SubnetRewardInfo, SubnetValidator,
         },
-        rewards::RewardConfig,
+        rewards::{RewardConfig, RewardTracker},
         test_utils::create_test_db,
         IpcCreateSubnetMsg, SubnetId,
     };
@@ -635,5 +678,77 @@ mod tests {
             cfg.snapshot_boundaries_from_height(105).unwrap(),
             Some((1, 105, 109))
         );
+    }
+
+    #[test]
+    fn test_snapshot_end_reward_overflow_publishes_no_rewards() {
+        let db = create_test_db();
+        let mut pks = crate::test_utils::generate_xonly_pubkeys(3);
+        pks.sort();
+        let half = Amount::from_sat(u64::MAX / 2 + 1);
+        // Snapshot 0: the sum of one validator overflows. Snapshot 1: only the
+        // total overflows. Snapshot 2: no overflow.
+        let candidates = [
+            (0, vec![(pks[0], half), (pks[1], Amount::from_sat(10))]),
+            (0, vec![(pks[0], half), (pks[2], Amount::from_sat(20))]),
+            (1, vec![(pks[0], half), (pks[1], Amount::from_sat(10))]),
+            (1, vec![(pks[2], half)]),
+            (
+                2,
+                vec![
+                    (pks[2], Amount::from_sat(30)),
+                    (pks[0], Amount::from_sat(10)),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (pks[1], Amount::from_sat(20)),
+                    (pks[0], Amount::from_sat(5)),
+                ],
+            ),
+        ];
+        let mut wtxn = db.write_txn().unwrap();
+        for (snapshot, amounts) in candidates {
+            db.put_reward_candidate_info(
+                &mut wtxn,
+                snapshot,
+                crate::test_utils::generate_subnet_id(),
+                &SubnetRewardInfo {
+                    most_recent_committee_number: 0,
+                    rewarded_amounts: Some(amounts),
+                },
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let mut tracker = RewardTracker::new_with_config(RewardConfig {
+            activation_height: 100,
+            snapshot_length: 5,
+        });
+        for end_height in [104, 109, 114] {
+            let mut txn = db.write_txn().unwrap();
+            tracker
+                .update_after_block(&db, &mut txn, end_height)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        for snapshot in [0, 1] {
+            let result = db.get_snapshot_result(snapshot).unwrap().unwrap();
+            assert!(result.rewards_list.is_empty());
+            assert_eq!(result.total_rewarded_collateral, Amount::ZERO);
+        }
+        let result = db.get_snapshot_result(2).unwrap().unwrap();
+        assert_eq!(
+            result.rewards_list,
+            vec![
+                (pks[0], Amount::from_sat(15)),
+                (pks[1], Amount::from_sat(20)),
+                (pks[2], Amount::from_sat(30)),
+            ]
+        );
+        assert_eq!(result.total_rewarded_collateral, Amount::from_sat(65));
     }
 }

@@ -678,6 +678,7 @@ dependencies = [
  "csv",
  "dotenv",
  "env_logger",
+ "futures",
  "fvm_shared",
  "heed",
  "hex",

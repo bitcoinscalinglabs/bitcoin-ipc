@@ -1044,14 +1044,26 @@ pub async fn gen_checkpoint_psbt(
         .into());
     }
 
-    validate_erc_batch_data(
-        msg.subnet_id,
-        &msg.token_registrations,
-        &msg.token_supply_adjustments,
-        &msg.token_transfers,
-        &*data.db,
-    )
-    .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    // Only token entries need database reads.
+    if !msg.token_registrations.is_empty()
+        || !msg.token_supply_adjustments.is_empty()
+        || !msg.token_transfers.is_empty()
+    {
+        data.db
+            .read_txn()
+            .map_err(|e| ipc_lib::IpcValidateError::InvalidMsg(e.to_string()))
+            .and_then(|read_txn| {
+                validate_erc_batch_data(
+                    msg.subnet_id,
+                    &msg.token_registrations,
+                    &msg.token_supply_adjustments,
+                    &msg.token_transfers,
+                    &*data.db,
+                    &read_txn,
+                )
+            })
+            .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    }
 
     let unsigned_psbt = msg
         .to_checkpoint_psbt(&subnet.committee, &next_committee, fee_rate, &unspent)

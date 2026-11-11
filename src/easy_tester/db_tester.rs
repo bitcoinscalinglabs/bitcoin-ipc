@@ -140,8 +140,14 @@ impl DbTester {
 
     fn mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
         self.block_hash(height);
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
         self.db
-            .set_last_processed_block(height)
+            .set_last_processed_block(&mut txn, height)
+            .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
         info!("Mined block {}", height);
         Ok(())
@@ -169,8 +175,14 @@ impl DbTester {
             .map_err(|e| EasyTesterError::runtime(format!("create msg invalid: {e}")))?;
 
         let txid = create_rand_txid();
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("create failed: {e}")))?;
         let genesis_info = create_msg
-            .save_to_db(&self.db, height, txid)
+            .save_to_db(&self.db, &mut txn, height, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("create failed: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("create failed: {e}")))?;
         self.created_subnets
             .insert(subnet_name.to_string(), genesis_info.subnet_id);
@@ -220,8 +232,14 @@ impl DbTester {
             .map_err(|e| EasyTesterError::runtime(format!("join rejected: {e}")))?;
 
         let txid = create_rand_txid();
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("join failed: {e}")))?;
         join_msg
-            .save_to_db(&self.db, height, block_hash, txid)
+            .save_to_db(&self.db, &mut txn, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("join failed: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("join failed: {e}")))?;
         info!(
             "Join: validator '{}' joined subnet '{}' with {} sats",
@@ -260,7 +278,13 @@ impl DbTester {
         msg.validate_for_subnet(&subnet_state)
             .map_err(|e| EasyTesterError::runtime(format!("stake rejected: {e}")))?;
         let txid = create_rand_txid();
-        msg.save_to_db(&self.db, height, block_hash, txid)
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("stake failed: {e}")))?;
+        msg.save_to_db(&self.db, &mut txn, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("stake failed: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("stake failed: {e}")))?;
         info!(
             "Stake: validator '{}' staked {} sats to subnet '{}'",
@@ -309,7 +333,13 @@ impl DbTester {
             .map_err(|e| EasyTesterError::runtime(format!("unstake rejected: {e}")))?;
 
         let txid = create_rand_txid();
-        msg.save_to_db(&self.db, height, block_hash, txid)
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("unstake failed: {e}")))?;
+        msg.save_to_db(&self.db, &mut txn, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("unstake failed: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("unstake failed: {e}")))?;
         info!(
             "Unstake: validator '{}' unstaked {} sats from subnet '{}'",
@@ -374,8 +404,14 @@ impl DbTester {
         let supply_adjustments = msg.token_supply_adjustments.clone();
         let erc_transfers = msg.token_transfers.clone();
         let txid = create_rand_txid();
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
         let checkpoint = msg
-            .save_to_db(&self.db, height, block_hash, txid)
+            .save_to_db(&self.db, &mut txn, height, block_hash, txid)
+            .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
         println!(
             "OUTPUT checkpoint subnet='{}' height={} checkpointTx=accepted",
@@ -392,7 +428,14 @@ impl DbTester {
                 token_transfers: erc_transfers,
             };
             let batch_txid = create_rand_txid();
-            match batch_msg.save_to_db(&self.db, height, block_hash, batch_txid) {
+            let batch_result = (|| {
+                let mut txn = self.db.write_txn()?;
+                let checkpoint =
+                    batch_msg.save_to_db(&self.db, &mut txn, height, block_hash, batch_txid)?;
+                txn.commit()?;
+                Ok::<_, crate::ipc_lib::IpcLibError>(checkpoint)
+            })();
+            match batch_result {
                 Ok(_) => println!(
                     "OUTPUT checkpoint subnet='{}' height={} batchTx=accepted",
                     subnet_name, height
@@ -630,8 +673,20 @@ impl Tester for DbTester {
         self.mine_block(height)?;
 
         if let Some(rt) = &mut self.reward_tracker {
-            match rt.update_after_block(&self.db, height) {
-                Ok(_) => info!("Updated reward bookkeeping after block {}", height),
+            let mut txn = self.db.write_txn().map_err(|e| {
+                EasyTesterError::runtime(format!(
+                    "reward bookkeeping after block {height} failed: {e}"
+                ))
+            })?;
+            match rt.update_after_block(&self.db, &mut txn, height) {
+                Ok(_) => {
+                    txn.commit().map_err(|e| {
+                        EasyTesterError::runtime(format!(
+                            "reward bookkeeping after block {height} failed: {e}"
+                        ))
+                    })?;
+                    info!("Updated reward bookkeeping after block {}", height)
+                }
                 Err(e) => {
                     error!(
                         "Error updating reward bookkeeping after block {}: {:?}",
@@ -730,12 +785,18 @@ impl Tester for DbTester {
         )?;
 
         if let Some(rt) = &mut self.reward_tracker {
-            rt.update_after_checkpoint(&self.db, height, subnet_id, &checkpoint)
+            let mut txn = self.db.write_txn().map_err(|e| {
+                EasyTesterError::runtime(format!("reward bookkeeping after checkpoint failed: {e}"))
+            })?;
+            rt.update_after_checkpoint(&self.db, &mut txn, height, subnet_id, &checkpoint)
                 .map_err(|e| {
                     EasyTesterError::runtime(format!(
                         "reward bookkeeping after checkpoint failed: {e}"
                     ))
                 })?;
+            txn.commit().map_err(|e| {
+                EasyTesterError::runtime(format!("reward bookkeeping after checkpoint failed: {e}"))
+            })?;
         }
 
         Ok(())
