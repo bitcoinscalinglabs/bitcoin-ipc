@@ -27,7 +27,7 @@ Information moves between Bitcoin L1 and the subnet only through the existing to
 
 **B. bitcoin-ipc provider** (`bitcoin-ipc/src/provider/`, `src/bin/provider.rs`)
 - `rpc.rs`: every JSON-RPC method, `ServerData` (database, Bitcoin RPC, validator key). Checkpoint building: `signing_configuration`, `plan_checkpoint` (fund UTXOs, fee), `carried_slash_entries` (from the slash pre-signatures that the checkpoint carries), `get_unslashable_outputs`, `latest_checkpoint_at`.
-- `eots_signer.rs`: EOTS signing and the sign record. The commitment trees are rebuilt from the nonce seed at start (`build_nonce_trees` in `bin/provider.rs`) and never stored.
+- `eots_signer.rs`: EOTS signing and the sign record. At start the roots of the subtrees of 2^16 heights of each commitment tree are read from a file next to the key file (`build_nonce_trees` in `bin/provider.rs`, written at the join), and only the subtree of the next height is built; the next subtree is built in the background while signing.
 - Keys from the environment: `VALIDATOR_SK_PATH`, `EOTS_SK_PATH`, `EOTS_SEED_PATH` (`load_validator`, `load_hex32` in `bin/provider.rs`).
 - Checks: as A, plus monitor-tester scenarios (one provider per validator).
 
