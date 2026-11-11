@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use bitcoin::{hashes::Hash, Amount, BlockHash, Txid, XOnlyPublicKey};
+use heed::{RoTxn, RwTxn};
 use log::{info, warn};
 
 use crate::db::{
@@ -38,24 +39,26 @@ pub fn warn_if_small(subnet_id: SubnetId, epoch: u64, members: usize) {
 /// The number of the configuration of epoch `epoch`.
 pub fn epoch_committee_number<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     epoch: u64,
 ) -> Result<Option<u64>, DbError> {
     if epoch == 0 {
         return Ok(Some(WHITELIST_COMMITTEE_NUMBER));
     }
-    db.get_epoch_committee_number(subnet_id, epoch)
+    db.get_epoch_committee_number_txn(txn, subnet_id, epoch)
 }
 
 /// Whether the member with `join_txid` and `pubkey` joined with `join-ue`.
 pub fn is_ue_validator<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     join_txid: Txid,
     pubkey: &XOnlyPublicKey,
 ) -> Result<bool, DbError> {
     Ok(db
-        .get_ue_collateral(subnet_id, join_txid, pubkey)?
+        .get_ue_collateral_txn(txn, subnet_id, join_txid, pubkey)?
         .is_some())
 }
 
@@ -63,6 +66,7 @@ pub fn is_ue_validator<D: DatabaseCore>(
 /// changes, by key.
 pub fn multisig_members_after<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     genesis_info: &SubnetGenesisInfo,
     committee: &SubnetCommittee,
     pending: &[PendingMultisigChange],
@@ -73,7 +77,7 @@ pub fn multisig_members_after<D: DatabaseCore>(
 
     let mut members = BTreeMap::new();
     for member in &committee.validators {
-        if is_ue_validator(db, subnet_id, member.join_txid, &member.pubkey)? {
+        if is_ue_validator(db, txn, subnet_id, member.join_txid, &member.pubkey)? {
             continue;
         }
         let mut member = member.clone();
@@ -131,11 +135,13 @@ pub fn multisig_members_after<D: DatabaseCore>(
 /// configuration after the pending changes.
 pub fn next_multisig_members<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     genesis_info: &SubnetGenesisInfo,
     state: &SubnetState,
 ) -> Result<BTreeMap<XOnlyPublicKey, SubnetValidator>, IpcLibError> {
     multisig_members_after(
         db,
+        txn,
         genesis_info,
         state.latest_committee(),
         &state.pending_multisig_changes,
@@ -146,6 +152,7 @@ pub fn next_multisig_members<D: DatabaseCore>(
 /// qualifying collateral and the multisig members of `base` after `pending`.
 pub fn compute_configuration<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     genesis_info: &SubnetGenesisInfo,
     base: &SubnetCommittee,
     pending: &[PendingMultisigChange],
@@ -155,11 +162,14 @@ pub fn compute_configuration<D: DatabaseCore>(
     let params = &genesis_info.create_subnet_msg;
 
     let mut seated: BTreeMap<XOnlyPublicKey, SubnetValidator> = BTreeMap::new();
-    for record in db.get_ue_collaterals(subnet_id)? {
+    for record in db.get_ue_collaterals_txn(txn, subnet_id)? {
         if record.spent || u64::from(record.timeout) <= boundary {
             continue;
         }
-        if db.get_slash_presigs(subnet_id, &record.outpoint)?.is_none() {
+        if db
+            .get_slash_presigs_txn(txn, subnet_id, &record.outpoint)?
+            .is_none()
+        {
             continue;
         }
         match seated.get_mut(&record.pubkey) {
@@ -191,7 +201,7 @@ pub fn compute_configuration<D: DatabaseCore>(
     for validator in seated.values_mut() {
         validator.power = params.power_of(&validator.collateral)?;
     }
-    for (key, member) in multisig_members_after(db, genesis_info, base, pending)? {
+    for (key, member) in multisig_members_after(db, txn, genesis_info, base, pending)? {
         seated.entry(key).or_insert(member);
     }
     Ok(seated.into_values().collect())
@@ -297,13 +307,17 @@ pub fn configuration_changes(
 /// Whether the join collateral of every member of `C_gen` is spent or slashable.
 fn genesis_collaterals_slashable<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     state: &SubnetState,
 ) -> Result<bool, IpcLibError> {
-    for record in db.get_ue_collaterals(state.id)? {
+    for record in db.get_ue_collaterals_txn(txn, state.id)? {
         if record.spent || !state.committee.is_validator(&record.pubkey) {
             continue;
         }
-        if db.get_slash_presigs(state.id, &record.outpoint)?.is_none() {
+        if db
+            .get_slash_presigs_txn(txn, state.id, &record.outpoint)?
+            .is_none()
+        {
             return Ok(false);
         }
     }
@@ -313,18 +327,21 @@ fn genesis_collaterals_slashable<D: DatabaseCore>(
 /// Runs the cutoff of every subnet that Bitcoin block `block_height` activates or ends an epoch of.
 pub fn process_cutoffs<D: DatabaseCore>(
     db: &D,
+    txn: &mut RwTxn,
     block_height: u64,
     block_hash: BlockHash,
 ) -> Result<Vec<CutoffOutcome>, IpcLibError> {
     let mut outcomes = Vec::new();
-    for mut state in db.get_all_subnets()? {
-        let genesis_info = db.get_subnet_genesis_info(state.id)?.ok_or_else(|| {
-            IpcValidateError::InvalidMsg(format!("Subnet {} not found.", state.id))
-        })?;
+    for mut state in db.get_all_subnets_txn(txn)? {
+        let genesis_info = db
+            .get_subnet_genesis_info_txn(txn, state.id)?
+            .ok_or_else(|| {
+                IpcValidateError::InvalidMsg(format!("Subnet {} not found.", state.id))
+            })?;
         let params = &genesis_info.create_subnet_msg;
         let epoch = match state.h_0 {
             None => {
-                if !genesis_collaterals_slashable(db, &state)? {
+                if !genesis_collaterals_slashable(db, txn, &state)? {
                     continue;
                 }
                 state.h_0 = Some(block_height);
@@ -339,6 +356,7 @@ pub fn process_cutoffs<D: DatabaseCore>(
         };
         outcomes.push(process_cutoff(
             db,
+            txn,
             &genesis_info,
             state,
             epoch,
@@ -352,6 +370,7 @@ pub fn process_cutoffs<D: DatabaseCore>(
 /// Computes and records the configuration at one subnet's cutoff.
 fn process_cutoff<D: DatabaseCore>(
     db: &D,
+    txn: &mut RwTxn,
     genesis_info: &SubnetGenesisInfo,
     mut state: SubnetState,
     epoch: u64,
@@ -374,6 +393,7 @@ fn process_cutoff<D: DatabaseCore>(
     let boundary = params.cutoff_height(h_0, epoch + 2);
     let mut target = compute_configuration(
         db,
+        txn,
         genesis_info,
         &base,
         &state.pending_multisig_changes,
@@ -391,7 +411,7 @@ fn process_cutoff<D: DatabaseCore>(
     }
     warn_if_small(subnet_id, epoch, target.len());
 
-    let first_number = db.get_next_stake_change_configuration_number(subnet_id)?;
+    let first_number = db.get_next_stake_change_configuration_number_txn(txn, subnet_id)?;
     let (committee, changes) = configuration_changes(
         subnet_id,
         &base,
@@ -405,7 +425,7 @@ fn process_cutoff<D: DatabaseCore>(
     let current_number = if state.epoch == 0 {
         state.committee_number
     } else {
-        epoch_committee_number(db, subnet_id, state.epoch)?.unwrap_or(state.committee_number)
+        epoch_committee_number(db, txn, subnet_id, state.epoch)?.unwrap_or(state.committee_number)
     };
     let changed = !changes.is_empty();
     let committee_number = if changed {
@@ -421,16 +441,14 @@ fn process_cutoff<D: DatabaseCore>(
     if changed {
         state.waiting_committee = Some(committee.clone());
     }
-    let mut wtxn = db.write_txn()?;
     for change in changes {
-        db.add_stake_change(&mut wtxn, subnet_id, change)?;
+        db.add_stake_change(txn, subnet_id, change)?;
     }
     if changed {
-        db.save_committee(&mut wtxn, subnet_id, committee_number, &committee)?;
+        db.save_committee(txn, subnet_id, committee_number, &committee)?;
     }
-    db.save_epoch_committee_number(&mut wtxn, subnet_id, epoch, committee_number)?;
-    db.save_subnet_state(&mut wtxn, subnet_id, &state)?;
-    wtxn.commit()?;
+    db.save_epoch_committee_number(txn, subnet_id, epoch, committee_number)?;
+    db.save_subnet_state(txn, subnet_id, &state)?;
 
     if epoch == 1 {
         info!("Subnet {subnet_id} activated at block {block_height}: H_0 = {block_height}");

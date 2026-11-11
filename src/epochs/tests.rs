@@ -195,7 +195,9 @@ impl Fixture {
         txn.commit().unwrap();
     }
     fn cutoff(&self, height: u64) {
-        process_cutoffs(&self.db, height, hash()).unwrap();
+        let mut txn = self.db.write_txn().unwrap();
+        process_cutoffs(&self.db, &mut txn, height, hash()).unwrap();
+        txn.commit().unwrap();
     }
     fn changes(&self) -> Vec<StakeChangeRequest> {
         self.db
@@ -393,7 +395,15 @@ async fn eligibility_has_a_strict_timeout_boundary() {
     f.collateral(2, 140, true, false);
     f.collateral(3, 141, true, false);
     f.collateral(4, 2000, true, false);
-    let target = compute_configuration(&f.db, &genesis(), &committee(), &[], 140).unwrap();
+    let target = compute_configuration(
+        &f.db,
+        &f.db.read_txn().unwrap(),
+        &genesis(),
+        &committee(),
+        &[],
+        140,
+    )
+    .unwrap();
     let mut keys = target.iter().map(|v| v.pubkey).collect::<Vec<_>>();
     keys.sort();
     let mut expected = vec![pubkey(3), pubkey(4)];
@@ -405,7 +415,15 @@ async fn eligibility_has_a_strict_timeout_boundary() {
 async fn spent_slashable_collateral_is_excluded_from_the_next_configuration() {
     let f = Fixture::new().await;
     f.collateral(1, 2000, true, true);
-    let target = compute_configuration(&f.db, &genesis(), &committee(), &[], 140).unwrap();
+    let target = compute_configuration(
+        &f.db,
+        &f.db.read_txn().unwrap(),
+        &genesis(),
+        &committee(),
+        &[],
+        140,
+    )
+    .unwrap();
     assert!(!target.iter().any(|v| v.pubkey == pubkey(1)));
 }
 
@@ -603,14 +621,17 @@ async fn active_join_accepts_the_exact_total_power_limit_with_a_fractional_unit(
     // Four members hold 10 units each; the extra 9999 sat do not make another unit.
     let sats = (2_147_483_647u64 - 40) * 10_000 + 9_999;
     let join = active_join(sats);
+    let mut txn = f.db.write_txn().unwrap();
     crate::collateral::process_join_ue(
         &f.db,
+        &mut txn,
         &join,
         Txid::from_byte_array([0x74; 32]),
         109,
         hash(),
     )
     .unwrap();
+    txn.commit().unwrap();
     assert_eq!(f.db.get_ue_collaterals(id()).unwrap().len(), 5);
     assert_eq!(
         genesis()
@@ -628,14 +649,17 @@ async fn active_join_rejects_one_power_unit_above_the_total_limit_without_reserv
         f.collateral(n, 2000, true, false);
     }
     let join = active_join((2_147_483_647u64 - 39) * 10_000);
+    let mut txn = f.db.write_txn().unwrap();
     assert!(crate::collateral::process_join_ue(
         &f.db,
+        &mut txn,
         &join,
         Txid::from_byte_array([0x74; 32]),
         109,
         hash()
     )
     .is_err());
+    txn.commit().unwrap();
     assert_eq!(f.db.get_ue_collaterals(id()).unwrap().len(), 4);
     assert!(f
         .db
@@ -659,14 +683,17 @@ async fn active_join_counts_pending_multisig_changes_in_the_total_power() {
     txn.commit().unwrap();
     // The exact total power limit without the 10 units of the pending join
     let join = active_join((2_147_483_647u64 - 40) * 10_000);
+    let mut txn = f.db.write_txn().unwrap();
     assert!(crate::collateral::process_join_ue(
         &f.db,
+        &mut txn,
         &join,
         Txid::from_byte_array([0x74; 32]),
         109,
         hash()
     )
     .is_err());
+    txn.commit().unwrap();
     assert_eq!(f.db.get_ue_collaterals(id()).unwrap().len(), 4);
 }
 
@@ -676,19 +703,34 @@ const JOIN_AT_LIMIT: u64 = (2_147_483_647 - 40) * 10_000 + 9_999;
 const STAKE_AT_LIMIT: u64 = (2_147_483_647 - 30) * 10_000 + 9_999 - 100_000;
 
 fn multisig_join(f: &Fixture, sats: u64) -> Result<Option<SubnetState>, IpcLibError> {
-    active_join(sats)
-        .msg
-        .join
-        .save_to_db(&f.db, 109, hash(), Txid::from_byte_array([0x74; 32]))
+    let mut txn = f.db.write_txn().unwrap();
+    let joined = active_join(sats).msg.join.save_to_db(
+        &f.db,
+        &mut txn,
+        109,
+        hash(),
+        Txid::from_byte_array([0x74; 32]),
+    );
+    txn.commit().unwrap();
+    joined
 }
 
 fn multisig_stake(f: &Fixture, sats: u64) -> Result<(), IpcLibError> {
-    crate::ipc_lib::IpcStakeCollateralMsg {
+    let mut txn = f.db.write_txn().unwrap();
+    let staked = crate::ipc_lib::IpcStakeCollateralMsg {
         subnet_id: id(),
         amount: Amount::from_sat(sats),
         pubkey: pubkey(2),
     }
-    .save_to_db(&f.db, 109, hash(), Txid::from_byte_array([0x75; 32]))
+    .save_to_db(
+        &f.db,
+        &mut txn,
+        109,
+        hash(),
+        Txid::from_byte_array([0x75; 32]),
+    );
+    txn.commit().unwrap();
+    staked
 }
 
 fn refused_for_total_power<T>(result: Result<T, IpcLibError>) -> bool {
@@ -720,7 +762,16 @@ async fn multisig_join_before_bootstrap_counts_every_validator_in_the_total_powe
     let join = |n: u8, sats: u64| {
         let mut join = checked(id, n, n + 20, n + 10).msg.join;
         join.collateral = Amount::from_sat(sats);
-        join.save_to_db(&db, 102, hash(), Txid::from_byte_array([n + 30; 32]))
+        let mut txn = db.write_txn().unwrap();
+        let joined = join.save_to_db(
+            &db,
+            &mut txn,
+            102,
+            hash(),
+            Txid::from_byte_array([n + 30; 32]),
+        );
+        txn.commit().unwrap();
+        joined
     };
     join(2, 100_000).unwrap();
     let validators = || {
@@ -900,6 +951,7 @@ async fn activation_with_no_qualifying_collateral_keeps_genesis_power() {
 async fn epoch_zero_deposits_are_recorded_at_their_own_blocks_with_continuing_nonces() {
     let f = EpochZeroFixture::new([1000; 4]).await;
     for (i, sats) in [777, 330, 1001].into_iter().enumerate() {
+        let mut txn = f.db.write_txn().unwrap();
         IpcFundSubnetMsg {
             subnet_id: f.id,
             amount: Amount::from_sat(sats),
@@ -907,11 +959,13 @@ async fn epoch_zero_deposits_are_recorded_at_their_own_blocks_with_continuing_no
         }
         .save_to_db(
             &f.db,
+            &mut txn,
             103 + i as u64,
             BlockHash::from_byte_array([i as u8; 32]),
             Txid::from_byte_array([i as u8 + 101; 32]),
         )
         .unwrap();
+        txn.commit().unwrap();
         assert_eq!(f.db.get_all_rootnet_msgs(f.id).unwrap().len(), i + 1);
     }
     assert_eq!(f.state().h_0, None);
@@ -958,6 +1012,7 @@ async fn epoch_zero_deposits_are_recorded_at_their_own_blocks_with_continuing_no
     assert_eq!(f.state().h_0, Some(111));
     assert_eq!(f.db.get_all_rootnet_msgs(f.id).unwrap().len(), 3);
     assert_eq!(f.db.get_next_rootnet_msg_nonce(f.id).unwrap(), 3);
+    let mut txn = f.db.write_txn().unwrap();
     IpcFundSubnetMsg {
         subnet_id: f.id,
         amount: Amount::from_sat(444),
@@ -965,11 +1020,13 @@ async fn epoch_zero_deposits_are_recorded_at_their_own_blocks_with_continuing_no
     }
     .save_to_db(
         &f.db,
+        &mut txn,
         112,
         BlockHash::from_byte_array([112; 32]),
         Txid::from_byte_array([104; 32]),
     )
     .unwrap();
+    txn.commit().unwrap();
     let messages = f.db.get_all_rootnet_msgs(f.id).unwrap();
     assert_eq!(messages.len(), 4);
     assert!(matches!(
@@ -1044,24 +1101,30 @@ async fn waiting_rotation() -> EpochZeroFixture {
     // Record epoch 1's rotation before H_1; its four updates are already applied
     // when the epoch-2 checkpoint below carries the previous change number.
     let epoch_one = rotation(&f, 4);
+    let mut txn = f.db.write_txn().unwrap();
     epoch_one
         .save_to_db(
             &f.db,
+            &mut txn,
             112,
             BlockHash::from_byte_array([112; 32]),
             Txid::from_byte_array([0x97; 32]),
         )
         .unwrap();
+    txn.commit().unwrap();
     let mut join = checked(f.id, 5, 25, 15);
     join.committee_number = f.state().committee_number;
+    let mut txn = f.db.write_txn().unwrap();
     process_join_ue(
         &f.db,
+        &mut txn,
         &join,
         Txid::from_byte_array([35; 32]),
         113,
         BlockHash::from_byte_array([113; 32]),
     )
     .unwrap();
+    txn.commit().unwrap();
     let record =
         f.db.get_ue_collateral(f.id, Txid::from_byte_array([35; 32]), &pubkey(5))
             .unwrap()
@@ -1077,7 +1140,10 @@ async fn waiting_rotation() -> EpochZeroFixture {
     let mut txn = f.db.write_txn().unwrap();
     f.db.add_slash_presigs(&mut txn, &presigs).unwrap();
     txn.commit().unwrap();
-    crate::epochs::process_cutoffs(&f.db, 121, BlockHash::from_byte_array([121; 32])).unwrap();
+    let mut txn = f.db.write_txn().unwrap();
+    crate::epochs::process_cutoffs(&f.db, &mut txn, 121, BlockHash::from_byte_array([121; 32]))
+        .unwrap();
+    txn.commit().unwrap();
     f
 }
 
@@ -1086,14 +1152,17 @@ async fn rotation_with_zero_or_an_older_change_number_precedes_regular_update_co
     for applied in [0, 4, 5] {
         let f = waiting_rotation().await;
         let msg = rotation(&f, applied);
+        let mut txn = f.db.write_txn().unwrap();
         let cp = msg
             .save_to_db(
                 &f.db,
+                &mut txn,
                 122,
                 BlockHash::from_byte_array([122; 32]),
                 Txid::from_byte_array([0x96; 32]),
             )
             .unwrap();
+        txn.commit().unwrap();
         assert!(cp.is_rotation_checkpoint);
         assert_eq!(cp.epoch, 2);
         assert_eq!(cp.checkpoint_number, 2);
@@ -1123,14 +1192,17 @@ async fn rotation_with_zero_or_an_older_change_number_precedes_regular_update_co
         regular.checkpoint_hash =
             bitcoin::hashes::sha256::Hash::hash(&regular.checkpoint_height.to_le_bytes());
         let before = serde_json::to_value(f.state()).unwrap();
+        let mut txn = f.db.write_txn().unwrap();
         assert!(regular
             .save_to_db(
                 &f.db,
+                &mut txn,
                 123,
                 BlockHash::from_byte_array([123; 32]),
                 Txid::from_byte_array([0x98; 32]),
             )
             .is_err());
+        txn.commit().unwrap();
         assert_eq!(serde_json::to_value(f.state()).unwrap(), before);
         assert_eq!(
             f.db.get_unconfirmed_stake_changes(f.id).unwrap().len(),
@@ -1138,14 +1210,17 @@ async fn rotation_with_zero_or_an_older_change_number_precedes_regular_update_co
         );
 
         regular.is_rotation_checkpoint = false;
+        let mut txn = f.db.write_txn().unwrap();
         let cp = regular
             .save_to_db(
                 &f.db,
+                &mut txn,
                 123,
                 BlockHash::from_byte_array([123; 32]),
                 Txid::from_byte_array([0x98; 32]),
             )
             .unwrap();
+        txn.commit().unwrap();
         assert!(!cp.is_rotation_checkpoint);
         assert_eq!(cp.epoch, 2);
         assert_eq!(cp.checkpoint_number, 3);
@@ -1172,14 +1247,17 @@ async fn rotation_with_zero_or_an_older_change_number_precedes_regular_update_co
 async fn rotation_with_the_latest_change_number_confirms_all_released_updates() {
     let f = waiting_rotation().await;
     let msg = rotation(&f, 6);
+    let mut txn = f.db.write_txn().unwrap();
     let cp = msg
         .save_to_db(
             &f.db,
+            &mut txn,
             122,
             BlockHash::from_byte_array([122; 32]),
             Txid::from_byte_array([0x96; 32]),
         )
         .unwrap();
+    txn.commit().unwrap();
     assert_eq!(cp.next_configuration_number, 6);
     assert_eq!(cp.epoch, 2);
     assert!(cp.is_rotation_checkpoint);
@@ -1197,14 +1275,17 @@ async fn rotation_with_an_unreleased_change_number_is_rejected_atomically() {
     let before_state = serde_json::to_value(f.state()).unwrap();
     let before_changes = serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap();
     let msg = rotation(&f, 7);
+    let mut txn = f.db.write_txn().unwrap();
     assert!(msg
         .save_to_db(
             &f.db,
+            &mut txn,
             122,
             BlockHash::from_byte_array([122; 32]),
             Txid::from_byte_array([0x96; 32]),
         )
         .is_err());
+    txn.commit().unwrap();
     assert_eq!(serde_json::to_value(f.state()).unwrap(), before_state);
     assert_eq!(
         serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap(),
@@ -1222,14 +1303,17 @@ async fn rotation_whose_change_does_not_pay_the_new_multisig_is_rejected() {
     let mut msg = rotation(&f, 6);
     msg.change_address = Some(previous);
 
+    let mut txn = f.db.write_txn().unwrap();
     let err = msg
         .save_to_db(
             &f.db,
+            &mut txn,
             122,
             BlockHash::from_byte_array([122; 32]),
             Txid::from_byte_array([0x96; 32]),
         )
         .unwrap_err();
+    txn.commit().unwrap();
 
     assert!(
         matches!(
@@ -1256,14 +1340,17 @@ fn assert_change_refused(
     for change in wrong {
         let mut msg = msg.clone();
         msg.change_address = change.clone();
+        let mut txn = f.db.write_txn().unwrap();
         let err = msg
             .save_to_db(
                 &f.db,
+                &mut txn,
                 height,
                 BlockHash::from_byte_array([height as u8; 32]),
                 Txid::from_byte_array([0x99; 32]),
             )
             .unwrap_err();
+        txn.commit().unwrap();
         assert!(
             matches!(
                 err,
@@ -1283,13 +1370,18 @@ async fn every_checkpoint_but_the_kill_checkpoint_pays_its_change_to_ms_of_its_c
     let c_gen = f.state().committee.multisig_address.clone();
     assert_ne!(c_wlist, c_gen);
     let accept = |msg: &IpcCheckpointSubnetMsg, height: u64| {
-        msg.save_to_db(
-            &f.db,
-            height,
-            BlockHash::from_byte_array([height as u8; 32]),
-            Txid::from_byte_array([height as u8; 32]),
-        )
-        .unwrap()
+        let mut txn = f.db.write_txn().unwrap();
+        let checkpoint = msg
+            .save_to_db(
+                &f.db,
+                &mut txn,
+                height,
+                BlockHash::from_byte_array([height as u8; 32]),
+                Txid::from_byte_array([height as u8; 32]),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        checkpoint
     };
 
     // Epoch 0

@@ -44,7 +44,9 @@ fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
     db.save_checkpoint(&mut wtxn, subnet_id, &checkpoint(1, 120), 1)
         .unwrap();
     wtxn.commit().unwrap();
-    db.set_last_processed_block(125).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 125).unwrap();
+    txn.commit().unwrap();
 
     let at = |height: Option<u64>| latest_checkpoint_at(&db, subnet_id, None, height);
     // Processed heights answer by the height alone
@@ -62,10 +64,14 @@ fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
         })
     ));
     // Once that height is processed, the same question has an answer
-    db.set_last_processed_block(126).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 126).unwrap();
+    txn.commit().unwrap();
     assert_eq!(at(Some(126)).unwrap().unwrap().checkpoint_number, 1);
     // Without a Bitcoin height the processed height does not matter
-    db.set_last_processed_block(0).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 0).unwrap();
+    txn.commit().unwrap();
     assert_eq!(at(None).unwrap().unwrap().checkpoint_number, 1);
     assert_eq!(
         latest_checkpoint_at(&db, subnet_id, Some(0), None)
@@ -139,7 +145,9 @@ fn eots_records_hold_what_was_recorded_above_a_height_and_at_or_below_the_answer
     }
     wtxn.commit().unwrap();
     // The join at 23 is written, its Bitcoin block not processed yet
-    db.set_last_processed_block(22).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 22).unwrap();
+    txn.commit().unwrap();
 
     let at =
         |after: Option<u64>, max: Option<u64>| eots_records_at(&db, subnet_id, after, max).unwrap();
@@ -179,7 +187,9 @@ fn eots_records_hold_what_was_recorded_above_a_height_and_at_or_below_the_answer
 fn eots_records_at_a_bitcoin_height_wait_for_the_monitor() {
     let db = create_test_db();
     let subnet = generate_subnet(3);
-    db.set_last_processed_block(125).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 125).unwrap();
+    txn.commit().unwrap();
     // No state of the subnet is recorded yet: the height is not processed, the subnet is not missing
     assert!(matches!(
         eots_records_at(&db, subnet.id, None, Some(126)),
@@ -266,7 +276,8 @@ fn carried_entries_keep_complete_valid_ones_only() {
         .unwrap();
     db.add_ue_collateral(&mut wtxn, &record).unwrap();
     wtxn.commit().unwrap();
-    let script: CollateralScript = collateral::collateral_script_of(&db, &record).unwrap();
+    let script: CollateralScript =
+        collateral::collateral_script_of(&db, &db.read_txn().unwrap(), &record).unwrap();
     let sign = |k: &bitcoin::secp256k1::SecretKey| {
         sign_slash(
             &secp,
@@ -282,15 +293,15 @@ fn carried_entries_keep_complete_valid_ones_only() {
     bad.1[1][0] ^= 1;
     // Two valid of three: carried with the valid ones only; one valid: left out
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1, bad])];
-    let carried = carried_slash_entries(&db, subnet_id, &posted);
+    let carried = carried_slash_entries(&db, &db.read_txn().unwrap(), subnet_id, &posted);
     assert_eq!(carried.len(), 1);
     assert_eq!(carried[0].signatures, vec![s0, s1]);
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, bad])];
-    assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
+    assert!(carried_slash_entries(&db, &db.read_txn().unwrap(), subnet_id, &posted).is_empty());
     // An unknown output is left out; a slashable one is carried again
     let mut unknown = SlashSignatureEntry::new(record.outpoint, vec![s0, s1]);
     unknown.vout = 3;
-    assert!(carried_slash_entries(&db, subnet_id, &[unknown]).is_empty());
+    assert!(carried_slash_entries(&db, &db.read_txn().unwrap(), subnet_id, &[unknown]).is_empty());
     let mut wtxn = db.write_txn().unwrap();
     db.add_slash_presigs(
         &mut wtxn,
@@ -305,7 +316,10 @@ fn carried_entries_keep_complete_valid_ones_only() {
     .unwrap();
     wtxn.commit().unwrap();
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, s1])];
-    assert_eq!(carried_slash_entries(&db, subnet_id, &posted).len(), 1);
+    assert_eq!(
+        carried_slash_entries(&db, &db.read_txn().unwrap(), subnet_id, &posted).len(),
+        1
+    );
 
     // A second collateral whose join is in an earlier block comes first, whatever its outpoint
     let older = UeCollateral {
@@ -343,7 +357,8 @@ fn carried_entries_keep_complete_valid_ones_only() {
     }
     wtxn.commit().unwrap();
     let entry_of = |collateral: &UeCollateral| {
-        let script = collateral::collateral_script_of(&db, collateral).unwrap();
+        let script =
+            collateral::collateral_script_of(&db, &db.read_txn().unwrap(), collateral).unwrap();
         let signatures = keys[..2]
             .iter()
             .map(|k| {
@@ -360,7 +375,7 @@ fn carried_entries_keep_complete_valid_ones_only() {
         SlashSignatureEntry::new(collateral.outpoint, signatures)
     };
     let posted = vec![entry_of(&newer), entry_of(&older)];
-    let carried = carried_slash_entries(&db, subnet_id, &posted);
+    let carried = carried_slash_entries(&db, &db.read_txn().unwrap(), subnet_id, &posted);
     assert_eq!(
         carried.iter().map(|e| e.outpoint()).collect::<Vec<_>>(),
         vec![older.outpoint, newer.outpoint]
@@ -946,7 +961,17 @@ async fn checkpoint_epochs_across_periods_and_epoch_lengths() {
                     &secret(25),
                     join.msg.nonce_commitment,
                 );
-                process_join_ue(db, &join, Txid::from_byte_array([35; 32]), height, hash).unwrap();
+                let mut txn = db.write_txn().unwrap();
+                process_join_ue(
+                    db,
+                    &mut txn,
+                    &join,
+                    Txid::from_byte_array([35; 32]),
+                    height,
+                    hash,
+                )
+                .unwrap();
+                txn.commit().unwrap();
                 let record = db
                     .get_ue_collateral(id, Txid::from_byte_array([35; 32]), &pubkey(5))
                     .unwrap()
@@ -963,10 +988,14 @@ async fn checkpoint_epochs_across_periods_and_epoch_lengths() {
                 let funds = wallet.0.lock().unwrap().funds.clone();
                 let (psbt, reveal) = provider_checkpoint_and_reveal(&data, request.clone()).await;
                 let tx = psbt.unsigned_tx;
-                let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(db, &tx).unwrap();
+                let parsed =
+                    IpcCheckpointSubnetMsg::from_checkpoint_tx(db, &db.read_txn().unwrap(), &tx)
+                        .unwrap();
+                let mut txn = db.write_txn().unwrap();
                 let cp = parsed
-                    .save_to_db(db, height, hash, tx.compute_txid())
+                    .save_to_db(db, &mut txn, height, hash, tx.compute_txid())
                     .unwrap();
+                txn.commit().unwrap();
                 let expected_epoch = if height <= h_zero {
                     0
                 } else {
@@ -1066,15 +1095,20 @@ async fn checkpoint_epochs_across_periods_and_epoch_lengths() {
                     else {
                         panic!("batch reveal")
                     };
+                    let mut txn = db.write_txn().unwrap();
                     batch
-                        .process(db, height, hash, reveal.compute_txid())
+                        .process(db, &mut txn, height, hash, reveal.compute_txid())
                         .unwrap();
+                    txn.commit().unwrap();
                 }
                 request.slash_signatures.clear();
             }
 
             // No height is skipped: process_cutoffs observes every H_e.
-            for outcome in crate::epochs::process_cutoffs(db, height, hash).unwrap() {
+            let mut txn = db.write_txn().unwrap();
+            let outcomes = crate::epochs::process_cutoffs(db, &mut txn, height, hash).unwrap();
+            txn.commit().unwrap();
+            for outcome in outcomes {
                 assert_eq!(outcome.subnet_id, id);
                 let current = db
                     .get_subnet_state(id)
@@ -1261,17 +1295,22 @@ async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_
         tx.output.last().unwrap().script_pubkey,
         destination.script_pubkey()
     );
-    let msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, tx).unwrap();
+    let msg =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, &data.db.read_txn().unwrap(), tx)
+            .unwrap();
     assert!(msg.is_rotation_checkpoint);
     assert_eq!(msg.next_committee_configuration_number, 0);
+    let mut txn = data.db.write_txn().unwrap();
     let cp = msg
         .save_to_db(
             &*data.db,
+            &mut txn,
             113,
             BlockHash::from_byte_array([113; 32]),
             tx.compute_txid(),
         )
         .unwrap();
+    txn.commit().unwrap();
     assert!(cp.is_rotation_checkpoint);
     assert_eq!(cp.epoch, 1);
     assert_eq!(
@@ -1293,14 +1332,17 @@ async fn unchanged_epoch_has_a_flagged_rotation_without_updates_or_a_fund_sweep(
     f.accept(&first, &tx, 110);
     f.reveal(&reveal, 111).unwrap();
     f.cutoff(111);
+    let mut txn = f.db.write_txn().unwrap();
     rotation(&f, 4)
         .save_to_db(
             &f.db,
+            &mut txn,
             112,
             BlockHash::from_byte_array([112; 32]),
             Txid::from_byte_array([0x97; 32]),
         )
         .unwrap();
+    txn.commit().unwrap();
     let changes = serde_json::to_value(f.db.get_all_stake_changes(f.id).unwrap()).unwrap();
     let previous = f.state().committee;
     f.cutoff(121);
@@ -1347,17 +1389,22 @@ async fn unchanged_epoch_has_a_flagged_rotation_without_updates_or_a_fund_sweep(
         tx.output.last().unwrap().script_pubkey,
         address.script_pubkey()
     );
-    let msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, tx).unwrap();
+    let msg =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, &data.db.read_txn().unwrap(), tx)
+            .unwrap();
     assert!(msg.is_rotation_checkpoint);
     assert_eq!(msg.next_committee_configuration_number, 4);
+    let mut txn = data.db.write_txn().unwrap();
     let cp = msg
         .save_to_db(
             &*data.db,
+            &mut txn,
             122,
             BlockHash::from_byte_array([122; 32]),
             tx.compute_txid(),
         )
         .unwrap();
+    txn.commit().unwrap();
     assert!(cp.is_rotation_checkpoint);
     assert_eq!(cp.epoch, 2);
     let state = data.db.get_subnet_state(id).unwrap().unwrap();
@@ -1505,7 +1552,9 @@ async fn join_ue_takes_the_eots_key_and_nonces_from_the_eots_signer() {
     let (dir, db) = database().await;
     let id = subnet(92);
     create(&db, id);
-    db.set_last_processed_block(100).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 100).unwrap();
+    txn.commit().unwrap();
     let genesis = db.get_subnet_genesis_info(id).unwrap().unwrap();
     let seed = crate::eots::EotsSeed::from_bytes([0x5e; 32]);
     let signer = crate::provider::eots_signer::EotsSigner::load(

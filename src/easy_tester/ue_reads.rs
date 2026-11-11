@@ -38,8 +38,9 @@ pub fn read_validators<D: DatabaseCore>(
     names: &Names,
     current: bool,
 ) -> Result<UeRead, EasyTesterError> {
+    let txn = db.read_txn().map_err(db_err)?;
     let state = db
-        .get_subnet_state(subnet_id)
+        .get_subnet_state_txn(&txn, subnet_id)
         .map_err(db_err)?
         .ok_or_else(|| {
             EasyTesterError::runtime(format!("subnet '{subnet_name}' is not bootstrapped"))
@@ -59,7 +60,7 @@ pub fn read_validators<D: DatabaseCore>(
     for v in &committee.validators {
         let n = name(names, &v.pubkey);
         fields.insert(format!("{n}.collateral"), v.collateral.to_sat().to_string());
-        let ue = is_ue_validator(db, subnet_id, v.join_txid, &v.pubkey).map_err(db_err)?;
+        let ue = is_ue_validator(db, &txn, subnet_id, v.join_txid, &v.pubkey).map_err(db_err)?;
         fields.insert(format!("{n}.ue"), ue.to_string());
         list.push(n);
     }

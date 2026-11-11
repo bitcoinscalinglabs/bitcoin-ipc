@@ -155,7 +155,7 @@ fn presign_entry(
     signers: &[&Keypair],
 ) -> crate::slash::SlashSignatureEntry {
     let secp = Secp256k1::new();
-    let script = collateral_script_of(db, record).unwrap();
+    let script = collateral_script_of(db, &db.read_txn().unwrap(), record).unwrap();
     let mut signatures = signers
         .iter()
         .map(|k| {
@@ -193,7 +193,9 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     for key in &keys[..2] {
         let (checked, join_txid) = checked_join_in_db(&db, &secp, key, subnet_id, TIMEOUT);
         assert_eq!(checked.committee_number, WHITELIST_COMMITTEE_NUMBER);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
     }
     let state = db
         .get_subnet_state(subnet_id)
@@ -211,11 +213,13 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
 
     // A third key joins after activation: recorded, naming configuration 1, not seated
     let (checked, join_txid) = checked_join_in_db(&db, &secp, &keys[2], subnet_id, TIMEOUT);
+    let mut txn = db.write_txn().unwrap();
     assert!(
-        process_join_ue(&db, &checked, join_txid, BLOCK + 1, block_hash)
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK + 1, block_hash)
             .unwrap()
             .is_none()
     );
+    txn.commit().unwrap();
     let record = db
         .get_ue_collateral(subnet_id, join_txid, &pks[2])
         .unwrap()
@@ -228,11 +232,11 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     // One member of configuration 1 does not reach its threshold: valid, not slashable
     let one = presign_entry(&db, &record, &[&keys[0]]);
     assert!(batch_with(subnet_id, vec![one])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .unwrap()
         .is_empty());
     // A signature by a key outside the configuration cannot be built
-    let script = collateral_script_of(&db, &record).unwrap();
+    let script = collateral_script_of(&db, &db.read_txn().unwrap(), &record).unwrap();
     assert!(
         crate::slash::sign_slash(&secp, &script, record.outpoint, record.value, &keys[3]).is_err()
     );
@@ -240,12 +244,12 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     let mut bad = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
     bad.signatures[0].1[1][0] ^= 1;
     assert!(batch_with(subnet_id, vec![bad])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .is_err());
     let mut unknown = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
     unknown.vout = 7;
     assert!(batch_with(subnet_id, vec![unknown])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .is_err());
     // Disorder is rejected by validation
     let entry = presign_entry(&db, &record, &[&keys[0], &keys[1]]);
@@ -258,21 +262,21 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
 
     // Both members reach the threshold: slashable
     let newly = batch_with(subnet_id, vec![entry.clone()])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .unwrap();
     assert_eq!(newly.len(), 1);
     assert_eq!(newly[0].0.outpoint, record.outpoint);
     make_slashable(&db, subnet_id, join_txid, &pks[2], BLOCK + 2);
     // A later entry for a slashable output changes nothing
     assert!(batch_with(subnet_id, vec![entry])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .unwrap()
         .is_empty());
     // A genesis member's collateral names the whitelist: two whitelisted keys suffice
     let genesis_entry = presign_entry(&db, &record0, &[&keys[1], &keys[2]]);
     assert_eq!(
         batch_with(subnet_id, vec![genesis_entry])
-            .newly_slashable(&db)
+            .newly_slashable(&db, &db.read_txn().unwrap())
             .unwrap()
             .len(),
         1
@@ -887,12 +891,18 @@ fn two_join_ue_in_one_reveal_of_the_same_subnet() {
     let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK, &context()).unwrap();
     assert!(check_join_ue(&secp, &reveal, 0, &commits[1], BLOCK, &context()).is_err());
     assert_ne!(a.outpoint, b.outpoint);
-    assert!(process_join_ue(&db, &a, join_txid, BLOCK, block_hash)
-        .unwrap()
-        .is_none());
-    let state = process_join_ue(&db, &b, join_txid, BLOCK, block_hash)
+    let mut txn = db.write_txn().unwrap();
+    assert!(
+        process_join_ue(&db, &mut txn, &a, join_txid, BLOCK, block_hash)
+            .unwrap()
+            .is_none()
+    );
+    txn.commit().unwrap();
+    let mut txn = db.write_txn().unwrap();
+    let state = process_join_ue(&db, &mut txn, &b, join_txid, BLOCK, block_hash)
         .unwrap()
         .expect("the second join bootstraps");
+    txn.commit().unwrap();
 
     // Two records under the reveal txid, one per key, and both keys in the configuration
     let mut records = db.get_ue_collaterals(subnet_id).unwrap();
@@ -914,10 +924,10 @@ fn two_join_ue_in_one_reveal_of_the_same_subnet() {
         .validators
         .iter()
         .all(|v| v.join_txid == join_txid));
-    assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[0]).unwrap());
-    assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[1]).unwrap());
+    assert!(is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pks[0]).unwrap());
+    assert!(is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pks[1]).unwrap());
     let other = generate_keypairs(1)[0].x_only_public_key().0;
-    assert!(!is_ue_validator(&db, subnet_id, join_txid, &other).unwrap());
+    assert!(!is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &other).unwrap());
 
     // Once slashable, key 0 leaves at the cutoff whose boundary reaches T, with the value
     // `C_gen` gave it; key 1 stays, and stays past its own timeout as the only member
@@ -959,12 +969,20 @@ fn two_join_ue_in_one_reveal_of_different_subnets() {
     let a = check_join_ue(&secp, &reveal, 0, &commits[0], BLOCK, &context()).unwrap();
     let b = check_join_ue(&secp, &reveal, 1, &commits[1], BLOCK, &context()).unwrap();
     assert_ne!(a.outpoint, b.outpoint);
-    assert!(process_join_ue(&db, &a, join_txid, BLOCK, block_hash)
-        .unwrap()
-        .is_some());
-    assert!(process_join_ue(&db, &b, join_txid, BLOCK, block_hash)
-        .unwrap()
-        .is_some());
+    let mut txn = db.write_txn().unwrap();
+    assert!(
+        process_join_ue(&db, &mut txn, &a, join_txid, BLOCK, block_hash)
+            .unwrap()
+            .is_some()
+    );
+    txn.commit().unwrap();
+    let mut txn = db.write_txn().unwrap();
+    assert!(
+        process_join_ue(&db, &mut txn, &b, join_txid, BLOCK, block_hash)
+            .unwrap()
+            .is_some()
+    );
+    txn.commit().unwrap();
 
     for (subnet_id, checked) in [(subnet_a, &a), (subnet_b, &b)] {
         let records = db.get_ue_collaterals(subnet_id).unwrap();
@@ -973,7 +991,7 @@ fn two_join_ue_in_one_reveal_of_different_subnets() {
             (records[0].pubkey, records[0].join_txid, records[0].outpoint),
             (pk, join_txid, checked.outpoint)
         );
-        assert!(is_ue_validator(&db, subnet_id, join_txid, &pk).unwrap());
+        assert!(is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pk).unwrap());
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
         assert_eq!(state.latest_committee().validators.len(), 1);
     }
@@ -1022,9 +1040,12 @@ fn replayed_block_with_two_join_ue_in_one_reveal_gives_the_same_state() {
         joins
             .iter()
             .map(|j| {
-                process_join_ue(&db, j, join_txid, BLOCK, block_hash)
+                let mut txn = db.write_txn().unwrap();
+                let applied = process_join_ue(&db, &mut txn, j, join_txid, BLOCK, block_hash)
                     .unwrap()
-                    .is_some()
+                    .is_some();
+                txn.commit().unwrap();
+                applied
             })
             .collect::<Vec<_>>()
     };
@@ -1170,7 +1191,11 @@ fn activate(db: &HeedDb, subnet_id: SubnetId, h_0: u64) {
 
 /// The cutoff pass of block `height`
 fn cutoff(db: &HeedDb, height: u64) -> Vec<crate::epochs::CutoffOutcome> {
-    crate::epochs::process_cutoffs(db, height, BlockHash::all_zeros()).unwrap()
+    let mut txn = db.write_txn().unwrap();
+    let outcomes =
+        crate::epochs::process_cutoffs(db, &mut txn, height, BlockHash::all_zeros()).unwrap();
+    txn.commit().unwrap();
+    outcomes
 }
 
 /// A join checked against the configurations the recorded state of the subnet names
@@ -1192,7 +1217,7 @@ fn checked_join_in_db(
         &eots_key_of(&pubkey),
         test_commitment(),
     );
-    let context = join_context(db, subnet_id).unwrap();
+    let context = join_context(db, &db.read_txn().unwrap(), subnet_id).unwrap();
     let (commit, reveal, _) =
         unsigned_join_ue_txs(secp, &msg, COLLATERAL, &context.named[0].1).unwrap();
     let checked = check_join_ue(secp, &reveal, 0, &commit, BLOCK, &context).unwrap();
@@ -1234,7 +1259,9 @@ fn multisig_unstake_rejects_a_ue_member() {
     let subnet_id = subnet_with_whitelist(&db, vec![pk], 1);
     let block_hash = BlockHash::all_zeros();
     let (checked, join_txid) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
-    process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+    txn.commit().unwrap();
     let before = db.get_subnet_state(subnet_id).unwrap().unwrap();
     assert_eq!(before.latest_committee().pubkeys(), vec![pk]);
 
@@ -1244,9 +1271,11 @@ fn multisig_unstake_rejects_a_ue_member() {
         amount: COLLATERAL,
         pubkey: Some(pk),
     };
+    let mut txn = db.write_txn().unwrap();
     let err = unstake
-        .save_to_db(&db, BLOCK + 1, block_hash, join_txid)
+        .save_to_db(&db, &mut txn, BLOCK + 1, block_hash, join_txid)
         .unwrap_err();
+    txn.commit().unwrap();
     assert!(matches!(err, IpcLibError::IpcValidateError(_)), "{err}");
     let after = db.get_subnet_state(subnet_id).unwrap().unwrap();
     assert_eq!(after.latest_committee().pubkeys(), vec![pk]);
@@ -1262,8 +1291,16 @@ fn multisig_unstake_of_the_only_member_withdraws_its_whole_collateral() {
     let mut join = test_join_msg(pk);
     join.subnet_id = subnet_id;
     join.collateral = COLLATERAL;
-    join.save_to_db(&db, BLOCK, block_hash, Txid::from_byte_array([0x61; 32]))
-        .unwrap();
+    let mut txn = db.write_txn().unwrap();
+    join.save_to_db(
+        &db,
+        &mut txn,
+        BLOCK,
+        block_hash,
+        Txid::from_byte_array([0x61; 32]),
+    )
+    .unwrap();
+    txn.commit().unwrap();
     // A configuration after the first rotation, holding the join collateral
     let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
     let mut member = state.committee.validators[0].clone();
@@ -1276,6 +1313,7 @@ fn multisig_unstake_of_the_only_member_withdraws_its_whole_collateral() {
     wtxn.commit().unwrap();
     activate(&db, subnet_id, BLOCK);
 
+    let mut txn = db.write_txn().unwrap();
     IpcUnstakeCollateralMsg {
         subnet_id,
         amount: COLLATERAL,
@@ -1283,11 +1321,13 @@ fn multisig_unstake_of_the_only_member_withdraws_its_whole_collateral() {
     }
     .save_to_db(
         &db,
+        &mut txn,
         BLOCK + 1,
         block_hash,
         Txid::from_byte_array([0x62; 32]),
     )
     .unwrap();
+    txn.commit().unwrap();
 
     let after = db.get_subnet_state(subnet_id).unwrap().unwrap();
     assert!(matches!(
@@ -1307,11 +1347,18 @@ fn a_join_before_activation_counts_its_collateral_once_against_the_total_power_l
     let power = u64::from(crate::multisig::MAX_TOTAL_POWER / 2 + 1);
     let collateral = Amount::from_sat(power * UNIT.to_sat());
     let (checked, join_txid) = checked_join_with(&secp, &keys[0], subnet_id, TIMEOUT, collateral);
-    assert!(
-        process_join_ue(&db, &checked, join_txid, BLOCK, BlockHash::all_zeros())
-            .unwrap()
-            .is_none()
-    );
+    let mut txn = db.write_txn().unwrap();
+    assert!(process_join_ue(
+        &db,
+        &mut txn,
+        &checked,
+        join_txid,
+        BLOCK,
+        BlockHash::all_zeros()
+    )
+    .unwrap()
+    .is_none());
+    txn.commit().unwrap();
     assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 1);
 }
 
@@ -1326,9 +1373,13 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
 
     // First join: not yet bootstrapped, record written
     let (checked, join_txid) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
-    assert!(process_join_ue(&db, &checked, join_txid, BLOCK, block_hash)
-        .unwrap()
-        .is_none());
+    let mut txn = db.write_txn().unwrap();
+    assert!(
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash)
+            .unwrap()
+            .is_none()
+    );
+    txn.commit().unwrap();
     let record = db
         .get_ue_collateral(subnet_id, join_txid, &pks[0])
         .unwrap()
@@ -1338,12 +1389,14 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
     assert_eq!(record.value, COLLATERAL);
     assert_eq!(record.timeout, TIMEOUT);
     assert!(!record.spent);
-    assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[0]).unwrap());
-    assert!(!is_ue_validator(&db, subnet_id, join_txid, &pks[1]).unwrap());
+    assert!(is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pks[0]).unwrap());
+    assert!(!is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pks[1]).unwrap());
 
     // The same key again, in another reveal: rejected, and only the first record stays
     let (dup, dup_txid) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
-    assert!(process_join_ue(&db, &dup, dup_txid, BLOCK, block_hash).is_err());
+    let mut txn = db.write_txn().unwrap();
+    assert!(process_join_ue(&db, &mut txn, &dup, dup_txid, BLOCK, block_hash).is_err());
+    txn.commit().unwrap();
     assert!(db
         .get_ue_collateral(subnet_id, dup_txid, &pks[0])
         .unwrap()
@@ -1355,9 +1408,11 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
 
     // Second whitelisted key bootstraps the subnet
     let (checked2, join_txid2) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT);
-    let state = process_join_ue(&db, &checked2, join_txid2, BLOCK, block_hash)
+    let mut txn = db.write_txn().unwrap();
+    let state = process_join_ue(&db, &mut txn, &checked2, join_txid2, BLOCK, block_hash)
         .unwrap()
         .expect("bootstrapped");
+    txn.commit().unwrap();
     assert_eq!(state.committee.validators.len(), 2);
     assert!(state
         .committee
@@ -1369,11 +1424,13 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
     // After activation a third key joins; the next cutoff seats it once slashable
     activate(&db, subnet_id, BLOCK);
     let (checked3, join_txid3) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 500);
+    let mut txn = db.write_txn().unwrap();
     assert!(
-        process_join_ue(&db, &checked3, join_txid3, BLOCK + 1, block_hash)
+        process_join_ue(&db, &mut txn, &checked3, join_txid3, BLOCK + 1, block_hash)
             .unwrap()
             .is_none()
     );
+    txn.commit().unwrap();
     for (pk, txid) in [
         (pks[0], join_txid),
         (pks[1], join_txid2),
@@ -1387,11 +1444,13 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
 
     // Reprocessing the same reveal (a restart) is a no-op: no new stake changes
     let changes = db.get_unconfirmed_stake_changes(subnet_id).unwrap().len();
+    let mut txn = db.write_txn().unwrap();
     assert!(
-        process_join_ue(&db, &checked3, join_txid3, BLOCK + 1, block_hash)
+        process_join_ue(&db, &mut txn, &checked3, join_txid3, BLOCK + 1, block_hash)
             .unwrap()
             .is_none()
     );
+    txn.commit().unwrap();
     assert_eq!(
         db.get_unconfirmed_stake_changes(subnet_id).unwrap().len(),
         changes
@@ -1405,7 +1464,9 @@ fn process_join_ue_bootstraps_records_and_rejects_duplicates() {
     let mut small = checked_join(&secp, &keys[2], subnet_id, TIMEOUT).0;
     small.msg.join.collateral = Amount::from_sat(9_999);
     let small_txid = Txid::from_slice(&[9u8; 32]).unwrap();
-    assert!(process_join_ue(&db, &small, small_txid, BLOCK + 1, block_hash).is_err());
+    let mut txn = db.write_txn().unwrap();
+    assert!(process_join_ue(&db, &mut txn, &small, small_txid, BLOCK + 1, block_hash).is_err());
+    txn.commit().unwrap();
     assert!(db
         .get_ue_collateral(subnet_id, small_txid, &pks[2])
         .unwrap()
@@ -1426,7 +1487,9 @@ fn cutoffs_drop_the_collaterals_that_mature_within_three_epochs() {
             activate(&db, subnet_id, BLOCK);
         }
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     assert!(withdrawals(&db, subnet_id).is_empty());
@@ -1470,7 +1533,9 @@ fn replayed_block_gives_the_same_state() {
     let block_hash = BlockHash::all_zeros();
     for (key, timeout) in keys.iter().take(2).zip([TIMEOUT, TIMEOUT + 1000]) {
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     activate(&db, subnet_id, BLOCK);
@@ -1480,7 +1545,10 @@ fn replayed_block_gives_the_same_state() {
     let (checked3, join_txid3) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 2000);
     let run_block = || {
         cutoff(&db, h);
-        process_join_ue(&db, &checked3, join_txid3, h, block_hash).unwrap()
+        let mut txn = db.write_txn().unwrap();
+        let joined = process_join_ue(&db, &mut txn, &checked3, join_txid3, h, block_hash).unwrap();
+        txn.commit().unwrap();
+        joined
     };
     run_block();
     let snapshot = |db: &HeedDb| {
@@ -1510,7 +1578,9 @@ fn activation_switch_reconciles_with_the_database() {
     check_ue_activation(&db, Some(5)).unwrap();
 
     // Blocks up to 10 processed with the switch at 5: it cannot change
-    db.set_last_processed_block(10).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 10).unwrap();
+    txn.commit().unwrap();
     check_ue_activation(&db, Some(5)).unwrap();
     assert!(check_ue_activation(&db, Some(7)).is_err());
     assert!(check_ue_activation(&db, Some(20)).is_err());
@@ -1519,7 +1589,9 @@ fn activation_switch_reconciles_with_the_database() {
 
     // A switch wholly in the future can be set, moved and unset (block 11 counts as processed)
     let db = create_test_db();
-    db.set_last_processed_block(10).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 10).unwrap();
+    txn.commit().unwrap();
     assert!(check_ue_activation(&db, Some(10)).is_err());
     assert!(check_ue_activation(&db, Some(11)).is_err());
     check_ue_activation(&db, Some(12)).unwrap();
@@ -1530,7 +1602,9 @@ fn activation_switch_reconciles_with_the_database() {
     // A join-ue accepted in block 10 before a crash (recorded height 9): the switch is fixed
     let db = create_test_db();
     check_ue_activation(&db, Some(10)).unwrap();
-    db.set_last_processed_block(9).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    db.set_last_processed_block(&mut txn, 9).unwrap();
+    txn.commit().unwrap();
     assert!(check_ue_activation(&db, None).is_err());
     assert!(check_ue_activation(&db, Some(11)).is_err());
     check_ue_activation(&db, Some(10)).unwrap();
@@ -1547,7 +1621,9 @@ fn one_reveal_can_carry_a_ue_join_and_an_ordinary_join() {
     let block_hash = BlockHash::all_zeros();
     for key in &keys[..2] {
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, TIMEOUT + 500);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     activate(&db, subnet_id, BLOCK);
@@ -1555,17 +1631,28 @@ fn one_reveal_can_carry_a_ue_join_and_an_ordinary_join() {
     // A replaced reveal carries the UE join of key 2 and an ordinary join of a fresh key
     let ordinary = generate_keypairs(1)[0].x_only_public_key().0;
     let (checked, join_txid) = checked_join(&secp, &keys[2], subnet_id, TIMEOUT + 100);
-    process_join_ue(&db, &checked, join_txid, BLOCK + 1, block_hash).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK + 1, block_hash).unwrap();
+    txn.commit().unwrap();
     make_slashable(&db, subnet_id, join_txid, &pks[2], BLOCK + 1);
     let mut plain = test_join_msg(ordinary);
     plain.subnet_id = subnet_id;
     plain.collateral = COLLATERAL;
+    let mut txn = db.write_txn().unwrap();
     plain
-        .save_to_db(&db, BLOCK + 1, block_hash, join_txid)
+        .save_to_db(&db, &mut txn, BLOCK + 1, block_hash, join_txid)
         .unwrap();
+    txn.commit().unwrap();
 
-    assert!(is_ue_validator(&db, subnet_id, join_txid, &pks[2]).unwrap());
-    assert!(!is_ue_validator(&db, subnet_id, join_txid, &ordinary).unwrap());
+    assert!(is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &pks[2]).unwrap());
+    assert!(!is_ue_validator(
+        &db,
+        &db.read_txn().unwrap(),
+        subnet_id,
+        join_txid,
+        &ordinary
+    )
+    .unwrap());
     // The next cutoff seats both
     cutoff(&db, BLOCK + 10);
     let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
@@ -1590,9 +1677,13 @@ fn stake_and_unstake_of_a_ue_member_are_refused() {
     let subnet_id = subnet_with_whitelist(&db, vec![pks[0], pks[1]], 2);
     let block_hash = BlockHash::all_zeros();
     let (a, txid_a) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT);
-    process_join_ue(&db, &a, txid_a, BLOCK, block_hash).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(&db, &mut txn, &a, txid_a, BLOCK, block_hash).unwrap();
+    txn.commit().unwrap();
     let (b, txid_b) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT + 1000);
-    process_join_ue(&db, &b, txid_b, BLOCK, block_hash).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(&db, &mut txn, &b, txid_b, BLOCK, block_hash).unwrap();
+    txn.commit().unwrap();
     activate(&db, subnet_id, BLOCK);
     make_slashable(&db, subnet_id, txid_a, &pks[0], BLOCK);
     make_slashable(&db, subnet_id, txid_b, &pks[1], BLOCK);
@@ -1600,23 +1691,26 @@ fn stake_and_unstake_of_a_ue_member_are_refused() {
     let mut plain = test_join_msg(ordinary);
     plain.subnet_id = subnet_id;
     plain.collateral = COLLATERAL;
+    let mut txn = db.write_txn().unwrap();
     plain
         .save_to_db(
             &db,
+            &mut txn,
             BLOCK + 1,
             block_hash,
             Txid::from_slice(&[3u8; 32]).unwrap(),
         )
         .unwrap();
+    txn.commit().unwrap();
     let outsider = generate_keypairs(1)[0].x_only_public_key().0;
 
-    let err = refuse_ue_member(&db, subnet_id, &pks[0]).unwrap_err();
+    let err = refuse_ue_member(&db, &db.read_txn().unwrap(), subnet_id, &pks[0]).unwrap_err();
     assert!(
         matches!(&err, IpcLibError::IpcValidateError(e) if e.to_string().contains("unstakeue")),
         "{err}"
     );
-    refuse_ue_member(&db, subnet_id, &ordinary).unwrap();
-    refuse_ue_member(&db, subnet_id, &outsider).unwrap();
+    refuse_ue_member(&db, &db.read_txn().unwrap(), subnet_id, &ordinary).unwrap();
+    refuse_ue_member(&db, &db.read_txn().unwrap(), subnet_id, &outsider).unwrap();
 
     // The cutoffs are not affected: the one whose boundary reaches A's timeout withdraws
     // its whole collateral
@@ -1625,7 +1719,7 @@ fn stake_and_unstake_of_a_ue_member_are_refused() {
     cutoff(&db, BLOCK + 87 * 10);
     assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], COLLATERAL)]);
     // A has left and is not a member: not refused
-    refuse_ue_member(&db, subnet_id, &pks[0]).unwrap();
+    refuse_ue_member(&db, &db.read_txn().unwrap(), subnet_id, &pks[0]).unwrap();
 }
 
 #[test]
@@ -1638,7 +1732,9 @@ fn a_key_that_left_cannot_join_again() {
     let block_hash = BlockHash::all_zeros();
     for (key, timeout) in keys.iter().zip([TIMEOUT, TIMEOUT + 1000]) {
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     activate(&db, subnet_id, BLOCK);
@@ -1651,7 +1747,10 @@ fn a_key_that_left_cannot_join_again() {
 
     // Its new join-ue is refused: a key joins a subnet once
     let (again, txid_again) = checked_join(&secp, &keys[0], subnet_id, TIMEOUT + 1000);
-    let err = process_join_ue(&db, &again, txid_again, BLOCK + 20, block_hash).unwrap_err();
+    let mut txn = db.write_txn().unwrap();
+    let err =
+        process_join_ue(&db, &mut txn, &again, txid_again, BLOCK + 20, block_hash).unwrap_err();
+    txn.commit().unwrap();
     assert!(err.to_string().contains("joins a subnet once"), "{err}");
     assert!(db
         .get_ue_collateral(subnet_id, txid_again, &pks[0])
@@ -1675,22 +1774,27 @@ fn a_key_with_an_earlier_multisig_join_cannot_join_ue() {
         let mut join = test_join_msg(pubkey);
         join.subnet_id = subnet_id;
         join.collateral = COLLATERAL;
+        let mut txn = db.write_txn().unwrap();
         join.save_to_db(
             &db,
+            &mut txn,
             block,
             block_hash,
             Txid::from_slice(&[txid_byte; 32]).unwrap(),
         )
         .unwrap();
+        txn.commit().unwrap();
     };
 
     // Key 0 joins through the multisig before bootstrap, key 1 bootstraps with join-ue,
     // key 2 joins through the multisig after activation
     multisig_join(pks[0], BLOCK, 1);
     let (checked, join_txid) = checked_join(&secp, &keys[1], subnet_id, TIMEOUT);
-    process_join_ue(&db, &checked, join_txid, BLOCK, block_hash)
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash)
         .unwrap()
         .expect("bootstrapped");
+    txn.commit().unwrap();
     activate(&db, subnet_id, BLOCK);
     make_slashable(&db, subnet_id, join_txid, &pks[1], BLOCK);
     multisig_join(pks[2], BLOCK + 1, 2);
@@ -1710,6 +1814,7 @@ fn a_key_with_an_earlier_multisig_join_cannot_join_ue() {
             .find(|v| v.pubkey == pk)
             .unwrap()
             .collateral;
+        let mut txn = db.write_txn().unwrap();
         IpcUnstakeCollateralMsg {
             subnet_id,
             amount,
@@ -1717,11 +1822,13 @@ fn a_key_with_an_earlier_multisig_join_cannot_join_ue() {
         }
         .save_to_db(
             &db,
+            &mut txn,
             BLOCK + 15,
             block_hash,
             Txid::from_slice(&[txid_byte; 32]).unwrap(),
         )
         .unwrap();
+        txn.commit().unwrap();
     }
     cutoff(&db, BLOCK + 20);
     rotate(&db, subnet_id);
@@ -1731,17 +1838,20 @@ fn a_key_with_an_earlier_multisig_join_cannot_join_ue() {
     // Their join-ue is refused: the genesis join and the multisig join count
     for key in [&keys[0], &keys[2]] {
         let (again, txid_again) = checked_join(&secp, key, subnet_id, TIMEOUT + 1000);
-        let err = process_join_ue(&db, &again, txid_again, BLOCK + 20, block_hash).unwrap_err();
+        let mut txn = db.write_txn().unwrap();
+        let err =
+            process_join_ue(&db, &mut txn, &again, txid_again, BLOCK + 20, block_hash).unwrap_err();
+        txn.commit().unwrap();
         assert!(err.to_string().contains("joins a subnet once"), "{err}");
     }
     assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 1);
 
     // The check before the reveal exists
-    assert!(refuse_earlier_join(&db, subnet_id, &pks[0], None).is_err());
-    assert!(refuse_earlier_join(&db, subnet_id, &pks[1], None).is_err());
-    assert!(refuse_earlier_join(&db, subnet_id, &pks[2], None).is_err());
+    assert!(refuse_earlier_join(&db, &db.read_txn().unwrap(), subnet_id, &pks[0], None).is_err());
+    assert!(refuse_earlier_join(&db, &db.read_txn().unwrap(), subnet_id, &pks[1], None).is_err());
+    assert!(refuse_earlier_join(&db, &db.read_txn().unwrap(), subnet_id, &pks[2], None).is_err());
     let fresh = generate_keypairs(1)[0].x_only_public_key().0;
-    assert!(refuse_earlier_join(&db, subnet_id, &fresh, None).is_ok());
+    assert!(refuse_earlier_join(&db, &db.read_txn().unwrap(), subnet_id, &fresh, None).is_ok());
 }
 
 #[test]
@@ -1757,7 +1867,9 @@ fn cutoffs_without_a_rotation_checkpoint_continue_from_the_waiting_configuration
             activate(&db, subnet_id, BLOCK);
         }
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
 
@@ -1837,7 +1949,15 @@ fn an_eots_key_joins_once_across_subnets_and_within_a_reveal() {
     wtxn.commit().unwrap();
 
     // The join's own record is a replay
-    assert!(refuse_earlier_eots_key(&db, subnet_a, &pks[0], &pk_eots, Some(txid)).is_ok());
+    assert!(refuse_earlier_eots_key(
+        &db,
+        &db.read_txn().unwrap(),
+        subnet_a,
+        &pks[0],
+        &pk_eots,
+        Some(txid)
+    )
+    .is_ok());
     // Another input of the same reveal, a join in another subnet
     for (subnet_id, pubkey, join_txid) in [
         (subnet_a, pks[1], Some(txid)),
@@ -1845,11 +1965,26 @@ fn an_eots_key_joins_once_across_subnets_and_within_a_reveal() {
         (subnet_b, pks[1], Some(other)),
         (subnet_a, pks[0], None),
     ] {
-        let err =
-            refuse_earlier_eots_key(&db, subnet_id, &pubkey, &pk_eots, join_txid).unwrap_err();
+        let err = refuse_earlier_eots_key(
+            &db,
+            &db.read_txn().unwrap(),
+            subnet_id,
+            &pubkey,
+            &pk_eots,
+            join_txid,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("an EOTS key joins once"), "{err}");
     }
-    assert!(refuse_earlier_eots_key(&db, subnet_b, &pks[1], &pks[1], Some(other)).is_ok());
+    assert!(refuse_earlier_eots_key(
+        &db,
+        &db.read_txn().unwrap(),
+        subnet_b,
+        &pks[1],
+        &pks[1],
+        Some(other)
+    )
+    .is_ok());
 }
 
 #[test]
@@ -2142,12 +2277,16 @@ fn record_checkpoint(
         is_kill_checkpoint: false,
         is_rotation_checkpoint,
     };
-    msg.save_to_db(
+    let mut txn = db.write_txn().unwrap();
+    let checkpoint = msg.save_to_db(
         db,
+        &mut txn,
         height,
         BlockHash::all_zeros(),
         crate::test_utils::create_rand_txid(),
-    )
+    );
+    txn.commit().unwrap();
+    checkpoint
 }
 
 fn unconfirmed_changes(db: &HeedDb, subnet_id: SubnetId) -> usize {
@@ -2167,7 +2306,9 @@ fn a_rotation_checkpoint_carrying_the_previous_change_number_is_that_of_its_epoc
             activate(&db, subnet_id, BLOCK);
         }
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, timeout);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     // The cutoff H_1 releases the configuration updates of C_2
@@ -2219,7 +2360,9 @@ fn the_rotation_checkpoint_of_epoch_1_with_c_1_equal_to_c_gen_leaves_c_wlist() {
     let block_hash = BlockHash::all_zeros();
     for key in &keys {
         let (checked, join_txid) = checked_join(&secp, key, subnet_id, TIMEOUT);
-        process_join_ue(&db, &checked, join_txid, BLOCK, block_hash).unwrap();
+        let mut txn = db.write_txn().unwrap();
+        process_join_ue(&db, &mut txn, &checked, join_txid, BLOCK, block_hash).unwrap();
+        txn.commit().unwrap();
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
     // Epoch 1 with C_1 = C_gen, before its rotation checkpoint

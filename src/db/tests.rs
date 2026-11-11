@@ -1371,14 +1371,17 @@ fn active_configuration(db: &HeedDb, id: SubnetId) {
 fn accept_active_join(db: &HeedDb, id: SubnetId) -> UeCollateral {
     let mut join = checked(id, 5, 25, 15);
     join.committee_number = 1;
+    let mut txn = db.write_txn().unwrap();
     process_join_ue(
         db,
+        &mut txn,
         &join,
         Txid::from_byte_array([35; 32]),
         200,
         BlockHash::from_byte_array([0x43; 32]),
     )
     .unwrap();
+    txn.commit().unwrap();
     db.get_ue_collateral(id, Txid::from_byte_array([35; 32]), &pubkey(5))
         .unwrap()
         .unwrap()
@@ -1410,7 +1413,10 @@ async fn two_whitelisted_signatures_do_not_make_a_genesis_collateral_slashable()
     let id = subnet(1);
     create(&db, id);
     let batch = genesis_presign_batch(&db, id, &[1, 5]);
-    assert!(batch.newly_slashable(&db).unwrap().is_empty());
+    assert!(batch
+        .newly_slashable(&db, &db.read_txn().unwrap())
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1422,7 +1428,7 @@ async fn three_of_six_whitelisted_keys_make_a_genesis_collateral_slashable() {
     let genesis = db.get_subnet_genesis_info(id).unwrap().unwrap();
     assert_eq!(genesis.genesis_validators.len(), 1);
     assert_eq!(genesis.genesis_validators[0].pubkey, pubkey(1));
-    let newly = batch.newly_slashable(&db).unwrap();
+    let newly = batch.newly_slashable(&db, &db.read_txn().unwrap()).unwrap();
     assert_eq!(newly.len(), 1);
     assert_eq!(newly[0].0.pubkey, pubkey(1));
     assert_eq!(newly[0].1.len(), 3);
@@ -1448,7 +1454,7 @@ async fn accepted_active_join_without_l1_presignatures_changes_no_configuration(
     assert_eq!(state.committee.configuration_number, 0);
     assert!(db.get_all_stake_changes(id).unwrap().is_empty());
     assert!(presign_batch(id, vec![])
-        .newly_slashable(&db)
+        .newly_slashable(&db, &db.read_txn().unwrap())
         .unwrap()
         .is_empty());
 }
@@ -1461,14 +1467,17 @@ async fn an_accepted_but_unseated_validator_cannot_join_again() {
     accept_active_join(&db, id);
     let mut second = checked(id, 5, 26, 16);
     second.committee_number = 1;
+    let mut txn = db.write_txn().unwrap();
     assert!(process_join_ue(
         &db,
+        &mut txn,
         &second,
         Txid::from_byte_array([36; 32]),
         201,
         BlockHash::from_byte_array([0x44; 32]),
     )
     .is_err());
+    txn.commit().unwrap();
     assert_eq!(db.get_ue_collaterals(id).unwrap().len(), 1);
     assert!(db.get_eots_commitments(id, &pubkey(26)).unwrap().is_empty());
     assert!(db.get_all_stake_changes(id).unwrap().is_empty());
@@ -1481,7 +1490,10 @@ async fn two_existing_validators_do_not_make_the_joiner_slashable() {
     active_configuration(&db, id);
     let record = accept_active_join(&db, id);
     let batch = presign_batch(id, vec![slash_entry(&db, &record, &[1, 2])]);
-    assert!(batch.newly_slashable(&db).unwrap().is_empty());
+    assert!(batch
+        .newly_slashable(&db, &db.read_txn().unwrap())
+        .unwrap()
+        .is_empty());
     assert!(db
         .get_slash_presigs(id, &record.outpoint)
         .unwrap()
@@ -1496,7 +1508,7 @@ async fn three_existing_validators_make_the_joiner_slashable_without_its_node() 
     let record = accept_active_join(&db, id);
     let entry = slash_entry(&db, &record, &[1, 2, 3]);
     let batch = presign_batch(id, vec![entry.clone()]);
-    let newly = batch.newly_slashable(&db).unwrap();
+    let newly = batch.newly_slashable(&db, &db.read_txn().unwrap()).unwrap();
     assert_eq!(newly.len(), 1);
     assert_eq!(newly[0].0, record);
     assert_eq!(newly[0].1, entry.signatures);
@@ -1510,7 +1522,9 @@ async fn a_bad_extra_presignature_rejects_a_quorum_entry() {
     let record = accept_active_join(&db, id);
     let mut entry = slash_entry(&db, &record, &[1, 2, 3, 4]);
     entry.signatures[0].1 = [[0; 32]; 2];
-    assert!(presign_batch(id, vec![entry]).newly_slashable(&db).is_err());
+    assert!(presign_batch(id, vec![entry])
+        .newly_slashable(&db, &db.read_txn().unwrap())
+        .is_err());
     assert!(db
         .get_slash_presigs(id, &record.outpoint)
         .unwrap()
@@ -1528,7 +1542,9 @@ async fn a_quorum_for_another_collateral_does_not_make_the_joiner_slashable() {
     different.outpoint.vout = 2;
     let mut entry = slash_entry(&db, &different, &[1, 2, 3]);
     entry.vout = 1;
-    assert!(presign_batch(id, vec![entry]).newly_slashable(&db).is_err());
+    assert!(presign_batch(id, vec![entry])
+        .newly_slashable(&db, &db.read_txn().unwrap())
+        .is_err());
 }
 
 #[tokio::test]
@@ -1551,7 +1567,9 @@ async fn monitor_genesis_retains_create_parameters_before_bootstrap() {
     };
     params.validate().unwrap();
     let txid = Txid::from_byte_array([0x19; 32]);
-    params.save_to_db(&db, 102, txid).unwrap();
+    let mut txn = db.write_txn().unwrap();
+    params.save_to_db(&db, &mut txn, 102, txid).unwrap();
+    txn.commit().unwrap();
     let id = SubnetId::from_txid(&txid);
     let g = db.get_subnet_genesis_info(id).unwrap().unwrap();
     let p = &g.create_subnet_msg;

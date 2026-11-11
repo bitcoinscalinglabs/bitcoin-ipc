@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bitcoin::{hashes::sha256, key::Secp256k1, Amount, BlockHash, ScriptBuf, Transaction};
+use heed::{RoTxn, RwTxn};
 use log::{error, info, warn};
 use rand::RngCore;
 use tempfile::TempDir;
@@ -28,6 +29,26 @@ use crate::{
     rewards::{RewardConfig, RewardTracker},
     SubnetId,
 };
+
+/// Runs `f` in one write transaction, committed only when `f` succeeds.
+fn in_write_txn<T>(
+    db: &HeedDb,
+    f: impl FnOnce(&mut RwTxn) -> Result<T, IpcLibError>,
+) -> Result<T, IpcLibError> {
+    let mut txn = db.write_txn()?;
+    let out = f(&mut txn)?;
+    txn.commit()?;
+    Ok(out)
+}
+
+/// Runs `f` in a read transaction that ends with it.
+fn in_read_txn<T>(
+    db: &HeedDb,
+    f: impl FnOnce(&RoTxn) -> Result<T, IpcLibError>,
+) -> Result<T, IpcLibError> {
+    let txn = db.read_txn()?;
+    f(&txn)
+}
 
 /// A reveal that carries no message, for the rebuilt reveals
 fn empty_reveal(secp: &Secp256k1<bitcoin::secp256k1::All>) -> Result<Transaction, EasyTesterError> {
@@ -208,7 +229,9 @@ impl DbTester {
             let msg = super::model::join_ue_msg(&secp, join, timeout, &validator);
             // In epoch 0 the subnet names no configuration: the join names the whitelist, and
             // the rejection of the join is what the scenario checks
-            let configuration = match collateral::named_configurations(&self.db, subnet_id) {
+            let configuration = match in_read_txn(&self.db, |txn| {
+                collateral::named_configurations(&self.db, txn, subnet_id)
+            }) {
                 Ok(named) => named[0].1.clone(),
                 Err(e) => {
                     warn!("JoinUe: '{}' names the whitelist: {e}", spec.validator_name);
@@ -250,7 +273,9 @@ impl DbTester {
                 warn!("JoinUe: input {input} spends an unknown commit {spent}");
                 continue;
             };
-            let context = match collateral::join_context(&self.db, msg.join.subnet_id) {
+            let context = match in_read_txn(&self.db, |txn| {
+                collateral::join_context(&self.db, txn, msg.join.subnet_id)
+            }) {
                 Ok(context) => context,
                 Err(e) => {
                     warn!("JoinUe: '{validator_name}' rejected at block {height}: {e}");
@@ -265,7 +290,10 @@ impl DbTester {
                         continue;
                     }
                 };
-            match collateral::process_join_ue(&self.db, &checked, join_txid, height, block_hash) {
+            let processed = in_write_txn(&self.db, |txn| {
+                collateral::process_join_ue(&self.db, txn, &checked, join_txid, height, block_hash)
+            });
+            match processed {
                 Ok(_) => {
                     accepted += 1;
                     info!(
@@ -322,8 +350,14 @@ impl DbTester {
 
     fn mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
         self.block_hash(height);
+        let mut txn = self
+            .db
+            .write_txn()
+            .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
         self.db
-            .set_last_processed_block(height)
+            .set_last_processed_block(&mut txn, height)
+            .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
+        txn.commit()
             .map_err(|e| EasyTesterError::runtime(format!("failed to mine block {height}: {e}")))?;
         info!("Mined block {}", height);
         Ok(())
@@ -379,9 +413,9 @@ impl DbTester {
             };
             msg.validate()
                 .map_err(|e| EasyTesterError::runtime(format!("create msg invalid: {e}")))?;
-            let genesis_info = msg
-                .save_to_db(&self.db, height, txid)
-                .map_err(|e| EasyTesterError::runtime(format!("create failed: {e}")))?;
+            let genesis_info =
+                in_write_txn(&self.db, |txn| msg.save_to_db(&self.db, txn, height, txid))
+                    .map_err(|e| EasyTesterError::runtime(format!("create failed: {e}")))?;
             info!(
                 "Created subnet '{}' with subnet_id={} ({shape})",
                 subnet_name, genesis_info.subnet_id
@@ -437,7 +471,10 @@ impl DbTester {
         }
 
         let txid = create_rand_txid();
-        if let Err(e) = join_msg.save_to_db(&self.db, height, block_hash, txid) {
+        let saved = in_write_txn(&self.db, |txn| {
+            join_msg.save_to_db(&self.db, txn, height, block_hash, txid)
+        });
+        if let Err(e) = saved {
             return refusal(
                 raw,
                 format!("join of '{validator_name}' at block {height} failed: {e}"),
@@ -469,7 +506,10 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("stake msg invalid: {e}")))?;
-        if let Err(e) = collateral::refuse_ue_member(&self.db, subnet_id, &msg.pubkey) {
+        let refused = in_read_txn(&self.db, |txn| {
+            collateral::refuse_ue_member(&self.db, txn, subnet_id, &msg.pubkey)
+        });
+        if let Err(e) = refused {
             warn!("Stake: '{validator_name}' rejected at block {height}: {e}");
             return Ok(());
         }
@@ -489,7 +529,10 @@ impl DbTester {
             );
         }
         let txid = create_rand_txid();
-        if let Err(e) = msg.save_to_db(&self.db, height, block_hash, txid) {
+        let saved = in_write_txn(&self.db, |txn| {
+            msg.save_to_db(&self.db, txn, height, block_hash, txid)
+        });
+        if let Err(e) = saved {
             return refusal(
                 raw,
                 format!("stake of '{validator_name}' at block {height} failed: {e}"),
@@ -521,7 +564,10 @@ impl DbTester {
         };
         msg.validate()
             .map_err(|e| EasyTesterError::runtime(format!("unstake msg invalid: {e}")))?;
-        if let Err(e) = collateral::refuse_ue_member(&self.db, subnet_id, &validator.pubkey) {
+        let refused = in_read_txn(&self.db, |txn| {
+            collateral::refuse_ue_member(&self.db, txn, subnet_id, &validator.pubkey)
+        });
+        if let Err(e) = refused {
             warn!("Unstake: '{validator_name}' rejected at block {height}: {e}");
             return Ok(());
         }
@@ -551,7 +597,10 @@ impl DbTester {
         }
 
         let txid = create_rand_txid();
-        if let Err(e) = msg.save_to_db(&self.db, height, block_hash, txid) {
+        let saved = in_write_txn(&self.db, |txn| {
+            msg.save_to_db(&self.db, txn, height, block_hash, txid)
+        });
+        if let Err(e) = saved {
             return refusal(
                 raw,
                 format!("unstake of '{validator_name}' at block {height} failed: {e}"),
@@ -645,20 +694,11 @@ impl DbTester {
             .map_err(|e| EasyTesterError::runtime(format!("checkpoint transaction: {e}")))?;
         let checkpoint_tx = psbt.unsigned_tx;
         let txid = checkpoint_tx.compute_txid();
-        {
-            let mut wtxn = self
-                .db
-                .write_txn()
-                .map_err(|e| EasyTesterError::runtime(format!("db write failed: {e}")))?;
-            self.db
-                .save_transaction(&mut wtxn, &checkpoint_tx)
-                .map_err(|e| EasyTesterError::runtime(format!("db write failed: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| EasyTesterError::runtime(format!("db write failed: {e}")))?;
-        }
-        let checkpoint = msg
-            .save_to_db(&self.db, height, block_hash, txid)
-            .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
+        let checkpoint = in_write_txn(&self.db, |txn| {
+            self.db.save_transaction(txn, &checkpoint_tx)?;
+            msg.save_to_db(&self.db, txn, height, block_hash, txid)
+        })
+        .map_err(|e| EasyTesterError::runtime(format!("checkpoint failed: {e}")))?;
         println!(
             "OUTPUT checkpoint subnet='{}' height={} checkpointTx=accepted",
             subnet_name, height
@@ -700,7 +740,10 @@ impl DbTester {
                 continue;
             };
             batches += 1;
-            match batch.process(&self.db, height, block_hash, txid) {
+            let outcome = in_write_txn(&self.db, |txn| {
+                batch.process(&self.db, txn, height, block_hash, txid)
+            });
+            match outcome {
                 Ok(_) => println!(
                     "OUTPUT checkpoint subnet='{}' height={} batchTx=accepted (input {input}, {shape})",
                     names.get(&batch.subnet_id).cloned().unwrap_or_default(),
@@ -950,9 +993,11 @@ fn validator_ordinal(name: &str) -> Option<u64> {
 impl Tester for DbTester {
     fn exec_mine_block(&mut self, height: u64) -> Result<(), EasyTesterError> {
         let block_hash = self.block_hash(height);
-        for outcome in crate::epochs::process_cutoffs(&self.db, height, block_hash)
-            .map_err(|e| EasyTesterError::runtime(format!("cutoff at block {height}: {e}")))?
-        {
+        let outcomes = in_write_txn(&self.db, |txn| {
+            crate::epochs::process_cutoffs(&self.db, txn, height, block_hash)
+        })
+        .map_err(|e| EasyTesterError::runtime(format!("cutoff at block {height}: {e}")))?;
+        for outcome in outcomes {
             info!(
                 "Block {height}: subnet {} begins epoch {}",
                 outcome.subnet_id, outcome.epoch
@@ -961,8 +1006,20 @@ impl Tester for DbTester {
         self.mine_block(height)?;
 
         if let Some(rt) = &mut self.reward_tracker {
-            match rt.update_after_block(&self.db, height) {
-                Ok(_) => info!("Updated reward bookkeeping after block {}", height),
+            let mut txn = self.db.write_txn().map_err(|e| {
+                EasyTesterError::runtime(format!(
+                    "reward bookkeeping after block {height} failed: {e}"
+                ))
+            })?;
+            match rt.update_after_block(&self.db, &mut txn, height) {
+                Ok(_) => {
+                    txn.commit().map_err(|e| {
+                        EasyTesterError::runtime(format!(
+                            "reward bookkeeping after block {height} failed: {e}"
+                        ))
+                    })?;
+                    info!("Updated reward bookkeeping after block {}", height)
+                }
                 Err(e) => {
                     error!(
                         "Error updating reward bookkeeping after block {}: {:?}",
@@ -1088,12 +1145,22 @@ impl Tester for DbTester {
             reveals.extend(reveal);
 
             if let Some(rt) = &mut self.reward_tracker {
-                rt.update_after_checkpoint(&self.db, height, subnet_id, &checkpoint)
+                let mut txn = self.db.write_txn().map_err(|e| {
+                    EasyTesterError::runtime(format!(
+                        "reward bookkeeping after checkpoint failed: {e}"
+                    ))
+                })?;
+                rt.update_after_checkpoint(&self.db, &mut txn, height, subnet_id, &checkpoint)
                     .map_err(|e| {
                         EasyTesterError::runtime(format!(
                             "reward bookkeeping after checkpoint failed: {e}"
                         ))
                     })?;
+                txn.commit().map_err(|e| {
+                    EasyTesterError::runtime(format!(
+                        "reward bookkeeping after checkpoint failed: {e}"
+                    ))
+                })?;
             }
         }
         self.process_batch_reveals(height, reveals, shape)

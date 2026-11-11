@@ -91,7 +91,12 @@ fn a_second_create_of_an_existing_subnet_id_is_ignored() {
     };
     let txid = crate::test_utils::create_rand_txid();
     let subnet_id = SubnetId::from_txid(&txid);
-    assert_eq!(msg.save_to_db(&db, 100, txid).unwrap().subnet_id, subnet_id);
+    let mut txn = db.write_txn().unwrap();
+    assert_eq!(
+        msg.save_to_db(&db, &mut txn, 100, txid).unwrap().subnet_id,
+        subnet_id
+    );
+    txn.commit().unwrap();
 
     let mut info = db.get_subnet_genesis_info(subnet_id).unwrap().unwrap();
     info.bootstrapped = true;
@@ -103,7 +108,9 @@ fn a_second_create_of_an_existing_subnet_id_is_ignored() {
     // A second create with other parameters and the same id is ignored, the state kept
     let mut other = msg.clone();
     other.min_validators = 1;
-    let err = other.save_to_db(&db, 101, txid).unwrap_err();
+    let mut txn = db.write_txn().unwrap();
+    let err = other.save_to_db(&db, &mut txn, 101, txid).unwrap_err();
+    txn.commit().unwrap();
     assert!(matches!(err, IpcLibError::IpcValidateError(_)), "{err}");
     let kept = db.get_subnet_genesis_info(subnet_id).unwrap().unwrap();
     assert!(kept.bootstrapped);
@@ -161,14 +168,17 @@ fn a_batch_reveal_of_an_unprocessed_transaction_is_rejected() {
     let Some((0, IpcMessage::BatchTransfer(mut batch))) = found.pop() else {
         panic!("the reveal carries a batch transfer at input 0");
     };
+    let mut txn = db.write_txn().unwrap();
     let err = batch
         .process(
             &db,
+            &mut txn,
             200,
             <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros(),
             reveal.compute_txid(),
         )
         .unwrap_err();
+    txn.commit().unwrap();
     assert!(
         matches!(&err, IpcLibError::IpcValidateError(e) if e.to_string().contains("not found in database")),
         "{err}"
@@ -264,11 +274,19 @@ fn record_checkpoint(
     msg: &IpcCheckpointSubnetMsg,
     tx: &Transaction,
 ) -> db::SubnetCheckpoint {
-    let mut wtxn = db.write_txn().unwrap();
-    db.save_transaction(&mut wtxn, tx).unwrap();
-    wtxn.commit().unwrap();
-    msg.save_to_db(db, CHECKPOINT_BLOCK, block_hash(), tx.compute_txid())
-        .unwrap()
+    let mut txn = db.write_txn().unwrap();
+    db.save_transaction(&mut txn, tx).unwrap();
+    let checkpoint = msg
+        .save_to_db(
+            db,
+            &mut txn,
+            CHECKPOINT_BLOCK,
+            block_hash(),
+            tx.compute_txid(),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+    checkpoint
 }
 
 /// The batch transfer reveal of `msg`, spending the commitment output of `tx`
@@ -296,7 +314,16 @@ fn process_batch(
     let IpcMessage::BatchTransfer(mut batch) = found.swap_remove(position).1 else {
         unreachable!()
     };
-    batch.process(db, REVEAL_BLOCK, block_hash(), reveal.compute_txid())
+    let mut txn = db.write_txn().unwrap();
+    let checkpoint = batch.process(
+        db,
+        &mut txn,
+        REVEAL_BLOCK,
+        block_hash(),
+        reveal.compute_txid(),
+    );
+    txn.commit().unwrap();
+    checkpoint
 }
 
 fn rejected(result: Result<db::SubnetCheckpoint, IpcLibError>, reason: &str) {
@@ -667,7 +694,9 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
     let context = {
         let scratch = test_utils::create_test_db();
         save_genesis(&scratch);
-        collateral::join_context(&scratch, destination_id).unwrap()
+        let txn = scratch.read_txn().unwrap();
+        let context = collateral::join_context(&scratch, &txn, destination_id).unwrap();
+        context
     };
     let join_ue = IpcJoinUeMsg::new_signed(
         &secp,
@@ -695,18 +724,23 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
             0,
             &join_commit,
             REVEAL_BLOCK,
-            &collateral::join_context(&scratch, destination_id).unwrap(),
+            &collateral::join_context(&scratch, &scratch.read_txn().unwrap(), destination_id)
+                .unwrap(),
         )
         .unwrap();
-        collateral::process_join_ue(
+        let mut txn = scratch.write_txn().unwrap();
+        let state = collateral::process_join_ue(
             &scratch,
+            &mut txn,
             &checked,
             join_reveal.compute_txid(),
             REVEAL_BLOCK,
             block_hash(),
         )
         .unwrap()
-        .expect("bootstrapped")
+        .expect("bootstrapped");
+        txn.commit().unwrap();
+        state
     };
 
     let db = test_utils::create_test_db();
@@ -736,8 +770,10 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
                     &context,
                 )
                 .unwrap();
+                let mut txn = db.write_txn().unwrap();
                 collateral::process_join_ue(
                     &db,
+                    &mut txn,
                     &checked,
                     reveal.compute_txid(),
                     REVEAL_BLOCK,
@@ -745,12 +781,21 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
                 )
                 .unwrap()
                 .expect("bootstrapped");
+                txn.commit().unwrap();
             }
             IpcMessage::BatchTransfer(mut batch) => {
                 assert_eq!(index, 1);
+                let mut txn = db.write_txn().unwrap();
                 batch
-                    .process(&db, REVEAL_BLOCK, block_hash(), reveal.compute_txid())
+                    .process(
+                        &db,
+                        &mut txn,
+                        REVEAL_BLOCK,
+                        block_hash(),
+                        reveal.compute_txid(),
+                    )
                     .unwrap();
+                txn.commit().unwrap();
             }
             other => panic!("unexpected message {other:?}"),
         }
@@ -2046,7 +2091,7 @@ proptest! {
             })
             .collect();
         let tx = op_return_tx(&payload, outputs);
-        let _ = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &tx);
+        let _ = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx);
         let _ = IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&tx.output[0]);
         let _ = IpcMessage::from_reveal_inputs(&tx);
     }
@@ -2096,7 +2141,7 @@ proptest! {
             input: vec![],
             output: vec![metadata],
         };
-        let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &tx).unwrap();
+        let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
         prop_assert_eq!(parsed.subnet_id, subnet.id);
         prop_assert_eq!(parsed.checkpoint_hash, msg.checkpoint_hash);
         prop_assert_eq!(parsed.checkpoint_height, height);
@@ -2300,8 +2345,9 @@ fn test_checkpoint_with_unstakes() {
     dbg!(&checkpoint_tx);
 
     // Parse the transaction back to a checkpoint message
-    let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &checkpoint_tx)
-        .expect("Should parse checkpoint message");
+    let parsed_msg =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &checkpoint_tx)
+            .expect("Should parse checkpoint message");
     dbg!(&parsed_msg);
 
     // Verify unstakes were correctly serialized and deserialized
@@ -3392,7 +3438,8 @@ fn test_stake_collateral_from_tx() {
     let tx: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&txbytes).expect("Failed to deserialize transaction");
 
-    let msg = IpcStakeCollateralMsg::from_tx(&db, &tx).expect("Should parse tx as msg");
+    let msg = IpcStakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx)
+        .expect("Should parse tx as msg");
 
     assert_eq!(msg.amount, Amount::from_sat(5500000));
     assert_eq!(
@@ -3483,7 +3530,8 @@ fn test_unstake_collateral_from_tx() {
     }];
 
     // Test parsing the transaction back into a message
-    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx).expect("Should parse tx as msg");
+    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx)
+        .expect("Should parse tx as msg");
 
     // Verify the parsed message matches the original
     assert_eq!(parsed_msg.subnet_id, subnet_id);
@@ -3502,8 +3550,9 @@ fn test_unstake_collateral_from_tx() {
     let tx_from_hex: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&hex::decode(hex_tx).unwrap()).unwrap();
 
-    let parsed_msg_from_hex = IpcUnstakeCollateralMsg::from_tx(&db, &tx_from_hex)
-        .expect("Should parse tx from hex as msg");
+    let parsed_msg_from_hex =
+        IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx_from_hex)
+            .expect("Should parse tx from hex as msg");
 
     assert_eq!(parsed_msg_from_hex.subnet_id, subnet_id);
     assert_eq!(parsed_msg_from_hex.amount, amount);
@@ -3574,7 +3623,7 @@ fn test_unstake_collateral_unknown_signature() {
     }];
 
     // Test parsing the transaction back into a message
-    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx);
     assert!(parsed_msg.is_err());
 
     let expected_error_msg = format!(
@@ -3825,7 +3874,7 @@ fn test_unstake_collateral_replay_attack() {
     }];
 
     // Test parsing the transaction back into a message
-    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+    let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx);
     assert!(parsed_msg.is_err());
 
     // Even though our validator is in the committee, the prev_txid is different
@@ -4489,7 +4538,7 @@ fn etx(
 fn test_empty_batch_ok() {
     let db = test_utils::create_test_db();
     let source = test_utils::generate_subnet_id();
-    assert!(validate_erc_batch_data(source, &[], &[], &[], &db).is_ok());
+    assert!(validate_erc_batch_data(source, &[], &[], &[], &db, &db.read_txn().unwrap()).is_ok());
 }
 
 #[test]
@@ -4497,7 +4546,15 @@ fn test_new_registration_ok() {
     let db = test_utils::create_test_db();
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
-    assert!(validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db).is_ok());
+    assert!(validate_erc_batch_data(
+        source,
+        &[etr(token, 1_000_000)],
+        &[],
+        &[],
+        &db,
+        &db.read_txn().unwrap()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4506,7 +4563,15 @@ fn test_mint_ok() {
     let db = test_utils::create_test_db();
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
-    assert!(validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok());
+    assert!(validate_erc_batch_data(
+        source,
+        &[],
+        &[ets_mint(token, 500)],
+        &[],
+        &db,
+        &db.read_txn().unwrap()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4514,7 +4579,15 @@ fn test_burn_within_balance_ok() {
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(1000u64));
-    assert!(validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok());
+    assert!(validate_erc_batch_data(
+        source,
+        &[],
+        &[ets_burn(token, 500)],
+        &[],
+        &db,
+        &db.read_txn().unwrap()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4523,9 +4596,15 @@ fn test_transfer_within_balance_ok() {
     let dest = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(1000u64));
-    assert!(
-        validate_erc_batch_data(source, &[], &[], &[etx(source, token, 500, dest)], &db).is_ok()
-    );
+    assert!(validate_erc_batch_data(
+        source,
+        &[],
+        &[],
+        &[etx(source, token, 500, dest)],
+        &db,
+        &db.read_txn().unwrap()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -4541,6 +4620,7 @@ fn test_register_then_transfer_in_same_batch_ok() {
         &[],
         &[etx(source, token, 500, dest)],
         &db,
+        &db.read_txn().unwrap(),
     )
     .is_ok());
 }
@@ -4559,6 +4639,7 @@ fn test_mint_before_burn_order_in_batch_ok() {
         &[ets_burn(token, 250), ets_mint(token, 300)],
         &[],
         &db,
+        &db.read_txn().unwrap(),
     )
     .is_ok());
 }
@@ -4572,7 +4653,15 @@ fn test_foreign_token_transfer_ok() {
     let token = test_utils::create_rand_eth_addr();
     // source_subnet holds 1000 of the foreign token
     let db = db_with_balance(home, token, source, U256::from(1000u64));
-    assert!(validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db).is_ok());
+    assert!(validate_erc_batch_data(
+        source,
+        &[],
+        &[],
+        &[etx(home, token, 500, dest)],
+        &db,
+        &db.read_txn().unwrap()
+    )
+    .is_ok());
 }
 
 // ── error paths ─────────────────────────────────────────────────────────
@@ -4582,8 +4671,14 @@ fn test_duplicate_registration_in_batch_err() {
     let db = test_utils::create_test_db();
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
-    let result =
-        validate_erc_batch_data(source, &[etr(token, 1000), etr(token, 2000)], &[], &[], &db);
+    let result = validate_erc_batch_data(
+        source,
+        &[etr(token, 1000), etr(token, 2000)],
+        &[],
+        &[],
+        &db,
+        &db.read_txn().unwrap(),
+    );
     assert!(result.is_err());
     assert!(
         result
@@ -4599,7 +4694,14 @@ fn test_re_registration_of_existing_token_err() {
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(500u64));
-    let result = validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db);
+    let result = validate_erc_batch_data(
+        source,
+        &[etr(token, 1_000_000)],
+        &[],
+        &[],
+        &db,
+        &db.read_txn().unwrap(),
+    );
     assert!(result.is_err());
     assert!(
         result
@@ -4615,7 +4717,14 @@ fn test_burn_exceeds_balance_err() {
     let source = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(100u64));
-    let result = validate_erc_batch_data(source, &[], &[ets_burn(token, 200)], &[], &db);
+    let result = validate_erc_batch_data(
+        source,
+        &[],
+        &[ets_burn(token, 200)],
+        &[],
+        &db,
+        &db.read_txn().unwrap(),
+    );
     assert!(result.is_err());
     assert!(
         result
@@ -4632,7 +4741,14 @@ fn test_transfer_exceeds_balance_err() {
     let dest = test_utils::generate_subnet_id();
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(100u64));
-    let result = validate_erc_batch_data(source, &[], &[], &[etx(source, token, 200, dest)], &db);
+    let result = validate_erc_batch_data(
+        source,
+        &[],
+        &[],
+        &[etx(source, token, 200, dest)],
+        &db,
+        &db.read_txn().unwrap(),
+    );
     assert!(result.is_err());
     assert!(
         result
@@ -4656,6 +4772,7 @@ fn test_register_then_over_transfer_err() {
         &[],
         &[etx(source, token, 200, dest)],
         &db,
+        &db.read_txn().unwrap(),
     );
     assert!(result.is_err());
 }
@@ -4677,6 +4794,7 @@ fn test_two_transfers_same_token_cumulative_check_err() {
             etx(source, token, 200, dest2),
         ],
         &db,
+        &db.read_txn().unwrap(),
     );
     assert!(result.is_err());
     assert!(
@@ -4695,7 +4813,14 @@ fn test_etx_zero_amount_rejected() {
     let token = test_utils::create_rand_eth_addr();
     let db = db_with_balance(source, token, source, U256::from(1000));
 
-    let result = validate_erc_batch_data(source, &[], &[], &[etx(source, token, 0, dest)], &db);
+    let result = validate_erc_batch_data(
+        source,
+        &[],
+        &[],
+        &[etx(source, token, 0, dest)],
+        &db,
+        &db.read_txn().unwrap(),
+    );
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("Zero-amount ETX"),
@@ -4805,7 +4930,8 @@ fn assert_checkpoint_parses_back(
     let msg = build(&source, &destination);
     let tx = checkpoint_tx(&msg, &source);
 
-    let parsed = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &tx).unwrap();
+    let parsed =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
     let withdrawals = |m: &IpcCheckpointSubnetMsg| {
         m.withdrawals
             .iter()
@@ -4837,7 +4963,9 @@ fn assert_checkpoint_parses_back(
                 _ => None,
             })
             .expect("a batch transfer in the reveal");
-        batch.validate_for_checkpoint(&db, &tx).unwrap();
+        batch
+            .validate_for_checkpoint(&db, &db.read_txn().unwrap(), &tx)
+            .unwrap();
     }
 }
 
@@ -4924,4 +5052,281 @@ fn a_kill_checkpoint_with_erc20_records_and_unstakes_parses_back() {
         msg.change_address = None;
         msg
     });
+}
+
+/// The batch transfer in the reveal transaction, as the monitor reads it
+fn batch_of(reveal: &Transaction) -> IpcBatchTransferMsg {
+    IpcMessage::from_reveal_inputs(reveal)
+        .into_iter()
+        .find_map(|(_, m)| match m {
+            IpcMessage::BatchTransfer(batch) => Some(batch),
+            _ => None,
+        })
+        .expect("a batch transfer in the reveal")
+}
+
+/// Transfers of 400 sat to `count` distinct addresses of the destination
+fn transfers_to(destination: &db::SubnetState, count: u16) -> Vec<IpcCrossSubnetTransfer> {
+    (1..=count)
+        .map(|i| IpcCrossSubnetTransfer {
+            subnet_user_address: alloy_primitives::Address::left_padding_from(&i.to_be_bytes()),
+            ..transfer(destination, 400)
+        })
+        .collect()
+}
+
+#[test]
+fn one_batch_with_more_than_255_transfers_is_valid() {
+    set_test_fvm_network();
+    let db = test_utils::create_test_db();
+    let source = test_utils::generate_subnet(3);
+    let destination = test_utils::generate_subnet(3);
+    save_subnets(&db, &[&source, &destination]);
+
+    let msg = checkpoint_msg(&source, 1, vec![], transfers_to(&destination, 300));
+    msg.validate().expect("One batch must be valid");
+    let tx = checkpoint_tx(&msg, &source);
+    let (_, batch_count, _, _) =
+        IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(&tx.output[0]).unwrap();
+    assert_eq!(batch_count, 1);
+    assert_eq!(
+        tx.output.len(),
+        4,
+        "OP_RETURN, commitment, one transfer output, change"
+    );
+    assert_eq!(
+        tx.output[msg.checkpoint_outputs().transfer(0)].value,
+        Amount::from_sat(400 * 300)
+    );
+
+    let parsed =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
+    assert!(parsed.change_address.is_some());
+    let batch = batch_of(&reveal_of(&msg, &tx));
+    batch
+        .validate_for_checkpoint(&db, &db.read_txn().unwrap(), &tx)
+        .unwrap();
+    assert_eq!(batch.transfers.len(), 300);
+}
+
+#[test]
+fn a_checkpoint_has_at_most_255_destination_subnets() {
+    let source = test_utils::generate_subnet(3);
+    let template = transfer(&source, 1_000);
+    let to_destinations = |count: u16| -> Vec<IpcCrossSubnetTransfer> {
+        (0..count)
+            .map(|i| {
+                let mut txid20 = [0u8; 20];
+                txid20[..2].copy_from_slice(&i.to_be_bytes());
+                IpcCrossSubnetTransfer {
+                    destination_subnet_id: SubnetId::from_txid20(
+                        &Txid20::from_slice(&txid20).unwrap(),
+                    ),
+                    ..template.clone()
+                }
+            })
+            .collect()
+    };
+
+    let mut msg = checkpoint_msg(&source, 1, vec![], to_destinations(255));
+    msg.validate()
+        .expect("255 destination subnets must be valid");
+    let (_, batch_count, _, _) = IpcCheckpointSubnetMsg::extract_markers_from_metadata_tx_out(
+        &msg.make_metadata_tx_out(DEFAULT_BTC_FEE_RATE),
+    )
+    .unwrap();
+    assert_eq!(batch_count, 255);
+
+    msg.transfers = to_destinations(256);
+    assert!(msg.validate().is_err());
+}
+
+#[test]
+fn a_kill_checkpoint_with_one_batch_of_three_transfers_gives_its_change_to_the_unstakes() {
+    set_test_fvm_network();
+    let db = test_utils::create_test_db();
+    let source = test_utils::generate_subnet(3);
+    let destination = test_utils::generate_subnet(3);
+    save_subnets(&db, &[&source, &destination]);
+
+    let mut msg = checkpoint_msg(&source, 1, vec![], transfers_to(&destination, 3));
+    msg.is_kill_checkpoint = true;
+    msg.change_address = None;
+    msg.unstakes = vec![unstake_of(&source, 0, 40_000)];
+
+    // The unstake output takes the change
+    let tx = checkpoint_tx(&msg, &source);
+    assert_eq!(
+        tx.output.len(),
+        4,
+        "OP_RETURN, commitment, one transfer output, unstake"
+    );
+    let parsed =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
+    assert!(parsed.is_kill_checkpoint);
+    assert!(parsed.change_address.is_none());
+
+    // Without unstakes the change output stays, and the kill checkpoint is invalid
+    msg.unstakes.clear();
+    let tx = checkpoint_tx(&msg, &source);
+    assert_eq!(
+        tx.output.len(),
+        4,
+        "OP_RETURN, commitment, one transfer output, change"
+    );
+    let parsed =
+        IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
+    assert_eq!(
+        parsed.change_address,
+        Some(source.committee.multisig_address.clone())
+    );
+    assert!(parsed.validate().is_err());
+}
+
+#[test]
+fn the_reveal_spends_the_commitment_and_is_the_same_with_several_destinations() {
+    set_test_fvm_network();
+    let db = test_utils::create_test_db();
+    let source = test_utils::generate_subnet(3);
+    let destinations: Vec<_> = (0..5).map(|_| test_utils::generate_subnet(3)).collect();
+    save_subnets(&db, &[&source]);
+    save_subnets(&db, &destinations.iter().collect::<Vec<_>>());
+
+    let transfers = destinations.iter().map(|d| transfer(d, 10_000)).collect();
+    let msg = checkpoint_msg(&source, 1, vec![], transfers);
+
+    // Every construction builds the same checkpoint and reveal transactions
+    let committee = &source.committee;
+    let utxos = create_test_utxos(committee.address_checked().script_pubkey());
+    let build = || {
+        msg.to_checkpoint_psbt(committee, committee, DEFAULT_BTC_FEE_RATE, &utxos)
+            .unwrap()
+            .unsigned_tx
+    };
+    let build_reveal = |tx: &Transaction| {
+        msg.make_reveal_batch_transfer_tx(
+            tx.compute_txid(),
+            DEFAULT_BTC_FEE_RATE,
+            &committee.address_checked(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let tx = build();
+    let reveal = build_reveal(&tx);
+    for _ in 0..10 {
+        assert_eq!(build(), tx);
+        assert_eq!(build_reveal(&tx), reveal);
+    }
+
+    // The reveal transaction spends the commitment output with its data leaf
+    let input = &reveal.input[0];
+    assert_eq!(input.previous_output.txid, tx.compute_txid());
+    let spent = &tx.output[input.previous_output.vout as usize].script_pubkey;
+    assert!(spent.is_p2tr());
+    let output_key = XOnlyPublicKey::from_slice(&spent.as_bytes()[2..34]).unwrap();
+    let control_block =
+        bitcoin::taproot::ControlBlock::decode(input.witness.last().unwrap()).unwrap();
+    assert!(control_block.verify_taproot_commitment(
+        &Secp256k1::verification_only(),
+        output_key,
+        input.witness.tapscript().expect("a script path spend"),
+    ));
+
+    // It is accepted as the batch of its checkpoint
+    IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &db.read_txn().unwrap(), &tx).unwrap();
+    let batch = batch_of(&reveal);
+    batch
+        .validate_for_checkpoint(&db, &db.read_txn().unwrap(), &tx)
+        .unwrap();
+    assert_eq!(batch.transfers.len(), msg.transfers.len());
+}
+
+/// Records the checkpoint of `source` at subnet height `height` with one transfer to
+/// `destination`, returning its transaction and reveal transaction
+fn record_checkpoint_with_transfer(
+    db: &db::HeedDb,
+    source: &db::SubnetState,
+    destination: &db::SubnetState,
+    height: u64,
+    block_height: u64,
+) -> (Transaction, Transaction) {
+    let msg = checkpoint_msg(source, height, vec![], vec![transfer(destination, 30_000)]);
+    let tx = checkpoint_tx(&msg, source);
+    let mut txn = db.write_txn().unwrap();
+    db.save_transaction(&mut txn, &tx).unwrap();
+    msg.save_to_db(db, &mut txn, block_height, block_hash(), tx.compute_txid())
+        .unwrap();
+    txn.commit().unwrap();
+    let reveal = reveal_of(&msg, &tx);
+    (tx, reveal)
+}
+
+/// Applies the reveal transaction to its checkpoint record
+fn apply_reveal(db: &db::HeedDb, reveal: &Transaction, block_height: u64) {
+    let mut batch = batch_of(reveal);
+    let mut txn = db.write_txn().unwrap();
+    batch
+        .process(
+            db,
+            &mut txn,
+            block_height,
+            block_hash(),
+            reveal.compute_txid(),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+/// Asserts that the checkpoint records are stored under their own numbers, each with its reveal
+/// transaction and the height of the Bitcoin block of that reveal transaction, and that no other
+/// record follows them
+fn assert_checkpoint_records(
+    db: &db::HeedDb,
+    subnet_id: SubnetId,
+    expected: &[(&Transaction, &Transaction, u64)],
+) {
+    for (number, (tx, reveal, reveal_height)) in expected.iter().enumerate() {
+        let number = number as u64;
+        let record = db.get_checkpoint(subnet_id, number).unwrap().unwrap();
+        assert_eq!(record.checkpoint_number, number);
+        assert_eq!(record.txid, tx.compute_txid());
+        assert_eq!(record.batch_transfer_txid, Some(reveal.compute_txid()));
+        assert_eq!(record.batch_transfer_block_height, Some(*reveal_height));
+    }
+    let next_number = expected.len() as u64;
+    assert!(db.get_checkpoint(subnet_id, next_number).unwrap().is_none());
+    let subnet_state = db.get_subnet_state(subnet_id).unwrap().unwrap();
+    assert_eq!(subnet_state.last_checkpoint_number, Some(next_number - 1));
+}
+
+#[test]
+fn a_reveal_updates_its_checkpoint_record() {
+    set_test_fvm_network();
+    // The reveal transaction in the Bitcoin block of its checkpoint, and in a later one
+    for reveal_height in [100, 101] {
+        let db = test_utils::create_test_db();
+        let source = test_utils::generate_subnet(3);
+        let destination = test_utils::generate_subnet(3);
+        save_subnets(&db, &[&source, &destination]);
+
+        let (c0, r0) = record_checkpoint_with_transfer(&db, &source, &destination, 50, 100);
+        apply_reveal(&db, &r0, reveal_height);
+        assert_checkpoint_records(&db, source.id, &[(&c0, &r0, reveal_height)]);
+    }
+}
+
+#[test]
+fn reveals_after_a_later_checkpoint_update_their_own_checkpoint_records() {
+    set_test_fvm_network();
+    let db = test_utils::create_test_db();
+    let source = test_utils::generate_subnet(3);
+    let destination = test_utils::generate_subnet(3);
+    save_subnets(&db, &[&source, &destination]);
+
+    let (c0, r0) = record_checkpoint_with_transfer(&db, &source, &destination, 50, 100);
+    let (c1, r1) = record_checkpoint_with_transfer(&db, &source, &destination, 60, 101);
+    apply_reveal(&db, &r0, 102);
+    apply_reveal(&db, &r1, 102);
+    assert_checkpoint_records(&db, source.id, &[(&c0, &r0, 102), (&c1, &r1, 102)]);
 }

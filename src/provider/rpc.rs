@@ -254,7 +254,8 @@ pub async fn join_subnet(
             RpcError::InvalidParams(e.to_string())
         })?;
     if let Some(state) = &subnet_state {
-        epochs::next_multisig_members(&*data.db, &genesis_info, state)
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        epochs::next_multisig_members(&*data.db, &txn, &genesis_info, state)
             .and_then(|members| Ok(msg.validate_for_members(state, &members)?))
             .map_err(|e| {
                 error!("Error validating join msg for subnet info: {}", e);
@@ -314,10 +315,13 @@ fn join_subnet_ue(
         )));
     }
 
-    collateral::refuse_earlier_join(&*data.db, join.subnet_id, &join.pubkey, None)
-        .map_err(|e| invalid(e.to_string()))?;
-    let context =
-        collateral::join_context(&*data.db, join.subnet_id).map_err(|e| invalid(e.to_string()))?;
+    let context = {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        collateral::refuse_earlier_join(&*data.db, &txn, join.subnet_id, &join.pubkey, None)
+            .map_err(|e| invalid(e.to_string()))?;
+        collateral::join_context(&*data.db, &txn, join.subnet_id)
+            .map_err(|e| invalid(e.to_string()))?
+    };
 
     // Before activation the origin is the last processed Bitcoin block
     let origin = match context.h_0 {
@@ -344,14 +348,18 @@ fn join_subnet_ue(
     let (commitment, _) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count);
     let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk, &eots_sk, commitment);
     msg.validate().map_err(|e| invalid(e.to_string()))?;
-    collateral::refuse_earlier_eots_key(
-        &*data.db,
-        msg.join.subnet_id,
-        &msg.join.pubkey,
-        &msg.pk_eots,
-        None,
-    )
-    .map_err(|e| invalid(e.to_string()))?;
+    {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        collateral::refuse_earlier_eots_key(
+            &*data.db,
+            &txn,
+            msg.join.subnet_id,
+            &msg.join.pubkey,
+            &msg.pk_eots,
+            None,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+    }
 
     info!(
         "joinsubnet (join-ue): timeout {timeout} for {epochs} epochs from epoch {} (origin {origin}, tip {tip}), EOTS key {} nonces {start}..{}",
@@ -461,12 +469,13 @@ fn plan_checkpoint(
 /// The members of `committee` that joined with `join-ue`.
 fn ue_members(
     db: &db::HeedDb,
+    txn: &heed::RoTxn,
     subnet_id: SubnetId,
     committee: &db::SubnetCommittee,
 ) -> Result<std::collections::HashSet<bitcoin::XOnlyPublicKey>, RpcError> {
     let mut members = std::collections::HashSet::new();
     for v in &committee.validators {
-        if epochs::is_ue_validator(db, subnet_id, v.join_txid, &v.pubkey)? {
+        if epochs::is_ue_validator(db, txn, subnet_id, v.join_txid, &v.pubkey)? {
             members.insert(v.pubkey);
         }
     }
@@ -1044,7 +1053,10 @@ pub async fn gen_checkpoint_psbt(
             RpcError::InvalidParams("Specifying change address not supported".to_string()).into(),
         );
     }
-    msg.slash_signatures = carried_slash_entries(&*data.db, msg.subnet_id, &msg.slash_signatures);
+    msg.slash_signatures = {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        carried_slash_entries(&*data.db, &txn, msg.subnet_id, &msg.slash_signatures)
+    };
     fit_slash_entries(&mut msg).map_err(|e| RpcError::InternalError(e.to_string()))?;
 
     if !msg.unstakes.len().is_zero() {
@@ -1104,7 +1116,10 @@ pub async fn gen_checkpoint_psbt(
     let unspent = &plan.unspent;
     let mut exhaust_unspent = plan.sweep;
 
-    let ue_members = ue_members(&data.db, msg.subnet_id, &subnet.committee)?;
+    let ue_members = {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        ue_members(&data.db, &txn, msg.subnet_id, &subnet.committee)?
+    };
 
     if should_kill_subnet {
         // Mark the checkpoint as a kill checkpoint
@@ -1170,14 +1185,26 @@ pub async fn gen_checkpoint_psbt(
         info!("Processing {} unstakes.", msg.unstakes.len());
     }
 
-    validate_erc_batch_data(
-        msg.subnet_id,
-        &msg.token_registrations,
-        &msg.token_supply_adjustments,
-        &msg.token_transfers,
-        &*data.db,
-    )
-    .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    // Only token entries need database reads.
+    if !msg.token_registrations.is_empty()
+        || !msg.token_supply_adjustments.is_empty()
+        || !msg.token_transfers.is_empty()
+    {
+        data.db
+            .read_txn()
+            .map_err(|e| ipc_lib::IpcValidateError::InvalidMsg(e.to_string()))
+            .and_then(|read_txn| {
+                validate_erc_batch_data(
+                    msg.subnet_id,
+                    &msg.token_registrations,
+                    &msg.token_supply_adjustments,
+                    &msg.token_transfers,
+                    &*data.db,
+                    &read_txn,
+                )
+            })
+            .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
+    }
 
     let unsigned_psbt = msg
         .build_checkpoint_psbt(
@@ -1628,10 +1655,13 @@ pub async fn stake_collateral(
             msg.subnet_id
         )))?;
 
-    collateral::refuse_ue_member(&*data.db, msg.subnet_id, &msg.pubkey).map_err(|e| {
-        error!("{e}");
-        RpcError::InvalidParams(e.to_string())
-    })?;
+    {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        collateral::refuse_ue_member(&*data.db, &txn, msg.subnet_id, &msg.pubkey).map_err(|e| {
+            error!("{e}");
+            RpcError::InvalidParams(e.to_string())
+        })?;
+    }
     msg.validate_for_subnet(&subnet_state).map_err(|e| {
         error!(
             "Error validating stake collateral msg for subnet info: {}",
@@ -1650,15 +1680,18 @@ pub async fn stake_collateral(
             "Subnet {} not found.",
             msg.subnet_id
         )))?;
-    epochs::next_multisig_members(&*data.db, &genesis_info, &subnet_state)
-        .and_then(|members| Ok(msg.validate_for_members(&members)?))
-        .map_err(|e| {
-            error!(
-                "Error validating stake collateral msg for subnet info: {}",
-                e
-            );
-            RpcError::InvalidParams(e.to_string())
-        })?;
+    {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        epochs::next_multisig_members(&*data.db, &txn, &genesis_info, &subnet_state)
+            .and_then(|members| Ok(msg.validate_for_members(&members)?))
+            .map_err(|e| {
+                error!(
+                    "Error validating stake collateral msg for subnet info: {}",
+                    e
+                );
+                RpcError::InvalidParams(e.to_string())
+            })?;
+    }
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -1723,10 +1756,15 @@ pub async fn unstake_collateral(
             msg.subnet_id
         )))?;
 
-    collateral::refuse_ue_member(&*data.db, msg.subnet_id, &validator_xpk).map_err(|e| {
-        error!("{e}");
-        RpcError::InvalidParams(e.to_string())
-    })?;
+    {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        collateral::refuse_ue_member(&*data.db, &txn, msg.subnet_id, &validator_xpk).map_err(
+            |e| {
+                error!("{e}");
+                RpcError::InvalidParams(e.to_string())
+            },
+        )?;
+    }
     msg.validate_for_subnet(&genesis_info, &subnet_state)
         .map_err(|e| {
             error!(
@@ -1735,15 +1773,18 @@ pub async fn unstake_collateral(
             );
             RpcError::InvalidParams(e.to_string())
         })?;
-    epochs::next_multisig_members(&*data.db, &genesis_info, &subnet_state)
-        .and_then(|members| msg.validate_for_members(&genesis_info, &members))
-        .map_err(|e| {
-            error!(
-                "Error validating unstake collateral msg for subnet info: {}",
-                e
-            );
-            RpcError::InvalidParams(e.to_string())
-        })?;
+    {
+        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+        epochs::next_multisig_members(&*data.db, &txn, &genesis_info, &subnet_state)
+            .and_then(|members| msg.validate_for_members(&genesis_info, &members))
+            .map_err(|e| {
+                error!(
+                    "Error validating unstake collateral msg for subnet info: {}",
+                    e
+                );
+                RpcError::InvalidParams(e.to_string())
+            })?;
+    }
 
     let multisig_address = subnet_state.multisig_address();
 
@@ -1831,6 +1872,7 @@ pub async fn unstake_ue(
             matured.len()
         );
     }
+    let txn = data.db.read_txn().map_err(RpcError::DbError)?;
     let inputs = matured
         .iter()
         .take(MAX_EXIT_INPUTS)
@@ -1838,7 +1880,7 @@ pub async fn unstake_ue(
             Ok(collateral::UeExitInput {
                 outpoint: r.outpoint,
                 value: r.value,
-                script: collateral::collateral_script_of(&*data.db, r)?,
+                script: collateral::collateral_script_of(&*data.db, &txn, r)?,
             })
         })
         .collect::<Result<Vec<_>, IpcLibError>>()
@@ -2487,7 +2529,8 @@ pub async fn sign_slash(
                 params.subnet_id
             ))
         })?;
-    let script = collateral::collateral_script_of(&*data.db, &record)
+    let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+    let script = collateral::collateral_script_of(&*data.db, &txn, &record)
         .map_err(|e| RpcError::InternalError(e.to_string()))?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (index, signature) = crate::slash::sign_slash(
@@ -2544,17 +2587,22 @@ pub async fn get_unslashable_outputs(
         {
             continue;
         }
-        let block_height =
-            collateral::join_block_height(&*data.db, &record).map_err(RpcError::DbError)?;
-        let configuration = collateral::configuration_by_number(
-            &*data.db,
-            params.subnet_id,
-            record.committee_number,
-        )
-        .map_err(|e| RpcError::InternalError(e.to_string()))?
-        .ok_or_else(|| {
-            RpcError::InternalError(format!("No committee {}", record.committee_number))
-        })?;
+        let (block_height, configuration) = {
+            let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+            let block_height = collateral::join_block_height(&*data.db, &txn, &record)
+                .map_err(RpcError::DbError)?;
+            let configuration = collateral::configuration_by_number(
+                &*data.db,
+                &txn,
+                params.subnet_id,
+                record.committee_number,
+            )
+            .map_err(|e| RpcError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                RpcError::InternalError(format!("No committee {}", record.committee_number))
+            })?;
+            (block_height, configuration)
+        };
         let keys = configuration.sorted_keys();
         outputs.push(UnslashableOutput {
             txid: record.outpoint.txid,
@@ -2577,12 +2625,13 @@ pub async fn get_unslashable_outputs(
 /// order of index until their powers reach it.
 pub(crate) fn carried_slash_entries<D: DatabaseCore>(
     db: &D,
+    txn: &heed::RoTxn,
     subnet_id: SubnetId,
     posted: &[crate::slash::SlashSignatureEntry],
 ) -> Vec<crate::slash::SlashSignatureEntry> {
     let mut entries = Vec::new();
     for entry in posted {
-        let checked = match ipc_lib::check_slash_entry(db, subnet_id, entry) {
+        let checked = match ipc_lib::check_slash_entry(db, txn, subnet_id, entry) {
             Ok(checked) => checked,
             Err(e) => {
                 warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());
@@ -2599,7 +2648,7 @@ pub(crate) fn carried_slash_entries<D: DatabaseCore>(
         if !checked.reaches_threshold() {
             continue;
         }
-        let join_height = match collateral::join_block_height(db, &checked.record) {
+        let join_height = match collateral::join_block_height(db, txn, &checked.record) {
             Ok(height) => height,
             Err(e) => {
                 warn!("Slash pre-signatures of {} left out: {e}", entry.outpoint());

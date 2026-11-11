@@ -352,13 +352,16 @@ pub fn build_slash_entries<D: crate::db::DatabaseCore>(
 ) -> Result<Vec<crate::slash::SlashSignatureEntry>, crate::easy_tester::EasyTesterError> {
     use crate::easy_tester::EasyTesterError;
     let secp = Secp256k1::new();
+    let txn = db
+        .read_txn()
+        .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
     let mut entries: Vec<crate::slash::SlashSignatureEntry> = Vec::new();
     for spec in specs {
         let owner = validators
             .get(&spec.owner)
             .ok_or_else(|| EasyTesterError::runtime(format!("unknown validator '{}'", spec.owner)))?;
         let record = db
-            .get_ue_collaterals(subnet_id)
+            .get_ue_collaterals_txn(&txn, subnet_id)
             .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
             .into_iter()
             .filter(|r| r.pubkey == owner.pubkey)
@@ -366,7 +369,7 @@ pub fn build_slash_entries<D: crate::db::DatabaseCore>(
             .ok_or_else(|| {
                 EasyTesterError::runtime(format!("'{}' has no join-ue collateral", spec.owner))
             })?;
-        let script = crate::collateral::collateral_script_of(db, &record)
+        let script = crate::collateral::collateral_script_of(db, &txn, &record)
             .map_err(|e| EasyTesterError::runtime(format!("collateral script: {e}")))?;
         let mut signatures = Vec::new();
         for signer_name in &spec.signers {

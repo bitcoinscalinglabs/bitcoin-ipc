@@ -15,6 +15,7 @@ use bitcoin::{
 };
 use std::collections::BTreeMap;
 
+use heed::{RoTxn, RwTxn};
 use thiserror::Error;
 
 use crate::bitcoin_utils::{reveal_input, unsigned_commit_reveal, unspenable_internal_key};
@@ -165,12 +166,13 @@ impl CollateralScript {
 /// The configurations a `join-ue` may name, with their numbers (an error in epoch 0).
 pub fn named_configurations<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
 ) -> Result<Vec<(u64, Configuration)>, IpcLibError> {
-    let genesis_info = db.get_subnet_genesis_info(subnet_id)?.ok_or_else(|| {
-        IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet_id))
-    })?;
-    let Some(state) = db.get_subnet_state(subnet_id)? else {
+    let genesis_info = db
+        .get_subnet_genesis_info_txn(txn, subnet_id)?
+        .ok_or_else(|| IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet_id)))?;
+    let Some(state) = db.get_subnet_state_txn(txn, subnet_id)? else {
         return Ok(vec![(
             WHITELIST_COMMITTEE_NUMBER,
             genesis_info.whitelist_configuration(),
@@ -184,7 +186,7 @@ pub fn named_configurations<D: DatabaseCore>(
     }
     let mut numbers = Vec::new();
     for epoch in (0..=state.epoch).rev() {
-        if let Some(number) = epoch_committee_number(db, subnet_id, epoch)? {
+        if let Some(number) = epoch_committee_number(db, txn, subnet_id, epoch)? {
             numbers.push(number);
             if numbers.len() == 2 {
                 break;
@@ -193,9 +195,12 @@ pub fn named_configurations<D: DatabaseCore>(
     }
     let mut named = Vec::new();
     for number in numbers {
-        let configuration = configuration_by_number(db, subnet_id, number)?.ok_or_else(|| {
-            IpcValidateError::InvalidMsg(format!("Subnet {subnet_id} has no committee {number}"))
-        })?;
+        let configuration =
+            configuration_by_number(db, txn, subnet_id, number)?.ok_or_else(|| {
+                IpcValidateError::InvalidMsg(format!(
+                    "Subnet {subnet_id} has no committee {number}"
+                ))
+            })?;
         named.push((number, configuration));
     }
     Ok(named)
@@ -248,14 +253,15 @@ impl JoinContext {
 /// The [`JoinContext`] of `subnet_id` from the recorded state of the subnet.
 pub fn join_context<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
 ) -> Result<JoinContext, IpcLibError> {
-    let named = named_configurations(db, subnet_id)?;
+    let named = named_configurations(db, txn, subnet_id)?;
     let genesis_info = db
-        .get_subnet_genesis_info(subnet_id)?
+        .get_subnet_genesis_info_txn(txn, subnet_id)?
         .ok_or_else(|| IpcValidateError::InvalidMsg(format!("Subnet {} not found.", subnet_id)))?;
     let params = &genesis_info.create_subnet_msg;
-    let state = db.get_subnet_state(subnet_id)?;
+    let state = db.get_subnet_state_txn(txn, subnet_id)?;
     Ok(JoinContext {
         named,
         epoch: state.as_ref().map_or(0, |s| s.epoch),
@@ -269,31 +275,35 @@ pub fn join_context<D: DatabaseCore>(
 /// The configuration with number `number`, `C_wlist` for 0.
 pub fn configuration_by_number<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     number: u64,
 ) -> Result<Option<Configuration>, IpcLibError> {
     if number == WHITELIST_COMMITTEE_NUMBER {
         return Ok(db
-            .get_subnet_genesis_info(subnet_id)?
+            .get_subnet_genesis_info_txn(txn, subnet_id)?
             .map(|g| g.whitelist_configuration()));
     }
     Ok(db
-        .get_committee(subnet_id, number)?
+        .get_committee_txn(txn, subnet_id, number)?
         .map(|c| c.configuration()))
 }
 
 /// The collateral script of a recorded collateral.
 pub fn collateral_script_of<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     record: &UeCollateral,
 ) -> Result<CollateralScript, IpcLibError> {
-    let configuration = configuration_by_number(db, record.subnet_id, record.committee_number)?
-        .ok_or_else(|| {
-            IpcValidateError::InvalidMsg(format!(
-                "Subnet {} has no committee {}",
-                record.subnet_id, record.committee_number
-            ))
-        })?;
+    let configuration =
+        configuration_by_number(db, txn, record.subnet_id, record.committee_number)?.ok_or_else(
+            || {
+                IpcValidateError::InvalidMsg(format!(
+                    "Subnet {} has no committee {}",
+                    record.subnet_id, record.committee_number
+                ))
+            },
+        )?;
     Ok(CollateralScript::new(
         record.pubkey,
         record.pk_eots,
@@ -305,10 +315,11 @@ pub fn collateral_script_of<D: DatabaseCore>(
 /// The Bitcoin block of a collateral's join: that of the EOTS nonce commitment the join carried.
 pub fn join_block_height<D: DatabaseCore>(
     db: &D,
+    txn: &heed::RoTxn,
     record: &UeCollateral,
 ) -> Result<u64, db::DbError> {
     Ok(db
-        .get_eots_commitments(record.subnet_id, &record.pk_eots)?
+        .get_eots_commitments_txn(txn, record.subnet_id, &record.pk_eots)?
         .iter()
         .find(|c| c.txid == record.join_txid)
         .map_or(0, |c| c.block_height))
@@ -533,19 +544,22 @@ pub fn build_ue_exit_tx(
 /// Returns the subnet state when the join bootstraps the subnet.
 pub fn process_join_ue<D: DatabaseCore>(
     db: &D,
+    txn: &mut RwTxn,
     checked: &CheckedJoinUe,
     join_txid: Txid,
     block_height: u64,
     block_hash: BlockHash,
 ) -> Result<Option<db::SubnetState>, IpcLibError> {
     let join = &checked.msg.join;
-    let genesis_info = db.get_subnet_genesis_info(join.subnet_id)?.ok_or_else(|| {
-        IpcValidateError::InvalidMsg(format!("Subnet {} not found.", join.subnet_id))
-    })?;
-    let subnet_state = db.get_subnet_state(join.subnet_id)?;
+    let genesis_info = db
+        .get_subnet_genesis_info_txn(txn, join.subnet_id)?
+        .ok_or_else(|| {
+            IpcValidateError::InvalidMsg(format!("Subnet {} not found.", join.subnet_id))
+        })?;
+    let subnet_state = db.get_subnet_state_txn(txn, join.subnet_id)?;
 
     let existed = db
-        .get_ue_collateral(join.subnet_id, join_txid, &join.pubkey)?
+        .get_ue_collateral_txn(txn, join.subnet_id, join_txid, &join.pubkey)?
         .is_some();
     let applied = subnet_state
         .as_ref()
@@ -561,13 +575,14 @@ pub fn process_join_ue<D: DatabaseCore>(
 
     join.validate_for_subnet(&genesis_info, &subnet_state)?;
     if let Some(state) = &subnet_state {
-        let members = crate::epochs::next_multisig_members(db, &genesis_info, state)?;
+        let members = crate::epochs::next_multisig_members(db, txn, &genesis_info, state)?;
         join.validate_for_members(state, &members)?;
     }
     join.validate()?;
-    refuse_earlier_join(db, join.subnet_id, &join.pubkey, Some(join_txid))?;
+    refuse_earlier_join(db, txn, join.subnet_id, &join.pubkey, Some(join_txid))?;
     refuse_earlier_eots_key(
         db,
+        txn,
         join.subnet_id,
         &join.pubkey,
         &checked.msg.pk_eots,
@@ -575,6 +590,7 @@ pub fn process_join_ue<D: DatabaseCore>(
     )?;
     refuse_excess_power(
         db,
+        txn,
         &genesis_info,
         subnet_state.as_ref(),
         block_height,
@@ -582,7 +598,8 @@ pub fn process_join_ue<D: DatabaseCore>(
         join.collateral,
     )?;
 
-    // Written before the join; removed again if the join fails
+    // The collateral and the join share one write transaction: a failed join aborts both
+    let mut wtxn = db.nested_write_txn(txn)?;
     if !existed {
         let record = UeCollateral {
             subnet_id: join.subnet_id,
@@ -597,7 +614,6 @@ pub fn process_join_ue<D: DatabaseCore>(
             join_txid,
             spent: false,
         };
-        let mut wtxn = db.write_txn()?;
         db.add_ue_collateral(&mut wtxn, &record)?;
         db.add_eots_commitment(
             &mut wtxn,
@@ -609,31 +625,16 @@ pub fn process_join_ue<D: DatabaseCore>(
                 txid: join_txid,
             },
         )?;
-        wtxn.commit()?;
     }
 
     // After activation there is no bootstrap
-    if subnet_state.is_some() {
-        return Ok(None);
-    }
-
-    match join.save_to_db(db, block_height, block_hash, join_txid) {
-        Ok(bootstrapped) => Ok(bootstrapped),
-        Err(e) => {
-            if !existed {
-                let mut wtxn = db.write_txn()?;
-                db.delete_ue_collateral(&mut wtxn, join.subnet_id, join_txid, &join.pubkey)?;
-                db.delete_eots_commitment(
-                    &mut wtxn,
-                    join.subnet_id,
-                    &checked.msg.pk_eots,
-                    checked.msg.nonce_commitment.start,
-                )?;
-                wtxn.commit()?;
-            }
-            Err(e)
-        }
-    }
+    let bootstrapped = if subnet_state.is_some() {
+        None
+    } else {
+        join.save_to_db(db, &mut wtxn, block_height, block_hash, join_txid)?
+    };
+    wtxn.commit()?;
+    Ok(bootstrapped)
 }
 
 /// Refuses a collateral of `new_collateral` that raises the total power of the configuration after
@@ -641,6 +642,7 @@ pub fn process_join_ue<D: DatabaseCore>(
 /// collateral becomes `new_collateral`; for a join it is `None`.
 pub fn refuse_excess_power<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     genesis_info: &db::SubnetGenesisInfo,
     state: Option<&db::SubnetState>,
     block_height: u64,
@@ -655,7 +657,7 @@ pub fn refuse_excess_power<D: DatabaseCore>(
     let boundary = params.cutoff_height(origin, epoch + 3);
 
     let mut values: BTreeMap<XOnlyPublicKey, Amount> = BTreeMap::new();
-    for record in db.get_ue_collaterals(subnet_id)? {
+    for record in db.get_ue_collaterals_txn(txn, subnet_id)? {
         if record.spent || u64::from(record.timeout) <= boundary {
             continue;
         }
@@ -670,7 +672,7 @@ pub fn refuse_excess_power<D: DatabaseCore>(
     }
     match state {
         Some(state) => {
-            let members = crate::epochs::next_multisig_members(db, genesis_info, state)?;
+            let members = crate::epochs::next_multisig_members(db, txn, genesis_info, state)?;
             for member in members.values() {
                 if Some(&member.pubkey) != staker {
                     total = total.saturating_add(member.power);
@@ -680,7 +682,7 @@ pub fn refuse_excess_power<D: DatabaseCore>(
         None => {
             for member in &genesis_info.genesis_validators {
                 if Some(&member.pubkey) != staker
-                    && !is_ue_validator(db, subnet_id, member.join_txid, &member.pubkey)?
+                    && !is_ue_validator(db, txn, subnet_id, member.join_txid, &member.pubkey)?
                 {
                     total = total.saturating_add(member.power);
                 }
@@ -700,17 +702,19 @@ pub fn refuse_excess_power<D: DatabaseCore>(
 /// Records the spend of every collateral that an input of `tx` spends and returns them.
 pub fn record_collateral_spends<D: DatabaseCore>(
     db: &D,
+    txn: &mut RwTxn,
     tx: &Transaction,
 ) -> Result<Vec<UeCollateral>, db::DbError> {
     let mut spent = Vec::new();
     for input in &tx.input {
-        let Some(record) = db.get_ue_collateral_by_outpoint(&input.previous_output)? else {
+        let Some(record) = db.get_ue_collateral_by_outpoint_txn(txn, &input.previous_output)?
+        else {
             continue;
         };
         if record.spent {
             continue;
         }
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         db.set_ue_collateral_spent(&mut wtxn, &input.previous_output)?;
         wtxn.commit()?;
         spent.push(record);
@@ -721,12 +725,13 @@ pub fn record_collateral_spends<D: DatabaseCore>(
 /// Refuses a join-ue when an earlier join of the subnet carries `pubkey`, other than `join_txid`.
 pub fn refuse_earlier_join<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     pubkey: &XOnlyPublicKey,
     join_txid: Option<Txid>,
 ) -> Result<(), IpcLibError> {
     let genesis = db
-        .get_subnet_genesis_info(subnet_id)?
+        .get_subnet_genesis_info_txn(txn, subnet_id)?
         .map(|g| g.genesis_validators)
         .unwrap_or_default();
     let earlier = genesis
@@ -734,13 +739,13 @@ pub fn refuse_earlier_join<D: DatabaseCore>(
         .filter(|v| v.pubkey == *pubkey)
         .map(|v| v.join_txid)
         .chain(
-            db.get_ue_collaterals(subnet_id)?
+            db.get_ue_collaterals_txn(txn, subnet_id)?
                 .iter()
                 .filter(|r| r.pubkey == *pubkey)
                 .map(|r| r.join_txid),
         )
         .chain(
-            db.get_all_stake_changes(subnet_id)?
+            db.get_all_stake_changes_txn(txn, subnet_id)?
                 .iter()
                 .filter(|sc| {
                     matches!(sc.change, db::StakingChange::Join { .. })
@@ -761,6 +766,7 @@ pub fn refuse_earlier_join<D: DatabaseCore>(
 /// Refuses a join-ue when an earlier join-ue of any subnet carries `pk_eots`, other than its own.
 pub fn refuse_earlier_eots_key<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     pubkey: &XOnlyPublicKey,
     pk_eots: &XOnlyPublicKey,
@@ -770,7 +776,7 @@ pub fn refuse_earlier_eots_key<D: DatabaseCore>(
         r.subnet_id == subnet_id && r.pubkey == *pubkey && Some(r.join_txid) == join_txid
     };
     let earlier = db
-        .get_all_ue_collaterals()?
+        .get_all_ue_collaterals_txn(txn)?
         .into_iter()
         .find(|r| r.pk_eots == *pk_eots && !own(r));
     match earlier {
@@ -813,12 +819,13 @@ pub fn unsigned_join_ue_txs(
 /// Whether `pubkey` is a member of the configuration `committee` that joined with `join-ue`.
 pub fn is_ue_member<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     committee: &db::SubnetCommittee,
     pubkey: &XOnlyPublicKey,
 ) -> Result<bool, db::DbError> {
     match committee.validators.iter().find(|v| v.pubkey == *pubkey) {
-        Some(v) => is_ue_validator(db, subnet_id, v.join_txid, pubkey),
+        Some(v) => is_ue_validator(db, txn, subnet_id, v.join_txid, pubkey),
         None => Ok(false),
     }
 }
@@ -826,13 +833,14 @@ pub fn is_ue_member<D: DatabaseCore>(
 /// Refuses a stake or unstake through the multisig for a join-ue member of the latest configuration.
 pub fn refuse_ue_member<D: DatabaseCore>(
     db: &D,
+    txn: &RoTxn,
     subnet_id: SubnetId,
     pubkey: &XOnlyPublicKey,
 ) -> Result<(), IpcLibError> {
-    let Some(state) = db.get_subnet_state(subnet_id)? else {
+    let Some(state) = db.get_subnet_state_txn(txn, subnet_id)? else {
         return Ok(());
     };
-    if is_ue_member(db, subnet_id, state.latest_committee(), pubkey)? {
+    if is_ue_member(db, txn, subnet_id, state.latest_committee(), pubkey)? {
         return Err(IpcValidateError::InvalidMsg(format!(
             "Validator {pubkey} joined subnet {subnet_id} with join-ue; its collateral is \
              not in the multisig and is returned by unstakeue after it matures."

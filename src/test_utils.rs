@@ -372,19 +372,24 @@ pub fn process(
     join: &CheckedJoinUe,
     reveal_marker: u8,
 ) -> Result<Option<db::SubnetState>, IpcLibError> {
-    process_join_ue(
+    let mut txn = db.write_txn()?;
+    let state = process_join_ue(
         db,
+        &mut txn,
         join,
         Txid::from_byte_array([reveal_marker; 32]),
         102,
         BlockHash::from_byte_array([0x42; 32]),
-    )
+    )?;
+    txn.commit()?;
+    Ok(state)
 }
 
 /// The slash pre-signatures of `record` by the whitelisted keys `pubkey(signers)`.
 pub fn slash_entry(db: &HeedDb, record: &UeCollateral, signers: &[u8]) -> SlashSignatureEntry {
     let secp = Secp256k1::new();
-    let script = crate::collateral::collateral_script_of(db, record).unwrap();
+    let txn = db.read_txn().unwrap();
+    let script = crate::collateral::collateral_script_of(db, &txn, record).unwrap();
     let mut signatures: Vec<_> = signers
         .iter()
         .map(|n| {
@@ -527,12 +532,16 @@ impl EpochZeroFixture {
         else {
             panic!("batch reveal")
         };
-        batch.process(
+        let mut txn = self.db.write_txn()?;
+        let checkpoint = batch.process(
             &self.db,
+            &mut txn,
             height,
             BlockHash::from_byte_array([height as u8; 32]),
             reveal.compute_txid(),
-        )
+        )?;
+        txn.commit()?;
+        Ok(checkpoint)
     }
 
     pub fn accept(
@@ -541,22 +550,31 @@ impl EpochZeroFixture {
         tx: &bitcoin::Transaction,
         height: u64,
     ) -> db::SubnetCheckpoint {
-        msg.save_to_db(
-            &self.db,
-            height,
-            BlockHash::from_byte_array([height as u8; 32]),
-            tx.compute_txid(),
-        )
-        .unwrap()
+        let mut txn = self.db.write_txn().unwrap();
+        let checkpoint = msg
+            .save_to_db(
+                &self.db,
+                &mut txn,
+                height,
+                BlockHash::from_byte_array([height as u8; 32]),
+                tx.compute_txid(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        checkpoint
     }
 
     pub fn cutoff(&self, height: u64) -> Vec<crate::epochs::CutoffOutcome> {
-        crate::epochs::process_cutoffs(
+        let mut txn = self.db.write_txn().unwrap();
+        let outcomes = crate::epochs::process_cutoffs(
             &self.db,
+            &mut txn,
             height,
             BlockHash::from_byte_array([height as u8; 32]),
         )
-        .unwrap()
+        .unwrap();
+        txn.commit().unwrap();
+        outcomes
     }
 }
 

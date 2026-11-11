@@ -1435,7 +1435,10 @@ impl Tester for MonitorTester {
             // In epoch 0 the subnet names no configuration: the join names the whitelist, and
             // the rejection of the join is what the scenario checks
             let monitor_db = self.open_db()?;
-            let configuration = match collateral::named_configurations(&monitor_db, subnet_id) {
+            let named = monitor_db.read_txn().map_err(|e| err(&e)).and_then(|txn| {
+                collateral::named_configurations(&monitor_db, &txn, subnet_id).map_err(|e| err(&e))
+            });
+            let configuration = match named {
                 Ok(named) => named[0].1.clone(),
                 Err(e) => {
                     log::warn!("JoinUe: '{}' names the whitelist: {e}", spec.validator_name);
