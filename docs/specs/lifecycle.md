@@ -71,6 +71,12 @@ A configuration (`SubnetCommittee` in the code) is a set of validators, each wit
 
 The creator submits the [create transaction](transactions/create-subnet.md). The monitor checks the [validity of the parameters](#validity-of-the-parameters), derives the [subnet id](encoding.md#subnet-id) from the txid of the reveal transaction (`SubnetId::from_txid` in the code) and stores the subnet's genesis info. The subnet is now *created*.
 
+**Options of a subnet.** Some features of a subnet are on or off. None is a [subnet parameter](#subnet-parameters). Each depends on the kind of parent, on a node setting or on the genesis.
+
+- **Slashing.** On for every subnet whose parent is Bitcoin L1. No parameter or setting turns it off.
+- **EOTS finality.** On for a subnet whose parent is Bitcoin L1 and whose nodes have top-down finality on, the `[ipc.topdown]` section of the node's configuration file. This is a node setting, not a subnet parameter, so every node of the subnet must have it on. It is decided when the node starts and has no activation height. A node without EOTS finality takes a subnet block as final when CometBFT commits it.
+- **Reward minting.** On for a subnet whose genesis has reward parameters (an activation height and a snapshot length). They are not in the create transaction. The process that creates the genesis sets them, and every monitor must use the same values.
+
 ### Configuration C_wlist
 
 `C_wlist` holds the keys of `whitelist`, each with power 1. Any member counts towards its threshold to spend `MS(C_wlist)`, whether or not it joined. `C_wlist` exists so that the genesis collateral UTXOs name a concrete configuration and their slash pre-signatures can be collected on a running subnet in epoch 0.

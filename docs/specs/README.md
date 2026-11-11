@@ -29,5 +29,6 @@ Validators join with their collateral in their own output, exit unilaterally aft
   - [batch-transfer.md](transactions/batch-transfer.md): the checkpoint's reveal transaction with transfers, ERC20 records and slash pre-signatures (`IPCTFR`).
   - [exit.md](transactions/exit.md): spend matured collateral UTXOs and unbonding outputs (no tag).
   - [slash.md](transactions/slash.md): burn the collateral UTXO of an equivocating validator (no tag).
+- [erc20.md](erc20.md): registration of an ERC20 token, how it reaches other subnets, transfers and supply accounting.
 - [ipc-cli.md](ipc-cli.md): `ipc-cli` commands with a Bitcoin L1 parent and the provider methods they call.
 - [code-map.md](code-map.md): where the code lives and the interfaces between its parts.
