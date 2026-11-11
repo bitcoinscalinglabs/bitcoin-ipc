@@ -345,8 +345,13 @@ fn join_subnet_ue(
             "the EOTS nonce range needs start >= 1 and count >= 1, got start {start} count {count}"
         )));
     }
-    let (commitment, _) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count)
+    let (commitment, roots) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count)
         .map_err(|e| invalid(e.to_string()))?;
+    eots_signer
+        .lock()
+        .expect("EOTS signer lock")
+        .keep_subtree_roots(join.subnet_id, &commitment, roots)
+        .map_err(|e| RpcError::InternalError(format!("EOTS subtree roots: {e}")))?;
     let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk, &eots_sk, commitment);
     msg.validate().map_err(|e| invalid(e.to_string()))?;
     {

@@ -103,16 +103,14 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
-/// Builds in the background the nonce tree of every recorded commitment of the signer's key.
+/// Loads in the background the subtree roots of every recorded commitment of the signer's key,
+/// and builds the subtree of the next height to sign.
 fn build_nonce_trees(
     db: Arc<HeedDb>,
     signer: Arc<std::sync::Mutex<provider::eots_signer::EotsSigner>>,
 ) {
     std::thread::spawn(move || {
-        let (pk_eots, seed) = {
-            let signer = signer.lock().expect("EOTS signer lock");
-            (signer.pk_eots(), signer.seed())
-        };
+        let pk_eots = signer.lock().expect("EOTS signer lock").pk_eots();
         let records = match db.get_eots_commitments_of_key(&pk_eots) {
             Ok(records) => records,
             Err(e) => {
@@ -129,22 +127,18 @@ fn build_nonce_trees(
                 continue;
             }
             let started = std::time::Instant::now();
-            let tree =
-                match bitcoin_ipc::eots::nonce_tree(&seed, &record.subnet_id, &record.commitment) {
-                    Ok(tree) => tree,
-                    Err(e) => {
-                        warn!(
-                            "EOTS nonce tree of subnet {} not built: {e}",
-                            record.subnet_id
-                        );
-                        continue;
-                    }
-                };
-            signer.lock().expect("EOTS signer lock").insert_tree(
+            let built = provider::eots_signer::EotsSigner::hold_tree(
+                &signer,
                 record.subnet_id,
-                record.commitment.start,
-                tree,
+                &record.commitment,
             );
+            if let Err(e) = built {
+                warn!(
+                    "EOTS nonce tree of subnet {} not built: {e}",
+                    record.subnet_id
+                );
+                continue;
+            }
             match record.commitment.end() {
                 Ok(end) => info!(
                     "EOTS nonce tree of subnet {} heights {}..{} built in {:.1} s",

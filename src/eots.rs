@@ -1,5 +1,8 @@
 //! EOTS nonce derivation, the nonce commitment tree with its audit paths, and vote signatures.
 
+use std::collections::BTreeMap;
+use std::ops::Range;
+
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 #[cfg(test)]
 use bitcoin::secp256k1::{self, Message, XOnlyPublicKey};
@@ -44,7 +47,7 @@ impl std::fmt::Debug for EotsSeed {
 }
 
 /// A commitment of an EOTS key to one public nonce per subnet height in `[start, start + count)`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EotsNonceCommitment {
     pub start: u64,
     pub count: u32,
@@ -103,6 +106,8 @@ pub enum EotsError {
     RangeEndOverflow { start: u64, count: u32 },
     #[error("an EOTS nonce commitment needs count >= 1")]
     ZeroCount,
+    #[error("the subtree roots do not match the commitment tree")]
+    SubtreeMismatch,
     #[cfg(test)]
     #[error("invalid EOTS key")]
     InvalidKey,
@@ -208,17 +213,71 @@ pub fn nonce_tree(
     )?))
 }
 
-/// The commitment of `seed` to the heights `[start, start + count)` on `subnet_id`, with its
-/// tree.
+/// Leaves per subtree of a commitment tree, as a power of two.
+pub const SUBTREE_LOG2: u32 = 16;
+
+/// The roots of the subtrees of `2^log2` leaves of the tree of `seed` over the heights
+/// `[start, start + count)` on `subnet_id`, derived one subtree at a time.
+pub fn subtree_roots(
+    seed: &EotsSeed,
+    subnet_id: &SubnetId,
+    start: u64,
+    count: u32,
+    log2: u32,
+) -> Result<SubtreeRoots, EotsError> {
+    let roots = (0..SubtreeRoots::subtree_count_of(count, log2))
+        .map(|j| {
+            let (first, n) = subtree_heights(start, count, log2, j)?;
+            NonceTree::new(&public_nonces(seed, subnet_id, first, n)?)
+                .root()
+                .ok_or(EotsError::ZeroCount)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    SubtreeRoots::new(log2, count, roots)
+}
+
+/// The first height and the number of heights of subtree `j` of a tree over `count` heights
+/// from `start`.
+fn subtree_heights(start: u64, count: u32, log2: u32, j: usize) -> Result<(u64, u32), EotsError> {
+    let from = j << log2;
+    let n = (count as usize - from).min(1 << log2) as u32;
+    let first = start
+        .checked_add(from as u64)
+        .ok_or(EotsError::RangeEndOverflow { start, count })?;
+    Ok((first, n))
+}
+
+/// Subtree `j` of the tree of `commitment` on `subnet_id`, rebuilt from `seed` and checked
+/// against its root in `roots`.
+pub fn nonce_subtree(
+    seed: &EotsSeed,
+    subnet_id: &SubnetId,
+    commitment: &EotsNonceCommitment,
+    roots: &SubtreeRoots,
+    j: usize,
+) -> Result<NonceTree, EotsError> {
+    if roots.len() != commitment.count as usize || j >= roots.subtree_count() {
+        return Err(EotsError::SubtreeMismatch);
+    }
+    let (first, n) = subtree_heights(commitment.start, commitment.count, roots.log2(), j)?;
+    let subtree = NonceTree::new(&public_nonces(seed, subnet_id, first, n)?);
+    if subtree.root() != roots.subtree_root(j) {
+        return Err(EotsError::SubtreeMismatch);
+    }
+    Ok(subtree)
+}
+
+/// The commitment of `seed` to the heights `[start, start + count)` on `subnet_id`, with the
+/// roots of the subtrees of its tree.
 pub fn commit_nonces(
     seed: &EotsSeed,
     subnet_id: &SubnetId,
     start: u64,
     count: u32,
-) -> Result<(EotsNonceCommitment, NonceTree), EotsError> {
-    let tree = NonceTree::new(&public_nonces(seed, subnet_id, start, count)?);
-    let root = tree.root().ok_or(EotsError::ZeroCount)?;
-    Ok((EotsNonceCommitment { start, count, root }, tree))
+) -> Result<(EotsNonceCommitment, SubtreeRoots), EotsError> {
+    let roots = subtree_roots(seed, subnet_id, start, count, SUBTREE_LOG2)?;
+    let root = roots.root().ok_or(EotsError::ZeroCount)?;
+    Ok((EotsNonceCommitment { start, count, root }, roots))
 }
 
 fn leaf_hash(leaf: &[u8; 32]) -> [u8; 32] {
@@ -250,7 +309,12 @@ pub struct NonceTree {
 
 impl NonceTree {
     pub fn new(leaves: &[[u8; 32]]) -> Self {
-        let mut layers = vec![leaves.iter().map(leaf_hash).collect::<Vec<_>>()];
+        Self::from_hashes(leaves.iter().map(leaf_hash).collect())
+    }
+
+    /// The tree whose lowest layer is `hashes`: leaf hashes, or the roots of aligned subtrees.
+    fn from_hashes(hashes: Vec<[u8; 32]>) -> Self {
+        let mut layers = vec![hashes];
         while layers.last().map_or(false, |l| l.len() > 1) {
             let prev = layers.last().unwrap();
             let next = prev
@@ -314,6 +378,188 @@ impl NonceTree {
             self.audit_path_in(from + k, to, index, path);
             path.push(self.range_hash(from, from + k));
         }
+    }
+}
+
+/// The roots of the aligned subtrees of `2^log2` leaves of a commitment tree of `count` leaves,
+/// the last subtree possibly shorter. As RFC 6962 splits at powers of two, the tree's root is the
+/// tree over these roots, and the audit path of a leaf is its path inside its subtree followed by
+/// the path of its subtree root over the roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SubtreeRootsFields")]
+pub struct SubtreeRoots {
+    log2: u32,
+    count: u32,
+    roots: Vec<[u8; 32]>,
+}
+
+/// The fields of `SubtreeRoots` before their check.
+#[derive(Deserialize)]
+struct SubtreeRootsFields {
+    log2: u32,
+    count: u32,
+    roots: Vec<[u8; 32]>,
+}
+
+impl TryFrom<SubtreeRootsFields> for SubtreeRoots {
+    type Error = EotsError;
+
+    fn try_from(fields: SubtreeRootsFields) -> Result<Self, EotsError> {
+        Self::new(fields.log2, fields.count, fields.roots)
+    }
+}
+
+impl SubtreeRoots {
+    pub fn new(log2: u32, count: u32, roots: Vec<[u8; 32]>) -> Result<Self, EotsError> {
+        if log2 >= u32::BITS || roots.len() != Self::subtree_count_of(count, log2) {
+            return Err(EotsError::SubtreeMismatch);
+        }
+        Ok(Self { log2, count, roots })
+    }
+
+    fn subtree_count_of(count: u32, log2: u32) -> usize {
+        (count as usize).div_ceil(1 << log2)
+    }
+
+    pub fn log2(&self) -> u32 {
+        self.log2
+    }
+
+    /// The number of leaves.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn subtree_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// The subtree of leaf `index`.
+    pub fn subtree_of(&self, index: usize) -> usize {
+        index >> self.log2
+    }
+
+    /// The leaves of subtree `j`.
+    pub fn subtree_range(&self, j: usize) -> Option<Range<usize>> {
+        (j < self.roots.len()).then(|| {
+            let from = j << self.log2;
+            from..(from + (1 << self.log2)).min(self.len())
+        })
+    }
+
+    pub fn subtree_root(&self, j: usize) -> Option<[u8; 32]> {
+        self.roots.get(j).copied()
+    }
+
+    /// The leaves of subtree `j`, if `subtree` is that subtree.
+    fn checked_range(&self, j: usize, subtree: &NonceTree) -> Option<Range<usize>> {
+        let range = self.subtree_range(j)?;
+        (subtree.len() == range.len() && subtree.root() == self.subtree_root(j)).then_some(range)
+    }
+
+    /// The tree over the subtree roots, inner nodes of the commitment tree.
+    fn upper_tree(&self) -> NonceTree {
+        NonceTree::from_hashes(self.roots.clone())
+    }
+
+    pub fn root(&self) -> Option<[u8; 32]> {
+        self.upper_tree().root()
+    }
+
+    /// The audit path of leaf `index`, given the full subtree that holds it.
+    pub fn audit_path(&self, index: usize, subtree: &NonceTree) -> Option<Vec<[u8; 32]>> {
+        let j = self.subtree_of(index);
+        let range = self.checked_range(j, subtree)?;
+        let mut path = subtree.audit_path(index - range.start)?;
+        path.extend(self.upper_tree().audit_path(j)?);
+        Some(path)
+    }
+}
+
+/// A commitment tree held in part: the roots of its subtrees and the full subtrees of some
+/// heights.
+#[derive(Debug, Clone)]
+pub struct CommitmentTree {
+    roots: SubtreeRoots,
+    subtrees: BTreeMap<usize, NonceTree>,
+}
+
+impl CommitmentTree {
+    pub fn new(roots: SubtreeRoots) -> Self {
+        Self {
+            roots,
+            subtrees: BTreeMap::new(),
+        }
+    }
+
+    /// The whole tree of `leaves` in subtrees of `2^log2` leaves, every subtree held.
+    pub fn from_leaves(leaves: &[[u8; 32]], log2: u32) -> Self {
+        let subtrees: Vec<NonceTree> = leaves.chunks(1 << log2).map(NonceTree::new).collect();
+        let roots = subtrees
+            .iter()
+            .map(|t| t.root().expect("a chunk has a leaf"))
+            .collect();
+        Self {
+            roots: SubtreeRoots::new(log2, leaves.len() as u32, roots)
+                .expect("one root per subtree"),
+            subtrees: subtrees.into_iter().enumerate().collect(),
+        }
+    }
+
+    pub fn roots(&self) -> &SubtreeRoots {
+        &self.roots
+    }
+
+    /// The number of leaves.
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    pub fn root(&self) -> Option<[u8; 32]> {
+        self.roots.root()
+    }
+
+    pub fn holds_subtree(&self, j: usize) -> bool {
+        self.subtrees.contains_key(&j)
+    }
+
+    /// Whether the subtree of leaf `index` is held.
+    pub fn holds(&self, index: usize) -> bool {
+        self.holds_subtree(self.roots.subtree_of(index))
+    }
+
+    /// Holds subtree `j`, which must have the root recorded for it.
+    pub fn insert_subtree(&mut self, j: usize, subtree: NonceTree) -> Result<(), EotsError> {
+        self.roots
+            .checked_range(j, &subtree)
+            .ok_or(EotsError::SubtreeMismatch)?;
+        self.subtrees.insert(j, subtree);
+        Ok(())
+    }
+
+    /// Releases every subtree but subtree `j` and the next one.
+    pub fn release_other_subtrees(&mut self, j: usize) {
+        self.subtrees.retain(|&k, _| k == j || k == j + 1);
+    }
+
+    /// The subtrees held.
+    #[cfg(test)]
+    pub fn held_subtrees(&self) -> Vec<usize> {
+        self.subtrees.keys().copied().collect()
+    }
+
+    /// The audit path of leaf `index`, if its subtree is held.
+    pub fn audit_path(&self, index: usize) -> Option<Vec<[u8; 32]>> {
+        let subtree = self.subtrees.get(&self.roots.subtree_of(index))?;
+        self.roots.audit_path(index, subtree)
     }
 }
 
@@ -402,7 +648,7 @@ pub fn sign_vote(
     seed: &EotsSeed,
     subnet_id: &SubnetId,
     commitment: &EotsNonceCommitment,
-    tree: &NonceTree,
+    tree: &CommitmentTree,
     height: u64,
     block_hash: &[u8; 32],
 ) -> Result<EotsVote, EotsError> {
@@ -558,7 +804,7 @@ mod tests {
         let subnet = test_subnet();
         let commitment_start = 5;
         let nonces = public_nonces(&seed, &subnet, commitment_start, 20).unwrap();
-        let tree = NonceTree::new(&nonces);
+        let tree = CommitmentTree::from_leaves(&nonces, 2);
         let commitment = EotsNonceCommitment {
             start: commitment_start,
             count: 20,
@@ -598,7 +844,7 @@ mod tests {
             let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
             let nonce_seed = EotsSeed::from_bytes([seed; 32]);
             let nonces = public_nonces(&nonce_seed, &subnet, 1, 3).unwrap();
-            let tree = NonceTree::new(&nonces);
+            let tree = CommitmentTree::from_leaves(&nonces, 2);
             let commitment = EotsNonceCommitment {
                 start: 1,
                 count: 3,
@@ -626,7 +872,7 @@ mod tests {
             let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
             let nonce_seed = EotsSeed::from_bytes([seed.wrapping_mul(7); 32]);
             let nonces = public_nonces(&nonce_seed, &subnet, 1, 4).unwrap();
-            let tree = NonceTree::new(&nonces);
+            let tree = CommitmentTree::from_leaves(&nonces, 2);
             let commitment = EotsNonceCommitment {
                 start: 1,
                 count: 4,
@@ -885,8 +1131,10 @@ mod tests {
         let subnet = SubnetId::from_txid20(&[0x53; 20]);
         let seed = EotsSeed::from_bytes([0xa3; 32]);
         let leaves = public_nonces(&seed, &subnet, 0x0102, 11).unwrap();
-        let (commitment, original) = commit_nonces(&seed, &subnet, 0x0102, 11).unwrap();
+        let (commitment, roots) = commit_nonces(&seed, &subnet, 0x0102, 11).unwrap();
         assert_eq!(commitment.root, reference_root(&leaves));
+        let original = whole_tree(&seed, &subnet, &commitment);
+        assert_eq!(original.roots(), &roots);
         let restored = EotsSeed::from_bytes(*seed.as_bytes());
         let rebuilt = nonce_tree(&restored, &subnet, &commitment).unwrap();
         assert_eq!(rebuilt.root(), Some(reference_root(&leaves)));
@@ -895,12 +1143,192 @@ mod tests {
         }
     }
 
+    /// The tree of `commitment` with every subtree held.
+    fn whole_tree(
+        seed: &EotsSeed,
+        subnet: &SubnetId,
+        commitment: &EotsNonceCommitment,
+    ) -> CommitmentTree {
+        let leaves = public_nonces(seed, subnet, commitment.start, commitment.count).unwrap();
+        CommitmentTree::from_leaves(&leaves, SUBTREE_LOG2)
+    }
+
+    /// Leaves whose bytes differ by index and `salt`.
+    fn test_leaves(size: usize, salt: u8) -> Vec<[u8; 32]> {
+        (0..size)
+            .map(|i| {
+                let mut leaf = [salt; 32];
+                leaf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                leaf
+            })
+            .collect()
+    }
+
+    /// Tree sizes around the subtree boundaries of `2^log2` leaves: 1, powers of two, multiples of
+    /// the subtree size and one more or one less.
+    fn tree_size(log2: u32) -> impl Strategy<Value = usize> {
+        let subtree = 1usize << log2;
+        prop_oneof![
+            1usize..70,
+            (0u32..7).prop_map(|p| 1usize << p),
+            (1usize..6).prop_map(move |m| m * subtree),
+            (1usize..6).prop_map(move |m| m * subtree + 1),
+            (1usize..6).prop_map(move |m| (m * subtree - 1).max(1)),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn subtree_roots_give_the_root_and_audit_paths_of_the_whole_tree(
+            (log2, size, index) in (0u32..5).prop_flat_map(|log2| {
+                (Just(log2), tree_size(log2)).prop_flat_map(|(log2, size)| {
+                    (Just(log2), Just(size), 0..size)
+                })
+            }),
+            salt in any::<u8>(),
+        ) {
+            let leaves = test_leaves(size, salt);
+            let whole = NonceTree::new(&leaves);
+            let split = CommitmentTree::from_leaves(&leaves, log2);
+            prop_assert_eq!(split.root(), whole.root());
+            prop_assert_eq!(split.len(), size);
+            for i in 0..size {
+                prop_assert_eq!(split.audit_path(i), whole.audit_path(i));
+            }
+            // The roots and the one subtree of a height give its path
+            let roots = split.roots().clone();
+            let j = roots.subtree_of(index);
+            let range = roots.subtree_range(j).unwrap();
+            prop_assert!(range.contains(&index));
+            let mut partial = CommitmentTree::new(roots);
+            prop_assert_eq!(partial.audit_path(index), None);
+            partial.insert_subtree(j, NonceTree::new(&leaves[range])).unwrap();
+            prop_assert_eq!(partial.audit_path(index), whole.audit_path(index));
+            let path = partial.audit_path(index).unwrap();
+            prop_assert!(verify_audit_path(
+                &leaves[index],
+                index as u64,
+                size as u64,
+                &path,
+                &whole.root().unwrap(),
+            ));
+        }
+    }
+
+    /// Time and memory of the whole tree against the subtree roots and one subtree, for
+    /// 1,000,000 heights. `EOTS_TIMING=whole` or `EOTS_TIMING=split`, under `/usr/bin/time -v`:
+    /// `cargo test --release --lib eots_tree_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn eots_tree_timing() {
+        let subnet = SubnetId::from_txid20(&[0x71; 20]);
+        let seed = EotsSeed::from_bytes([0x17; 32]);
+        let count = 1_000_000;
+        let started = std::time::Instant::now();
+        if std::env::var("EOTS_TIMING").as_deref() == Ok("whole") {
+            let tree = NonceTree::new(&public_nonces(&seed, &subnet, 1, count).unwrap());
+            println!(
+                "whole tree of {count} heights (join, and start): {:.1} s, {} layers",
+                started.elapsed().as_secs_f64(),
+                tree.layers.len()
+            );
+            return;
+        }
+        let (commitment, roots) = commit_nonces(&seed, &subnet, 1, count).unwrap();
+        println!(
+            "subtree roots of {count} heights (join): {:.1} s, {} roots",
+            started.elapsed().as_secs_f64(),
+            roots.subtree_count()
+        );
+        let started = std::time::Instant::now();
+        let subtree = nonce_subtree(&seed, &subnet, &commitment, &roots, 7).unwrap();
+        println!(
+            "one subtree of {} heights (start): {:.1} s",
+            subtree.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn a_subtree_with_another_root_is_refused() {
+        let leaves = test_leaves(10, 1);
+        let mut tree = CommitmentTree::new(CommitmentTree::from_leaves(&leaves, 2).roots().clone());
+        assert_eq!(tree.roots().subtree_count(), 3);
+        assert!(matches!(
+            tree.insert_subtree(1, NonceTree::new(&test_leaves(4, 2))),
+            Err(EotsError::SubtreeMismatch)
+        ));
+        assert!(matches!(
+            tree.insert_subtree(2, NonceTree::new(&leaves[4..8])),
+            Err(EotsError::SubtreeMismatch)
+        ));
+        assert!(matches!(
+            tree.insert_subtree(3, NonceTree::new(&leaves[8..])),
+            Err(EotsError::SubtreeMismatch)
+        ));
+        tree.insert_subtree(2, NonceTree::new(&leaves[8..]))
+            .unwrap();
+        tree.insert_subtree(1, NonceTree::new(&leaves[4..8]))
+            .unwrap();
+        assert!(tree.holds(5) && tree.holds(9) && !tree.holds(3));
+        tree.release_other_subtrees(0);
+        assert!(tree.holds(5) && !tree.holds(9));
+        tree.insert_subtree(2, NonceTree::new(&leaves[8..]))
+            .unwrap();
+        tree.release_other_subtrees(2);
+        assert!(!tree.holds(5) && tree.holds(9));
+        assert!(matches!(
+            SubtreeRoots::new(2, 10, vec![[0; 32]; 2]),
+            Err(EotsError::SubtreeMismatch)
+        ));
+    }
+
+    #[test]
+    fn subtrees_derived_from_the_seed_match_the_whole_tree() {
+        let subnet = SubnetId::from_txid20(&[0x54; 20]);
+        let seed = EotsSeed::from_bytes([0xa5; 32]);
+        let (start, count) = (0x0100, 11);
+        let leaves = public_nonces(&seed, &subnet, start, count).unwrap();
+        let whole = CommitmentTree::from_leaves(&leaves, 2);
+        let roots = subtree_roots(&seed, &subnet, start, count, 2).unwrap();
+        assert_eq!(&roots, whole.roots());
+        assert_eq!(roots.root(), Some(reference_root(&leaves)));
+        let commitment = EotsNonceCommitment {
+            start,
+            count,
+            root: roots.root().unwrap(),
+        };
+        let mut rebuilt = CommitmentTree::new(roots.clone());
+        for j in 0..roots.subtree_count() {
+            let subtree = nonce_subtree(&seed, &subnet, &commitment, &roots, j).unwrap();
+            assert_eq!(subtree.len(), roots.subtree_range(j).unwrap().len());
+            rebuilt.insert_subtree(j, subtree).unwrap();
+        }
+        for i in 0..count as usize {
+            assert_eq!(rebuilt.audit_path(i), whole.audit_path(i));
+        }
+        assert!(matches!(
+            nonce_subtree(&seed, &subnet, &commitment, &roots, 3),
+            Err(EotsError::SubtreeMismatch)
+        ));
+        let other = EotsSeed::from_bytes([0xa6; 32]);
+        assert!(matches!(
+            nonce_subtree(&other, &subnet, &commitment, &roots, 0),
+            Err(EotsError::SubtreeMismatch)
+        ));
+        let (committed, committed_roots) = commit_nonces(&seed, &subnet, start, count).unwrap();
+        assert_eq!(committed, commitment);
+        assert_eq!(committed_roots.subtree_count(), 1);
+        assert_eq!(committed_roots.root(), Some(commitment.root));
+    }
+
     #[test]
     fn changing_only_the_nonce_seed_invalidates_the_original_commitment() {
         let subnet = SubnetId::from_txid20(&[0x53; 20]);
         let seed = EotsSeed::from_bytes([0xa3; 32]);
         let other = EotsSeed::from_bytes([0xa4; 32]);
-        let (commitment, tree) = commit_nonces(&seed, &subnet, 17, 5).unwrap();
+        let (commitment, _) = commit_nonces(&seed, &subnet, 17, 5).unwrap();
+        let tree = whole_tree(&seed, &subnet, &commitment);
         let sk = SecretKey::from_slice(&[7; 32]).unwrap();
         let vote = sign_vote(&sk, &other, &subnet, &commitment, &tree, 19, &[0x29; 32]).unwrap();
         assert_ne!(
@@ -916,7 +1344,8 @@ mod tests {
         let height = 0x0102_0304_0506_0708;
         let block = [0x87; 32];
         let seed = EotsSeed::from_bytes([0x73; 32]);
-        let (commitment, tree) = commit_nonces(&seed, &subnet, height, 3).unwrap();
+        let (commitment, _) = commit_nonces(&seed, &subnet, height, 3).unwrap();
+        let tree = whole_tree(&seed, &subnet, &commitment);
         let mut payload = vec![0x42; 20];
         payload.extend(height.to_le_bytes());
         payload.extend(block);
