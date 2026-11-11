@@ -6,6 +6,7 @@ use bitcoin::Amount;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::XOnlyPublicKey;
+use heed::{RoTxn, RwTxn};
 use log::error;
 use log::trace;
 use log::warn;
@@ -426,6 +427,7 @@ impl IpcCreateSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         txid: bitcoin::Txid,
     ) -> Result<db::SubnetGenesisInfo, IpcLibError> {
@@ -442,7 +444,7 @@ impl IpcCreateSubnetMsg {
         };
 
         trace!("Saving {self:?} to DB, genesis_info={genesis_info:?}");
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         db.save_subnet_genesis_info(&mut wtxn, subnet_id, &genesis_info)?;
         wtxn.commit()?;
 
@@ -689,18 +691,16 @@ impl IpcJoinSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<Option<db::SubnetState>, IpcLibError> {
-        let mut genesis_info =
-            db.get_subnet_genesis_info(self.subnet_id)?
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "subnet id={} does not exist",
-                    self.subnet_id
-                )))?;
+        let mut genesis_info = db.get_subnet_genesis_info_txn(txn, self.subnet_id)?.ok_or(
+            IpcValidateError::InvalidMsg(format!("subnet id={} does not exist", self.subnet_id)),
+        )?;
 
-        let subnet_state = db.get_subnet_state(self.subnet_id).map_err(|e| {
+        let subnet_state = db.get_subnet_state_txn(txn, self.subnet_id).map_err(|e| {
             error!("Error getting subnet info from Db: {}", e);
             IpcValidateError::InvalidMsg(e.to_string())
         })?;
@@ -759,7 +759,7 @@ impl IpcJoinSubnetMsg {
             subnet.waiting_committee = Some(next_committee.clone());
 
             let stake_change_configuration_number =
-                db.get_next_stake_change_configuration_number(self.subnet_id)?;
+                db.get_next_stake_change_configuration_number_txn(txn, self.subnet_id)?;
 
             let validator_subnet_address = eth_addr_from_x_only_pubkey(self.pubkey);
 
@@ -797,7 +797,7 @@ impl IpcJoinSubnetMsg {
             };
 
             // Write to DB
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet)?;
             db.add_stake_change(&mut wtxn, self.subnet_id, stake_change_join)?;
             db.add_stake_change(&mut wtxn, self.subnet_id, stake_change)?;
@@ -812,7 +812,7 @@ impl IpcJoinSubnetMsg {
             genesis_info.genesis_validators.push(new_validator);
 
             // Write to DB
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
 
             //
             // Check if the subnet is bootstrapped
@@ -1091,15 +1091,13 @@ impl IpcPrefundSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
-        let mut genesis_info =
-            db.get_subnet_genesis_info(self.subnet_id)?
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "subnet id={} does not exist",
-                    self.subnet_id
-                )))?;
+        let mut genesis_info = db.get_subnet_genesis_info_txn(txn, self.subnet_id)?.ok_or(
+            IpcValidateError::InvalidMsg(format!("subnet id={} does not exist", self.subnet_id)),
+        )?;
 
         self.validate_for_genesis_info(&genesis_info)?;
 
@@ -1107,7 +1105,7 @@ impl IpcPrefundSubnetMsg {
 
         genesis_info.add_genesis_balance_entry(self.address, self.amount, txid, block_height);
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         db.save_subnet_genesis_info(&mut wtxn, self.subnet_id, &genesis_info)?;
         wtxn.commit()?;
 
@@ -1179,12 +1177,13 @@ impl IpcFundSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
         let subnet_state =
-            db.get_subnet_state(self.subnet_id)?
+            db.get_subnet_state_txn(txn, self.subnet_id)?
                 .ok_or(IpcValidateError::InvalidMsg(format!(
                     "subnet id={} does not exist",
                     self.subnet_id
@@ -1196,8 +1195,8 @@ impl IpcFundSubnetMsg {
 
         // Get next nonce
 
-        let nonce = db.get_next_rootnet_msg_nonce(self.subnet_id)?;
-        let mut wtxn = db.write_txn()?;
+        let nonce = db.get_next_rootnet_msg_nonce_txn(txn, self.subnet_id)?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         // Construct rootnet message
         let rootnet_msg = self.to_rootnet_message(nonce, block_height, block_hash, txid);
         debug!("New rootnet message: {rootnet_msg:?}");
@@ -2222,6 +2221,7 @@ impl IpcCheckpointSubnetMsg {
     /// Returns an error if the transaction doesn't match the expected format.
     pub fn from_checkpoint_tx<D: db::DatabaseCore>(
         db: &D,
+        txn: &RoTxn,
         tx: &Transaction,
     ) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
@@ -2312,7 +2312,7 @@ impl IpcCheckpointSubnetMsg {
         }
 
         let subnet = db
-            .get_subnet_state(subnet_id)?
+            .get_subnet_state_txn(txn, subnet_id)?
             .ok_or(err(format!("Subnet {} not found", subnet_id)))?;
 
         // Parse withdrawals
@@ -2386,7 +2386,7 @@ impl IpcCheckpointSubnetMsg {
                     })?;
                 let subnet_multisig_address = subnet_multisig_address.into_unchecked();
 
-                match db.get_subnet_by_multisig_address(&subnet_multisig_address) {
+                match db.get_subnet_by_multisig_address_txn(txn, &subnet_multisig_address) {
                     Ok(Some(subnet)) => {
                         trace!(
                             "Found subnet {} for multisig address {:?}",
@@ -2443,14 +2443,17 @@ impl IpcCheckpointSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<db::SubnetCheckpoint, IpcLibError> {
         // Get the current subnet state
-        let mut subnet_state = db.get_subnet_state(self.subnet_id)?.ok_or_else(|| {
-            IpcValidateError::InvalidMsg(format!("Subnet ID {} does not exist", self.subnet_id))
-        })?;
+        let mut subnet_state = db
+            .get_subnet_state_txn(txn, self.subnet_id)?
+            .ok_or_else(|| {
+                IpcValidateError::InvalidMsg(format!("Subnet ID {} does not exist", self.subnet_id))
+            })?;
 
         let checkpoint_number = subnet_state.last_checkpoint_number.map_or(0, |n| n + 1);
         let last_committee_configuration_number = subnet_state.committee.configuration_number;
@@ -2475,8 +2478,11 @@ impl IpcCheckpointSubnetMsg {
                 .into());
             }
 
-            let stake_change =
-                db.get_stake_change(self.subnet_id, self.next_committee_configuration_number)?;
+            let stake_change = db.get_stake_change_txn(
+                txn,
+                self.subnet_id,
+                self.next_committee_configuration_number,
+            )?;
 
             if stake_change.is_none() {
                 return Err(IpcValidateError::InvalidField(
@@ -2552,7 +2558,7 @@ impl IpcCheckpointSubnetMsg {
         }
 
         // Begin a database transaction
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         // Save the updated subnet state
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
         // Save the checkpoint record
@@ -2603,6 +2609,7 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
     token_supply_adjustments: &[IpcErcSupplyAdjustment],
     token_transfers: &[IpcCrossSubnetErcTransfer],
     db: &D,
+    txn: &RoTxn,
 ) -> Result<(), IpcValidateError> {
     // key: "{home_subnet_id}:{home_token_address}"
     let mut final_balances: std::collections::HashMap<String, U256> =
@@ -2618,7 +2625,12 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
             )));
         }
         let existing = db
-            .get_token_balance(source_subnet_id, etr.home_token_address, source_subnet_id)
+            .get_token_balance_txn(
+                txn,
+                source_subnet_id,
+                etr.home_token_address,
+                source_subnet_id,
+            )
             .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
         if existing > U256::ZERO {
             return Err(IpcValidateError::InvalidMsg(format!(
@@ -2657,7 +2669,12 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let fetched = db
-                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .get_token_balance_txn(
+                        txn,
+                        source_subnet_id,
+                        ets.home_token_address,
+                        source_subnet_id,
+                    )
                     .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
                 e.insert(fetched)
             }
@@ -2676,7 +2693,12 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let fetched = db
-                    .get_token_balance(source_subnet_id, ets.home_token_address, source_subnet_id)
+                    .get_token_balance_txn(
+                        txn,
+                        source_subnet_id,
+                        ets.home_token_address,
+                        source_subnet_id,
+                    )
                     .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
                 e.insert(fetched)
             }
@@ -2703,7 +2725,12 @@ pub fn validate_erc_batch_data<D: db::DatabaseCore>(
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let fetched = db
-                    .get_token_balance(etx.home_subnet_id, etx.home_token_address, source_subnet_id)
+                    .get_token_balance_txn(
+                        txn,
+                        etx.home_subnet_id,
+                        etx.home_token_address,
+                        source_subnet_id,
+                    )
                     .map_err(|e| IpcValidateError::InvalidMsg(e.to_string()))?;
                 e.insert(fetched)
             }
@@ -2860,7 +2887,11 @@ impl IpcBatchTransferMsg {
     /// - The witness contains our batch transfer data with IPC:TFR tag prefix
     ///
     /// Returns an error if the expected data is missing or malformed.
-    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(
+        db: &D,
+        txn: &RoTxn,
+        tx: &Transaction,
+    ) -> Result<Self, IpcLibError> {
         // Helper closure for error creation
         let err = |msg: String| IpcLibError::MsgParseError(IPC_TRANSFER_TAG, msg);
 
@@ -2895,7 +2926,7 @@ impl IpcBatchTransferMsg {
                 let destination_subnet_id = SubnetId::from_txid20(&txid20);
 
                 // Try to get the subnet state
-                match db.get_subnet_state(destination_subnet_id) {
+                match db.get_subnet_state_txn(txn, destination_subnet_id) {
                     Ok(Some(subnet)) => {
                         // If we have a subnet, return its address and transfers
                         let subnet_multisig_address = subnet.committee.multisig_address;
@@ -3019,6 +3050,7 @@ impl IpcBatchTransferMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
@@ -3026,9 +3058,14 @@ impl IpcBatchTransferMsg {
         let source_subnet_id = self.subnet_id;
 
         // Find the checkpoint's number in the source subnet
-        let source_subnet_state = db.get_subnet_state(source_subnet_id)?.ok_or_else(|| {
-            IpcValidateError::InvalidMsg(format!("Source subnet {} not found", source_subnet_id))
-        })?;
+        let source_subnet_state =
+            db.get_subnet_state_txn(txn, source_subnet_id)?
+                .ok_or_else(|| {
+                    IpcValidateError::InvalidMsg(format!(
+                        "Source subnet {} not found",
+                        source_subnet_id
+                    ))
+                })?;
 
         let last_checkpoint_number =
             source_subnet_state.last_checkpoint_number.ok_or_else(|| {
@@ -3041,7 +3078,7 @@ impl IpcBatchTransferMsg {
         // Get the checkpoint whose transaction this reveal transaction spends, from the latest one
         let mut found = None;
         for number in (0..=last_checkpoint_number).rev() {
-            if let Some(checkpoint) = db.get_checkpoint(source_subnet_id, number)? {
+            if let Some(checkpoint) = db.get_checkpoint_txn(txn, source_subnet_id, number)? {
                 if checkpoint.txid == self.checkpoint_txid {
                     found = Some((number, checkpoint));
                     break;
@@ -3063,6 +3100,7 @@ impl IpcBatchTransferMsg {
             &self.token_supply_adjustments,
             &self.token_transfers,
             db,
+            txn,
         )?;
 
         // Update the checkpoint with the batch transfer information
@@ -3070,7 +3108,7 @@ impl IpcBatchTransferMsg {
         checkpoint.batch_transfer_block_height = Some(block_height);
 
         // Start a database transaction
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
 
         // Save the updated checkpoint
         db.save_checkpoint(&mut wtxn, source_subnet_id, &checkpoint, checkpoint_number)?;
@@ -3109,7 +3147,7 @@ impl IpcBatchTransferMsg {
         // except the source (home) subnet itself.
         // Also seed the balance ledger: balance(homeSubnet, token, S_home) = initialSupply.
         if !self.token_registrations.is_empty() {
-            let all_subnets = db.get_all_subnets()?;
+            let all_subnets = db.get_all_subnets_txn(&wtxn)?;
             for etr in &self.token_registrations {
                 // Seed balance for S_home with initial_supply (validation already
                 // confirmed this is a new token).
@@ -3420,7 +3458,11 @@ impl IpcStakeCollateralMsg {
     }
 
     /// Parses an IpcStakeCollateralMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(
+        db: &D,
+        txn: &RoTxn,
+        tx: &Transaction,
+    ) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -3477,7 +3519,7 @@ impl IpcStakeCollateralMsg {
             .map_err(|_| err("Could not parse address from output 1".to_string()))?
             .into_unchecked();
 
-        let subnet_id = match db.get_subnet_by_multisig_address(&multisig_address) {
+        let subnet_id = match db.get_subnet_by_multisig_address_txn(txn, &multisig_address) {
             Ok(Some(subnet)) => subnet.id,
             Ok(None) => {
                 error!(
@@ -3546,19 +3588,17 @@ impl IpcStakeCollateralMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
-        let genesis_info =
-            db.get_subnet_genesis_info(self.subnet_id)?
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "subnet id={} does not exist",
-                    self.subnet_id
-                )))?;
+        let genesis_info = db.get_subnet_genesis_info_txn(txn, self.subnet_id)?.ok_or(
+            IpcValidateError::InvalidMsg(format!("subnet id={} does not exist", self.subnet_id)),
+        )?;
 
         let mut subnet_state = db
-            .get_subnet_state(self.subnet_id)
+            .get_subnet_state_txn(txn, self.subnet_id)
             .map_err(|e| {
                 error!("Error getting subnet info from Db: {}", e);
                 IpcValidateError::InvalidMsg(e.to_string())
@@ -3604,7 +3644,7 @@ impl IpcStakeCollateralMsg {
         subnet_state.waiting_committee = Some(next_committee.clone());
 
         let stake_change_configuration_number =
-            db.get_next_stake_change_configuration_number(self.subnet_id)?;
+            db.get_next_stake_change_configuration_number_txn(txn, self.subnet_id)?;
 
         // Create a stake change request to track this change
         let stake_change = db::StakeChangeRequest {
@@ -3622,7 +3662,7 @@ impl IpcStakeCollateralMsg {
             txid,
         };
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
 
         // Save the updated subnet state to the database
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
@@ -3887,7 +3927,11 @@ impl IpcUnstakeCollateralMsg {
     }
 
     /// Parses an IpcUnstakeCollateralMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(
+        db: &D,
+        txn: &RoTxn,
+        tx: &Transaction,
+    ) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -3950,7 +3994,7 @@ impl IpcUnstakeCollateralMsg {
             .map_err(|_| err("Could not parse address from output 1".to_string()))?
             .into_unchecked();
 
-        let subnet = match db.get_subnet_by_multisig_address(&multisig_address) {
+        let subnet = match db.get_subnet_by_multisig_address_txn(txn, &multisig_address) {
             Ok(Some(subnet)) => subnet,
             Ok(None) => {
                 error!(
@@ -4086,19 +4130,17 @@ impl IpcUnstakeCollateralMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
-        let genesis_info =
-            db.get_subnet_genesis_info(self.subnet_id)?
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "subnet id={} does not exist",
-                    self.subnet_id
-                )))?;
+        let genesis_info = db.get_subnet_genesis_info_txn(txn, self.subnet_id)?.ok_or(
+            IpcValidateError::InvalidMsg(format!("subnet id={} does not exist", self.subnet_id)),
+        )?;
 
         let mut subnet_state = db
-            .get_subnet_state(self.subnet_id)
+            .get_subnet_state_txn(txn, self.subnet_id)
             .map_err(|e| {
                 error!("Error getting subnet info from Db: {}", e);
                 IpcValidateError::InvalidMsg(e.to_string())
@@ -4175,7 +4217,7 @@ impl IpcUnstakeCollateralMsg {
         subnet_state.waiting_committee = Some(next_committee.clone());
 
         let stake_change_configuration_number =
-            db.get_next_stake_change_configuration_number(self.subnet_id)?;
+            db.get_next_stake_change_configuration_number_txn(txn, self.subnet_id)?;
 
         // Create a stake change request to track this change
         let stake_change = db::StakeChangeRequest {
@@ -4193,7 +4235,7 @@ impl IpcUnstakeCollateralMsg {
             txid,
         };
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
 
         // Save the updated subnet state to the database
         db.save_subnet_state(&mut wtxn, self.subnet_id, &subnet_state)?;
@@ -4374,7 +4416,11 @@ impl IpcKillSubnetMsg {
     }
 
     /// Parses an IpcKillSubnetMsg from a Bitcoin transaction
-    pub fn from_tx<D: db::DatabaseCore>(db: &D, tx: &Transaction) -> Result<Self, IpcLibError> {
+    pub fn from_tx<D: db::DatabaseCore>(
+        db: &D,
+        txn: &RoTxn,
+        tx: &Transaction,
+    ) -> Result<Self, IpcLibError> {
         use bitcoin::blockdata::script::Instruction;
 
         // Helper closure for error creation
@@ -4428,7 +4474,7 @@ impl IpcKillSubnetMsg {
             .map_err(|_| err("Could not parse address from output 1".to_string()))?
             .into_unchecked();
 
-        let subnet = match db.get_subnet_by_multisig_address(&multisig_address) {
+        let subnet = match db.get_subnet_by_multisig_address_txn(txn, &multisig_address) {
             Ok(Some(subnet)) => subnet,
             Ok(None) => {
                 error!(
@@ -4555,19 +4601,17 @@ impl IpcKillSubnetMsg {
     pub fn save_to_db<D: db::DatabaseCore>(
         &self,
         db: &D,
+        txn: &mut RwTxn,
         block_height: u64,
         block_hash: bitcoin::BlockHash,
         txid: Txid,
     ) -> Result<(), IpcLibError> {
-        let genesis_info =
-            db.get_subnet_genesis_info(self.subnet_id)?
-                .ok_or(IpcValidateError::InvalidMsg(format!(
-                    "subnet id={} does not exist",
-                    self.subnet_id
-                )))?;
+        let genesis_info = db.get_subnet_genesis_info_txn(txn, self.subnet_id)?.ok_or(
+            IpcValidateError::InvalidMsg(format!("subnet id={} does not exist", self.subnet_id)),
+        )?;
 
         let subnet_state = db
-            .get_subnet_state(self.subnet_id)
+            .get_subnet_state_txn(txn, self.subnet_id)
             .map_err(|e| {
                 error!("Error getting subnet info from Db: {}", e);
                 IpcValidateError::InvalidMsg(e.to_string())
@@ -4597,7 +4641,8 @@ impl IpcKillSubnetMsg {
             .clone();
 
         // Get all valid kill requests not including the new one to be added
-        let mut valid_kill_requests = db.get_valid_kill_requests(self.subnet_id, block_height)?;
+        let mut valid_kill_requests =
+            db.get_valid_kill_requests_txn(txn, self.subnet_id, block_height)?;
 
         // Create the kill request
         let kill_request = db::KillRequest {
@@ -4622,7 +4667,7 @@ impl IpcKillSubnetMsg {
         // Append the new kill request
         valid_kill_requests.push(kill_request.clone());
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
 
         // Add the kill request to the database
         db.add_kill_request(&mut wtxn, self.subnet_id, kill_request)?;
@@ -5640,8 +5685,12 @@ mod checkpoint_msg_tests {
         dbg!(&checkpoint_tx);
 
         // Parse the transaction back to a checkpoint message
-        let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &checkpoint_tx)
-            .expect("Should parse checkpoint message");
+        let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(
+            &db,
+            &db.read_txn().unwrap(),
+            &checkpoint_tx,
+        )
+        .expect("Should parse checkpoint message");
         dbg!(&parsed_msg);
 
         // Verify unstakes were correctly serialized and deserialized
@@ -5723,8 +5772,9 @@ mod checkpoint_msg_tests {
         db: &impl DatabaseCore,
         checkpoint_tx: &Transaction,
     ) -> IpcCheckpointSubnetMsg {
-        let checkpoint_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(db, checkpoint_tx)
-            .expect("Should parse checkpoint message");
+        let checkpoint_msg =
+            IpcCheckpointSubnetMsg::from_checkpoint_tx(db, &db.read_txn().unwrap(), checkpoint_tx)
+                .expect("Should parse checkpoint message");
         checkpoint_msg.validate().expect("Checkpoint must be valid");
         checkpoint_msg
     }
@@ -5735,8 +5785,8 @@ mod checkpoint_msg_tests {
         checkpoint_tx: &Transaction,
         reveal_tx: &Transaction,
     ) -> IpcBatchTransferMsg {
-        let mut reveal_msg =
-            IpcBatchTransferMsg::from_tx(db, reveal_tx).expect("Should parse reveal tx");
+        let mut reveal_msg = IpcBatchTransferMsg::from_tx(db, &db.read_txn().unwrap(), reveal_tx)
+            .expect("Should parse reveal tx");
         reveal_msg.validate().expect("Reveal must be valid");
         reveal_msg
             .validate_for_checkpoint(checkpoint_tx)
@@ -5928,8 +5978,12 @@ mod checkpoint_msg_tests {
         checkpoint_msg.unstakes.clear();
         let (checkpoint_tx, _) = build_checkpoint_and_reveal(&checkpoint_msg, &subnet.committee);
         assert_eq!(checkpoint_tx.output.len(), 4);
-        let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(&db, &checkpoint_tx)
-            .expect("Should parse checkpoint message");
+        let parsed_msg = IpcCheckpointSubnetMsg::from_checkpoint_tx(
+            &db,
+            &db.read_txn().unwrap(),
+            &checkpoint_tx,
+        )
+        .expect("Should parse checkpoint message");
         assert_eq!(
             parsed_msg.change_address,
             Some(subnet.committee.multisig_address.clone())
@@ -5995,14 +6049,18 @@ mod checkpoint_msg_tests {
 
         let (checkpoint_tx, reveal_tx) =
             build_checkpoint_and_reveal(&checkpoint_msg, &subnet.committee);
-        parse_checkpoint(db, &checkpoint_tx)
+        let checkpoint_msg = parse_checkpoint(db, &checkpoint_tx);
+        let mut txn = db.write_txn().expect("Should create transaction");
+        checkpoint_msg
             .save_to_db(
                 db,
+                &mut txn,
                 block_height,
                 test_utils::create_rand_blockhash(),
                 checkpoint_tx.compute_txid(),
             )
             .expect("Should save checkpoint");
+        txn.commit().expect("Should commit transaction");
         (checkpoint_tx, reveal_tx)
     }
 
@@ -6013,14 +6071,18 @@ mod checkpoint_msg_tests {
         reveal_tx: &Transaction,
         block_height: u64,
     ) {
-        parse_reveal(db, checkpoint_tx, reveal_tx)
+        let reveal_msg = parse_reveal(db, checkpoint_tx, reveal_tx);
+        let mut txn = db.write_txn().expect("Should create transaction");
+        reveal_msg
             .save_to_db(
                 db,
+                &mut txn,
                 block_height,
                 test_utils::create_rand_blockhash(),
                 reveal_tx.compute_txid(),
             )
             .expect("Should save reveal");
+        txn.commit().expect("Should commit transaction");
     }
 
     /// Asserts that the checkpoint records are stored under their own numbers, each with its
@@ -6826,7 +6888,8 @@ mod checkpoint_msg_tests {
         let tx: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&txbytes).expect("Failed to deserialize transaction");
 
-        let msg = IpcStakeCollateralMsg::from_tx(&db, &tx).expect("Should parse tx as msg");
+        let msg = IpcStakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx)
+            .expect("Should parse tx as msg");
 
         assert_eq!(msg.amount, Amount::from_sat(5500000));
         assert_eq!(
@@ -6918,8 +6981,8 @@ mod checkpoint_msg_tests {
         }];
 
         // Test parsing the transaction back into a message
-        let parsed_msg =
-            IpcUnstakeCollateralMsg::from_tx(&db, &tx).expect("Should parse tx as msg");
+        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx)
+            .expect("Should parse tx as msg");
 
         // Verify the parsed message matches the original
         assert_eq!(parsed_msg.subnet_id, subnet_id);
@@ -6938,8 +7001,9 @@ mod checkpoint_msg_tests {
         let tx_from_hex: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(hex_tx).unwrap()).unwrap();
 
-        let parsed_msg_from_hex = IpcUnstakeCollateralMsg::from_tx(&db, &tx_from_hex)
-            .expect("Should parse tx from hex as msg");
+        let parsed_msg_from_hex =
+            IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx_from_hex)
+                .expect("Should parse tx from hex as msg");
 
         assert_eq!(parsed_msg_from_hex.subnet_id, subnet_id);
         assert_eq!(parsed_msg_from_hex.amount, amount);
@@ -7011,7 +7075,7 @@ mod checkpoint_msg_tests {
         }];
 
         // Test parsing the transaction back into a message
-        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx);
         assert!(parsed_msg.is_err());
 
         let expected_error_msg = format!(
@@ -7263,7 +7327,7 @@ mod checkpoint_msg_tests {
         }];
 
         // Test parsing the transaction back into a message
-        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &tx);
+        let parsed_msg = IpcUnstakeCollateralMsg::from_tx(&db, &db.read_txn().unwrap(), &tx);
         assert!(parsed_msg.is_err());
 
         // Even though our validator is in the committee, the prev_txid is different
@@ -7915,7 +7979,9 @@ mod validate_erc_batch_tests {
     fn test_empty_batch_ok() {
         let db = test_utils::create_test_db();
         let source = test_utils::generate_subnet_id();
-        assert!(validate_erc_batch_data(source, &[], &[], &[], &db).is_ok());
+        assert!(
+            validate_erc_batch_data(source, &[], &[], &[], &db, &db.read_txn().unwrap()).is_ok()
+        );
     }
 
     #[test]
@@ -7923,7 +7989,15 @@ mod validate_erc_batch_tests {
         let db = test_utils::create_test_db();
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
-        assert!(validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db).is_ok());
+        assert!(validate_erc_batch_data(
+            source,
+            &[etr(token, 1_000_000)],
+            &[],
+            &[],
+            &db,
+            &db.read_txn().unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -7932,7 +8006,15 @@ mod validate_erc_batch_tests {
         let db = test_utils::create_test_db();
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
-        assert!(validate_erc_batch_data(source, &[], &[ets_mint(token, 500)], &[], &db).is_ok());
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[ets_mint(token, 500)],
+            &[],
+            &db,
+            &db.read_txn().unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -7940,7 +8022,15 @@ mod validate_erc_batch_tests {
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(1000u64));
-        assert!(validate_erc_batch_data(source, &[], &[ets_burn(token, 500)], &[], &db).is_ok());
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[ets_burn(token, 500)],
+            &[],
+            &db,
+            &db.read_txn().unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -7949,10 +8039,15 @@ mod validate_erc_batch_tests {
         let dest = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(1000u64));
-        assert!(
-            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 500, dest)], &db)
-                .is_ok()
-        );
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[etx(source, token, 500, dest)],
+            &db,
+            &db.read_txn().unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -7968,6 +8063,7 @@ mod validate_erc_batch_tests {
             &[],
             &[etx(source, token, 500, dest)],
             &db,
+            &db.read_txn().unwrap(),
         )
         .is_ok());
     }
@@ -7986,6 +8082,7 @@ mod validate_erc_batch_tests {
             &[ets_burn(token, 250), ets_mint(token, 300)],
             &[],
             &db,
+            &db.read_txn().unwrap(),
         )
         .is_ok());
     }
@@ -7999,9 +8096,15 @@ mod validate_erc_batch_tests {
         let token = test_utils::create_rand_eth_addr();
         // source_subnet holds 1000 of the foreign token
         let db = db_with_balance(home, token, source, U256::from(1000u64));
-        assert!(
-            validate_erc_batch_data(source, &[], &[], &[etx(home, token, 500, dest)], &db).is_ok()
-        );
+        assert!(validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[etx(home, token, 500, dest)],
+            &db,
+            &db.read_txn().unwrap()
+        )
+        .is_ok());
     }
 
     // ── error paths ─────────────────────────────────────────────────────────
@@ -8011,8 +8114,14 @@ mod validate_erc_batch_tests {
         let db = test_utils::create_test_db();
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
-        let result =
-            validate_erc_batch_data(source, &[etr(token, 1000), etr(token, 2000)], &[], &[], &db);
+        let result = validate_erc_batch_data(
+            source,
+            &[etr(token, 1000), etr(token, 2000)],
+            &[],
+            &[],
+            &db,
+            &db.read_txn().unwrap(),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -8028,7 +8137,14 @@ mod validate_erc_batch_tests {
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(500u64));
-        let result = validate_erc_batch_data(source, &[etr(token, 1_000_000)], &[], &[], &db);
+        let result = validate_erc_batch_data(
+            source,
+            &[etr(token, 1_000_000)],
+            &[],
+            &[],
+            &db,
+            &db.read_txn().unwrap(),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -8044,7 +8160,14 @@ mod validate_erc_batch_tests {
         let source = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(100u64));
-        let result = validate_erc_batch_data(source, &[], &[ets_burn(token, 200)], &[], &db);
+        let result = validate_erc_batch_data(
+            source,
+            &[],
+            &[ets_burn(token, 200)],
+            &[],
+            &db,
+            &db.read_txn().unwrap(),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -8061,8 +8184,14 @@ mod validate_erc_batch_tests {
         let dest = test_utils::generate_subnet_id();
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(100u64));
-        let result =
-            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 200, dest)], &db);
+        let result = validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[etx(source, token, 200, dest)],
+            &db,
+            &db.read_txn().unwrap(),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -8086,6 +8215,7 @@ mod validate_erc_batch_tests {
             &[],
             &[etx(source, token, 200, dest)],
             &db,
+            &db.read_txn().unwrap(),
         );
         assert!(result.is_err());
     }
@@ -8107,6 +8237,7 @@ mod validate_erc_batch_tests {
                 etx(source, token, 200, dest2),
             ],
             &db,
+            &db.read_txn().unwrap(),
         );
         assert!(result.is_err());
         assert!(
@@ -8125,8 +8256,14 @@ mod validate_erc_batch_tests {
         let token = test_utils::create_rand_eth_addr();
         let db = db_with_balance(source, token, source, U256::from(1000));
 
-        let result =
-            validate_erc_batch_data(source, &[], &[], &[etx(source, token, 0, dest)], &db);
+        let result = validate_erc_batch_data(
+            source,
+            &[],
+            &[],
+            &[etx(source, token, 0, dest)],
+            &db,
+            &db.read_txn().unwrap(),
+        );
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("Zero-amount ETX"),

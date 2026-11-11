@@ -5,7 +5,7 @@ use crate::{
     },
     SubnetId,
 };
-use heed::RwTxn;
+use heed::{RoTxn, RwTxn};
 use log::{info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -17,13 +17,23 @@ impl DatabaseRewardExtensions for HeedDb {
         height_from: u64,
         height_to: u64,
     ) -> Result<Vec<SubnetState>, DbError> {
-        let all = self.get_all_subnets()?;
+        let txn = self.env.read_txn()?;
+        self.get_all_active_subnets_txn(&txn, height_from, height_to)
+    }
+
+    fn get_all_active_subnets_txn(
+        &self,
+        txn: &RoTxn,
+        height_from: u64,
+        height_to: u64,
+    ) -> Result<Vec<SubnetState>, DbError> {
+        let all = self.get_all_subnets_txn(txn)?;
         let mut active = Vec::new();
 
         for subnet_state in all {
             use crate::db::SubnetKillState;
 
-            let genesis = match self.get_subnet_genesis_info(subnet_state.id)? {
+            let genesis = match self.get_subnet_genesis_info_txn(txn, subnet_state.id)? {
                 Some(g) => g,
                 None => continue,
             };
@@ -57,9 +67,18 @@ impl DatabaseRewardExtensions for HeedDb {
         snapshot: u64,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetRewardInfo>, DbError> {
-        let key = reward_candidate_key(snapshot, subnet_id);
         let txn = self.env.read_txn()?;
-        Ok(self.reward_candidates_db.get(&txn, &key)?)
+        self.get_reward_candidate_info_txn(&txn, snapshot, subnet_id)
+    }
+
+    fn get_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetRewardInfo>, DbError> {
+        let key = reward_candidate_key(snapshot, subnet_id);
+        Ok(self.reward_candidates_db.get(txn, &key)?)
     }
 
     fn put_reward_candidate_info(
@@ -90,9 +109,17 @@ impl DatabaseRewardExtensions for HeedDb {
         snapshot: u64,
     ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
         let txn = self.env.read_txn()?;
+        self.iter_reward_candidate_info_txn(&txn, snapshot)
+    }
+
+    fn iter_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError> {
         let prefix = reward_candidates_prefix(snapshot);
         let mut out = Vec::new();
-        for res in self.reward_candidates_db.prefix_iter(&txn, &prefix)? {
+        for res in self.reward_candidates_db.prefix_iter(txn, &prefix)? {
             let (k, v) = res?;
             // key format: "reward_candidates:<snapshot>:<subnet_id>"
             let subnet_id_str = k.rsplit(':').next().ok_or_else(|| {
@@ -260,6 +287,7 @@ impl RewardTracker {
     pub fn update_after_block(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &mut RwTxn,
         block_height: u64,
     ) -> Result<(), RewardTrackerError> {
         let Some((snapshot, start_height, end_height)) = self
@@ -274,9 +302,9 @@ impl RewardTracker {
         // 1. Start of snapshot: store candidate subnets.
         if block_height == start_height {
             info!("Start of snapshot {snapshot} at block height {start_height}.");
-            let active_subnets = db.get_all_active_subnets(start_height, end_height)?;
+            let active_subnets = db.get_all_active_subnets_txn(txn, start_height, end_height)?;
 
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             for subnet in active_subnets {
                 db.put_reward_candidate_info(
                     &mut wtxn,
@@ -294,7 +322,7 @@ impl RewardTracker {
         // 2. End of snapshot: finalize rewards.
         if block_height == end_height {
             info!("End of snapshot {snapshot} at block height {end_height}.");
-            let candidates = db.iter_reward_candidate_info(snapshot)?;
+            let candidates = db.iter_reward_candidate_info_txn(txn, snapshot)?;
 
             let mut rewards_total: std::collections::BTreeMap<
                 bitcoin::XOnlyPublicKey,
@@ -304,7 +332,7 @@ impl RewardTracker {
 
             for (subnet_id, info) in candidates {
                 let rewards_in_subnet =
-                    self.get_or_init_reward_amounts(db, subnet_id, &info, block_height)?;
+                    self.get_or_init_reward_amounts(db, txn, subnet_id, &info, block_height)?;
 
                 for (pk, amt) in rewards_in_subnet {
                     let total = rewards_total.entry(pk).or_insert(bitcoin::Amount::ZERO);
@@ -334,7 +362,7 @@ impl RewardTracker {
                 }
             };
 
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             db.put_snapshot_result(&mut wtxn, snapshot, &snapshot_result)?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
             info!("Updated reward bookkeeping after block {block_height}.");
@@ -348,6 +376,7 @@ impl RewardTracker {
     pub fn update_after_checkpoint(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &mut RwTxn,
         block_height: u64,
         subnet_id: SubnetId,
         checkpoint: &crate::db::SubnetCheckpoint,
@@ -368,7 +397,7 @@ impl RewardTracker {
 
         // 1. Kill checkpoint: remove subnet from candidates.
         if checkpoint.is_kill_checkpoint {
-            let mut wtxn = db.write_txn()?;
+            let mut wtxn = db.nested_write_txn(txn)?;
             db.delete_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id)?;
             wtxn.commit().map_err(crate::db::DbError::from)?;
             return Ok(());
@@ -380,7 +409,9 @@ impl RewardTracker {
         }
 
         // Only update if subnet is still a candidate for this snapshot.
-        let Some(mut cand_info) = db.get_reward_candidate_info(current_snapshot, subnet_id)? else {
+        let Some(mut cand_info) =
+            db.get_reward_candidate_info_txn(txn, current_snapshot, subnet_id)?
+        else {
             return Ok(());
         };
 
@@ -392,10 +423,10 @@ impl RewardTracker {
 
         // 2. Rotation checkpoint: update the min-collateral accumulator.
         let mut rewards_in_subnet =
-            self.get_or_init_reward_amounts(db, subnet_id, &cand_info, block_height)?;
+            self.get_or_init_reward_amounts(db, txn, subnet_id, &cand_info, block_height)?;
 
         let new_committee = db
-            .get_committee(subnet_id, checkpoint.next_committee_number)?
+            .get_committee_txn(txn, subnet_id, checkpoint.next_committee_number)?
             .ok_or_else(|| {
                 RewardTrackerError::IpcTxInvalid(format!(
                     "could not get committee {} for subnet {} at block height {}",
@@ -424,7 +455,7 @@ impl RewardTracker {
         cand_info.most_recent_committee_number = checkpoint.next_committee_number;
         cand_info.rewarded_amounts = Some(rewards_in_subnet);
 
-        let mut wtxn = db.write_txn()?;
+        let mut wtxn = db.nested_write_txn(txn)?;
         db.put_reward_candidate_info(&mut wtxn, current_snapshot, subnet_id, &cand_info)?;
         wtxn.commit().map_err(crate::db::DbError::from)?;
 
@@ -434,6 +465,7 @@ impl RewardTracker {
     fn get_or_init_reward_amounts(
         &mut self,
         db: &dyn crate::db::DatabaseRewardExtensions,
+        txn: &RoTxn,
         subnet_id: SubnetId,
         info: &crate::db::SubnetRewardInfo,
         block_height: u64,
@@ -443,7 +475,7 @@ impl RewardTracker {
                 v.clone()
             } else {
                 let committee = db
-                    .get_committee(subnet_id, info.most_recent_committee_number)?
+                    .get_committee_txn(txn, subnet_id, info.most_recent_committee_number)?
                     .ok_or_else(|| {
                         RewardTrackerError::IpcTxInvalid(format!(
                             "could not get committee {} for subnet {} at block height {}",
@@ -696,7 +728,11 @@ mod tests {
             snapshot_length: 5,
         });
         for end_height in [104, 109, 114] {
-            tracker.update_after_block(&db, end_height).unwrap();
+            let mut txn = db.write_txn().unwrap();
+            tracker
+                .update_after_block(&db, &mut txn, end_height)
+                .unwrap();
+            txn.commit().unwrap();
         }
 
         for snapshot in [0, 1] {

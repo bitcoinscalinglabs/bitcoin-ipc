@@ -801,11 +801,23 @@ pub trait DatabaseRewardExtensions: DatabaseCore {
         height_from: u64,
         height_to: u64,
     ) -> Result<Vec<SubnetState>, DbError>;
+    fn get_all_active_subnets_txn(
+        &self,
+        txn: &RoTxn,
+        height_from: u64,
+        height_to: u64,
+    ) -> Result<Vec<SubnetState>, DbError>;
 
     /// Returns the reward-related information for a subnet, if it is a candidate
     /// for rewards in snapshot `snapshot`, and None otherwise.
     fn get_reward_candidate_info(
         &self,
+        snapshot: u64,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetRewardInfo>, DbError>;
+    fn get_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
         snapshot: u64,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetRewardInfo>, DbError>;
@@ -829,6 +841,11 @@ pub trait DatabaseRewardExtensions: DatabaseCore {
         &self,
         snapshot: u64,
     ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
+    fn iter_reward_candidate_info_txn(
+        &self,
+        txn: &RoTxn,
+        snapshot: u64,
+    ) -> Result<Vec<(SubnetId, SubnetRewardInfo)>, DbError>;
 
     /// Returns the result of snapshot.
     /// If the snapshot has not yet been finalized it returns an error.
@@ -842,6 +859,7 @@ pub trait DatabaseRewardExtensions: DatabaseCore {
     ) -> Result<(), DbError>;
 }
 
+#[derive(Clone)]
 pub struct HeedDb {
     pub(crate) env: Env,
     monitor_info: HeedDatabase<Str, SerdeBincode<MonitorInfo>>,
@@ -998,13 +1016,25 @@ impl HeedDb {
 pub trait DatabaseCore {
     fn write_txn(&self) -> Result<RwTxn, DbError>;
 
+    /// Opens a read transaction.
+    fn read_txn(&self) -> Result<RoTxn, DbError>;
+
+    /// Opens a write transaction nested in `parent` (committing it merges into `parent`,
+    /// dropping it aborts only the nested transaction).
+    fn nested_write_txn<'p>(&'p self, parent: &'p mut RwTxn) -> Result<RwTxn<'p>, DbError>;
+
     // Monitor Info
     fn get_last_processed_block(&self) -> Result<u64, DbError>;
-    fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
+    fn set_last_processed_block(&self, txn: &mut RwTxn, block_height: u64) -> Result<(), DbError>;
 
     // Genesis Info
     fn get_subnet_genesis_info(
         &self,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetGenesisInfo>, DbError>;
+    fn get_subnet_genesis_info_txn(
+        &self,
+        txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetGenesisInfo>, DbError>;
     fn save_subnet_genesis_info(
@@ -1016,6 +1046,11 @@ pub trait DatabaseCore {
 
     // Subnet State
     fn get_subnet_state(&self, subnet_id: SubnetId) -> Result<Option<SubnetState>, DbError>;
+    fn get_subnet_state_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetState>, DbError>;
     fn save_subnet_state(
         &self,
         txn: &mut RwTxn,
@@ -1026,9 +1061,17 @@ pub trait DatabaseCore {
     /// Returns all subnet states stored in the database.
     fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError>;
 
+    /// Returns all subnet states within a transaction (sees uncommitted writes).
+    fn get_all_subnets_txn(&self, txn: &RoTxn) -> Result<Vec<SubnetState>, DbError>;
+
     /// Gets a subnet by its multisig address
     fn get_subnet_by_multisig_address(
         &self,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError>;
+    fn get_subnet_by_multisig_address_txn(
+        &self,
+        txn: &RoTxn,
         multisig_address: &Address<NetworkUnchecked>,
     ) -> Result<Option<SubnetState>, DbError>;
 
@@ -1073,6 +1116,12 @@ pub trait DatabaseCore {
         subnet_id: SubnetId,
         number: u64,
     ) -> Result<Option<SubnetCheckpoint>, DbError>;
+    fn get_checkpoint_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError>;
     fn save_checkpoint(
         &self,
         txn: &mut RwTxn,
@@ -1083,11 +1132,22 @@ pub trait DatabaseCore {
 
     // Transaction storage
     fn get_transaction(&self, txid: &Txid) -> Result<Option<bitcoin::Transaction>, DbError>;
+    fn get_transaction_txn(
+        &self,
+        txn: &RoTxn,
+        txid: &Txid,
+    ) -> Result<Option<bitcoin::Transaction>, DbError>;
     fn save_transaction(&self, txn: &mut RwTxn, tx: &bitcoin::Transaction) -> Result<(), DbError>;
 
     // Committees
     fn get_committee(
         &self,
+        subnet_id: SubnetId,
+        committee_number: u64,
+    ) -> Result<Option<SubnetCommittee>, DbError>;
+    fn get_committee_txn(
+        &self,
+        txn: &RoTxn,
         subnet_id: SubnetId,
         committee_number: u64,
     ) -> Result<Option<SubnetCommittee>, DbError>;
@@ -1107,9 +1167,20 @@ pub trait DatabaseCore {
         subnet_id: SubnetId,
         configuration_number: u64,
     ) -> Result<Option<StakeChangeRequest>, DbError>;
+    fn get_stake_change_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        configuration_number: u64,
+    ) -> Result<Option<StakeChangeRequest>, DbError>;
 
     fn get_all_stake_changes(
         &self,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError>;
+    fn get_all_stake_changes_txn(
+        &self,
+        txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<Vec<StakeChangeRequest>, DbError>;
 
@@ -1128,9 +1199,19 @@ pub trait DatabaseCore {
         &self,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError>;
+    fn get_last_stake_change_configuration_number_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError>;
 
     fn get_next_stake_change_configuration_number(
         &self,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError>;
+    fn get_next_stake_change_configuration_number_txn(
+        &self,
+        txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError>;
 
@@ -1160,6 +1241,12 @@ pub trait DatabaseCore {
 
     fn get_valid_kill_requests(
         &self,
+        subnet_id: SubnetId,
+        current_block_height: u64,
+    ) -> Result<Vec<KillRequest>, DbError>;
+    fn get_valid_kill_requests_txn(
+        &self,
+        txn: &RoTxn,
         subnet_id: SubnetId,
         current_block_height: u64,
     ) -> Result<Vec<KillRequest>, DbError>;
@@ -1212,6 +1299,14 @@ impl DatabaseCore for HeedDb {
         self.env.write_txn().map_err(|e| e.into())
     }
 
+    fn read_txn(&self) -> Result<RoTxn, DbError> {
+        self.env.read_txn().map_err(|e| e.into())
+    }
+
+    fn nested_write_txn<'p>(&'p self, parent: &'p mut RwTxn) -> Result<RwTxn<'p>, DbError> {
+        self.env.nested_write_txn(parent).map_err(|e| e.into())
+    }
+
     // Monitor Info
     fn get_last_processed_block(&self) -> Result<u64, DbError> {
         let txn = self.env.read_txn()?;
@@ -1229,17 +1324,15 @@ impl DatabaseCore for HeedDb {
         }
     }
 
-    fn set_last_processed_block(&self, block_height: u64) -> Result<(), DbError> {
+    fn set_last_processed_block(&self, txn: &mut RwTxn, block_height: u64) -> Result<(), DbError> {
         trace!("Set last processed block = {}", block_height);
-        let mut txn = self.env.write_txn()?;
         self.monitor_info.put(
-            &mut txn,
+            txn,
             LAST_PROCESSED_BLOCK_KEY,
             &MonitorInfo {
                 last_processed_block: block_height,
             },
         )?;
-        txn.commit()?;
         Ok(())
     }
 
@@ -1249,9 +1342,17 @@ impl DatabaseCore for HeedDb {
         &self,
         subnet_id: SubnetId,
     ) -> Result<Option<SubnetGenesisInfo>, DbError> {
-        let key = subnet_genesis_info_key(subnet_id);
         let txn = self.env.read_txn()?;
-        let subnet = self.subnet_genesis_db.get(&txn, &key)?;
+        self.get_subnet_genesis_info_txn(&txn, subnet_id)
+    }
+
+    fn get_subnet_genesis_info_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetGenesisInfo>, DbError> {
+        let key = subnet_genesis_info_key(subnet_id);
+        let subnet = self.subnet_genesis_db.get(txn, &key)?;
         Ok(subnet)
     }
 
@@ -1268,9 +1369,17 @@ impl DatabaseCore for HeedDb {
 
     // Subnet State
     fn get_subnet_state(&self, subnet_id: SubnetId) -> Result<Option<SubnetState>, DbError> {
-        let key = subnet_state_key(subnet_id);
         let txn = self.env.read_txn()?;
-        let subnet = self.subnet_db.get(&txn, &key)?;
+        self.get_subnet_state_txn(&txn, subnet_id)
+    }
+
+    fn get_subnet_state_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Option<SubnetState>, DbError> {
+        let key = subnet_state_key(subnet_id);
+        let subnet = self.subnet_db.get(txn, &key)?;
         Ok(subnet)
     }
 
@@ -1287,8 +1396,12 @@ impl DatabaseCore for HeedDb {
 
     fn get_all_subnets(&self) -> Result<Vec<SubnetState>, DbError> {
         let txn = self.env.read_txn()?;
+        self.get_all_subnets_txn(&txn)
+    }
+
+    fn get_all_subnets_txn(&self, txn: &RoTxn) -> Result<Vec<SubnetState>, DbError> {
         let prefix = all_subnets_prefix();
-        let iter = self.subnet_db.prefix_iter(&txn, &prefix)?;
+        let iter = self.subnet_db.prefix_iter(txn, &prefix)?;
         let subnets = iter
             .map(|res| res.map(|(_, subnet_state)| subnet_state))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1300,7 +1413,15 @@ impl DatabaseCore for HeedDb {
         multisig_address: &Address<NetworkUnchecked>,
     ) -> Result<Option<SubnetState>, DbError> {
         let txn = self.env.read_txn()?;
-        let subnets = self.subnet_db.iter(&txn)?;
+        self.get_subnet_by_multisig_address_txn(&txn, multisig_address)
+    }
+
+    fn get_subnet_by_multisig_address_txn(
+        &self,
+        txn: &RoTxn,
+        multisig_address: &Address<NetworkUnchecked>,
+    ) -> Result<Option<SubnetState>, DbError> {
+        let subnets = self.subnet_db.iter(txn)?;
 
         for item in subnets {
             let (_, subnet_state) = item?;
@@ -1471,9 +1592,18 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         number: u64,
     ) -> Result<Option<SubnetCheckpoint>, DbError> {
-        let key = checkpoints_key(subnet_id, number);
         let txn = self.env.read_txn()?;
-        let checkpoint = self.checkpoints_db.get(&txn, &key)?;
+        self.get_checkpoint_txn(&txn, subnet_id, number)
+    }
+
+    fn get_checkpoint_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        number: u64,
+    ) -> Result<Option<SubnetCheckpoint>, DbError> {
+        let key = checkpoints_key(subnet_id, number);
+        let checkpoint = self.checkpoints_db.get(txn, &key)?;
         Ok(checkpoint)
     }
 
@@ -1493,9 +1623,17 @@ impl DatabaseCore for HeedDb {
 
     fn get_transaction(&self, txid: &Txid) -> Result<Option<bitcoin::Transaction>, DbError> {
         let txn = self.env.read_txn()?;
+        self.get_transaction_txn(&txn, txid)
+    }
+
+    fn get_transaction_txn(
+        &self,
+        txn: &RoTxn,
+        txid: &Txid,
+    ) -> Result<Option<bitcoin::Transaction>, DbError> {
         let key = transaction_key(txid);
 
-        match self.transactions_db.get(&txn, &key)? {
+        match self.transactions_db.get(txn, &key)? {
             Some(tx_bytes) => {
                 let tx = bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| {
                     DbError::TypeConversionError("Failed to deserialize transaction".to_string())
@@ -1523,9 +1661,18 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         committee_number: u64,
     ) -> Result<Option<SubnetCommittee>, DbError> {
-        let key = committee_key(subnet_id, committee_number);
         let txn = self.env.read_txn()?;
-        let committee = self.committee_db.get(&txn, &key)?;
+        self.get_committee_txn(&txn, subnet_id, committee_number)
+    }
+
+    fn get_committee_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        committee_number: u64,
+    ) -> Result<Option<SubnetCommittee>, DbError> {
+        let key = committee_key(subnet_id, committee_number);
+        let committee = self.committee_db.get(txn, &key)?;
         Ok(committee)
     }
 
@@ -1548,9 +1695,18 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         configuration_number: u64,
     ) -> Result<Option<StakeChangeRequest>, DbError> {
-        let key = stake_change_key(subnet_id, configuration_number);
         let txn = self.env.read_txn()?;
-        let change = self.stake_changes_db.get(&txn, &key)?;
+        self.get_stake_change_txn(&txn, subnet_id, configuration_number)
+    }
+
+    fn get_stake_change_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        configuration_number: u64,
+    ) -> Result<Option<StakeChangeRequest>, DbError> {
+        let key = stake_change_key(subnet_id, configuration_number);
+        let change = self.stake_changes_db.get(txn, &key)?;
         Ok(change)
     }
 
@@ -1558,10 +1714,18 @@ impl DatabaseCore for HeedDb {
         &self,
         subnet_id: SubnetId,
     ) -> Result<Vec<StakeChangeRequest>, DbError> {
-        let prefix = stake_changes_prefix(subnet_id);
         let txn = self.env.read_txn()?;
+        self.get_all_stake_changes_txn(&txn, subnet_id)
+    }
 
-        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+    fn get_all_stake_changes_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<Vec<StakeChangeRequest>, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+
+        let changes_iter = self.stake_changes_db.prefix_iter(txn, &prefix)?;
 
         let changes = changes_iter
             .map(|res| res.map(|(_, change)| change))
@@ -1629,9 +1793,17 @@ impl DatabaseCore for HeedDb {
         &self,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError> {
-        let prefix = stake_changes_prefix(subnet_id);
         let txn = self.env.read_txn()?;
-        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+        self.get_last_stake_change_configuration_number_txn(&txn, subnet_id)
+    }
+
+    fn get_last_stake_change_configuration_number_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError> {
+        let prefix = stake_changes_prefix(subnet_id);
+        let changes_iter = self.stake_changes_db.prefix_iter(txn, &prefix)?;
         let count: u64 = changes_iter
             .count()
             .try_into()
@@ -1648,7 +1820,16 @@ impl DatabaseCore for HeedDb {
         &self,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError> {
-        let last_number = self.get_last_stake_change_configuration_number(subnet_id)?;
+        let txn = self.env.read_txn()?;
+        self.get_next_stake_change_configuration_number_txn(&txn, subnet_id)
+    }
+
+    fn get_next_stake_change_configuration_number_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+    ) -> Result<u64, DbError> {
+        let last_number = self.get_last_stake_change_configuration_number_txn(txn, subnet_id)?;
         Ok(last_number + 1)
     }
 
@@ -1673,7 +1854,7 @@ impl DatabaseCore for HeedDb {
         confirmed_block_hash: BlockHash,
     ) -> Result<(Option<StakeChangeRequest>, Vec<StakeChangeRequest>), DbError> {
         // Get all stake changes for the subnet
-        let stake_changes = self.get_all_stake_changes(subnet_id)?;
+        let stake_changes = self.get_all_stake_changes_txn(txn, subnet_id)?;
 
         // Filter unconfirmed stake changes that are up to the specified configuration number
         let mut last_confirmed: Option<StakeChangeRequest> = None;
@@ -1728,13 +1909,25 @@ impl DatabaseCore for HeedDb {
         current_block_height: u64,
     ) -> Result<Vec<KillRequest>, DbError> {
         let rtxn = self.env.read_txn().map_err(DbError::HeedError)?;
+        let kill_requests =
+            self.get_valid_kill_requests_txn(&rtxn, subnet_id, current_block_height)?;
+        rtxn.commit().map_err(DbError::HeedError)?;
+        Ok(kill_requests)
+    }
+
+    fn get_valid_kill_requests_txn(
+        &self,
+        txn: &RoTxn,
+        subnet_id: SubnetId,
+        current_block_height: u64,
+    ) -> Result<Vec<KillRequest>, DbError> {
         let prefix = kill_requests_prefix(subnet_id);
         let mut kill_requests = Vec::new();
 
         // Calculate the minimum valid block height
         let min_valid_height = current_block_height.saturating_sub(KILL_REQUEST_VALID_BLOCKS);
 
-        for item in self.kill_requests_db.prefix_iter(&rtxn, &prefix)? {
+        for item in self.kill_requests_db.prefix_iter(txn, &prefix)? {
             let (_key, kill_request) = item?;
 
             // Only include kill requests that are still valid (not too old)
@@ -1743,7 +1936,6 @@ impl DatabaseCore for HeedDb {
             }
         }
 
-        rtxn.commit().map_err(DbError::HeedError)?;
         Ok(kill_requests)
     }
 
