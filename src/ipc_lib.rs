@@ -1844,7 +1844,8 @@ impl IpcCheckpointSubnetMsg {
         let reveal_tx_out = bitcoin::TxOut {
             value: return_address
                 .script_pubkey()
-                .minimal_non_dust_custom(fee_rate),
+                .minimal_non_dust_custom(fee_rate)
+                .max(return_address.script_pubkey().minimal_non_dust()),
             script_pubkey: return_address.script_pubkey(),
         };
 
