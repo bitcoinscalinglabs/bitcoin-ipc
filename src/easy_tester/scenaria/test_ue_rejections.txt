@@ -1,4 +1,4 @@
-# join-ue requests the monitor rejects, and the ones it accepts right after.
+# join-ue requests that are rejected, and the ones that are accepted right after.
 
 setup
 

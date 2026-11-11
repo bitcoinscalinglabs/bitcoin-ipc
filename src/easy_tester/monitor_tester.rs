@@ -330,8 +330,8 @@ fn compile_binaries(workspace_root: &std::path::Path) -> Result<(), EasyTesterEr
 // safely capture only the fields we actually use.
 //
 // Exceptions: DevMultisignPsbtParams / DevMultisignPsbtResponse are imported
-// from provider::rpc because their `signatures` type must match the
-// Finalize*Params structs exactly for serde roundtrip.
+// from provider::rpc because their `signatures` type must match the provider's
+// exactly for serde roundtrip.
 
 // ---- params (Serialize) ----
 
@@ -370,7 +370,7 @@ struct JoinSubnetLocalRequest {
 struct FinalizeCheckpointLocalParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    signatures: Vec<(bitcoin::XOnlyPublicKey, Vec<bitcoin::secp256k1::schnorr::Signature>)>,
+    signatures: Vec<Vec<bitcoin::secp256k1::schnorr::Signature>>,
     batch_transfer_tx_hex: Option<String>,
 }
 
@@ -480,7 +480,7 @@ pub struct MonitorTester {
     all_sk_hex: HashMap<String, String>,
     /// Directory where log files are written.
     log_dir: PathBuf,
-    /// The monitor's LMDB directory, opened read-only for the unilateral-exit reads.
+    /// The recorded-state database directory, opened read-only for the unilateral-exit reads.
     db_url: String,
     last_ue: Option<UeRead>,
 }
@@ -1084,7 +1084,11 @@ impl MonitorTester {
         let finalize_params = FinalizeCheckpointLocalParams {
             subnet_id,
             unsigned_psbt_base64: gen_resp.unsigned_psbt_base64,
-            signatures: sign_resp.signatures,
+            signatures: sign_resp
+                .signatures
+                .into_iter()
+                .map(|(_, sigs)| sigs)
+                .collect(),
             batch_transfer_tx_hex: if submit_batch {
                 gen_resp.batch_transfer_tx_hex
             } else {
@@ -1101,7 +1105,7 @@ impl MonitorTester {
         Ok(reveal)
     }
 
-    /// The multisig address of the subnet's current committee, from the provider
+    /// The multisig address of the subnet's current configuration, from the provider
     fn multisig_address(&self, subnet_id: SubnetId) -> Result<bitcoin::Address, EasyTesterError> {
         let state: crate::db::SubnetState =
             self.rpc_call("getsubnet", SubnetIdParam { subnet_id })?;
@@ -1396,7 +1400,7 @@ impl Tester for MonitorTester {
     }
 
     /// `join-ue`: one funded commit per join, each submitted as built, then one reveal for all
-    /// of them, without the provider's own check so that every rejection is the monitor's.
+    /// of them, without the provider's own check so that every rejection comes from the protocol rules.
     /// With `collateral_spent`, a transaction spending the collateral UTXO follows its commit,
     /// and both are mined one Bitcoin block before the reveal transaction.
     fn exec_join_ue(
@@ -1429,7 +1433,7 @@ impl Tester for MonitorTester {
             let data = msg.to_bytes().map_err(|e| err(&e))?;
             let return_address = crate::wallet::get_new_address(&rpc).map_err(|e| err(&e))?;
             // In epoch 0 the subnet names no configuration: the join names the whitelist, and
-            // the monitor's refusal is what the scenario checks
+            // the rejection of the join is what the scenario checks
             let monitor_db = self.open_db()?;
             let configuration = match collateral::named_configurations(&monitor_db, subnet_id) {
                 Ok(named) => named[0].1.clone(),
@@ -1518,7 +1522,7 @@ impl Tester for MonitorTester {
     }
 
     /// `raw`: the stake transaction is built with the library and the tester's wallet, so
-    /// that the monitor's own rules are what refuses or accepts it
+    /// that the protocol rules alone decide whether it is accepted
     fn exec_stake_subnet(
         &mut self,
         _height: u64,

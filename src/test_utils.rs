@@ -560,7 +560,7 @@ impl EpochZeroFixture {
     }
 }
 
-/// A rotation checkpoint of the latest committee of `f`, 30 subnet blocks after the last
+/// A rotation checkpoint of the latest configuration of `f`, 30 subnet blocks after the last
 /// checkpoint, that carries the configuration number `number`.
 pub fn rotation(f: &EpochZeroFixture, number: u64) -> IpcCheckpointSubnetMsg {
     let mut msg = f.message(&[]);

@@ -387,7 +387,7 @@ struct CheckpointPlan {
 }
 
 impl CheckpointPlan {
-    /// The plan from the monitor's state, without the unspent outputs.
+    /// The plan from the recorded state of the subnet, without the unspent outputs.
     fn of_state(
         genesis_info: &db::SubnetGenesisInfo,
         subnet: &db::SubnetState,
@@ -1476,8 +1476,8 @@ pub async fn dev_multisign_psbt(
 pub struct FinalizeCheckpointPsbtParams {
     subnet_id: SubnetId,
     unsigned_psbt_base64: String,
-    /// Each signer's x-only key with one signature per input, in hex, as posted to the subnet.
-    signatures: Vec<(String, Vec<String>)>,
+    /// Each signer's signatures, one per input, in hex, as posted to the subnet.
+    signatures: Vec<Vec<String>>,
     batch_transfer_tx_hex: Option<String>,
 }
 
@@ -1536,19 +1536,23 @@ pub async fn finalize_checkpoint_psbt(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
-    // A malformed key drops its signer, a malformed signature counts as missing for its input
-    let signatures: Vec<_> = params
+    // A malformed signature counts as missing for its input
+    let signatures: Vec<Vec<_>> = params
         .signatures
         .iter()
-        .filter_map(|(key, sigs)| {
-            let key = key.parse::<bitcoin::XOnlyPublicKey>().ok()?;
-            let sigs = sigs.iter().map(|sig| sig.parse().ok()).collect::<Vec<_>>();
-            Some((key, sigs))
-        })
+        .map(|sigs| sigs.iter().map(|sig| sig.parse().ok()).collect())
         .collect();
 
+    // Each signer's key is the one of the configuration that signs the checkpoint, also after a
+    // configuration rotation, for which its signatures verify
+    let signers =
+        multisig::signers_of_spend_psbt(&secp, &unsigned_psbt, &signatures).map_err(|e| {
+            error!("Error resolving the signers of the PSBT: {}", e);
+            RpcError::InternalError(e.to_string())
+        })?;
+
     // Nothing is posted while the valid signatures of an input stay below its threshold
-    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(&secp, &unsigned_psbt, &signatures)
+    let finalized_tx = multisig::finalize_spend_psbt_from_sigs(&secp, &unsigned_psbt, &signers)
         .map_err(|e| {
             error!("Error finalizing PSBT: {}", e);
             RpcError::InternalError(e.to_string())

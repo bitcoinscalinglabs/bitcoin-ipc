@@ -120,7 +120,7 @@ impl EotsSigner {
         Ok(self.votes.get(&txn, &vote_key(subnet_id, height))?)
     }
 
-    /// Deletes the votes of `subnet_id` at or below `height`, where the provider signs no vote.
+    /// Deletes the votes of `subnet_id` at or below `height`, where no vote is signed.
     pub fn delete_up_to(&self, subnet_id: SubnetId, height: u64) -> Result<(), EotsSignerError> {
         let range = KeyRange {
             first: vote_key(subnet_id, 0),
@@ -219,9 +219,9 @@ mod tests {
 
     #[test]
     fn loads_a_vote_written_on_the_configured_network() {
-        // The database holds subnet ids as the provider writes them on its network (`t410...` on
-        // regtest and testnet): loading them needs the FVM network set first, as the provider
-        // binary does before `load`. A vote at a height must survive the restart.
+        // The database holds subnet ids as written on the configured network (`t410...` on
+        // regtest and testnet): loading them needs the FVM network set first,
+        // before `load`. A vote at a height must survive the restart.
         crate::eth_utils::set_fvm_network();
         let dir = tempfile::tempdir().unwrap();
         let subnet = SubnetId::from_txid20(&[7u8; 20]);
@@ -457,7 +457,7 @@ mod tests {
             return;
         };
         // The key of a vote is the subnet id as displayed on the configured network: the child
-        // and the parent must agree on it, as the provider sets it before `load`
+        // and the parent must agree on it, set before `load`
         crate::eth_utils::set_fvm_network();
         let subnet = SubnetId::from_txid20(&[3u8; 20]);
         let mut signer = signer_in(Path::new(&dir));

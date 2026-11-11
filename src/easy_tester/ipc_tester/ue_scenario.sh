@@ -120,7 +120,7 @@ config_number() { getsubnet | jq '.result.committee.configuration_number'; }
 cp_number() { getsubnet | jq '.result.last_checkpoint_number // 0'; }
 cp_txid() { rpc getsubnetcheckpoint "{\"subnet_id\":\"$SUBNET\",\"number\":$1}" | jq -r '.result.txid'; }
 
-# Check identities as well as size, without requiring a transient waiting committee.
+# Check identities as well as size, without requiring a transient waiting configuration.
 committee_is() {
   local n expected keys=()
   for n in "$@"; do keys+=("$(xonly "$n")"); done
@@ -146,7 +146,7 @@ wait_for() {
 }
 
 tip() { bitcoin-cli getblockcount; }
-# Wait for both mining and indexing; bitcoind's tip can be ahead of the monitor.
+# Wait for both mining and indexing; bitcoind's tip can be ahead of the processed Bitcoin height.
 wait_block() {
   local target="$1" started=$SECONDS height
   echo "   waiting for block $target (tip $(tip))"
@@ -164,7 +164,7 @@ wait_block() {
   done
 }
 wait_blocks() { wait_block $(( $(tip) + $1 )); }
-# wait_checkpoints <k>: until k more checkpoints are recorded by the monitor
+# wait_checkpoints <k>: until k more checkpoints are recorded
 wait_checkpoints() {
   local target=$(( $(cp_number) + $1 )) started=$SECONDS
   echo "   waiting for checkpoint number $target (now $(cp_number), about one per 60 s)"
@@ -420,7 +420,7 @@ sign_record_ready() {
 }
 
 # Check that every complete old vote above the latest checkpointed height is still present, with one
-# record per height. The provider deletes its records at or below that height (docs/specs/slashing.md).
+# record per height. The records at or below that height are deleted (docs/specs/slashing.md).
 # The checkpointed height is read before and after the snapshot; a sample whose two reads differ is
 # retried. A lost or changed record, or a duplicate, fails at once; only a missing new height is retried.
 sign_record_extended() {
@@ -491,7 +491,7 @@ join_ue() {
     echo "$out"; fail "join-ue of validator$n"
   fi
   echo "$out"
-  # The provider client logs the txid; the command's documented stdout gives the monitor height.
+  # The txid is logged; the command's documented stdout gives the processed Bitcoin height.
   JOIN_TXID[$n]=$(echo "$out" | grep -o 'Joined subnet with txid: [0-9a-f]*' | awk '{print $NF}')
   [ -n "${JOIN_TXID[$n]}" ] || fail "join-ue of validator$n: no txid in the output"
   wait_for "validator$n accepted join appears in the monitor" 0 has_join_key "$n"
@@ -660,7 +660,7 @@ step_create() {
   [ -n "$SUBNET" ] || fail "create: no subnet id in the output"
   echo "SUBNET=$SUBNET"
   wait_blocks 1
-  # the subnet state exists only once bootstrapped; before that the monitor holds the genesis info
+  # the subnet state exists only once bootstrapped; before that only the genesis info exists
   check "subnet $SUBNET known to the monitor" rpc getgenesisinfo "{\"subnet_id\":\"$SUBNET\"}"
   local genesis; genesis=$(rpc getgenesisinfo "{\"subnet_id\":\"$SUBNET\"}")
   check "all seven epoch flags reach the monitor with their requested values" \
@@ -1396,7 +1396,7 @@ def main():
     params = genesis["create_subnet_msg"]
     h0 = state["h_0"]
     assert h0 is not None, "H_0 has not been recorded"
-    # Freeze the monitor history. Later mining during this audit cannot add a
+    # Freeze the recorded history. Later mining during this audit cannot add a
     # partial epoch or checkpoint to the observations below.
     current = (processed - h0)//k + 1
     result(params["epoch_length"] == k and params["bottomup_check_period"] == period,
@@ -1475,7 +1475,7 @@ def main():
               and all(c["block_height"] == cutoff for c in changes))
         result(ok, epoch, f"Bitcoin-height={cutoff}", "invariant 6: change number advances exactly for cutoff updates and stays unchanged otherwise")
 
-    # Read all Bitcoin transactions, not only monitor-accepted deposits. This
+    # Read all Bitcoin transactions, not only accepted deposits. This
     # also reconstructs fund UTXOs at each PAST cutoff; a current scan alone
     # cannot detect a sweep that happened after its deadline.
     transactions, positions, spent, fund_outputs, block_times = {}, {}, {}, {}, []
@@ -1500,8 +1500,8 @@ def main():
             if opreturn[:2] == b"\x6a\x2e" and opreturn[2:28] == b"IPCFND" + subnet_bytes:
                 deposits.append(tx)
 
-    # Check every monitor record against Bitcoin Core's transaction index too.
-    # Keep the actual block time, rather than the time the monitor logged it.
+    # Check every recorded transaction against Bitcoin Core's transaction index too.
+    # Keep the actual block time, rather than the time it was logged.
     inclusion_times = {}
     for cp in checkpoints:
         tx = btc("getrawtransaction", cp["txid"], 1)
@@ -1592,7 +1592,7 @@ def main():
 
     # Every periodic height between recorded checkpoints must be present;
     # full-batch/event heights are allowed too. Attribute a gap to its own
-    # creation time or, preferentially, the provider's rotation-attempt epoch.
+    # creation time or, preferentially, the epoch of the rotation attempt.
     recorded_heights = {cp["checkpoint_height"] for cp in checkpoints}
     for height in created:
         if not checkpoints[0]["checkpoint_height"] < height < last_height or height in recorded_heights:
@@ -1668,7 +1668,7 @@ PY
 ALL_STEPS="create bootstrap commitment_queries spin_up eots_finality eots_nonce_seeds epoch_checkpoint_timing deposits provider_outage monitor_outage join_v5 traffic removal exit spent_commitment_queries rejoin steady l2_replay"
 FIXTURE_STEPS="checkpoint_fixture checkpoint_invariants"
 PAIR_STEPS="provider_key_isolation bootstrap_a bootstrap_b bootstrap_a_queries bootstrap_b_queries bootstrap_pair"
-# Needs subnet B active: run with --step after subnet B's monitor has set H_0.
+# Needs subnet B active: run with --step after subnet B has set H_0.
 PAIR_ACTIVE_STEPS="subnet_b_cli_routing"
 
 usage() {

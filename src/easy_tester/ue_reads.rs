@@ -1,5 +1,5 @@
 //! Reads of the unilateral-exit state for scenarios, shared by the db tester and the
-//! monitor tester (which opens the monitor's database read-only). Each read flattens its
+//! monitor tester (which opens the recorded state read-only). Each read flattens its
 //! result into `path -> value` fields that `expect result.<path> = <value>` checks.
 
 use std::collections::{BTreeMap, HashMap};

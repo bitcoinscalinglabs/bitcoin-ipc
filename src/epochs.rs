@@ -13,7 +13,7 @@ use crate::eth_utils::eth_addr_from_x_only_pubkey;
 use crate::ipc_lib::{IpcLibError, IpcValidateError, SubnetId};
 use crate::multisig::{MultisigError, MIN_CONFIGURATION_SIZE};
 
-/// The committee number of `C_wlist`.
+/// The number of `C_wlist`.
 pub const WHITELIST_COMMITTEE_NUMBER: u64 = 0;
 
 /// What a cutoff did to one subnet.
@@ -22,7 +22,7 @@ pub struct CutoffOutcome {
     pub subnet_id: SubnetId,
     /// The epoch that begins at the cutoff.
     pub epoch: u64,
-    /// The new configuration with its committee number, when it differs from the latest one.
+    /// The new configuration with its number, when it differs from the latest one.
     pub new_committee: Option<(u64, SubnetCommittee)>,
 }
 
@@ -35,7 +35,7 @@ pub fn warn_if_small(subnet_id: SubnetId, epoch: u64, members: usize) {
     }
 }
 
-/// The committee number of the configuration of epoch `epoch`.
+/// The number of the configuration of epoch `epoch`.
 pub fn epoch_committee_number<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -59,7 +59,7 @@ pub fn is_ue_validator<D: DatabaseCore>(
         .is_some())
 }
 
-/// The multisig members of `committee` (those without a collateral record) after the pending
+/// The multisig members of the configuration `committee` (those without a collateral record) after the pending
 /// changes, by key.
 pub fn multisig_members_after<D: DatabaseCore>(
     db: &D,
@@ -198,7 +198,7 @@ pub fn compute_configuration<D: DatabaseCore>(
 }
 
 /// The changes from `base` to `target`, one per validator in ascending key order from
-/// `first_number`, and the resulting committee.
+/// `first_number`, and the resulting configuration.
 pub fn configuration_changes(
     subnet_id: SubnetId,
     base: &SubnetCommittee,
@@ -401,7 +401,7 @@ fn process_cutoff<D: DatabaseCore>(
         block_hash,
     )?;
 
-    // Continues from the committee number of the ending epoch, or of `C_gen` in epoch 0
+    // Continues from the number of the configuration of the ending epoch, or of `C_gen` in epoch 0
     let current_number = if state.epoch == 0 {
         state.committee_number
     } else {

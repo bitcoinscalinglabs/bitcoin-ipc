@@ -16,7 +16,7 @@ create subnet_a
 block 103
 join-ue subnet_a validator1 100000 2000 validator2 120000 2000
 block 104
-# The db tester's deposit is a no-op; the monitor records it in its own Bitcoin block.
+# The db tester's deposit is a no-op; it is recorded in its own Bitcoin block.
 deposit subnet_a validator1 1000000
 presign subnet_a validator1 by validator1 validator2
 presign subnet_a validator2 by validator1 validator2

@@ -1,4 +1,4 @@
-# The monitor reads a batch transfer from any input of a reveal that spends a checkpoint's commitment output.
+# A batch transfer is read from any input of a reveal that spends a checkpoint's commitment output.
 
 setup
 validator1

@@ -1,4 +1,4 @@
-# The monitor reads a create only from a reveal with exactly one input and one output.
+# A create is read only from a reveal with exactly one input and one output.
 
 setup
 validator1

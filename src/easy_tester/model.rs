@@ -105,7 +105,7 @@ pub enum OutputDb {
     TokenBalance,
     /// FendermintTester only: `read token_metadata <subnet> <token_name>`
     TokenMetadata,
-    /// `read validators <subnet> [current]`: the latest (or the current) committee
+    /// `read validators <subnet> [current]`: the latest (or the current) configuration
     Validators,
     /// `read ue_collaterals <subnet>`: the unilateral-exit collateral records
     UeCollaterals,

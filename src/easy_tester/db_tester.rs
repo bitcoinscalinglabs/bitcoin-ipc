@@ -90,7 +90,7 @@ pub struct DbTester {
     // Reward fields
     reward_tracker: Option<RewardTracker>,
     last_reward_results: Option<LastRewardResults>,
-    // Unilateral exit: on from this height, as the monitor's switch
+    // Unilateral exit: on from this height
     ue_activation_height: Option<u64>,
     last_ue: Option<UeRead>,
 }
@@ -169,7 +169,7 @@ impl DbTester {
             .collect()
     }
 
-    /// `join-ue`: the monitor's handling on synthetic transactions, one commit per join and
+    /// `join-ue`: the handling of synthetic transactions, one commit per join and
     /// one reveal for all of them. A rejected join is logged, not fatal.
     fn join_ue(
         &mut self,
@@ -207,7 +207,7 @@ impl DbTester {
             };
             let msg = super::model::join_ue_msg(&secp, join, timeout, &validator);
             // In epoch 0 the subnet names no configuration: the join names the whitelist, and
-            // the monitor's refusal is what the scenario checks
+            // the rejection of the join is what the scenario checks
             let configuration = match collateral::named_configurations(&self.db, subnet_id) {
                 Ok(named) => named[0].1.clone(),
                 Err(e) => {
@@ -329,8 +329,8 @@ impl DbTester {
         Ok(())
     }
 
-    /// `create`: the reveal, rebuilt in `shape`, goes through the monitor's scan; the subnet
-    /// id is the reveal's txid whether or not the monitor accepts the create
+    /// `create`: the reveal, rebuilt in `shape`, is processed as a create; the subnet
+    /// id is the reveal's txid whether or not the create is accepted
     fn create_subnet(
         &mut self,
         height: u64,
@@ -565,7 +565,7 @@ impl DbTester {
     }
 
     /// The checkpoint of `subnet_name` at `height`: the checkpoint transaction is built as
-    /// the provider builds it and recorded; its batch transfer reveal is returned, to be
+    /// a validator builds it, and recorded; its batch transfer reveal is returned, to be
     /// processed with the other reveals of the line.
     fn checkpoint_subnet(
         &mut self,
@@ -669,7 +669,7 @@ impl DbTester {
         Ok((checkpoint, reveal))
     }
 
-    /// The monitor's handling of the batch transfer reveals of a `checkpoint` line: one
+    /// The processing of the batch transfer reveals of a `checkpoint` line: one
     /// reveal with all of them, rebuilt in `shape`, each input processed on its own
     fn process_batch_reveals(
         &mut self,

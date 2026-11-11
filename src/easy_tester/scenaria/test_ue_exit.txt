@@ -36,7 +36,7 @@ presign subnet1 validator4 by validator1 validator2 validator3
 block 114
 checkpoint subnet1
 
-# before maturity the provider refuses: nothing to spend
+# before maturity the request is refused: nothing to spend
 block 120
 unstake-ue subnet1 validator1
 

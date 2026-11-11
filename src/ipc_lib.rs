@@ -320,7 +320,7 @@ pub struct IpcCreateSubnetMsg {
     pub min_timeout: u32,
     /// The most epochs for which a collateral seats its owner
     pub max_timeout: u32,
-    /// The smallest deposit the monitor credits, in satoshis
+    /// The smallest deposit that is credited, in satoshis
     #[serde(with = "bitcoin::amount::serde::as_sat")]
     pub min_deposit: Amount,
     /// Subnet blocks for which a kill proposal stays open
@@ -2605,7 +2605,7 @@ impl IpcCheckpointSubnetMsg {
     ///
     /// The checkpoint transaction has:
     /// 1. An OP_RETURN output with metadata in the format:
-    ///    [checkpoint tag | 20-byte subnet ID txid | 32-byte checkpoint hash | 8-byte checkpoint height | 1-byte withdrawal count | 1-byte transfer batch count | 1-byte unstake count | 8-byte committee configuration number | 1-byte killed flag]
+    ///    [checkpoint tag | 20-byte subnet ID txid | 32-byte checkpoint hash | 8-byte checkpoint height | 1-byte withdrawal count | 1-byte transfer batch count | 1-byte unstake count | 8-byte configuration number | 1-byte killed flag]
     /// 2. Withdrawal outputs for each withdrawal
     /// 3. The batch transfer commitment output, if the checkpoint has batch data
     /// 4. One transfer output per destination subnet

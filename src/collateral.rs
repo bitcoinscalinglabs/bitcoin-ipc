@@ -162,7 +162,7 @@ impl CollateralScript {
 
 }
 
-/// The configurations a `join-ue` may name, with their committee numbers (an error in epoch 0).
+/// The configurations a `join-ue` may name, with their numbers (an error in epoch 0).
 pub fn named_configurations<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -245,7 +245,7 @@ impl JoinContext {
     }
 }
 
-/// The [`JoinContext`] of `subnet_id` from the monitor's state.
+/// The [`JoinContext`] of `subnet_id` from the recorded state of the subnet.
 pub fn join_context<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -266,7 +266,7 @@ pub fn join_context<D: DatabaseCore>(
     })
 }
 
-/// The configuration of committee `number`, `C_wlist` for 0.
+/// The configuration with number `number`, `C_wlist` for 0.
 pub fn configuration_by_number<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -331,7 +331,7 @@ pub fn ue_activation_height() -> Option<u64> {
 pub struct CheckedJoinUe {
     pub msg: IpcJoinUeMsg,
     pub outpoint: OutPoint,
-    /// The committee number the collateral script names.
+    /// The number of the configuration the collateral script names.
     pub committee_number: u64,
 }
 
@@ -783,7 +783,7 @@ pub fn refuse_earlier_eots_key<D: DatabaseCore>(
     }
 }
 
-/// An unsigned commit and reveal pair for `msg` as the provider builds them, for tests.
+/// An unsigned commit and reveal pair for `msg` for tests.
 pub fn unsigned_join_ue_txs(
     secp: &Secp256k1<secp256k1::All>,
     msg: &IpcJoinUeMsg,
@@ -810,7 +810,7 @@ pub fn unsigned_join_ue_txs(
     Ok((commit, reveal, data))
 }
 
-/// Whether `pubkey` is a member of `committee` that joined with `join-ue`.
+/// Whether `pubkey` is a member of the configuration `committee` that joined with `join-ue`.
 pub fn is_ue_member<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,
@@ -823,7 +823,7 @@ pub fn is_ue_member<D: DatabaseCore>(
     }
 }
 
-/// Refuses a stake or unstake through the multisig for a join-ue member of the latest committee.
+/// Refuses a stake or unstake through the multisig for a join-ue member of the latest configuration.
 pub fn refuse_ue_member<D: DatabaseCore>(
     db: &D,
     subnet_id: SubnetId,

@@ -1,4 +1,4 @@
-# The monitor reads a join-ue from any input of a reveal, and several joins from one reveal.
+# A join-ue is read from any input of a reveal, and several joins from one reveal.
 
 setup
 

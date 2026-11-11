@@ -1,4 +1,4 @@
-//! Dumps the signed EOTS votes of a provider database as JSON.
+//! Dumps the signed EOTS votes of a recorded state as JSON.
 use bitcoin_ipc::eots::EotsVote;
 use heed::types::{SerdeBincode, Str};
 use heed::{Database, EnvFlags, EnvOpenOptions};

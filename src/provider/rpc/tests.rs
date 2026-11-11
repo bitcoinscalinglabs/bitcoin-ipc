@@ -53,7 +53,7 @@ fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
     assert_eq!(at(Some(125)).unwrap().unwrap().checkpoint_number, 1);
     assert!(at(Some(99)).unwrap().is_none());
     assert_eq!(at(None).unwrap().unwrap().checkpoint_number, 1);
-    // A height the monitor has not processed is refused, not answered with checkpoint 1
+    // A Bitcoin height not yet processed is refused, not answered with checkpoint 1
     assert!(matches!(
         at(Some(126)),
         Err(RpcError::MonitorBehind {
@@ -61,10 +61,10 @@ fn latest_checkpoint_at_a_bitcoin_height_waits_for_the_monitor() {
             processed: 125
         })
     ));
-    // Once the monitor is there, the same question has an answer
+    // Once that height is processed, the same question has an answer
     db.set_last_processed_block(126).unwrap();
     assert_eq!(at(Some(126)).unwrap().unwrap().checkpoint_number, 1);
-    // Without a Bitcoin height the monitor's lag does not matter
+    // Without a Bitcoin height the processed height does not matter
     db.set_last_processed_block(0).unwrap();
     assert_eq!(at(None).unwrap().unwrap().checkpoint_number, 1);
     assert_eq!(
@@ -180,7 +180,7 @@ fn eots_records_at_a_bitcoin_height_wait_for_the_monitor() {
     let db = create_test_db();
     let subnet = generate_subnet(3);
     db.set_last_processed_block(125).unwrap();
-    // The monitor holds no state of the subnet yet: a lagging monitor, not a missing subnet
+    // No state of the subnet is recorded yet: the height is not processed, the subnet is not missing
     assert!(matches!(
         eots_records_at(&db, subnet.id, None, Some(126)),
         Err(RpcError::MonitorBehind {
@@ -224,7 +224,7 @@ fn carried_entries_keep_complete_valid_ones_only() {
         .iter()
         .map(|k| k.x_only_public_key(&secp).0)
         .collect::<Vec<_>>();
-    // A subnet created with a whitelist of three keys, min 2: committee 0 has threshold 2
+    // A subnet created with a whitelist of three keys, min 2: configuration 0 has threshold 2
     let genesis = db::SubnetGenesisInfo {
         subnet_id,
         create_subnet_msg: IpcCreateSubnetMsg {
@@ -287,7 +287,7 @@ fn carried_entries_keep_complete_valid_ones_only() {
     assert_eq!(carried[0].signatures, vec![s0, s1]);
     let posted = vec![SlashSignatureEntry::new(record.outpoint, vec![s0, bad])];
     assert!(carried_slash_entries(&db, subnet_id, &posted).is_empty());
-    // An unknown output is left out; a slashable one is carried again, the monitor ignores it
+    // An unknown output is left out; a slashable one is carried again
     let mut unknown = SlashSignatureEntry::new(record.outpoint, vec![s0, s1]);
     unknown.vout = 3;
     assert!(carried_slash_entries(&db, subnet_id, &[unknown]).is_empty());
@@ -781,7 +781,7 @@ async fn provider_checkpoint_and_reveal(
 }
 
 /// An unsigned checkpoint transaction of the epoch zero fixture, with the posted form of the
-/// signatures of the whitelist keys `signers`.
+/// signatures of the keys `signers` (whitelist keys or not).
 async fn checkpoint_to_finalize(
     signers: &[u8],
 ) -> (
@@ -789,7 +789,7 @@ async fn checkpoint_to_finalize(
     WalletRpc,
     Arc<ServerData>,
     FinalizeCheckpointPsbtParams,
-    Vec<(String, Vec<String>)>,
+    Vec<Vec<String>>,
 ) {
     let f = EpochZeroFixture::new([9000; 4]).await;
     let id = f.id;
@@ -805,10 +805,7 @@ async fn checkpoint_to_finalize(
         .map(|n| {
             let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &secret(*n));
             let (_, sigs) = multisig::sign_spend_psbt(&secp, psbt.clone(), keypair).unwrap();
-            (
-                pubkey(*n).to_string(),
-                sigs.iter().map(|sig| sig.to_string()).collect(),
-            )
+            sigs.iter().map(|sig| sig.to_string()).collect()
         })
         .collect();
     let params = FinalizeCheckpointPsbtParams {
@@ -820,27 +817,79 @@ async fn checkpoint_to_finalize(
     (dir, wallet, data, params, posted)
 }
 
+/// A checkpoint that spends outputs of the whitelist configuration (keys 1 to 6) finalizes after
+/// the current configuration changed to keys 11 to 14: the keys come from the leaf of each input.
+/// The signatures of key 11 and a malformed row are dropped, a row of key 5 posted twice counts
+/// once.
 #[tokio::test]
-async fn finalize_checkpoint_psbt_drops_a_malformed_key_and_signature_and_still_finalizes() {
-    let (_dir, wallet, data, mut params, posted) = checkpoint_to_finalize(&[1, 2, 3]).await;
-    let inputs = posted[0].1.len();
-    params.signatures = posted;
-    params
-        .signatures
-        .push(("not a key".to_string(), vec!["00".to_string(); inputs]));
-    params
-        .signatures
-        .push((pubkey(4).to_string(), vec!["zz".to_string(); inputs]));
+async fn finalize_checkpoint_psbt_takes_the_keys_from_the_signing_configuration() {
+    let signers = [11, 5, 6, 2];
+    let (_dir, wallet, data, mut params, posted) = checkpoint_to_finalize(&signers).await;
+    let id = params.subnet_id;
+    let mut state = data.db.get_subnet_state(id).unwrap().unwrap();
+    state.committee = (11..=14)
+        .map(|n| validator(pubkey(n)))
+        .collect::<Vec<_>>()
+        .to_committee(&id, state.committee.configuration_number + 1);
+    let mut wtxn = data.db.write_txn().unwrap();
+    data.db.save_subnet_state(&mut wtxn, id, &state).unwrap();
+    wtxn.commit().unwrap();
+
+    let inputs = posted[0].len();
+    params.signatures = posted.clone();
+    params.signatures.push(vec!["zz".to_string(); inputs]);
+    params.signatures.push(posted[1].clone());
     finalize_checkpoint_psbt(Data::new(data), Params(params))
         .await
         .unwrap_or_else(|e| panic!("finalize failed: {}", serde_json::to_string(&e).unwrap()));
-    assert_eq!(wallet.0.lock().unwrap().submitted.len(), 1);
+
+    let wallet_state = wallet.0.lock().unwrap();
+    assert_eq!(wallet_state.submitted.len(), 1);
+    let tx = &wallet_state.submitted[0];
+    let mut whitelist: Vec<_> = (1..=6).map(pubkey).collect();
+    whitelist.sort();
+    for (input_index, input) in tx.input.iter().enumerate() {
+        let witness: Vec<&[u8]> = input.witness.iter().collect();
+        let (keys, _) = multisig::parse_multisig_script(bitcoin::Script::from_bytes(
+            witness[witness.len() - 2],
+        ))
+        .unwrap();
+        assert_eq!(
+            keys.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            whitelist
+        );
+        assert_eq!(witness.len(), keys.len() + 2);
+        // signatures in reverse key order
+        for (position, (key, _)) in keys.iter().enumerate() {
+            let expected = signers
+                .iter()
+                .position(|n| pubkey(*n) == *key)
+                .map(|signer| hex::decode(&posted[signer][input_index]).unwrap())
+                .unwrap_or_default();
+            assert_eq!(
+                witness[keys.len() - 1 - position],
+                expected,
+                "input {input_index}"
+            );
+        }
+    }
+    multisig::tests::verify_transaction(tx, |outpoint| {
+        wallet_state
+            .funds
+            .iter()
+            .find(|fund| fund.txid == outpoint.txid && fund.vout == outpoint.vout)
+            .map(|fund| bitcoin::TxOut {
+                value: fund.amount,
+                script_pubkey: fund.script_pub_key.clone(),
+            })
+    })
+    .unwrap();
 }
 
 #[tokio::test]
 async fn finalize_checkpoint_psbt_with_a_malformed_signature_below_the_threshold_submits_nothing() {
     let (_dir, wallet, data, mut params, mut posted) = checkpoint_to_finalize(&[1, 2, 3]).await;
-    posted[2].1 = vec!["zz".to_string(); posted[2].1.len()];
+    posted[2] = vec!["zz".to_string(); posted[2].len()];
     params.signatures = posted;
     assert!(finalize_checkpoint_psbt(Data::new(data), Params(params))
         .await

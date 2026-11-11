@@ -23,36 +23,33 @@ where
 {
     let serialized_tx = encode::serialize(tx);
 
-    // First, collect all UTXOs being spent in this transaction
-    let mut all_spent_utxos = Vec::with_capacity(tx.input.len());
-    for input in &tx.input {
-        if let Some(output) = spent(&input.previous_output) {
-            all_spent_utxos.push(bitcoinconsensus::Utxo {
-                script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
-                script_pubkey_len: output.script_pubkey.len() as u32,
-                value: output.value.to_sat() as i64,
-            });
-        } else {
-            println!("Unknown spent output: {:?}", input.previous_output);
-            panic!("Unknown spent output");
-        }
-    }
+    // First, collect all UTXOs being spent in this transaction; `all_spent_utxos` points into them
+    let spent_outputs: Vec<TxOut> = tx
+        .input
+        .iter()
+        .map(|input| {
+            spent(&input.previous_output)
+                .unwrap_or_else(|| panic!("Unknown spent output: {:?}", input.previous_output))
+        })
+        .collect();
+    let all_spent_utxos: Vec<_> = spent_outputs
+        .iter()
+        .map(|output| bitcoinconsensus::Utxo {
+            script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
+            script_pubkey_len: output.script_pubkey.len() as u32,
+            value: output.value.to_sat() as i64,
+        })
+        .collect();
 
-    for (idx, input) in tx.input.iter().enumerate() {
-        // Get the current input's UTXO for the first argument
-        if let Some(output) = spent(&input.previous_output) {
-            bitcoinconsensus::verify_with_flags(
-                output.script_pubkey.as_bytes(),
-                output.value.to_sat(),
-                serialized_tx.as_slice(),
-                Some(&all_spent_utxos),
-                idx,
-                bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
-            )?;
-        } else {
-            println!("Unknown spent output: {:?}", input.previous_output);
-            panic!("Unknown spent output");
-        }
+    for (idx, output) in spent_outputs.iter().enumerate() {
+        bitcoinconsensus::verify_with_flags(
+            output.script_pubkey.as_bytes(),
+            output.value.to_sat(),
+            serialized_tx.as_slice(),
+            Some(&all_spent_utxos),
+            idx,
+            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
+        )?;
     }
     Ok(())
 }
@@ -1917,4 +1914,216 @@ fn finalize_from_sigs_counts_valid_signatures_up_to_the_threshold() {
         (outpoint.txid == funding.compute_txid()).then(|| funding.output[0].clone())
     })
     .unwrap();
+}
+
+/// Signers posted without keys get the leaf key for which their signatures verify. A signer of a
+/// key outside the leaf and one with no signature are dropped.
+#[test]
+fn signers_of_spend_psbt_takes_the_keys_from_the_leaf() {
+    let secp = Secp256k1::new();
+    let keypairs = generate_keypairs(4);
+    let keys: Vec<WeightedKey> = keypairs
+        .iter()
+        .map(|kp| (kp.x_only_public_key().0, 1))
+        .collect();
+    let subnet_id = generate_subnet_id();
+    let address = create_subnet_multisig_address(&secp, &subnet_id, &keys, 3, NETWORK).unwrap();
+    let funding = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(70_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let utxo = ListUnspentResultEntry {
+        txid: funding.compute_txid(),
+        vout: 0,
+        address: None,
+        label: None,
+        redeem_script: None,
+        witness_script: None,
+        script_pub_key: address.script_pubkey(),
+        amount: Amount::from_sat(70_000),
+        confirmations: 1,
+        spendable: true,
+        solvable: true,
+        descriptor: None,
+        safe: true,
+    };
+    let tx_out = TxOut {
+        value: Amount::from_sat(30_000),
+        script_pubkey: address.script_pubkey(),
+    };
+    let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let psbt = construct_spend_psbt(
+        &secp,
+        &subnet_id,
+        &keys,
+        3,
+        &address,
+        &[utxo],
+        false,
+        &[tx_out],
+        &fee_rate,
+        0,
+    )
+    .unwrap();
+    let signed = |keypair: bitcoin::key::Keypair| {
+        let (_, sigs) = sign_spend_psbt(&secp, psbt.clone(), keypair).unwrap();
+        sigs.into_iter().map(Some).collect::<Vec<_>>()
+    };
+    let outsider = generate_keypairs(1)[0];
+
+    let posted = vec![
+        signed(keypairs[3]),
+        signed(outsider),
+        vec![None],
+        signed(keypairs[0]),
+        signed(keypairs[1]),
+    ];
+    let signers = signers_of_spend_psbt(&secp, &psbt, &posted).unwrap();
+    assert_eq!(
+        signers.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        vec![keys[3].0, keys[0].0, keys[1].0]
+    );
+    assert_eq!(signers[0].1, posted[0]);
+
+    let tx = finalize_spend_psbt_from_sigs(&secp, &psbt, &signers).unwrap();
+    verify_transaction(&tx, |outpoint| {
+        (outpoint.txid == funding.compute_txid()).then(|| funding.output[0].clone())
+    })
+    .unwrap();
+}
+
+/// A transaction with one input per configuration (keys of power 1, threshold 3), each input with
+/// the leaf of its configuration, and the outputs that the inputs spend, in input order.
+fn spend_of_configurations(
+    secp: &Secp256k1<All>,
+    configurations: &[&[WeightedKey]],
+) -> (bitcoin::Psbt, Vec<TxOut>) {
+    let subnet_id = generate_subnet_id();
+    let fee_rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let (psbts, spent): (Vec<_>, Vec<_>) = configurations
+        .iter()
+        .enumerate()
+        .map(|(n, keys)| {
+            let address =
+                create_subnet_multisig_address(secp, &subnet_id, keys, 3, NETWORK).unwrap();
+            let utxo = ListUnspentResultEntry {
+                script_pub_key: address.script_pubkey(),
+                ..create_test_utxo(70_000, &format!("{:064x}", n + 1), 0)
+            };
+            let tx_out = TxOut {
+                value: Amount::from_sat(30_000),
+                script_pubkey: address.script_pubkey(),
+            };
+            let psbt = construct_spend_psbt(
+                secp,
+                &subnet_id,
+                keys,
+                3,
+                &address,
+                &[utxo],
+                false,
+                &[tx_out],
+                &fee_rate,
+                0,
+            )
+            .unwrap();
+            let spent = psbt.inputs[0].witness_utxo.clone().unwrap();
+            (psbt, spent)
+        })
+        .unzip();
+    let mut unsigned_tx = psbts[0].unsigned_tx.clone();
+    unsigned_tx.input = psbts
+        .iter()
+        .flat_map(|psbt| psbt.unsigned_tx.input.clone())
+        .collect();
+    let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+    psbt.inputs = psbts.iter().flat_map(|psbt| psbt.inputs.clone()).collect();
+    (psbt, spent)
+}
+
+/// Verifies every input of `tx` against the output it spends, `spent` in input order.
+fn verify_inputs(tx: &Transaction, spent: &[TxOut]) {
+    verify_transaction(tx, |outpoint| {
+        tx.input
+            .iter()
+            .position(|input| input.previous_output == *outpoint)
+            .map(|input| spent[input].clone())
+    })
+    .unwrap();
+}
+
+/// Each signature of a row counts for the key of its input's leaf. Inputs of the disjoint
+/// configurations {A, B, C, D} and {E, F, G, H}, threshold 3: a row with a copy of A's signature of
+/// input 0 and E's signature of input 1 counts for A and for E.
+#[test]
+fn signers_of_spend_psbt_resolves_each_signature_of_a_row_by_its_input() {
+    let secp = Secp256k1::new();
+    let keypairs = generate_keypairs(8);
+    let keys: Vec<WeightedKey> = keypairs
+        .iter()
+        .map(|kp| (kp.x_only_public_key().0, 1))
+        .collect();
+    let (psbt, spent) = spend_of_configurations(&secp, &[&keys[..4], &keys[4..]]);
+    let signed = |n: usize| sign_spend_psbt(&secp, psbt.clone(), keypairs[n]).unwrap().1;
+    let (a, e) = (signed(0), signed(4));
+
+    let mut posted = vec![vec![Some(a[0]), Some(e[1])]];
+    posted.extend([0, 1, 2, 5, 6].map(|n| signed(n).into_iter().map(Some).collect()));
+    let signers = signers_of_spend_psbt(&secp, &psbt, &posted).unwrap();
+    assert_eq!(signers[0], (keys[0].0, vec![Some(a[0]), None]));
+    assert_eq!(signers[1], (keys[4].0, vec![None, Some(e[1])]));
+
+    let tx = finalize_spend_psbt_from_sigs(&secp, &psbt, &signers).unwrap();
+    verify_inputs(&tx, &spent);
+}
+
+/// Inputs of the configurations {A, B, C, D} and {D, E, F, G}, threshold 3. D's signature of
+/// input 1 in the slot of input 0 is dropped and D's signature of input 1 after it counts. A row
+/// posted twice counts its key once.
+#[test]
+fn signers_of_spend_psbt_drops_a_wrong_input_signature_and_counts_a_repeated_row_once() {
+    let secp = Secp256k1::new();
+    let keypairs = generate_keypairs(7);
+    let keys: Vec<WeightedKey> = keypairs
+        .iter()
+        .map(|kp| (kp.x_only_public_key().0, 1))
+        .collect();
+    let (psbt, spent) = spend_of_configurations(&secp, &[&keys[..4], &keys[3..]]);
+    let signed = |n: usize| {
+        let (_, sigs) = sign_spend_psbt(&secp, psbt.clone(), keypairs[n]).unwrap();
+        sigs.into_iter().map(Some).collect::<Vec<_>>()
+    };
+    let d = signed(3);
+
+    let mut posted = vec![vec![d[1], d[1]], signed(0), signed(0), signed(1), signed(4)];
+    let signers = signers_of_spend_psbt(&secp, &psbt, &posted).unwrap();
+    assert_eq!(
+        signers.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        vec![keys[3].0, keys[0].0, keys[1].0, keys[4].0]
+    );
+    assert_eq!(signers[0].1, vec![None, d[1]]);
+    match finalize_spend_psbt_from_sigs(&secp, &psbt, &signers) {
+        Err(MultisigError::SignaturesMissing(missing)) => {
+            assert_eq!(missing, vec![(0, 2, 3), (1, 2, 3)])
+        }
+        other => panic!(
+            "expected missing signatures, got {:?}",
+            other.map(|tx| tx.compute_txid())
+        ),
+    }
+
+    posted.extend([signed(2), signed(5)]);
+    let signers = signers_of_spend_psbt(&secp, &psbt, &posted).unwrap();
+    let tx = finalize_spend_psbt_from_sigs(&secp, &psbt, &signers).unwrap();
+    verify_inputs(&tx, &spent);
 }

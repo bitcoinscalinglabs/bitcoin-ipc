@@ -31,7 +31,7 @@ read ue_collaterals subnet_a
 expect result.count = 2
 # Another Bitcoin block in epoch 0 also rejects a whitelisted key without recording it.
 join-ue subnet_a validator4 140000 2000
-# The db tester's deposit is a no-op; the monitor records it in its own Bitcoin block.
+# The db tester's deposit is a no-op; it is recorded in its own Bitcoin block.
 deposit subnet_a validator1 1000000
 presign subnet_a validator1 by validator1 validator2
 presign subnet_a validator2 by validator1 validator2

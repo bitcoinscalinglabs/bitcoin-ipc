@@ -209,7 +209,7 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     assert_eq!(commitments[0].commitment, test_commitment());
     activate(&db, subnet_id, BLOCK);
 
-    // A third key joins after activation: recorded, naming committee 1, not seated
+    // A third key joins after activation: recorded, naming configuration 1, not seated
     let (checked, join_txid) = checked_join_in_db(&db, &secp, &keys[2], subnet_id, TIMEOUT);
     assert!(
         process_join_ue(&db, &checked, join_txid, BLOCK + 1, block_hash)
@@ -225,7 +225,7 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     assert!(state.waiting_committee.is_none());
     assert!(db.get_all_stake_changes(subnet_id).unwrap().is_empty());
 
-    // One member of committee 1 does not reach its threshold: valid, not slashable
+    // One member of configuration 1 does not reach its threshold: valid, not slashable
     let one = presign_entry(&db, &record, &[&keys[0]]);
     assert!(batch_with(subnet_id, vec![one])
         .newly_slashable(&db)
@@ -302,7 +302,7 @@ fn a_join_after_activation_is_seated_at_the_next_cutoff_once_slashable() {
     assert_eq!(db.get_all_stake_changes(subnet_id).unwrap().len(), 4);
 }
 
-/// A commit and reveal pair as the provider builds them, unsigned, and the data.
+/// An unsigned commit and reveal pair, and the data.
 fn join_ue_txs(
     secp: &Secp256k1<secp256k1::All>,
     msg: &IpcJoinUeMsg,
@@ -894,7 +894,7 @@ fn two_join_ue_in_one_reveal_of_the_same_subnet() {
         .unwrap()
         .expect("the second join bootstraps");
 
-    // Two records under the reveal txid, one per key, and both keys in the committee
+    // Two records under the reveal txid, one per key, and both keys in the configuration
     let mut records = db.get_ue_collaterals(subnet_id).unwrap();
     records.sort_by_key(|r| r.timeout);
     let summary: Vec<_> = records
@@ -1173,7 +1173,7 @@ fn cutoff(db: &HeedDb, height: u64) -> Vec<crate::epochs::CutoffOutcome> {
     crate::epochs::process_cutoffs(db, height, BlockHash::all_zeros()).unwrap()
 }
 
-/// A join checked against the configurations the subnet's state names, as the monitor does
+/// A join checked against the configurations the recorded state of the subnet names
 fn checked_join_in_db(
     db: &HeedDb,
     secp: &Secp256k1<secp256k1::All>,
@@ -1199,7 +1199,7 @@ fn checked_join_in_db(
     (checked, reveal.compute_txid())
 }
 
-/// Adopts the waiting committee, as the rotation checkpoint of the epoch does
+/// Adopts the waiting configuration, as the rotation checkpoint of the epoch does
 fn rotate(db: &HeedDb, subnet_id: SubnetId) {
     let mut state = db.get_subnet_state(subnet_id).unwrap().unwrap();
     let next = state.waiting_committee.take().expect("a waiting committee");
@@ -1736,7 +1736,7 @@ fn a_key_with_an_earlier_multisig_join_cannot_join_ue() {
     }
     assert_eq!(db.get_ue_collaterals(subnet_id).unwrap().len(), 1);
 
-    // The check the provider makes before the reveal exists
+    // The check before the reveal exists
     assert!(refuse_earlier_join(&db, subnet_id, &pks[0], None).is_err());
     assert!(refuse_earlier_join(&db, subnet_id, &pks[1], None).is_err());
     assert!(refuse_earlier_join(&db, subnet_id, &pks[2], None).is_err());
@@ -1761,7 +1761,7 @@ fn cutoffs_without_a_rotation_checkpoint_continue_from_the_waiting_configuration
         make_slashable(&db, subnet_id, join_txid, &key.x_only_public_key().0, BLOCK);
     }
 
-    // The first cutoff computes C_2 from C_gen, committee 1
+    // The first cutoff computes C_2 from C_gen, configuration 1
     let (number, committee) = cutoff(&db, BLOCK + 10)[0]
         .new_committee
         .clone()
@@ -1838,7 +1838,7 @@ fn an_eots_key_joins_once_across_subnets_and_within_a_reveal() {
 
     // The join's own record is a replay
     assert!(refuse_earlier_eots_key(&db, subnet_a, &pks[0], &pk_eots, Some(txid)).is_ok());
-    // Another input of the same reveal, a join in another subnet, the provider's check
+    // Another input of the same reveal, a join in another subnet
     for (subnet_id, pubkey, join_txid) in [
         (subnet_a, pks[1], Some(txid)),
         (subnet_b, pks[0], Some(other)),
@@ -2007,7 +2007,7 @@ fn chain_join_ue_and_exit() {
     let join_height = rpc.get_block_count().unwrap();
     assert_eq!(join_height, tip + 1);
 
-    // The monitor's view: the reveal and the commit it spends, from the chain
+    // The reveal and the commit it spends, from the chain
     let reveal = rpc.get_raw_transaction(&reveal_txid, None).unwrap();
     let commit_txid = reveal.input[0].previous_output.txid;
     let commit = rpc.get_raw_transaction(&commit_txid, None).unwrap();
@@ -2108,7 +2108,7 @@ fn join_context_checks_the_timeout_epoch() {
         .is_err());
 }
 
-/// A checkpoint carrying change number `number`, recorded by the monitor at block `height`
+/// A checkpoint carrying change number `number`, recorded at Bitcoin block `height`
 fn record_checkpoint(
     db: &HeedDb,
     subnet_id: SubnetId,

@@ -146,7 +146,7 @@ fn a_batch_reveal_of_an_unprocessed_transaction_is_rejected() {
         is_rotation_checkpoint: false,
     };
 
-    // The reveal spends the commitment output of a transaction the monitor never processed
+    // The reveal spends the commitment output of a transaction that is not recorded
     let unknown = crate::test_utils::create_rand_txid();
     let reveal = msg
         .make_reveal_batch_transfer_tx(
@@ -244,7 +244,7 @@ fn checkpoint_msg(
     }
 }
 
-/// The checkpoint transaction as the provider builds it
+/// The checkpoint transaction of `msg`
 fn checkpoint_tx(msg: &IpcCheckpointSubnetMsg, source: &db::SubnetState) -> Transaction {
     let mut utxo = test_utils::create_rand_utxo_entry(Some(Amount::from_sat(200_000)));
     utxo.script_pub_key = source.committee.address_checked().script_pubkey();
@@ -258,7 +258,7 @@ fn checkpoint_tx(msg: &IpcCheckpointSubnetMsg, source: &db::SubnetState) -> Tran
     .unsigned_tx
 }
 
-/// Records `tx` as the checkpoint of `msg`, as the monitor does
+/// Records `tx` as the checkpoint of `msg`
 fn record_checkpoint(
     db: &db::HeedDb,
     msg: &IpcCheckpointSubnetMsg,
@@ -282,7 +282,7 @@ fn reveal_of(msg: &IpcCheckpointSubnetMsg, tx: &Transaction) -> Transaction {
     .unwrap()
 }
 
-/// The monitor's processing of the batch transfer in input `index` of `reveal`
+/// The processing of the batch transfer in input `index` of `reveal`
 fn process_batch(
     db: &db::HeedDb,
     reveal: &Transaction,
@@ -718,7 +718,7 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
     record_checkpoint(&db, &msg, &tx);
 
     // One reveal: input 0 bootstraps the destination, input 1 carries the batch to it.
-    // As the monitor does, each input is processed in order.
+    // Each input is processed in order.
     let reveal = crate::easy_tester::reveal::merge_reveals([join_reveal, reveal_of(&msg, &tx)]);
     let found = IpcMessage::from_reveal_inputs(&reveal);
     assert_eq!(found.len(), 2);
@@ -2448,7 +2448,7 @@ fn create_test_utxos(
     }]
 }
 
-/// Two providers building the same checkpoint produce byte-identical transactions, with
+/// Building the same checkpoint twice produces byte-identical transactions, with
 /// one transfer output per destination in ascending `txid20` order
 #[test]
 fn checkpoint_and_batch_reveal_are_deterministic() {
@@ -2951,7 +2951,7 @@ fn batch_transfer_is_read_from_the_input_that_spends_the_commitment() {
             .collect::<Vec<_>>()
     };
 
-    // As the provider builds it
+    // The batch transfer of the checkpoint
     assert_eq!(
         batches(&reveal),
         vec![(0, checkpoint_txid, commitment.vout, 1)]

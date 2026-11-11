@@ -45,7 +45,7 @@ const UE_COLLATERALS_KEY: &str = "ue_collaterals:";
 const UE_OUTPOINT_KEY: &str = "ue_outpoint:";
 const EOTS_COMMITMENTS_KEY: &str = "eots_commitments:";
 const SLASH_PRESIGS_KEY: &str = "slash_presigs:";
-// epoch_committee:<subnet_id>:<epoch>, the committee number of the configuration of the epoch
+// epoch_committee:<subnet_id>:<epoch>, the number of the configuration of the epoch
 const EPOCH_COMMITTEES_KEY: &str = "epoch_committee:";
 // token_balance:<home_subnet_id>:<home_token_address>:<holder_subnet_id>
 const TOKEN_BALANCE_KEY: &str = "token_balance:";
@@ -398,7 +398,7 @@ impl SubnetCommittee {
         // Replace the validator with the updated one
         self.validators[validator_position] = validator.clone();
 
-        // Update the committee's threshold and multisig address
+        // Update the configuration's threshold and multisig address
         self.threshold = self.validators.threshold();
         self.multisig_address = self.validators.multisig_address(subnet_id);
 
@@ -417,7 +417,7 @@ impl SubnetCommittee {
         // Remove the validator from the committee
         self.validators.remove_validator(pubkey)?;
 
-        // Update the committee's threshold and multisig address, unless it is empty
+        // Update the configuration's threshold and multisig address, unless it is empty
         if !self.validators.is_empty() {
             self.threshold = self.validators.threshold();
             self.multisig_address = self.validators.multisig_address(subnet_id);
@@ -589,7 +589,7 @@ impl SubnetState {
         self.killed != SubnetKillState::NotKilled
     }
 
-    /// Activated: the monitor has set `H_0`
+    /// Activated: `H_0` is set
     pub fn is_activated(&self) -> bool {
         self.h_0.is_some()
     }
@@ -863,11 +863,11 @@ pub struct UeCollateral {
     /// Maturity height
     pub timeout: u32,
     pub pk_eots: XOnlyPublicKey,
-    /// The committee the collateral script names (0 for the whitelist)
+    /// The number of the configuration the collateral script names (0 for `C_wlist`)
     pub committee_number: u64,
     pub ip: std::net::SocketAddr,
     pub backup_address: Address<NetworkUnchecked>,
-    /// The reveal txid, the validator's `join_txid` in the committee
+    /// The reveal txid, the validator's `join_txid` in the configuration
     pub join_txid: Txid,
     /// Set once a Bitcoin block spends the outpoint
     pub spent: bool,
@@ -997,7 +997,7 @@ pub struct HeedDb {
     /// Per-token per-subnet balance ledger.
     token_balances_db: HeedDatabase<Str, SerdeBincode<alloy_primitives::U256>>,
     ue_collaterals_db: HeedDatabase<Str, SerdeBincode<UeCollateral>>,
-    /// Monitor settings that must agree with the processed blocks
+    /// Settings that must agree with the processed Bitcoin blocks
     settings_db: HeedDatabase<Str, SerdeBincode<u64>>,
     eots_commitments_db: HeedDatabase<Str, SerdeBincode<EotsCommitmentRecord>>,
     slash_presigs_db: HeedDatabase<Str, SerdeBincode<SlashPresigRecord>>,
@@ -1187,7 +1187,7 @@ pub trait DatabaseCore {
     fn get_last_processed_block(&self) -> Result<u64, DbError>;
     fn set_last_processed_block(&self, block: u64) -> Result<(), DbError>;
 
-    /// The UE activation height the monitor ran with, `None` if off or never recorded
+    /// The unilateral exit activation height recorded, `None` if off or never recorded
     fn get_ue_activation_height(&self) -> Result<Option<u64>, DbError>;
     fn set_ue_activation_height(&self, height: Option<u64>) -> Result<(), DbError>;
 
@@ -1289,7 +1289,7 @@ pub trait DatabaseCore {
         committee: &SubnetCommittee,
     ) -> Result<(), DbError>;
 
-    /// `None` until the monitor computes the committee number of `epoch`
+    /// `None` until the number of the configuration of `epoch` is computed
     fn get_epoch_committee_number(
         &self,
         subnet_id: SubnetId,
