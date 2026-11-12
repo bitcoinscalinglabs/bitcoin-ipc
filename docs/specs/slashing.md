@@ -38,12 +38,12 @@ The validator must store its EOTS vote before it publishes it. It publishes each
 A node accepts a received EOTS vote only if, in order:
 
 1. The envelope's signature verifies, and its subnet id is this subnet.
-2. `h` is above the latest checkpointed height `h_c`, and the latest checkpoint is not the kill checkpoint: finality ends with the kill checkpoint.
+2. `h` is above the latest checkpointed height `h_c` and at most the height of the chain's latest subnet block, and the latest checkpoint is not the kill checkpoint: finality ends with the kill checkpoint.
 3. `pk_eots` is the EOTS key of the validator that signed the envelope, and that validator is in the validator set at `h`.
 4. The monitor has recorded a commitment of `pk_eots` whose range holds `h`, the proof's `start` is that commitment's, and the audit path proves `R_h` at index `h − start` against its root.
 5. The signature verifies under `pk_eots` on `m`.
 
-A node drops an EOTS vote that fails a rule. The exception is rule 4: the node keeps the EOTS vote and checks it again after every read from its monitor, until its height is final.
+A node drops an EOTS vote that fails a rule. The exception is rule 4: the node keeps the EOTS vote and checks it again after every read from its monitor, until its height is final. Before its first read of the EOTS keys from its monitor since its start, a node also keeps an EOTS vote received on the vote gossip that fails only the EOTS key part of rule 3, if its validator is in the validator set at `h`, `h` is above the subnet final height and at most the height of the chain's latest subnet block, and it is the first such EOTS vote of that validator at `h`; the node checks it again after that read. A node also keeps an EOTS vote received on the vote gossip whose `h` is at most 10 above the height of the chain's latest subnet block, if `pk_eots` is the EOTS key that its monitor recorded for the validator that signed the envelope (before its first read of the EOTS keys: if that validator is in the validator set at `h`), and checks it again, rule 3 included, when its chain has a subnet block at `h`. In each case the node keeps at most 256 EOTS votes per validator, those of the lowest heights. This does not apply to the EOTS votes that subnet blocks carry ([subnet final height](#subnet-final-height)). No exception keeps an EOTS vote whose audit path holds more than 32 hashes, the most a commitment allows since `count` is a `u32`.
 
 A node accepts an EOTS vote for any subnet block hash at `h`, including one of another fork ([double votes](#double-votes)). It stores each accepted EOTS vote complete, envelope and proof included, across restarts, at most two per `(pk_eots, h)`: the first and the first for a different subnet block. It forwards an EOTS vote on the vote gossip when it first accepts it. It deletes the EOTS votes, subnet block hashes and superseded power tables at or below the subnet final height.
 
@@ -67,7 +67,7 @@ The proposer of a subnet block includes in its proposal one consensus message (`
 
 Every node checks the proposal and rejects it if a check fails:
 
-1. Every carried EOTS vote satisfies the rules of [accepting an EOTS vote](#accepting-an-eots-vote), evaluated at the parent finality of the chain's latest executed subnet block, so that all honest monitors [give the same result](lifecycle.md#processing-bitcoin-l1-blocks). A node whose monitor has not reached that height, or is unreachable, must wait for its monitor before it executes the subnet block. It does not skip the EOTS votes or stop.
+1. Every carried EOTS vote satisfies the rules of [accepting an EOTS vote](#accepting-an-eots-vote), evaluated at the parent finality of the chain's latest executed subnet block and with that subnet block as the chain's latest subnet block, so that all honest monitors [give the same result](lifecycle.md#processing-bitcoin-l1-blocks). A node whose monitor has not reached that height, or is unreachable, must wait for its monitor before it executes the subnet block. It does not skip the EOTS votes or stop.
 2. For every carried height, the carried EOTS votes reach the threshold for the subnet block that the node's chain holds at that height.
 3. The carried heights continue the chain's subnet final height without a gap.
 4. Every carried evidence consists of two accepted EOTS votes of one `pk_eots` at one height for two different subnet blocks.
