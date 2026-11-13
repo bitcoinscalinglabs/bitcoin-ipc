@@ -3,7 +3,7 @@
 
 COMPOSE_FILE := docker-compose.local.yml
 
-.PHONY: local-build local-up local-down local-reset-fendermint local-reset-fendermint-deps local-reset-ipc-cli local-delete-data
+.PHONY: local-build local-up local-down local-reset-fendermint local-reset-fendermint-deps local-reset-ipc-cli local-delete-data local-stop-validator local-start-validator checkpoint-matrix
 
 # Build the bitcoin-ipc image (both bitcoin-ipc and ipc-cli stages built in parallel).
 local-build:
@@ -41,3 +41,25 @@ local-delete-data:
 	docker compose -f $(COMPOSE_FILE) down -v
 	rm -rf $(HOME)/.ipc
 	@echo "Data reset complete."
+
+# Stop one subnet A validator's L2 containers, keeping their data: make local-stop-validator N=1
+local-stop-validator:
+	docker stop -t 0 validator-$(N)-cometbft validator-$(N)-fendermint validator-$(N)-ethapi
+
+# Start them again on their existing data: make local-start-validator N=1
+local-start-validator:
+	docker start validator-$(N)-fendermint
+	docker start validator-$(N)-cometbft validator-$(N)-ethapi
+
+# Checkpoint tests for several checkpoint periods and epoch lengths, described in
+# src/easy_tester/ipc_tester/README.md: make checkpoint-matrix OUT=<folder> HOST_ADDR=<host address>
+CHECKPOINT_PERIODS ?= 30 100
+EPOCH_LENGTH_MULTIPLIERS ?= 1
+INCLUDE_EQUAL_EPOCH_LENGTH ?= 1
+OUT ?=
+HOST_ADDR ?= host.docker.internal
+
+checkpoint-matrix:
+	CHECKPOINT_PERIODS="$(CHECKPOINT_PERIODS)" EPOCH_LENGTH_MULTIPLIERS="$(EPOCH_LENGTH_MULTIPLIERS)" \
+	INCLUDE_EQUAL_EPOCH_LENGTH="$(INCLUDE_EQUAL_EPOCH_LENGTH)" OUT="$(OUT)" HOST_ADDR="$(HOST_ADDR)" \
+	src/easy_tester/ipc_tester/checkpoint_matrix.sh

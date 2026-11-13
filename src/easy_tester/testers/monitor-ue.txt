@@ -1,0 +1,7 @@
+tester monitor
+activation_height 101
+snapshot_length 10
+ue_activation_height 102
+
+monitor_log_level debug
+provider_log_level info

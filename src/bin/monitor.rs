@@ -13,8 +13,10 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use bitcoin::{script::Instruction, Block, BlockHash};
+use bitcoin_ipc::collateral;
 use bitcoin_ipc::db::{self, DatabaseCore, HeedDb};
-use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcTag, IpcValidate, IpcValidateError};
+use bitcoin_ipc::epochs;
+use bitcoin_ipc::ipc_lib::{self, IpcLibError, IpcTag, IpcValidate};
 use bitcoin_ipc::{bitcoin_utils, eth_utils, IpcMessage, BTC_CONFIRMATIONS};
 use bitcoincore_rpc::RpcApi;
 
@@ -92,6 +94,9 @@ async fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_SYNC_BATCH_SIZE);
+
+    collateral::check_ue_activation(&db, collateral::ue_activation_height())
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let mut monitor = Monitor::new(
         db,
@@ -196,6 +201,8 @@ struct Monitor<D: Database> {
     cancel_token: CancellationToken,
     side_effects: Vec<SideEffect>,
     reward_tracker: Option<RewardTracker>,
+    /// Blocks from this height on are scanned for `join-ue`; `None` turns the feature off
+    ue_activation_height: Option<u64>,
 }
 
 impl<D> Monitor<D>
@@ -210,6 +217,14 @@ where
         check_interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
+        let ue_activation_height = collateral::ue_activation_height();
+        match ue_activation_height {
+            Some(height) => info!("Unilateral exit active from block {}", height),
+            None => info!(
+                "Unilateral exit off ({} not set)",
+                collateral::UE_ACTIVATION_HEIGHT_VAR
+            ),
+        }
         Self {
             db,
             rpc,
@@ -220,7 +235,13 @@ where
             current_height: 0,
             side_effects: Vec::new(),
             reward_tracker: None,
+            ue_activation_height,
         }
+    }
+
+    fn ue_active(&self, block_height: u64) -> bool {
+        self.ue_activation_height
+            .is_some_and(|activation| block_height >= activation)
     }
 
     #[cfg(feature = "emission_chain")]
@@ -533,12 +554,11 @@ where
         block_hash: BlockHash,
         block: Block,
     ) -> Result<(), MonitorError> {
-        let block_time = block.header.time;
-        for tx in block.txdata {
+        for tx in &block.txdata {
             // A panic on a transaction's content skips the transaction. A database write
             // transaction still open at the panic is dropped, which aborts it.
             let processing = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.process_transaction(txn, &tx, block_height, block_hash, block_time)
+                self.process_transaction(txn, tx, block_height, block_hash, &block)
             }));
             match processing {
                 Ok(result) => result?,
@@ -547,6 +567,22 @@ where
                     tx.compute_txid(),
                     panic_message(panic.as_ref())
                 ),
+            }
+        }
+
+        // Activations and cutoffs take effect after the transactions of the Bitcoin block
+        for outcome in epochs::process_cutoffs(&self.db, txn, block_height, block_hash)? {
+            info!(
+                "Subnet {} begins epoch {} at block {}",
+                outcome.subnet_id, outcome.epoch, block_height
+            );
+            if let Some((number, committee)) = outcome.new_committee {
+                let label = format!("{}-{}", outcome.subnet_id, number);
+                self.import_watchonly_address(
+                    committee.address_checked(),
+                    label,
+                    block.header.time,
+                );
             }
         }
 
@@ -559,53 +595,28 @@ where
         tx: &bitcoin::Transaction,
         block_height: u64,
         block_hash: BlockHash,
-        block_time: u32,
+        block: &Block,
     ) -> Result<(), MonitorError> {
         let txid = tx.compute_txid();
         debug!("Processing transaction {}", txid);
 
-        // Process inputs
+        for record in collateral::record_collateral_spends(&self.db, txn, tx)? {
+            info!(
+                "Collateral {} of validator {} in subnet {} spent by {} at block {}",
+                record.outpoint, record.pubkey, record.subnet_id, txid, block_height
+            );
+        }
 
-        for input in &tx.input {
-            // TODO check more efficiently if witness has IPC tag
-            for witness in input.witness.iter().filter(|w| !w.is_empty()) {
-                // Reconstruct the witness data
-                let witness_data = match bitcoin_utils::concatenate_op_push_data(witness) {
-                    Ok(data) => data,
-                    Err(_) => {
-                        continue;
-                    }
-                };
+        for (_, ipc_message) in IpcMessage::from_reveal_inputs(tx) {
+            if matches!(ipc_message, IpcMessage::JoinUe { .. }) && !self.ue_active(block_height) {
+                trace!("Skipping join-ue: unilateral exit is not active at this height");
+                continue;
+            }
 
-                let tag = IpcTag::from_payload(&witness_data);
-                let ipc_message = IpcMessage::from_witness(witness_data);
-                let ipc_message = match ipc_message {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        match tag {
-                            // The other IPC tags are handled from the outputs below
-                            Some(tag @ (IpcTag::CreateSubnet | IpcTag::JoinSubnet)) => warn!(
-                                "Skipping IPC message in transaction {txid}: cannot parse {}: {e}",
-                                tag.as_str()
-                            ),
-                            _ => trace!("Error deserializing IPC message: {:?}", e),
-                        }
-                        continue;
-                    }
-                };
-
-                match self.process_ipc_msg(
-                    txn,
-                    block_height,
-                    block_hash,
-                    block_time,
-                    tx,
-                    txid,
-                    ipc_message,
-                ) {
-                    Ok(_) => {}
-                    Err(e) => self.handle_ipc_msg_error(txid, e)?,
-                }
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
+                Ok(_) => {}
+                Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         }
 
@@ -615,30 +626,16 @@ where
         if let Ok(prefund_msg) = ipc_lib::IpcPrefundSubnetMsg::from_tx(tx) {
             let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
@@ -647,75 +644,32 @@ where
         {
             let ipc_message = IpcMessage::CheckpointSubnet(checkpoint_msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
-                Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(txid, e)?,
-            }
-        } else if let Ok(msg) = ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, txn, tx) {
-            let ipc_message = IpcMessage::BatchTransfer(msg);
-
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcStakeCollateralMsg::from_tx(&self.db, txn, tx) {
             let ipc_message = IpcMessage::StakeCollateral(msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcUnstakeCollateralMsg::from_tx(&self.db, txn, tx) {
             let ipc_message = IpcMessage::UnstakeCollateral(msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
         } else if let Ok(msg) = ipc_lib::IpcKillSubnetMsg::from_tx(&self.db, txn, tx) {
             let ipc_message = IpcMessage::KillSubnet(msg);
 
-            match self.process_ipc_msg(
-                txn,
-                block_height,
-                block_hash,
-                block_time,
-                tx,
-                txid,
-                ipc_message,
-            ) {
+            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
+            {
                 Ok(_) => {}
                 Err(e) => self.handle_ipc_msg_error(txid, e)?,
             }
@@ -751,7 +705,6 @@ where
             IpcTag::CheckpointSubnet => {
                 ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, txn, tx).err()
             }
-            IpcTag::BatchTransfer => ipc_lib::IpcBatchTransferMsg::from_tx(&self.db, txn, tx).err(),
             IpcTag::StakeCollateral => {
                 ipc_lib::IpcStakeCollateralMsg::from_tx(&self.db, txn, tx).err()
             }
@@ -760,7 +713,9 @@ where
             }
             IpcTag::KillSubnet => ipc_lib::IpcKillSubnetMsg::from_tx(&self.db, txn, tx).err(),
             // Parsed from the witness in `process_transaction`
-            IpcTag::CreateSubnet | IpcTag::JoinSubnet => None,
+            IpcTag::CreateSubnet | IpcTag::JoinSubnet | IpcTag::BatchTransfer | IpcTag::JoinUe => {
+                None
+            }
         }
     }
 
@@ -769,7 +724,7 @@ where
         txn: &mut RwTxn<'_>,
         block_height: u64,
         block_hash: BlockHash,
-        block_time: u32,
+        block: &Block,
         tx: &bitcoin::Transaction,
         txid: bitcoin::Txid,
         msg: IpcMessage,
@@ -784,7 +739,7 @@ where
 
                 let (whitelist_addr, label) = subnet_genesis_info.whitelist_address_label();
 
-                self.import_watchonly_address(whitelist_addr, label, block_time);
+                self.import_watchonly_address(whitelist_addr, label, block.header.time);
 
                 info!(
                     "Processed CreateSubnet for Subnet ID: {}",
@@ -831,7 +786,7 @@ where
                 {
                     // Subnet bootstrapped
                     let (committee_addr, label) = subnet.committee_address_label();
-                    self.import_watchonly_address(committee_addr, label, block_time);
+                    self.import_watchonly_address(committee_addr, label, block.header.time);
                 }
 
                 info!(
@@ -877,30 +832,13 @@ where
                     wtxn.commit().map_err(db::DbError::from)?;
                 }
 
-                // import new address if the committee changed
-                if checkpoint.signed_committee_number != checkpoint.next_committee_number {
-                    // get the update subnet state from the database
-                    let subnet = self
-                        .db
-                        .get_subnet_state_txn(txn, msg.subnet_id)
-                        .map_err(MonitorError::DbError)?
-                        // Should never happen
-                        .ok_or(IpcValidateError::InvalidMsg(
-                            "Could not fetch subnet id after a checkpoint".to_string(),
-                        ))?;
-
-                    info!(
-                        "Committee changed for Subnet ID: {}, importing address.",
-                        msg.subnet_id
-                    );
-
-                    let (new_committee_addr, new_label) = subnet.committee_address_label();
-                    self.import_watchonly_address(new_committee_addr, new_label, block_time);
-                }
-
                 info!(
-                    "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {}",
-                    msg.subnet_id, msg.checkpoint_height, checkpoint.checkpoint_number
+                    "Processed CheckpointSubnet for Subnet ID: {} Subnet Height: {} Checkpoint Number: {} Epoch: {} Rotation: {}",
+                    msg.subnet_id,
+                    msg.checkpoint_height,
+                    checkpoint.checkpoint_number,
+                    checkpoint.epoch,
+                    checkpoint.is_rotation_checkpoint
                 );
 
                 // Reward bookkeeping hooks after a checkpoint.
@@ -926,52 +864,18 @@ where
 
             IpcMessage::BatchTransfer(mut msg) => {
                 debug!("Found IPC message: {:#?}", msg);
-
-                msg.validate()?;
-
-                // Get checkpoint tx and parse as msg
-
-                let checkpoint_tx = self.db.get_transaction_txn(txn, &msg.checkpoint_txid)
-                    .map_err(MonitorError::DbError)?
-                    .ok_or_else(|| {
-                        MonitorError::IpcTxInvalid(format!(
-                            "Can't get Checkpoint Txid {} for BatchTransferMsg: not found in database",
-                            msg.checkpoint_txid
-                        ))
-                    })?;
-
-                let checkpoint_msg = ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(
-                    &self.db,
-                    txn,
-                    &checkpoint_tx,
-                )
-                .map_err(|e| {
-                    MonitorError::IpcTxInvalid(format!(
-                        "BatchTransferMsg has invalid CheckpointMsg as previous tx: {e}"
-                    ))
-                })?;
-
-                trace!("BatchTransfer: CheckpointMsg {:?}", checkpoint_msg);
-
-                checkpoint_msg.validate()?;
-                msg.validate_for_checkpoint(&checkpoint_tx)?;
-                msg.subnet_id = checkpoint_msg.subnet_id;
-
-                // Save to DB
-
-                msg.save_to_db(&self.db, txn, block_height, block_hash, txid)?;
-
+                msg.process(&self.db, txn, block_height, block_hash, txid)?;
                 info!(
                     "Processed BatchTransfer for Subnet ID: {} Checkpoint Txid: {}",
                     msg.subnet_id, msg.checkpoint_txid,
                 );
-
                 Ok(())
             }
 
             IpcMessage::StakeCollateral(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
+                collateral::refuse_ue_member(&self.db, txn, msg.subnet_id, &msg.pubkey)?;
                 msg.save_to_db(&self.db, txn, block_height, block_hash, txid)?;
                 info!(
                     "Processed StakeCollateral for Subnet ID: {} Validator XPK: {} Amount: {}",
@@ -983,10 +887,73 @@ where
             IpcMessage::UnstakeCollateral(msg) => {
                 debug!("Found IPC message: {:?}", msg);
                 msg.validate()?;
+                if let Some(pubkey) = &msg.pubkey {
+                    collateral::refuse_ue_member(&self.db, txn, msg.subnet_id, pubkey)?;
+                }
                 msg.save_to_db(&self.db, txn, block_height, block_hash, txid)?;
                 info!(
                     "Processed UnstakeCollateral for Subnet ID: {} Validator XPK: {:?} Amount: {}",
                     msg.subnet_id, msg.pubkey, msg.amount
+                );
+                Ok(())
+            }
+
+            IpcMessage::JoinUe { input, msg } => {
+                debug!("Found IPC message in input {}: {:?}", input, msg);
+
+                let commit =
+                    bitcoin_utils::commit_transaction(&tx.input[input], &block.txdata, |txid| {
+                        self.rpc.get_raw_transaction(txid, None)
+                    })?;
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let context = collateral::join_context(&self.db, txn, msg.join.subnet_id)?;
+                let checked =
+                    collateral::check_join_ue(&secp, tx, input, &commit, block_height, &context)
+                        .map_err(|e| MonitorError::IpcTxInvalid(e.to_string()))?;
+                let spent = bitcoin_utils::spent_before_reveal(
+                    &checked.outpoint,
+                    tx,
+                    block_height,
+                    &block.txdata,
+                    |txid| -> Result<u64, bitcoincore_rpc::Error> {
+                        let hash = self
+                            .rpc
+                            .get_raw_transaction_info(txid, None)?
+                            .blockhash
+                            .ok_or(bitcoincore_rpc::Error::UnexpectedStructure)?;
+                        Ok(self.rpc.get_block_header_info(&hash)?.height as u64)
+                    },
+                    |height| {
+                        self.rpc
+                            .get_block_hash(height)
+                            .and_then(|hash| self.rpc.get_block(&hash))
+                            .map(|block| block.txdata)
+                    },
+                )?;
+                if spent {
+                    return Err(MonitorError::IpcTxInvalid(format!(
+                        "Collateral UTXO {} is spent before the reveal transaction {txid}",
+                        checked.outpoint
+                    )));
+                }
+
+                if let Some(subnet) = collateral::process_join_ue(
+                    &self.db,
+                    txn,
+                    &checked,
+                    txid,
+                    block_height,
+                    block_hash,
+                )? {
+                    // Subnet bootstrapped
+                    let (committee_addr, label) = subnet.committee_address_label();
+                    self.import_watchonly_address(committee_addr, label, block.header.time);
+                }
+
+                let join = &checked.msg.join;
+                info!(
+                    "Processed JoinUe for Subnet ID: {} Validator XPK: {} Collateral: {} Timeout: {}",
+                    join.subnet_id, join.pubkey, join.collateral, checked.msg.timeout
                 );
                 Ok(())
             }
@@ -1218,7 +1185,7 @@ mod tests {
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
                 previous_output,
-                witness: Witness::from_slice(&[script.to_bytes()]),
+                witness: Witness::from_slice(&[script.to_bytes(), vec![0xc0; 33]]),
                 ..Default::default()
             }],
             output,
@@ -1263,11 +1230,18 @@ mod tests {
     ) -> IpcCreateSubnetMsg {
         IpcCreateSubnetMsg {
             min_validator_stake,
+            power_unit_exponent: 4,
             min_validators: whitelist.len() as u16,
             bottomup_check_period: 10,
             active_validators_limit: 20,
             min_cross_msg_fee: Amount::from_sat(50),
             whitelist,
+            epoch_length: 10,
+            min_timeout: 1,
+            max_timeout: 1000,
+            min_deposit: Amount::from_sat(330),
+            kill_vote_period: 36,
+            kill_delay_period: 5,
         }
     }
 
@@ -1305,8 +1279,8 @@ mod tests {
             "a skipped transaction wrote to the database"
         );
 
-        let msg = create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(9)]);
-        let valid = reveal_tx(&msg.to_bytes().unwrap(), vec![]);
+        let msg = create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(9)]);
+        let valid = reveal_tx(&msg.to_bytes().unwrap(), vec![payment(10_000)]);
         let subnet_id = SubnetId::from_txid(&valid.compute_txid());
         let mut txdata = malformed;
         txdata.push(valid);
@@ -1321,13 +1295,12 @@ mod tests {
     #[tokio::test]
     async fn test_skips_malformed_create_subnet() {
         let (mut monitor, dir) = test_monitor().await;
-        let msg = create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(1), pubkey(2)]);
+        let msg = create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(1), pubkey(2)]);
         let bytes = msg.to_bytes().unwrap();
 
-        // A create-subnet message with a `power_unit_exponent` field after the stake and
-        // epoch, timeout, deposit and kill fields after the whitelist
+        // A create-subnet message with all the fields of the current format and one more
         let with_extra_fields = postcard::to_stdvec(&(
-            1_000u64,
+            10_000u64,
             4u8,
             2u16,
             10u64,
@@ -1338,6 +1311,7 @@ mod tests {
             10u32,
             100u32,
             1_000u64,
+            10u64,
             10u64,
             10u64,
         ))
@@ -1353,11 +1327,14 @@ mod tests {
             &mut monitor,
             &dir,
             vec![
-                reveal_tx(&bytes[..bytes.len() / 2], vec![]),
-                reveal_tx(&[b"IPCCRT".as_slice(), &with_extra_fields].concat(), vec![]),
-                reveal_tx(&[bytes.as_slice(), &[0]].concat(), vec![]),
-                reveal_tx(&unknown_tag, vec![]),
-                reveal_tx(&invalid.to_bytes().unwrap(), vec![]),
+                reveal_tx(&bytes[..bytes.len() / 2], vec![payment(10_000)]),
+                reveal_tx(
+                    &[b"IPCCRT".as_slice(), &with_extra_fields].concat(),
+                    vec![payment(10_000)],
+                ),
+                reveal_tx(&[bytes.as_slice(), &[0]].concat(), vec![payment(10_000)]),
+                reveal_tx(&unknown_tag, vec![payment(10_000)]),
+                reveal_tx(&invalid.to_bytes().unwrap(), vec![payment(10_000)]),
             ],
         )
         .await;
@@ -1366,9 +1343,9 @@ mod tests {
     #[tokio::test]
     async fn test_skips_malformed_join_subnet() {
         let (mut monitor, dir) = test_monitor().await;
-        // A minimum stake of 1 sat admits validators with power 0
-        let msg = create_subnet_msg(Amount::from_sat(1), vec![pubkey(1)]);
-        let create = reveal_tx(&msg.to_bytes().unwrap(), vec![]);
+        // A collateral below the minimum stake of one power unit
+        let msg = create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(1)]);
+        let create = reveal_tx(&msg.to_bytes().unwrap(), vec![payment(10_000)]);
         let subnet_id = SubnetId::from_txid(&create.compute_txid());
         process_and_commit(&mut monitor, 1, bitcoin_block(vec![create]));
 
@@ -1383,7 +1360,7 @@ mod tests {
                     &join_msg_bytes(SubnetId::from_txid(&Txid::all_zeros()), 1),
                     vec![payment(20_000)],
                 ),
-                // Bootstraps the subnet with total power 0, which has no multisig: a panic
+                // Collateral below the minimum stake
                 reveal_tx(&bytes, vec![payment(5_000)]),
             ],
         )
@@ -1523,9 +1500,15 @@ mod tests {
         non_minimal_push.output[0].script_pubkey =
             bitcoin::ScriptBuf::from_bytes([&[0x6a, 0x4c, 0x06][..], b"IPCPFD"].concat());
         let tagged = vec![
-            reveal_tx(&[b"IPCCRT".as_slice(), &[0xff; 3]].concat(), vec![]),
+            reveal_tx(
+                &[b"IPCCRT".as_slice(), &[0xff; 3]].concat(),
+                vec![payment(10_000)],
+            ),
             op_return_tx(&[b"IPCPFD".as_slice(), &[0xff; 3]].concat()),
-            reveal_tx(&[b"IPCTFR".as_slice(), &[0xff; 3]].concat(), vec![]),
+            reveal_tx(
+                &[b"IPCTFR".as_slice(), &[0xff; 3]].concat(),
+                vec![payment(10_000)],
+            ),
             non_minimal_push,
         ];
         let ordinary = op_return_tx(b"not an IPC message");
@@ -1553,18 +1536,25 @@ mod tests {
         };
         let (mut single, single_dir) = test_monitor().await;
         single.reward_tracker = reward_tracker();
-        let mut create_msg = create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(1), pubkey(2)]);
+        let mut create_msg =
+            create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(1), pubkey(2)]);
         create_msg.min_validators = 1;
-        let create = reveal_tx(&create_msg.to_bytes().unwrap(), vec![]);
+        // Every Bitcoin block after the activation is the cutoff of an epoch
+        create_msg.epoch_length = 1;
+        let create = reveal_tx(&create_msg.to_bytes().unwrap(), vec![payment(10_000)]);
         let subnet_id = SubnetId::from_txid(&create.compute_txid());
         let mut blocks = vec![
-            bitcoin_block(vec![create, reveal_tx(&tagged("IPCCRT", 10), vec![])]),
-            // Power 10 bootstraps the subnet, then a second validator joins: stake changes with
-            // configuration numbers 1 and 2
+            // Power 10 bootstraps the subnet, which is activated after the Bitcoin block
             bitcoin_block(vec![
+                create,
+                reveal_tx(&tagged("IPCCRT", 10), vec![payment(10_000)]),
                 reveal_tx(&join_msg_bytes(subnet_id, 1), vec![payment(100_000)]),
-                reveal_tx(&join_msg_bytes(subnet_id, 2), vec![payment(100_000)]),
             ]),
+            // A second validator joins: stake changes with configuration numbers 1 and 2
+            bitcoin_block(vec![reveal_tx(
+                &join_msg_bytes(subnet_id, 2),
+                vec![payment(100_000)],
+            )]),
         ];
 
         for (height, block) in (1..).zip(&blocks) {
@@ -1576,24 +1566,31 @@ mod tests {
         // A checkpoint that changes the configuration to the one with both validators, with a
         // withdrawal, a transfer to the subnet itself, a token registration, a mint and a token
         // transfer, and its batch transfer reveal transaction
+        // The cutoff of epoch 2 made the configuration with both validators the waiting one;
+        // `C_wlist` signs until the rotation checkpoint of epoch 1 adopts it
         let committee = single
             .db
             .get_subnet_state(subnet_id)
             .unwrap()
             .unwrap()
-            .committee;
-        let next_committee = single
-            .db
-            .get_stake_change(subnet_id, 2)
-            .unwrap()
-            .unwrap()
-            .committee_after_change;
+            .latest_committee()
+            .clone();
+        let signer = ipc_lib::CheckpointSigner::of_configuration(
+            &subnet_id,
+            &single
+                .db
+                .get_subnet_genesis_info(subnet_id)
+                .unwrap()
+                .unwrap()
+                .whitelist_configuration(),
+        )
+        .unwrap();
         let token = alloy_primitives::Address::repeat_byte(0xaa);
         let checkpoint = IpcCheckpointSubnetMsg {
             subnet_id,
             checkpoint_hash: sha256::Hash::hash(b"checkpoint"),
             checkpoint_height: 10,
-            next_committee_configuration_number: 2,
+            next_committee_configuration_number: committee.configuration_number,
             withdrawals: vec![IpcWithdrawal {
                 amount: Amount::from_sat(5_000),
                 address: Address::p2tr(&Secp256k1::new(), pubkey(2), None, bitcoin_ipc::NETWORK)
@@ -1624,8 +1621,10 @@ mod tests {
                 recipient: alloy_primitives::Address::repeat_byte(2),
             }],
             unstakes: vec![],
-            change_address: None,
+            change_address: Some(committee.multisig_address.clone()),
             is_kill_checkpoint: false,
+            is_rotation_checkpoint: true,
+            slash_signatures: vec![],
         };
         let utxo = bitcoincore_rpc::json::ListUnspentResultEntry {
             txid: Txid::all_zeros(),
@@ -1634,7 +1633,7 @@ mod tests {
             label: None,
             redeem_script: None,
             witness_script: None,
-            script_pub_key: committee.address_checked().script_pubkey(),
+            script_pub_key: signer.address.script_pubkey(),
             amount: Amount::from_sat(200_000),
             confirmations: 10,
             spendable: true,
@@ -1643,7 +1642,13 @@ mod tests {
             safe: true,
         };
         let checkpoint_tx = checkpoint
-            .to_checkpoint_psbt(&committee, &next_committee, DEFAULT_BTC_FEE_RATE, &[utxo])
+            .build_checkpoint_psbt(
+                &signer,
+                &committee.address_checked(),
+                true,
+                DEFAULT_BTC_FEE_RATE,
+                &[utxo],
+            )
             .unwrap()
             .extract_tx()
             .unwrap();
@@ -1684,7 +1689,10 @@ mod tests {
             .get_rootnet_msgs_by_height(subnet_id, 4)
             .unwrap()
             .is_empty());
-        assert_eq!(state.committee.configuration_number, 2);
+        assert_eq!(
+            state.committee.configuration_number,
+            committee.configuration_number
+        );
         let stake_change = batch.db.get_stake_change(subnet_id, 1).unwrap().unwrap();
         assert_eq!(stake_change.checkpoint_block_height, Some(3));
         // 1_000 registered plus 500 minted; the token transfer to the subnet itself nets zero
@@ -1712,10 +1720,10 @@ mod tests {
     async fn test_failure_inside_batch_leaves_previous_batch() {
         let (mut monitor, dir) = test_monitor().await;
         let first = reveal_tx(
-            &create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(1)])
+            &create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(1)])
                 .to_bytes()
                 .unwrap(),
-            vec![],
+            vec![payment(10_000)],
         );
         let first_id = SubnetId::from_txid(&first.compute_txid());
         monitor
@@ -1732,10 +1740,10 @@ mod tests {
         let mut monitor = monitor_at(&dir).await;
 
         let second = reveal_tx(
-            &create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(2)])
+            &create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(2)])
                 .to_bytes()
                 .unwrap(),
-            vec![],
+            vec![payment(10_000)],
         );
         let second_id = SubnetId::from_txid(&second.compute_txid());
         let join = reveal_tx(&join_msg_bytes(first_id, 1), vec![payment(100_000)]);
@@ -1764,9 +1772,9 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_child_transaction_leaves_no_record() {
         let (mut monitor, _dir) = test_monitor().await;
-        let msg = |seed| create_subnet_msg(Amount::from_sat(1_000), vec![pubkey(seed)]);
+        let msg = |seed| create_subnet_msg(Amount::from_sat(10_000), vec![pubkey(seed)]);
         let txs: Vec<Transaction> = (1..=4)
-            .map(|seed| reveal_tx(&msg(seed).to_bytes().unwrap(), vec![]))
+            .map(|seed| reveal_tx(&msg(seed).to_bytes().unwrap(), vec![payment(10_000)]))
             .collect();
         let ids: Vec<SubnetId> = txs
             .iter()
@@ -1786,7 +1794,7 @@ mod tests {
         let skipped: Result<(), IpcLibError> = (|| {
             let mut child = db.nested_write_txn(&mut txn)?;
             msg(2).save_to_db(&db, &mut child, 1, txs[1].compute_txid())?;
-            Err(IpcValidateError::InvalidMsg("after the first write".to_string()).into())
+            Err(ipc_lib::IpcValidateError::InvalidMsg("after the first write".to_string()).into())
         })();
         assert!(skipped.is_err());
         let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {

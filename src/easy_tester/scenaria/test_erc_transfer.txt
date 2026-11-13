@@ -52,6 +52,12 @@ join subnet3 validator2 100_000_000
 join subnet3 validator3 100_000_000
 join subnet3 validator4 100_000_000
 
+# The first checkpoints of subnet2 and subnet3 activate them: a subnet receives transfers
+# from its activation on
+block 105
+checkpoint subnet2
+checkpoint subnet3
+
 # ──────────────────────────────────────────────────
 # Test 1: ETR fan-out to multiple subnets
 # ──────────────────────────────────────────────────

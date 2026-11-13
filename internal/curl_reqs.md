@@ -7,8 +7,9 @@ curl -X POST http://localhost:3040/api \
     "method": "createsubnet",
     "params": {
 	    "min_validator_stake": 100000000,
+	    "power_unit_exponent": 7,
 	    "min_validators": 4,
-	    "bottomup_check_period": 5,
+	    "bottomup_check_period": 10,
 	    "active_validators_limit": 4,
 	    "min_cross_msg_fee": 200,
 	    "whitelist": [
@@ -16,7 +17,13 @@ curl -X POST http://localhost:3040/api \
 		    "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
 		    "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
 				"b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
-	    ]
+	    ],
+	    "epoch_length": 30,
+	    "min_timeout": 1,
+	    "max_timeout": 2000,
+	    "min_deposit": 330,
+	    "kill_vote_period": 36,
+	    "kill_delay_period": 5
     },
     "id": 1
 }' | jq
@@ -320,32 +327,7 @@ curl -X POST http://localhost:3030/api \
     "id": 1
 }' | jq
 
-curl -X POST http://localhost:3040/api \
--H "Content-Type: application/json" \
--H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
--d '{
-    "jsonrpc": "2.0",
-    "method": "genbootstraphandover",
-    "params": {
-			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
-    },
-    "id": 1
-}' | jq
-
-curl -X POST http://localhost:3030/api \
--H "Content-Type: application/json" \
--H "Authorization: Bearer validator1_auth_token" \
--d '{
-    "jsonrpc": "2.0",
-    "method": "genbootstraphandover",
-    "params": {
-			"subnet_id": "/b4/t410f7eqjpzo3akekevrpbfdwwhkbj65pzaanskoml6i"
-    },
-    "id": 1
-}' | jq
-
 # checkpoint with withdrawals and transfers
-
 curl -X POST http://localhost:3030/api \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
@@ -444,28 +426,16 @@ curl -X POST http://localhost:3030/api \
         "unsigned_psbt_base64": "cHNidP8BAP1SAQIAAAABiZUUNBUjat9BZH6yhbFBVE01N39wx18nYv7bGCk9wNgBAAAAAP////8GAAAAAAAAAABLaklJUEM6Q1BUFweIKLGnkq7gNJVf/AZcY3oIqAkFnIr0Kg8sWUiGoaQAAAAAABnWaJwIWuFlgx6TT/djrkaipsFys/G2CozibwECqGEAAAAAAAAWABSKRTgEccvV0a9lany7HV7qjXmRW5gSAAAAAAAAIlEg65foRoWTTULdXwrR0E7GOxHyHdPpMXk3Jgme08GCfnLwSQIAAAAAACJRIKdn9Pj8p+KB3Ewsx/xFsoZK+IlU6OXxfS1+4VlmHXM7oIYBAAAAAAAiUSCnZ/T4/KfigdxMLMf8RbKGSviJVOjl8X0tfuFZZh1zO1r0RQwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEAAAAAAAEBK8BcSgwAAAAAIlEgmLN5C+hisXFbmnjZlOtkeIO+CAGxC7Zsvh8EYgTxUTEBBYogXw3+06UnrHQMfUpZTNOqEFmpNhhzmfxJ4/xupq4XcmisIIUcG9oydYRHnpinwo6nrcCX0pDv0QUxC89xQjG7mfr0uiCxX5mSjyR4oQxXOaA/VJXTQudzUtYk58yOv73tVE+awLogtF/VJXPo5r/gr/gvsijoh/3ZIhD+CVKuZaWQgP7H5Sm6U6JCFcB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmR/A0V8sImCxylvl4wqDc9KyfpJ29BMIsGNeb/ogOBLwiyBfDf7TpSesdAx9SllM06oQWak2GHOZ/Enj/G6mrhdyaKwghRwb2jJ1hEeemKfCjqetwJfSkO/RBTELz3FCMbuZ+vS6ILFfmZKPJHihDFc5oD9UldNC53NS1iTnzI6/ve1UT5rAuiC0X9Ulc+jmv+Cv+C+yKOiH/dkiEP4JUq5lpZCA/sflKbpTosABFyB5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmQEYIJ04u+iZnmVuhe+3wJVCa+C8bG10fuKiKDaN1vZukXIoAAAAAAAAAA==",
         "signatures": [
         [
-          "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268",
-          [
-            "f245679ccda14b190213d4115ba8c10d484d5f0d1e0a37a493bd88f9fce3f05b5514debb23e83c693a1fdeb0622970fc3691dbbdee87b7430af41acdca58f44c"
-          ]
+          "f245679ccda14b190213d4115ba8c10d484d5f0d1e0a37a493bd88f9fce3f05b5514debb23e83c693a1fdeb0622970fc3691dbbdee87b7430af41acdca58f44c"
         ],
         [
-          "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
-          [
-            "14da8c21b0a6ab6218b27e8bec5f750de26c0f0fe1e0265b6788dcc0f1c059473547e1737d16e2238587e927a428fa1c5d20e460bedf4ae4af25bb245448c1b2"
-          ]
+          "14da8c21b0a6ab6218b27e8bec5f750de26c0f0fe1e0265b6788dcc0f1c059473547e1737d16e2238587e927a428fa1c5d20e460bedf4ae4af25bb245448c1b2"
         ],
         [
-          "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
-          [
-            "c280fcca9d56e8f62757ee05ee17cec953bf09958e78d92ab50804d9d23b15a98a0a4ff6de421e78f73cd4874524e8d17efb2a21cccb92d9fac42407c2f3b031"
-          ]
+          "c280fcca9d56e8f62757ee05ee17cec953bf09958e78d92ab50804d9d23b15a98a0a4ff6de421e78f73cd4874524e8d17efb2a21cccb92d9fac42407c2f3b031"
         ],
         [
-          "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529",
-          [
-            "5625ce8a09a441111fc1fc1e8491a5ba0dd84a0bdc73c4c3e284321c64f1dfbd9a863725f0da7a2e99f014c3d10c6eb207f7d5bd06fd8fcacbc31a6d040bde7a"
-          ]
+          "5625ce8a09a441111fc1fc1e8491a5ba0dd84a0bdc73c4c3e284321c64f1dfbd9a863725f0da7a2e99f014c3d10c6eb207f7d5bd06fd8fcacbc31a6d040bde7a"
         ]
         ]
     },
@@ -495,6 +465,21 @@ curl -X POST http://localhost:3030/api \
     "params": {
         "subnet_id": "/b4/t420fluns5gbn747yx4niyqwmfvsessium7psci7w7lld7omo3n2hrutp3ayv2y",
         "number": 1
+    },
+    "id": 1
+}' | jq
+
+# get the EOTS keys, their EOTS nonce commitments above a Bitcoin height, and the latest checkpoint, at a Bitcoin height
+curl -X POST http://localhost:3030/api \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer asda123123jhaskjdhgbjsjhdj" \
+-d '{
+    "jsonrpc": "2.0",
+    "method": "geteotsrecords",
+    "params": {
+        "subnet_id": "/b4/t420fluns5gbn747yx4niyqwmfvsessium7psci7w7lld7omo3n2hrutp3ayv2y",
+        "after_block_height": 100,
+        "max_block_height": 120
     },
     "id": 1
 }' | jq

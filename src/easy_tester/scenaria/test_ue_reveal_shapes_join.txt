@@ -1,0 +1,101 @@
+# A join-ue is read from any input of a reveal, and several joins from one reveal.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+validator7
+validator8
+validator9
+validator10
+validator11
+validator12
+validator13
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+subnet2
+whitelist validator10 validator11 validator12 validator13
+min 4
+
+scenario
+
+block 105
+create subnet1
+create subnet2
+
+# Four joins in one reveal, with an input before and one after: data inputs 1 to 4 of 6
+block 110
+join-ue subnet1 validator1 100_000 400 validator2 100_000 400 validator3 100_000 400 validator4 100_000 400 @inputs-around
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+read ue_collaterals subnet1
+expect result.count = 4
+read subnet_genesis subnet1
+expect result.bootstrapped = true
+deposit subnet1 validator1 500_000_000
+presign subnet1 validator1 by validator1 validator2 validator3
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator4 by validator1 validator2 validator3
+
+# the first checkpoint activates subnet1 (H_0 = 113): joins are accepted from then on
+block 114
+checkpoint subnet1
+
+block 115
+read subnet_state subnet1
+expect result.activated = true
+# A join after activation is recorded and seated at a cutoff once slashable: the records
+# are counted. The data input last
+join-ue subnet1 validator5 100_000 400 @input-before
+
+block 116
+read ue_collaterals subnet1
+expect result.count = 5
+# The data input first, with an input after it
+join-ue subnet1 validator6 100_000 400 @input-after
+
+block 117
+read ue_collaterals subnet1
+expect result.count = 6
+# A rebuilt reveal with other outputs
+join-ue subnet1 validator7 100_000 400 @other-output
+
+block 118
+read ue_collaterals subnet1
+expect result.count = 7
+# The same key twice in one reveal, inputs reversed: one join accepted
+join-ue subnet1 validator8 100_000 400 validator8 100_000 400 @reversed
+
+block 119
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 8
+expect result.validator8.count = 1
+expect result.validator5.count = 1
+expect result.validator7.count = 1
+# One reveal for two subnets: subnet2 bootstraps and validator9 joins subnet1
+join-ue subnet2 validator10 100_000 400 validator11 100_000 400 subnet1:validator9 100_000 400 validator12 100_000 400 validator13 100_000 400 @inputs-around
+
+block 121
+read validators subnet2
+expect result.count = 4
+expect result.names = validator10,validator11,validator12,validator13
+read ue_collaterals subnet2
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 9
+expect result.validator9.count = 1
+read subnet_genesis subnet2
+expect result.bootstrapped = true

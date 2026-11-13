@@ -1,0 +1,118 @@
+# Several join-ue in one reveal are recorded apart by key, a rejected input leaves the others untouched, and each leaves at its own cutoff.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+# One reveal with four inputs bootstraps the subnet
+block 110
+join-ue subnet1 validator1 100_000 165 validator2 150_000 300 validator3 200_000 300 validator4 300_000 400
+
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+expect result.validator1.ue = true
+expect result.validator4.ue = true
+read ue_collaterals subnet1
+expect result.count = 4
+expect result.validator1.timeout = 165
+expect result.validator4.timeout = 400
+expect result.validator4.value = 300_000
+deposit subnet1 validator1 500_000_000
+presign subnet1 validator1 by validator1 validator2 validator3
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator4 by validator1 validator2 validator3
+
+# the first checkpoint: H_0 = 114
+block 114
+checkpoint subnet1
+
+# One reveal with three inputs: validator5 joins, validator1 is a duplicate key and is
+# rejected, validator6 joins
+block 115
+read validators subnet1
+expect result.validator4.collateral = 300_000
+read validators subnet1 current
+expect result.validator4.collateral = 10_000
+join-ue subnet1 validator5 100_000 200 validator1 100_000 300 validator6 100_000 200
+
+block 117
+read validators subnet1
+expect result.count = 4
+expect result.waiting = true
+read ue_collaterals subnet1
+expect result.count = 6
+expect result.validator1.count = 1
+expect result.validator1.timeout = 165
+presign subnet1 validator5 by validator2 validator3 validator4
+presign subnet1 validator6 by validator2 validator3 validator4
+
+block 118
+checkpoint subnet1
+
+block 119
+read ue_collaterals subnet1
+expect result.slashable_count = 6
+
+# the cutoff at 124 (boundary 154) seats validators 5 and 6
+block 125
+read validators subnet1
+expect result.count = 6
+expect result.names = validator1,validator2,validator3,validator4,validator5,validator6
+expect result.waiting = true
+checkpoint subnet1
+
+block 126
+read validators subnet1 current
+expect result.count = 6
+expect result.waiting = false
+
+# the cutoff at 144 (boundary 174) drops validator1 (165); the others of its reveal stay
+block 145
+read validators subnet1
+expect result.names = validator2,validator3,validator4,validator5,validator6
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator1 = 100_000
+read ue_collaterals subnet1
+expect result.spent_count = 0
+expect result.validator1.spent = false
+
+# the cutoff at 174 (boundary 204) drops validator5 and validator6 (200), of one reveal
+block 175
+read validators subnet1
+expect result.names = validator2,validator3,validator4
+read withdrawals subnet1
+expect result.count = 3
+expect result.validator5 = 100_000
+expect result.validator6 = 100_000
+
+# the cutoff at 274 (boundary 304) drops validator2 and validator3 (300)
+block 275
+read validators subnet1
+expect result.names = validator4
+read withdrawals subnet1
+expect result.count = 5
+
+# validator4 is the only member at the cutoff 374 (boundary 404): kept
+block 375
+read validators subnet1
+expect result.names = validator4
+read withdrawals subnet1
+expect result.count = 5

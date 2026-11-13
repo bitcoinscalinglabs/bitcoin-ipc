@@ -2,14 +2,15 @@
 set -e
 
 # Bootstrap Subnet B locally (run inside the container):
-# - Creates a subnet (via validator1 provider), mines blocks, has validators 1-4 join, funds it, mines more, and prints subnet state.
+# - Creates a subnet (via validator1 provider), mines blocks, has validators 1-4 join with join-ue, funds it, mines more, and prints subnet state.
 
 API_HOST="127.0.0.1"
 
-VAL1_PORT=3030
-VAL2_PORT=3031
-VAL3_PORT=3032
-VAL4_PORT=3033
+# The subnet B providers: they hold the validators' EOTS keys for this subnet
+VAL1_PORT=3130
+VAL2_PORT=3131
+VAL3_PORT=3132
+VAL4_PORT=3133
 
 VAL1_BEARER_TOKEN="validator1_auth_token"
 VAL2_BEARER_TOKEN="validator2_auth_token"
@@ -20,6 +21,11 @@ VAL1_API_URL="http://${API_HOST}:${VAL1_PORT}/api"
 VAL2_API_URL="http://${API_HOST}:${VAL2_PORT}/api"
 VAL3_API_URL="http://${API_HOST}:${VAL3_PORT}/api"
 VAL4_API_URL="http://${API_HOST}:${VAL4_PORT}/api"
+
+# join-ue: epochs of EPOCH_LENGTH Bitcoin blocks that the collateral seats the validator
+EPOCHS=533
+# EOTS nonce commitment covers subnet block heights 1 to this count
+EOTS_NONCE_COUNT=500000
 
 # Fixed collateral amounts
 COLLATERAL1=200000000
@@ -76,6 +82,7 @@ CREATE_PAYLOAD=$(cat <<'JSON'
   "method": "createsubnet",
   "params": {
     "min_validator_stake": 100000000,
+    "power_unit_exponent": 7,
     "min_validators": 4,
     "bottomup_check_period": 30,
     "active_validators_limit": 10,
@@ -85,7 +92,13 @@ CREATE_PAYLOAD=$(cat <<'JSON'
       "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0",
       "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4",
       "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
-    ]
+    ],
+    "epoch_length": 90,
+    "min_timeout": 1,
+    "max_timeout": 2000,
+    "min_deposit": 330,
+    "kill_vote_period": 36,
+    "kill_delay_period": 5
   },
   "id": 1
 }
@@ -121,88 +134,41 @@ SUBNET_CREATED_AT=$(date -u +"%Y-%m-%d %H:%M:%SZ")
 SUBNET_CREATED_HEIGHT="$BLOCK_NUM"
 
 # 3. Join the subnet with 4 validators using fixed collateral amounts and per-validator bearer token/port
+join_ue() {
+    local name=$1
+    local api_url=$2
+    local bearer=$3
+    local collateral=$4
+    local ip=$5
+    local pubkey=$6
 
-# Validator 1
-echo "Calling joinsubnet for validator1..."
-JOIN1_PAYLOAD=$(cat <<JSON
+    local payload
+    payload=$(cat <<JSON
 {
   "jsonrpc": "2.0",
   "method": "joinsubnet",
   "params": {
     "subnet_id": "$SUBNET_ID",
-    "collateral": $COLLATERAL1,
-    "ip": "66.222.44.55:8080",
+    "collateral": $collateral,
+    "ip": "$ip",
     "backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-    "pubkey": "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268"
+    "pubkey": "$pubkey",
+    "epochs": $EPOCHS,
+    "eots_nonce_start": 1,
+    "eots_nonce_count": $EOTS_NONCE_COUNT
   },
   "id": 1
 }
 JSON
 )
-
-# echo "curl -s -X POST \"$VAL1_API_URL\" \\"
-# echo "  -H \"Content-Type: application/json\" \\"
-# echo "  -H \"Authorization: Bearer $VAL1_BEARER_TOKEN\" \\"
-# echo "  -d '$JOIN1_PAYLOAD'"
-
-rpc_post_raw_or_die "joinsubnet (validator1)" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$JOIN1_PAYLOAD" | jq
-
-# Validator 2
-echo "Calling joinsubnet for validator2..."
-JOIN2_PAYLOAD=$(cat <<JSON
-{
-  "jsonrpc": "2.0",
-  "method": "joinsubnet",
-  "params": {
-    "subnet_id": "$SUBNET_ID",
-    "collateral": $COLLATERAL2,
-    "ip": "66.222.44.55:8081",
-    "backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-    "pubkey": "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
-  },
-  "id": 1
+    echo "Calling joinsubnet (join-ue) for ${name}..."
+    rpc_post_raw_or_die "joinsubnet (${name})" "$api_url" "$bearer" "$payload" | jq
 }
-JSON
-)
-rpc_post_raw_or_die "joinsubnet (validator2)" "$VAL2_API_URL" "$VAL2_BEARER_TOKEN" "$JOIN2_PAYLOAD" | jq
 
-# Validator 3
-echo "Calling joinsubnet for validator3..."
-JOIN3_PAYLOAD=$(cat <<JSON
-{
-  "jsonrpc": "2.0",
-  "method": "joinsubnet",
-  "params": {
-    "subnet_id": "$SUBNET_ID",
-    "collateral": $COLLATERAL3,
-    "ip": "66.222.44.55:8082",
-    "backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-    "pubkey": "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0"
-  },
-  "id": 1
-}
-JSON
-)
-rpc_post_raw_or_die "joinsubnet (validator3)" "$VAL3_API_URL" "$VAL3_BEARER_TOKEN" "$JOIN3_PAYLOAD" | jq
-
-# Validator 4
-echo "Calling joinsubnet for validator4..."
-JOIN4_PAYLOAD=$(cat <<JSON
-{
-  "jsonrpc": "2.0",
-  "method": "joinsubnet",
-  "params": {
-    "subnet_id": "$SUBNET_ID",
-    "collateral": $COLLATERAL4,
-    "ip": "66.222.44.55:8083",
-    "backup_address": "bcrt1q3fznspr3e02artm9df7tk827a2xhny2m4zzr6n",
-    "pubkey": "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
-  },
-  "id": 1
-}
-JSON
-)
-rpc_post_raw_or_die "joinsubnet (validator4)" "$VAL4_API_URL" "$VAL4_BEARER_TOKEN" "$JOIN4_PAYLOAD" | jq
+join_ue validator1 "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$COLLATERAL1" "66.222.44.55:8080" "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268"
+join_ue validator2 "$VAL2_API_URL" "$VAL2_BEARER_TOKEN" "$COLLATERAL2" "66.222.44.55:8081" "851c1bda327584479e98a7c28ea7adc097d290efd105310bcf714231bb99faf4"
+join_ue validator3 "$VAL3_API_URL" "$VAL3_BEARER_TOKEN" "$COLLATERAL3" "66.222.44.55:8082" "b15f99928f2478a10c5739a03f5495d342e77352d624e7cc8ebfbded544f9ac0"
+join_ue validator4 "$VAL4_API_URL" "$VAL4_BEARER_TOKEN" "$COLLATERAL4" "66.222.44.55:8083" "b45fd52573e8e6bfe0aff82fb228e887fdd92210fe0952ae65a59080fec7e529"
 
 # 4. Mine another block
 bitcoin-cli generatetoaddress 1 "$(bitcoin-cli -rpcwallet=default getnewaddress)" > /dev/null
@@ -276,6 +242,26 @@ JSON
 )
 rpc_post_raw_or_die "getsubnet" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$GETSUBNET_PAYLOAD" | jq
 
+# A rejected join-ue shows only in the monitor log: the four joins must have recorded four EOTS keys
+echo "Calling geteotskeys..."
+GETEOTSKEYS_PAYLOAD=$(cat <<JSON
+{
+  "jsonrpc": "2.0",
+  "method": "geteotskeys",
+  "params": {
+    "subnet_id": "$SUBNET_ID"
+  },
+  "id": 1
+}
+JSON
+)
+EOTS_KEYS=$(rpc_post_raw_or_die "geteotskeys" "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$GETEOTSKEYS_PAYLOAD")
+echo "$EOTS_KEYS" | jq
+if [ "$(echo "$EOTS_KEYS" | jq '[.result[].pk_eots] | unique | length')" -ne 4 ]; then
+  echo "Error: expected 4 distinct EOTS keys, see the monitor logs" >&2
+  exit 1
+fi
+
 # Add subnet configuration entry to all IPC config files (end of script)
 # Subnet B: validator1=9545, validator2=9645, validator3=9745, validator4=9845, validator5=9945, users=9545
 get_subnet_b_port() {
@@ -319,10 +305,14 @@ id = "${SUBNET_ID}"
 
 [subnets.config]
 network_type = "fevm"
-provider_http = "http://host.docker.internal:${PORT}/"
+provider_http = "http://${HOST_ADDR:-host.docker.internal}:${PORT}/"
 gateway_addr = "0x77aa40b105843728088c0132e43fc44348881da8"
 registry_addr = "0x74539671a1d2f1c8f200826baba665179f53a1b7"
 EOF
+done
+# The subnet B config of each validator is derived from config.toml, so it is rewritten here.
+for n in 1 2 3 4 5; do
+  subnet_b_config.sh "$n"
 done
 echo "Configuration added successfully."
 

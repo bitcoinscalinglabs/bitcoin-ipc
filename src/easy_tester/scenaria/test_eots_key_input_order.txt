@@ -1,0 +1,54 @@
+# The first accepted EOTS identity wins when a reveal carries several join-ue messages.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 4
+whitelist validator1 validator2 validator3 validator4
+subnet_b
+min 4
+whitelist validator1 validator2 validator3 validator4
+
+scenario
+block 102
+create subnet_a
+create subnet_b
+
+block 103
+# The first message is for b although a is the line's default subnet; unrelated inputs surround it.
+join-ue subnet_a subnet_b:validator1 100000 1000 validator1 200000 1100 @inputs-around
+
+block 104
+read ue_collaterals subnet_a
+expect result.count = 0
+read ue_collaterals subnet_b
+expect result.count = 1
+expect result.validator1.count = 1
+expect result.validator1.value = 100000
+expect result.validator1.timeout = 1000
+read subnet_genesis subnet_a
+expect result.genesis_validators = 0
+read subnet_genesis subnet_b
+expect result.genesis_validators = 1
+
+# With another identity, the first input now targets a; the second message must not be applied.
+join-ue subnet_a validator2 300000 1200 subnet_b:validator2 400000 1300
+
+block 105
+read ue_collaterals subnet_a
+expect result.count = 1
+expect result.validator2.count = 1
+expect result.validator2.value = 300000
+expect result.validator2.timeout = 1200
+read ue_collaterals subnet_b
+expect result.count = 1
+expect result.validator1.value = 100000
+read subnet_genesis subnet_a
+expect result.genesis_validators = 1
+expect result.bootstrapped = false
+read subnet_genesis subnet_b
+expect result.genesis_validators = 1
+expect result.bootstrapped = false

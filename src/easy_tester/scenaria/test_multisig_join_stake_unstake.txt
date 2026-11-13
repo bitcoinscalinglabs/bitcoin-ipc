@@ -1,0 +1,140 @@
+# A multisig join, stake or unstake is checked against the next configuration as filled so far: membership, min_validator_stake (100_000), 5% of its total collateral and MAX_TOTAL_POWER.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+validator7
+
+subnet1
+whitelist validator1 validator2 validator3 validator4 validator5
+min 5
+
+subnet2
+whitelist validator1 validator2 validator3 validator4 validator5
+min 5
+
+subnet3
+whitelist validator1 validator2 validator3 validator4 validator5
+min 5
+
+scenario
+
+block 105
+create subnet1
+create subnet2
+create subnet3
+
+block 110
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+join subnet1 validator5 100_000_000
+join subnet2 validator1 100_000
+join subnet2 validator2 100_000
+join subnet2 validator3 100_000
+join subnet2 validator4 100_000
+join subnet2 validator5 100_000
+join subnet3 validator1 100_000_000
+join subnet3 validator2 100_000_000
+join subnet3 validator3 100_000_000
+join subnet3 validator4 100_000_000
+join subnet3 validator5 100_000_000
+
+# the rotation checkpoint of epoch 1
+block 114
+checkpoint subnet1 subnet2 subnet3
+
+# the rotation checkpoint of epoch 2, after the cutoff at 120 = H_1
+block 124
+checkpoint subnet1 subnet2 subnet3
+
+block 125
+read validators subnet1 current
+expect result.count = 5
+expect result.waiting = false
+# refused, then accepted: 5% of the total collateral 500_000_000
+stake subnet1 validator5 24_999_999 @raw
+stake subnet1 validator5 25_000_000 @raw
+# accepted: collateral 100_000_000, a stake of 50_000_000, then an unstake of 120_000_000
+stake subnet1 validator1 50_000_000 @raw
+unstake subnet1 validator1 120_000_000 @raw
+# accepted: an unstake of 80_000_000 of 100_000_000; refused: then 50_000_000, and one unit over the rest
+unstake subnet1 validator2 80_000_000 @raw
+unstake subnet1 validator2 50_000_000 @raw
+unstake subnet1 validator2 20_000_001 @raw
+# accepted: validator2 unstakes its whole collateral
+unstake subnet1 validator2 20_000_000 @raw
+# accepted: the rest is min_validator_stake; refused: one unit under
+unstake subnet1 validator3 99_900_000 @raw
+unstake subnet1 validator4 99_900_001 @raw
+# refused: validator2 is not in the next configuration, and is in the current one
+stake subnet1 validator2 50_000_000 @raw
+unstake subnet1 validator2 100_000 @raw
+join subnet1 validator2 100_000_000 @raw
+# refused: under min_validator_stake; accepted; refused: a second join
+join subnet1 validator6 99_999 @raw
+join subnet1 validator6 100_000 @raw
+join subnet1 validator6 100_000 @raw
+# accepted in the epoch of its join
+stake subnet1 validator6 20_000_000 @raw
+unstake subnet1 validator6 10_000_000 @raw
+# refused: never joined
+stake subnet1 validator7 50_000_000 @raw
+unstake subnet1 validator7 100_000 @raw
+
+# accepted: a stake of 50_000 on 100_000; refused: an unstake of 120_000, whose rest 30_000 is under min_validator_stake
+stake subnet2 validator1 50_000 @raw
+unstake subnet2 validator1 120_000 @raw
+
+# The total power is 50_000 (power unit 10_000 sat); MAX_TOTAL_POWER - 50_000 = 2_147_433_647.
+# refused: one power unit over MAX_TOTAL_POWER; accepted: at MAX_TOTAL_POWER
+stake subnet3 validator1 21_474_336_480_000 @raw
+stake subnet3 validator1 21_474_336_470_000 @raw
+unstake subnet3 validator1 21_474_336_470_000 @raw
+join subnet3 validator6 21_474_336_480_000 @raw
+join subnet3 validator6 21_474_336_470_000 @raw
+
+block 126
+read subnet_state subnet1
+expect result.pending_multisig_changes = 9
+read validators subnet1
+expect result.count = 5
+expect result.validator1.collateral = 100_000_000
+expect result.validator2.collateral = 100_000_000
+read subnet_state subnet2
+expect result.pending_multisig_changes = 1
+read subnet_state subnet3
+expect result.pending_multisig_changes = 3
+
+# C_3, computed at the cutoff at 130 = H_2
+block 131
+read validators subnet1
+expect result.waiting = true
+expect result.count = 5
+expect result.names = validator1,validator3,validator4,validator5,validator6
+expect result.validator1.collateral = 30_000_000
+expect result.validator3.collateral = 100_000
+expect result.validator4.collateral = 100_000_000
+expect result.validator5.collateral = 125_000_000
+expect result.validator6.collateral = 10_100_000
+read withdrawals subnet1
+expect result.count = 3
+expect result.validator1 = 70_000_000
+expect result.validator2 = 100_000_000
+expect result.validator3 = 99_900_000
+
+read validators subnet2
+expect result.validator1.collateral = 150_000
+read withdrawals subnet2
+expect result.count = 0
+
+read validators subnet3
+expect result.count = 6
+expect result.validator1.collateral = 100_000_000
+expect result.validator6.collateral = 21_474_336_470_000

@@ -266,13 +266,41 @@ fn process_env_files(dir: &Path, home_dir: &str) -> io::Result<()> {
         } else if path.file_name().and_then(|n| n.to_str()) == Some(".env") {
             // Process .env file
             let content = fs::read_to_string(&path)?;
-            let updated_content = content.replace("$HOME", home_dir);
+            let mut updated_content = content.replace("$HOME", home_dir);
+            // A validator gets an EOTS key and the seed of its nonces
+            if updated_content.contains("VALIDATOR_SK_PATH=") {
+                if !updated_content.contains("EOTS_SK_PATH=") {
+                    let eots_path = write_eots_secret(&path, "eots.sk", "EOTS key")?;
+                    updated_content.push_str(&format!("\nEOTS_SK_PATH={}\n", eots_path.display()));
+                }
+                if !updated_content.contains("EOTS_SEED_PATH=") {
+                    let seed_path = write_eots_secret(&path, "eots.seed", "EOTS nonce seed")?;
+                    updated_content
+                        .push_str(&format!("\nEOTS_SEED_PATH={}\n", seed_path.display()));
+                }
+            }
             fs::write(&path, updated_content)?;
             println!("Processed .env file: {}", path.display());
         }
     }
 
     Ok(())
+}
+
+/// Writes 32 random bytes in hex as `file_name` next to `env_path`, unless it exists.
+fn write_eots_secret(
+    env_path: &Path,
+    file_name: &str,
+    what: &str,
+) -> io::Result<std::path::PathBuf> {
+    let dir = env_path.parent().unwrap_or(Path::new("."));
+    let path = dir.join(file_name);
+    if !path.exists() {
+        let sk = bitcoin::secp256k1::SecretKey::new(&mut rand::thread_rng());
+        fs::write(&path, hex::encode(sk.secret_bytes()))?;
+        println!("Generated {what}: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn print_validator_user_keys(ipc_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {

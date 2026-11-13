@@ -1,12 +1,13 @@
 use std::{collections::{HashMap, HashSet}, fs, path::PathBuf};
 
+use crate::easy_tester::reveal::RevealShape;
 use crate::easy_tester::{
     error::EasyTesterError,
     model::{
         generate_validator, normalize_numeric_literal, parse_u16_allow_underscores,
         parse_u64_allow_underscores, parse_u256_allow_underscores, FendermintIssuer,
-        FendermintSetup, FendermintSubnet, OutputDb, OutputExpectTarget, ParsedFendermintTest,
-        ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TesterConfig,
+        FendermintSetup, FendermintSubnet, JoinUeSpec, OutputDb, OutputExpectTarget,
+        ParsedFendermintTest, ParsedTest, ScenarioCommand, SetupSpec, SubnetSpec, TesterConfig,
     },
 };
 
@@ -24,8 +25,12 @@ enum SetupBuilder {
         name: String,
         whitelist_names: Option<Vec<String>>,
         min_validators: Option<u16>,
+        epoch_length: Option<u64>,
     },
 }
+
+/// The epoch length of a subnet whose setup does not set `epoch_length`
+const DEFAULT_EPOCH_LENGTH: u64 = 10;
 
 impl SetupBuilder {
     fn name(&self) -> &str {
@@ -62,6 +67,7 @@ impl SetupBuilder {
                 name,
                 whitelist_names,
                 min_validators,
+                epoch_length,
             } => {
                 if setup.subnets.contains_key(&name) {
                     return Err(EasyTesterError::parse(
@@ -89,21 +95,21 @@ impl SetupBuilder {
                     ));
                 };
 
-                if min_validators < 4 {
+                if min_validators == 0 {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         line_no,
-                        format!("subnet '{name}' min must be at least 4 (got {min_validators})"),
+                        format!("subnet '{name}' min must be at least 1"),
                         original_line,
                     ));
                 }
 
-                if whitelist_names.len() < 4 {
+                if whitelist_names.len() < usize::from(min_validators) {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         line_no,
                         format!(
-                            "subnet '{name}' whitelist must have at least 4 entries (got {})",
+                            "subnet '{name}' whitelist must have at least {min_validators} entries (got {})",
                             whitelist_names.len()
                         ),
                         original_line,
@@ -156,6 +162,7 @@ impl SetupBuilder {
                         min_validators,
                         whitelist_names,
                         whitelist_pubkeys,
+                        epoch_length: epoch_length.unwrap_or(DEFAULT_EPOCH_LENGTH),
                     },
                 );
                 Ok(())
@@ -251,6 +258,7 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             name,
                             whitelist_names: None,
                             min_validators: None,
+                            epoch_length: None,
                         });
                     }
                     continue;
@@ -281,14 +289,15 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     SetupBuilder::Subnet {
                         whitelist_names,
                         min_validators,
+                        epoch_length,
                         ..
                     } => match tokens[0] {
                         "whitelist" => {
-                            if tokens.len() < 5 {
+                            if tokens.len() < 2 {
                                 return Err(EasyTesterError::parse(
                                     path.clone(),
                                     line_no,
-                                    "whitelist requires at least 4 validator names",
+                                    "whitelist requires at least 1 validator name",
                                     original_line,
                                 ));
                             }
@@ -309,6 +318,28 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
                             })?;
                             *min_validators = Some(v);
+                        }
+                        "epoch_length" => {
+                            if tokens.len() != 2 {
+                                return Err(EasyTesterError::parse(
+                                    path.clone(),
+                                    line_no,
+                                    "epoch_length requires exactly one numeric argument",
+                                    original_line,
+                                ));
+                            }
+                            let v = parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?;
+                            if v == 0 {
+                                return Err(EasyTesterError::parse(
+                                    path.clone(),
+                                    line_no,
+                                    "epoch_length must be positive",
+                                    original_line,
+                                ));
+                            }
+                            *epoch_length = Some(v);
                         }
                         _ => {
                             return Err(EasyTesterError::parse(
@@ -341,11 +372,14 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     });
                 }
                 "create" => {
+                    let (tokens, shape) = split_shape(&tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
                     if tokens.len() != 2 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "create requires exactly one subnet name",
+                            "create syntax: create <subnetName> [@<shape>]",
                             original_line,
                         ));
                     }
@@ -354,15 +388,19 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         text: original_line.to_string(),
                         cmd: ScenarioCommand::Create {
                             subnet_name: tokens[1].to_string(),
+                            shape,
                         },
                     });
                 }
                 "join" => {
+                    let (tokens, raw) = split_raw(&tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
                     if tokens.len() != 4 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "join syntax: join <subnetName> <validatorName> <collateralSats>",
+                            "join syntax: join <subnetName> <validatorName> <collateralSats> [@raw]",
                             original_line,
                         ));
                     }
@@ -376,15 +414,66 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             subnet_name: tokens[1].to_string(),
                             validator_name: tokens[2].to_string(),
                             collateral_sats,
+                            raw,
+                        },
+                    });
+                }
+                "join-ue" => {
+                    let collateral_spent = tokens.last() == Some(&"@collateral-spent");
+                    let tokens = &tokens[..tokens.len() - usize::from(collateral_spent)];
+                    let (tokens, shape) = split_shape(tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    if tokens.len() < 5 || (tokens.len() - 2) % 3 != 0 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "join-ue syntax: join-ue <subnetName> <[subnet:]validatorName> <collateralSats> <timeoutHeight> [<[subnet:]validatorName> <collateralSats> <timeoutHeight>]... [@<shape>] [@collateral-spent]",
+                            original_line,
+                        ));
+                    }
+                    let mut joins = Vec::new();
+                    for spec in tokens[2..].chunks(3) {
+                        let collateral_sats =
+                            parse_u64_allow_underscores(spec[1]).map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?;
+                        let timeout = parse_u64_allow_underscores(spec[2]).map_err(|e| {
+                            EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                        })?;
+                        let (subnet_name, validator_name) = match spec[0].split_once(':') {
+                            Some((subnet, validator)) => {
+                                (Some(subnet.to_string()), validator.to_string())
+                            }
+                            None => (None, spec[0].to_string()),
+                        };
+                        joins.push(JoinUeSpec {
+                            subnet_name,
+                            validator_name,
+                            collateral_sats,
+                            timeout,
+                            collateral_spent,
+                        });
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::JoinUe {
+                            subnet_name: tokens[1].to_string(),
+                            joins,
+                            shape,
                         },
                     });
                 }
                 "stake" => {
+                    let (tokens, raw) = split_raw(&tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
                     if tokens.len() != 4 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "stake syntax: stake <subnetName> <validatorName> <amountToAddSats>",
+                            "stake syntax: stake <subnetName> <validatorName> <amountToAddSats> [@raw]",
                             original_line,
                         ));
                     }
@@ -398,15 +487,19 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             subnet_name: tokens[1].to_string(),
                             validator_name: tokens[2].to_string(),
                             amount_sats,
+                            raw,
                         },
                     });
                 }
                 "unstake" => {
+                    let (tokens, raw) = split_raw(&tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
                     if tokens.len() != 4 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "unstake syntax: unstake <subnetName> <validatorName> <amountToRemoveSats>",
+                            "unstake syntax: unstake <subnetName> <validatorName> <amountToRemoveSats> [@raw]",
                             original_line,
                         ));
                     }
@@ -420,6 +513,25 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                             subnet_name: tokens[1].to_string(),
                             validator_name: tokens[2].to_string(),
                             amount_sats,
+                            raw,
+                        },
+                    });
+                }
+                "unstake-ue" => {
+                    if tokens.len() != 3 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "unstake-ue syntax: unstake-ue <subnetName> <validatorName>",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::UnstakeUe {
+                            subnet_name: tokens[1].to_string(),
+                            validator_name: tokens[2].to_string(),
                         },
                     });
                 }
@@ -464,11 +576,14 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                     });
                 }
                 "checkpoint" => {
-                    if tokens.len() != 2 {
+                    let (tokens, shape) = split_shape(&tokens).map_err(|e| {
+                        EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                    })?;
+                    if tokens.len() < 2 {
                         return Err(EasyTesterError::parse(
                             path.clone(),
                             line_no,
-                            "checkpoint requires exactly one subnet name",
+                            "checkpoint syntax: checkpoint <subnetName> [<subnetName>...] [@<shape>]",
                             original_line,
                         ));
                     }
@@ -476,7 +591,33 @@ pub fn parse_test_file(path: impl Into<PathBuf>) -> Result<ParsedTest, EasyTeste
                         line_no,
                         text: original_line.to_string(),
                         cmd: ScenarioCommand::Checkpoint {
+                            subnets: tokens[1..].iter().map(|s| s.to_string()).collect(),
+                            shape,
+                        },
+                    });
+                }
+                "presign" => {
+                    let mut rest = tokens.get(3..).unwrap_or(&[]).to_vec();
+                    let bad = rest.last() == Some(&"bad");
+                    if bad {
+                        rest.pop();
+                    }
+                    if tokens.len() < 5 || tokens[3] != "by" || rest.len() < 2 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            line_no,
+                            "presign syntax: presign <subnet> <owner> by <signer> [<signer>...] [bad]",
+                            original_line,
+                        ));
+                    }
+                    scenario_entries.push(ScenarioEntry {
+                        line_no,
+                        text: original_line.to_string(),
+                        cmd: ScenarioCommand::Presign {
                             subnet_name: tokens[1].to_string(),
+                            owner: tokens[2].to_string(),
+                            signers: rest[1..].iter().map(|s| s.to_string()).collect(),
+                            bad,
                         },
                     });
                 }
@@ -699,7 +840,7 @@ fn validate_scenario(
                 last_block_height = Some(*height);
                 block_set = true;
             }
-            ScenarioCommand::Create { subnet_name } => {
+            ScenarioCommand::Create { subnet_name, .. } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
                         path.clone(),
@@ -730,6 +871,7 @@ fn validate_scenario(
                 subnet_name,
                 validator_name,
                 collateral_sats,
+                ..
             } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
@@ -772,10 +914,76 @@ fn validate_scenario(
                     ));
                 }
             }
+            ScenarioCommand::JoinUe {
+                subnet_name, joins, ..
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !created_subnets.contains(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' must be created before join-ue"),
+                        &entry.text,
+                    ));
+                }
+                for join in joins {
+                    if let Some(subnet_name) = &join.subnet_name {
+                        if !created_subnets.contains(subnet_name) {
+                            return Err(EasyTesterError::parse(
+                                path.clone(),
+                                entry.line_no,
+                                format!("subnet '{subnet_name}' must be created before join-ue"),
+                                &entry.text,
+                            ));
+                        }
+                    }
+                    let validator_name = &join.validator_name;
+                    if !setup.validators.contains_key(validator_name) {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            format!("validator '{validator_name}' was not declared in setup"),
+                            &entry.text,
+                        ));
+                    }
+                    if join.collateral_sats == 0 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            "collateral must be greater than 0",
+                            &entry.text,
+                        ));
+                    }
+                    if join.timeout == 0 {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            "timeout must be a block height greater than 0",
+                            &entry.text,
+                        ));
+                    }
+                }
+            }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
                 amount_sats,
+                ..
             } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
@@ -822,6 +1030,7 @@ fn validate_scenario(
                 subnet_name,
                 validator_name,
                 amount_sats,
+                ..
             } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
@@ -864,18 +1073,12 @@ fn validate_scenario(
                     ));
                 }
             }
-            ScenarioCommand::Wait { .. } => {}
-            ScenarioCommand::Deposit { amount_sats, .. } => {
-                if *amount_sats == 0 {
-                    return Err(EasyTesterError::parse(
-                        path.clone(),
-                        entry.line_no,
-                        "deposit amount must be greater than 0",
-                        &entry.text,
-                    ));
-                }
-            }
-            ScenarioCommand::Checkpoint { subnet_name } => {
+            ScenarioCommand::Presign {
+                subnet_name,
+                owner,
+                signers,
+                ..
+            } => {
                 if !block_set {
                     return Err(EasyTesterError::parse(
                         path.clone(),
@@ -892,13 +1095,91 @@ fn validate_scenario(
                         &entry.text,
                     ));
                 }
+                for name in std::iter::once(owner).chain(signers.iter()) {
+                    if !setup.validators.contains_key(name) {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            format!("validator '{name}' was not declared in setup"),
+                            &entry.text,
+                        ));
+                    }
+                }
+            }
+            ScenarioCommand::UnstakeUe {
+                subnet_name,
+                validator_name,
+            } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                if !setup.subnets.contains_key(subnet_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("subnet '{subnet_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
+                if !setup.validators.contains_key(validator_name) {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        format!("validator '{validator_name}' was not declared in setup"),
+                        &entry.text,
+                    ));
+                }
                 if !created_subnets.contains(subnet_name) {
                     return Err(EasyTesterError::parse(
                         path.clone(),
                         entry.line_no,
-                        format!("subnet '{subnet_name}' must be created before checkpoint"),
+                        format!("subnet '{subnet_name}' must be created before unstake-ue"),
                         &entry.text,
                     ));
+                }
+            }
+            ScenarioCommand::Wait { .. } => {}
+            ScenarioCommand::Deposit { amount_sats, .. } => {
+                if *amount_sats == 0 {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "deposit amount must be greater than 0",
+                        &entry.text,
+                    ));
+                }
+            }
+            ScenarioCommand::Checkpoint { subnets, .. } => {
+                if !block_set {
+                    return Err(EasyTesterError::parse(
+                        path.clone(),
+                        entry.line_no,
+                        "must set 'block <height>' before actions",
+                        &entry.text,
+                    ));
+                }
+                for subnet_name in subnets {
+                    if !setup.subnets.contains_key(subnet_name) {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            format!("subnet '{subnet_name}' was not declared in setup"),
+                            &entry.text,
+                        ));
+                    }
+                    if !created_subnets.contains(subnet_name) {
+                        return Err(EasyTesterError::parse(
+                            path.clone(),
+                            entry.line_no,
+                            format!("subnet '{subnet_name}' must be created before checkpoint"),
+                            &entry.text,
+                        ));
+                    }
                 }
             }
             ScenarioCommand::RegisterToken { subnet_name, .. } => {
@@ -984,6 +1265,10 @@ fn validate_scenario(
                     | OutputDb::StakeChanges
                     | OutputDb::KillRequests
                     | OutputDb::Committee
+                    | OutputDb::Validators
+                    | OutputDb::UeCollaterals
+                    | OutputDb::Withdrawals
+                    | OutputDb::SubnetState
                     | OutputDb::RewardCandidates => {
                         let subnet_arg_index = if *db == OutputDb::RewardCandidates {
                             1
@@ -1061,6 +1346,11 @@ fn validate_scenario(
                         | Some(OutputDb::RootnetMsgs)
                         | Some(OutputDb::TokenBalance)
                         | Some(OutputDb::TokenMetadata)
+                        | Some(OutputDb::Validators)
+                        | Some(OutputDb::UeCollaterals)
+                        | Some(OutputDb::Withdrawals)
+                        | Some(OutputDb::SubnetGenesis)
+                        | Some(OutputDb::SubnetState)
                 );
                 if !valid_precursor {
                     return Err(EasyTesterError::parse(
@@ -1166,6 +1456,25 @@ fn parse_output_expect(
     Ok((target, rhs_str))
 }
 
+fn split_shape<'a>(tokens: &'a [&'a str]) -> Result<(&'a [&'a str], RevealShape), String> {
+    match tokens.last() {
+        Some(last) if last.starts_with('@') => {
+            Ok((&tokens[..tokens.len() - 1], last[1..].parse()?))
+        }
+        _ => Ok((tokens, RevealShape::AsBuilt)),
+    }
+}
+
+fn split_raw<'a>(tokens: &'a [&'a str]) -> Result<(&'a [&'a str], bool), String> {
+    match tokens.last() {
+        Some(&"@raw") => Ok((&tokens[..tokens.len() - 1], true)),
+        Some(last) if last.starts_with('@') => {
+            Err(format!("unknown option '{last}', expected @raw"))
+        }
+        _ => Ok((tokens, false)),
+    }
+}
+
 fn parse_output_db(s: &str) -> Result<OutputDb, String> {
     match s {
         "subnet" => Ok(OutputDb::Subnet),
@@ -1178,6 +1487,10 @@ fn parse_output_db(s: &str) -> Result<OutputDb, String> {
         "rootnet_msgs" => Ok(OutputDb::RootnetMsgs),
         "token_balance" => Ok(OutputDb::TokenBalance),
         "token_metadata" => Ok(OutputDb::TokenMetadata),
+        "validators" => Ok(OutputDb::Validators),
+        "ue_collaterals" => Ok(OutputDb::UeCollaterals),
+        "withdrawals" => Ok(OutputDb::Withdrawals),
+        "subnet_state" => Ok(OutputDb::SubnetState),
         _ => Err(format!("unknown output db '{s}'")),
     }
 }
@@ -1255,6 +1568,16 @@ fn validate_output_args(
                 return Err(err("expected: read token_metadata <subnetName> <tokenName>"));
             }
         }
+        OutputDb::Validators => {
+            if args.is_empty() || args.len() > 2 || (args.len() == 2 && args[1] != "current") {
+                return Err(err("expected: read validators <subnetName> [current]"));
+            }
+        }
+        OutputDb::UeCollaterals | OutputDb::Withdrawals | OutputDb::SubnetState => {
+            if args.len() != 1 {
+                return Err(err("expected: read <db> <subnetName>"));
+            }
+        }
     }
 
     Ok(())
@@ -1278,6 +1601,7 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
     let mut tester_type: Option<String> = None;
     let mut activation_height: Option<u64> = None;
     let mut snapshot_length: Option<u64> = None;
+    let mut ue_activation_height: Option<u64> = None;
     let mut monitor_log_level: Option<String> = None;
     let mut provider_log_level: Option<String> = None;
 
@@ -1311,7 +1635,11 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
                 }
                 tester_type = Some(tokens[1].to_string());
             }
-            "activation_height" | "snapshot_length" | "monitor_log_level" | "provider_log_level" => {
+            "activation_height"
+            | "snapshot_length"
+            | "ue_activation_height"
+            | "monitor_log_level"
+            | "provider_log_level" => {
                 if tokens.len() != 2 {
                     return Err(EasyTesterError::parse(
                         path.clone(), line_no,
@@ -1333,6 +1661,12 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
                                 EasyTesterError::parse(path.clone(), line_no, e, original_line)
                             })?,
                         );
+                    }
+                    "ue_activation_height" => {
+                        ue_activation_height =
+                            Some(parse_u64_allow_underscores(tokens[1]).map_err(|e| {
+                                EasyTesterError::parse(path.clone(), line_no, e, original_line)
+                            })?);
                     }
                     "monitor_log_level" => monitor_log_level = Some(tokens[1].to_string()),
                     "provider_log_level" => provider_log_level = Some(tokens[1].to_string()),
@@ -1412,10 +1746,12 @@ pub fn parse_config_file(path: impl Into<PathBuf>) -> Result<TesterConfig, EasyT
         "db" => Ok(TesterConfig::Db {
             activation_height,
             snapshot_length,
+            ue_activation_height,
         }),
         "monitor" => Ok(TesterConfig::Monitor {
             activation_height,
             snapshot_length,
+            ue_activation_height,
             monitor_log_level,
             provider_log_level,
         }),
@@ -1616,9 +1952,10 @@ fn parse_fendermint_scenario_command(
     match tokens[0] {
         // NOPs: block, checkpoint, create, join, stake, unstake
         "block" | "checkpoint" => Ok(ScenarioCommand::Block { height: 0 }),
-        "create" | "join" | "stake" | "unstake" => Err(err(
-            &format!("'{}' is not supported by FendermintTester", tokens[0]),
-        )),
+        "create" | "join" | "join-ue" | "stake" | "unstake" | "unstake-ue" => Err(err(&format!(
+            "'{}' is not supported by FendermintTester",
+            tokens[0]
+        ))),
 
         // register_token <subnet> <issuer> <name> <symbol> <initial_supply>
         "register_token" => {

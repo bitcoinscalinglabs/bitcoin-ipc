@@ -1,0 +1,100 @@
+# A multisig stake or unstake for a join-ue validator is refused, and accepted for an ordinary validator.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+
+block 112
+read validators subnet1
+expect result.count = 4
+deposit subnet1 validator1 500_000_000
+
+read validators subnet1
+expect result.validator1.collateral = 100_000_000
+
+# the first checkpoint is the rotation checkpoint of epoch 1; C_1 is the genesis validators
+# with their join values
+block 114
+checkpoint subnet1
+
+block 115
+read subnet_state subnet1
+expect result.activated = true
+read validators subnet1 current
+expect result.count = 4
+expect result.validator1.collateral = 100_000_000
+join-ue subnet1 validator5 100_000_000 400
+
+block 116
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 1
+presign subnet1 validator5 by validator1 validator2 validator3
+
+block 117
+checkpoint subnet1
+
+block 118
+read ue_collaterals subnet1
+expect result.validator5.slashable = true
+
+# the cutoff at 120 = H_1 seats validator5
+block 124
+read validators subnet1
+expect result.count = 5
+expect result.validator5.ue = true
+expect result.validator5.collateral = 100_000_000
+expect result.waiting = true
+checkpoint subnet1
+
+block 125
+read validators subnet1 current
+expect result.count = 5
+expect result.validator5.ue = true
+expect result.waiting = false
+# Refused for the join-ue validator
+stake subnet1 validator5 50_000_000 @raw
+unstake subnet1 validator5 10_000_000 @raw
+# Accepted for ordinary validators: pending until the cutoff at 130
+stake subnet1 validator1 50_000_000 @raw
+unstake subnet1 validator2 10_000_000 @raw
+
+block 127
+read validators subnet1
+expect result.count = 5
+expect result.waiting = false
+expect result.validator5.collateral = 100_000_000
+read subnet_state subnet1
+expect result.pending_multisig_changes = 2
+read withdrawals subnet1
+expect result.count = 0
+
+block 134
+read validators subnet1
+expect result.waiting = true
+expect result.validator1.collateral = 150_000_000
+expect result.validator2.collateral = 90_000_000
+expect result.validator5.collateral = 100_000_000
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator2 = 10_000_000

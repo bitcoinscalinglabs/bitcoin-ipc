@@ -1,0 +1,192 @@
+# Unilateral-exit joins: activation, the rotation checkpoint of epoch 1, seating and leaving at cutoffs, a key joining once.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 165
+join-ue subnet1 validator2 200_000 175
+join-ue subnet1 validator3 100_000 185
+join-ue subnet1 validator4 100_000 195
+
+# C_gen: the genesis validators with one unit of power each (10_000 sats)
+block 112
+read validators subnet1
+expect result.count = 4
+expect result.names = validator1,validator2,validator3,validator4
+expect result.waiting = false
+expect result.validator1.ue = true
+expect result.validator1.collateral = 10_000
+expect result.validator2.collateral = 10_000
+read subnet_state subnet1
+expect result.activated = false
+expect result.epoch = 0
+expect result.h_0 = none
+read ue_collaterals subnet1
+expect result.count = 4
+expect result.spent_count = 0
+expect result.slashable_count = 0
+expect result.validator1.timeout = 165
+expect result.validator1.value = 100_000
+expect result.validator1.spent = false
+expect result.validator2.timeout = 175
+
+# epoch 0: no join is accepted before the first checkpoint
+join-ue subnet1 validator5 150_000 400
+
+block 114
+read ue_collaterals subnet1
+expect result.count = 4
+# the whitelist pre-signs the slash of every genesis collateral; the first checkpoint carries
+# the pre-signatures and spends the whitelist's funds
+deposit subnet1 validator1 500_000_000
+presign subnet1 validator1 by validator1 validator2 validator3
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator4 by validator1 validator2 validator3
+
+# the first checkpoint: its batch transfer makes every collateral slashable, so H_0 = 116 and
+# C_1 (the four genesis validators with their collaterals) is computed; the checkpoint itself
+# is regular
+block 116
+checkpoint subnet1
+
+block 117
+read subnet_state subnet1
+expect result.activated = true
+expect result.epoch = 1
+expect result.h_0 = 116
+expect result.last_rotation_epoch = 0
+# C_1 waits for the rotation checkpoint of epoch 1; C_gen is current
+read validators subnet1
+expect result.count = 4
+expect result.waiting = true
+expect result.validator1.collateral = 100_000
+expect result.validator2.collateral = 200_000
+read validators subnet1 current
+expect result.count = 4
+expect result.waiting = true
+expect result.validator1.collateral = 10_000
+expect result.validator2.collateral = 10_000
+read ue_collaterals subnet1
+expect result.slashable_count = 4
+# a fifth key joins in epoch 1: recorded, seated at the next cutoff once slashable
+join-ue subnet1 validator5 150_000 400
+
+block 118
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 5
+expect result.validator5.slashable = false
+presign subnet1 validator5 by validator1 validator2 validator3
+
+# the next checkpoint after H_0, the rotation checkpoint of epoch 1: it applies C_1
+block 119
+checkpoint subnet1
+
+block 120
+read subnet_state subnet1
+expect result.last_rotation_epoch = 1
+read ue_collaterals subnet1
+expect result.validator5.slashable = true
+read validators subnet1
+expect result.count = 4
+expect result.waiting = false
+read validators subnet1 current
+expect result.count = 4
+expect result.waiting = false
+expect result.validator1.collateral = 100_000
+expect result.validator2.collateral = 200_000
+
+# the cutoff at 126 = H_1 computes C_2 with boundary 156: everyone stays, validator5 is seated
+block 127
+read subnet_state subnet1
+expect result.epoch = 2
+expect result.last_rotation_epoch = 1
+read validators subnet1
+expect result.count = 5
+expect result.names = validator1,validator2,validator3,validator4,validator5
+expect result.waiting = true
+expect result.validator5.collateral = 150_000
+read validators subnet1 current
+expect result.count = 4
+read withdrawals subnet1
+expect result.count = 0
+# the rotation checkpoint of epoch 2 adopts C_2
+checkpoint subnet1
+
+block 128
+read subnet_state subnet1
+expect result.last_rotation_epoch = 2
+read validators subnet1 current
+expect result.count = 5
+expect result.waiting = false
+
+# the cutoff at 136 computes C_3 with boundary 166: validator1's collateral matures at 165,
+# so it leaves with its whole collateral
+block 137
+read validators subnet1
+expect result.names = validator2,validator3,validator4,validator5
+expect result.waiting = true
+read withdrawals subnet1
+expect result.count = 1
+expect result.validator1 = 100_000
+
+# cutoffs without a rotation checkpoint in between: C_4 (cutoff 146, boundary 176, validator2
+# leaves) continues from C_3
+block 147
+read subnet_state subnet1
+expect result.epoch = 4
+expect result.last_rotation_epoch = 2
+read validators subnet1
+expect result.names = validator3,validator4,validator5
+read withdrawals subnet1
+expect result.count = 2
+expect result.validator2 = 200_000
+
+block 157
+read validators subnet1
+expect result.names = validator4,validator5
+read withdrawals subnet1
+expect result.count = 3
+
+block 167
+read validators subnet1
+expect result.names = validator5
+read withdrawals subnet1
+expect result.count = 4
+
+# validator5 is the only member left: it stays past its timeout (cutoff 376, boundary 406)
+block 377
+read validators subnet1
+expect result.names = validator5
+read withdrawals subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.validator5.spent = false
+
+# a key that left cannot join again: a key joins a subnet once
+block 381
+join-ue subnet1 validator1 100_000 700
+
+block 383
+read validators subnet1
+expect result.names = validator5
+read ue_collaterals subnet1
+expect result.count = 5
+expect result.validator1.count = 1

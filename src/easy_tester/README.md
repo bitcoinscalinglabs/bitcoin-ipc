@@ -6,6 +6,8 @@ Scenario-based integration test runner for Bitcoin IPC.
 cargo run --bin easy_tester -- --scenario <scenario_file> --tester <config_file>
 ```
 
+Full-subnet scenarios (ipc-cli, fendermint, outages) run through `ue_scenario.sh`: see [ipc_tester/README.md](ipc_tester/README.md).
+
 ---
 
 ## Config file format
@@ -19,6 +21,7 @@ Space-separated `key value` lines (no `=`). Stored in `src/easy_tester/testers/`
 | `tester` | `db` \| `monitor` | required |
 | `activation_height` | integer | required for reward commands |
 | `snapshot_length` | integer | required for reward commands |
+| `ue_activation_height` | integer | unilateral exit (`join-ue`) active from this height; omitted = off |
 | `monitor_log_level` | e.g. `debug`, `info` | monitor tester only; defaults to `info` |
 | `provider_log_level` | e.g. `debug`, `info` | monitor tester only; defaults to `info` |
 
@@ -62,16 +65,24 @@ validators validator1 validator2 validator3
 subnet subnet_a min 2 whitelist validator1 validator2 validator3
 ```
 
+A subnet's setup block takes `whitelist <validators...>`, `min <n>` (`boot_validators`) and
+optionally `epoch_length <n>` (`K`, default 10). The other subnet parameters are fixed
+(`build_create_subnet_msg` in `model.rs`: power unit `10^4` sat, timeouts of 1 to 1000 epochs,
+minimum deposit 330 sat).
+
 ### Commands
 
 | Command | Description |
 |---------|-------------|
-| `block <n>` | Advance to block height `n`. Mines all intermediate blocks. |
-| `create <subnet>` | Create a subnet (uses setup whitelist). |
-| `checkpoint <subnet>` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). |
-| `join <subnet> <validator> <collateral_sats>` | Queue a join command. |
-| `stake <subnet> <validator> <amount_sats>` | Queue a stake-increase command. |
-| `unstake <subnet> <validator> <amount_sats>` | Queue a stake-decrease command. |
+| `block <n>` | What follows goes into block `n`; all earlier blocks are mined. |
+| `create <subnet> [@<shape>]` | Create a subnet (uses setup whitelist). With a shape the reveal is rebuilt (see "Reveal shapes"); the name still resolves to the subnet id the reveal names, so `read subnet_genesis` can check whether the monitor accepted it. |
+| `checkpoint <subnet> [<subnet>...] [@<shape>]` | Submit a checkpoint message to Bitcoin (containing all queued join/stake/unstake and token-related requests for that subnet). Several subnets: one checkpoint each, their batch transfers in one reveal transaction; a shape rebuilds that reveal. |
+| `join <subnet> <validator> <collateral_sats> [@raw]` | Queue a join command. `@raw` as for `stake`. |
+| `join-ue <subnet> <[subnet:]validator> <collateral_sats> <timeout_height> [<[subnet:]validator> <collateral_sats> <timeout_height>]... [@<shape>] [@collateral-spent]` | Join with the collateral under the unilateral-exit script, maturing at `timeout_height`, which must satisfy rule 2.6 of the join (its epoch, counted from `H_0` or from the join's block before activation, is `e + 4` to `e + 1003`). Several triples: all the joins in one reveal transaction, in that order, each read from its own input; a triple's `subnet:validator` targets another subnet than the line's. A rejected join is logged, not fatal, so the scenario can check it. Needs `ue_activation_height`. `@collateral-spent` (monitor tester only): a transaction spends each collateral UTXO through the cooperative-exit leaf, signed by the validator and every member of the configuration; it and the commit transactions are mined in block `n`, the reveal transaction goes into block `n + 1`. |
+| `stake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-increase command. `@raw` (monitor tester): the transaction is built with the library and the tester's wallet, not by the provider, so that the monitor's own rules decide; a refusal is logged, not fatal. The db tester's joins, stakes and unstakes are always hand-built; with `@raw` a refusal is logged, not fatal. |
+| `unstake <subnet> <validator> <amount_sats> [@raw]` | Queue a stake-decrease command; `@raw` as for `stake`. |
+| `unstake-ue <subnet> <validator>` | The validator's provider spends its matured unilateral-exit collaterals to its backup address (`unstakeue`). A refusal is logged, not fatal. Monitor tester only. |
+| `presign <subnet> <owner> by <signer> [<signer>...] [bad]` | Queues slash pre-signatures of the owner's latest collateral by the signers' keys for the subnet's next `checkpoint`, which carries them in its batch transfer. `bad` corrupts the first signature. The db tester hands the entry to the monitor as is; the monitor tester sends it through the provider's dev checkpoint route. |
 | `register_token <subnet> <name> <symbol> <initial_supply>` | Queue an ERC20 token registration (ETR). Decimals are fixed at 18. |
 | `mint_token <subnet> <token> <amount>` | Queue a supply increase (ETS). |
 | `burn_token <subnet> <token> <amount>` | Queue a supply decrease (ETS). |
@@ -80,7 +91,28 @@ subnet subnet_a min 2 whitelist validator1 validator2 validator3
 | `read rootnet_msgs <subnet>` | Read rootnet messages for the subnet (from all Bitcoin blocks). |
 | `read token_balance <subnet> <token>` | Read and cache the token balance on the subnet. |
 | `read reward_results <snapshot>` | Read reward results for the given snapshot. |
+| `read subnet_genesis <subnet>` | Fields: `exists`, and when it exists `bootstrapped`, `min_validators`, `genesis_validators`. |
+| `read subnet_state <subnet>` | The bootstrapped subnet's state. Fields: `activated`, `epoch` (0 until activation), `h_0` (`none` until activation), `last_rotation_epoch`, `committee_number`, `pending_multisig_changes`. |
+| `read validators <subnet> [current]` | The latest committee (the waiting one if any), or the current one. Fields: `count`, `names` (sorted, comma-separated), `waiting`, `<validator>.collateral`, `<validator>.ue`. |
+| `read ue_collaterals <subnet>` | The unilateral-exit collateral records. Fields: `count`, `spent_count`, the records whose collateral outpoint a Bitcoin transaction has spent; `slashable_count`, the outputs the monitor recorded as slashable; per validator `<validator>.count`, and for the validator's record with the greatest timeout `<validator>.value`, `<validator>.timeout`, `<validator>.spent`, `<validator>.slashable`. |
+| `read withdrawals <subnet>` | The Withdraw stake changes not yet confirmed by a checkpoint. Fields: `count`, `<validator>` (amount). |
 | `expect result.<path> = <value>` | Assert a field in the **last** `read` result. |
+
+### Reveal shapes
+
+A reveal transaction carries no signature, so the monitor reads a message from any input that spends a commitment output. A trailing `@<shape>` on `create`, `join-ue` or `checkpoint` rebuilds the reveal before it is submitted (`easy_tester::reveal::reshape_reveal`): `as-built` (default), `input-before` (a reveal that carries no message merged before it: the data input is the last), `input-after` (merged after it: the data input is the first), `inputs-around` (one before and one after: the data inputs are in the middle), `reversed` (the inputs in reverse order), `other-output` (every output pays another script), `extra-output` (output 0 split in two). The filler reveals spend an empty-data commitment, which the db tester fabricates and the monitor tester funds with its wallet.
+
+The monitor tester reads `validators`, `ue_collaterals`, `withdrawals` and `subnet_genesis` straight from the monitor's database (read-only), the other reads through the provider. `block N` means "what follows goes into block N": all earlier blocks are mined, and a `read` at `N` sees the state after block `N - 1`.
+
+### Scenario configs
+
+| Scenarios | Tester configs |
+|-----------|----------------|
+| `test_erc_*.txt`, `test_reveal_shapes_batch.txt`, `test_reveal_shapes_create.txt`, `test_rewards.txt`, `test_ue_off.txt` | `testers/db.txt` or `testers/monitor.txt` |
+| `test_ue_activation.txt` | `testers/db-ue-activation-110.txt` or `testers/monitor-ue-activation-110.txt` |
+| `test_ue_exit.txt`, `test_epoch_zero_deposit_release.txt`, `test_ue_collateral_spent_before_reveal.txt` | `testers/monitor-ue.txt` only (the db tester's `deposit` does nothing, and `unstake-ue` and `@collateral-spent` spend real outputs) |
+| `test_multisig_join_stake_unstake.txt` | `testers/db-ue.txt` only (collaterals above the regtest supply) |
+| every other `test_*.txt` except `test_fendermint_transfers.txt` | `testers/db-ue.txt` or `testers/monitor-ue.txt` |
 
 ---
 
@@ -137,7 +169,7 @@ It runs a real integration stack: spawns `bitcoind`, compiles and starts `monito
 
 - Requires `bitcoind` and `bitcoin-cli` in PATH.
 - On startup, creates a wallet and mines 101 blocks to mature coinbase UTXOs. **Scenario block heights must therefore start at 102 or higher**.
-- After each block is confirmed, the tester automatically performs the **bootstrap handover** (`genbootstraphandover` → `dev_multisignpsbt` → `finalizebootstraphandover`) for any subnet that just reached its `min_validators` count. This moves collateral from the whitelist multisig address to the committee multisig address, which is required before the first checkpoint can be created. Scenarios do not need a dedicated command for this.
+- The checkpoints of a bootstrapped subnet before activation are regular checkpoints of epoch 0: built with `dev_gencheckpointpsbt`, signed by the whitelist members, spending the whitelist's fund UTXOs. Each `checkpoint` is a checkpoint of epoch 0, and its batch transfer carries the queued `presign` entries. The monitor sets `H_0` and activates the subnet at the first Bitcoin L1 height at which every unspent join collateral of a member of `C_gen` is slashable; the next `checkpoint` is the rotation checkpoint of epoch 1, spending to `C_1`.
 - Checkpoints use `dev_gencheckpointpsbt` (no balance check) → `dev_multisignpsbt` (all validator keys) → `finalizecheckpointpsbt`. This intentionally bypasses the provider's firewall so that the monitor's own enforcement is what is tested.
 - Monitor and provider stderr are forwarded to the tester's stderr, prefixed with `[monitor]` / `[provider]`.
 - The tester uses the provider compiled with the `--dev` flag for creating the required bitcoin transactions. For checkpoints, it uses `dev_gencheckpointpsbt()` in order to create wrong checkpoint messages, that a correct provider would never create (see `do_checkpoint_malicious()` in the tester code).

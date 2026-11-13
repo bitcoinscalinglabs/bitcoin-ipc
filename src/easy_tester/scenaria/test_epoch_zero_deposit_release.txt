@@ -1,0 +1,60 @@
+# Deposits in epoch 0 are recorded immediately, in Bitcoin order, with continuing nonces.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 2
+whitelist validator1 validator2 validator3 validator4
+epoch_length 10
+
+scenario
+block 102
+create subnet_a
+block 103
+join-ue subnet_a validator1 100000 2000 validator2 120000 2000
+block 104
+deposit subnet_a validator1 1000000
+block 105
+deposit subnet_a validator2 777
+block 106
+read rootnet_msgs subnet_a
+expect result.count = 2
+expect result.0.kind = fund
+expect result.0.nonce = 0
+expect result.0.amount = 1000000
+expect result.1.kind = fund
+expect result.1.nonce = 1
+expect result.1.amount = 777
+read subnet_state subnet_a
+expect result.activated = false
+deposit subnet_a validator1 999
+presign subnet_a validator1 by validator1 validator2
+presign subnet_a validator2 by validator1 validator2
+block 107
+read rootnet_msgs subnet_a
+expect result.count = 3
+expect result.2.kind = fund
+expect result.2.nonce = 2
+expect result.2.amount = 999
+checkpoint subnet_a
+block 108
+read subnet_state subnet_a
+expect result.activated = true
+read rootnet_msgs subnet_a
+expect result.count = 3
+expect result.0.kind = fund
+expect result.0.nonce = 0
+expect result.0.amount = 1000000
+expect result.1.nonce = 1
+expect result.1.amount = 777
+expect result.2.nonce = 2
+expect result.2.amount = 999
+checkpoint subnet_a
+block 109
+read rootnet_msgs subnet_a
+expect result.count = 3
+expect result.0.nonce = 0
+expect result.2.nonce = 2

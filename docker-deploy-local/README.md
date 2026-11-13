@@ -41,11 +41,11 @@ The `bitcoin-ipc` container contains/runs:
 
 - Bitcoin Core in `regtest` mode.
 - Bitcoin wallets and IPC configuration (under `~/.ipc/`) for all 6 validators and 2 users, generated using the `src/bin/quickstart.rs` script upon container creation.
-- The `monitor` and `provider` binaries for each validator (`validator1`–`validator6`) and user (`user1`, `user2`), automatically started upon container creation.
+- The `monitor` and `provider` binaries for each validator (`validator1`–`validator6`) and user (`user1`, `user2`), automatically started upon container creation, plus a second `provider` for each validator for subnet B.
 - The captured logs for each monitor and provider instance in the `/root/logs/` directory inside the container.
 - The `ipc-cli` tool.
 - Sets the required environment variables
-- The script `/workspace/bitcoin-ipc/scripts/miner.sh` that mines regtest blocks every 10 seconds is started automatically upon container creation.
+- The script `/workspace/bitcoin-ipc/scripts/miner.sh` that mines regtest blocks every 20 seconds (set with `BLOCK_INTERVAL`) is started automatically upon container creation.
 - Scripts to quickly create, join, and fund subnets: `bootstrap_subnet_a_from_container.sh` and `bootstrap_subnet_b_from_container.sh` (mounted from `scripts/`, not run automatically).
 
 
@@ -63,9 +63,39 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 ## Exposed Ports
 <!-- - **18443** – Bitcoin RPC -->
 - **3030–3035** – Provider (validator1–6)
+- **3130–3135** – Provider of subnet B (validator1–6)
 - **3040–3041** – Provider (user1–2)
 
+### How containers reach these ports
 
+The subnet containers (fendermint, CometBFT, ETH API) call the providers, and `ipc-cli` inside
+`bitcoin-ipc` calls the subnet ETH API, through ports published on the host. The host name used
+for that is `HOST_ADDR`, default `host.docker.internal`, which Docker Desktop resolves to the host.
+Where that name does not reach published ports (rootless Docker on Linux, for example), set it to
+the host's own interface address, for the whole stack or for one command:
+
+```bash
+HOST_ADDR=10.0.0.4 make local-up
+docker exec -e HOST_ADDR=10.0.0.4 bitcoin-ipc spin_up_subnet_a_from_container.sh <subnet id>
+```
+
+The published ports then also answer on that interface; keep them closed to other machines with
+the host firewall.
+
+## Unilateral exit and EOTS keys
+
+The stack starts with `UE_ACTIVATION_HEIGHT=1`, and `bootstrap_subnet_{a,b}_from_container.sh` join validators 1-4 with join-ue. The monitor refuses to start when the height differs from the one stored in its database, so data of a stack started with another value needs `make local-delete-data`.
+
+An EOTS key joins once across all subnets, and a provider holds one EOTS key. Each validator therefore has two providers on the same monitor database and Bitcoin wallet:
+
+| Subnet | Provider | Environment | EOTS key | ipc-cli config |
+|---|---|---|---|---|
+| A | port 3030 + n - 1 | `~/.ipc/validator<n>/.env` | `~/.ipc/validator<n>/eots.sk` | `~/.ipc/validator<n>/config.toml` |
+| B | port 3130 + n - 1 | `~/.ipc/validator<n>/subnet-b.env` | `~/.ipc/validator<n>/eots-subnet-b.sk` | `~/.ipc/validator<n>/subnet-b.config.toml` |
+
+`quickstart` creates the keys of subnet A and `docker-entrypoint.sh` those of subnet B, each only when absent, so they survive restarts until `make local-delete-data`. Next to each key, the database `<key file>.votes.db` holds the votes signed with it. A join to subnet B and the nodes of subnet B use the subnet B provider. Everything else works on either provider.
+
+`ipc-cli` sends every request for a child of `/b4` to the provider of the `/b4` entry of its config file, whatever the child, so one config file per provider is needed. `subnet_b_config.sh <n>` derives `subnet-b.config.toml` from `config.toml` with the `/b4` entry on port 3130 + n - 1; `docker-entrypoint.sh` runs it at start and `bootstrap_subnet_b_from_container.sh` after it appends the subnet B entry. `ipc-cli` commands for subnet B, `subnet join-ue` above all, take `--config-path ~/.ipc/validator<n>/subnet-b.config.toml`; the relayers of subnet B started by `spin_up_subnet_b_from_container.sh` use it too.
 
 
 ## Monitor, provider, and relayer logs
@@ -73,6 +103,7 @@ Binaries (in `PATH`): `monitor`, `provider`, `quickstart`, `ipc-cli`, `fendermin
 Log files live inside the container at `/root/logs/` (same volume as `/root`, so they persist across restarts):
 
 - `monitor-validator1.log`, `provider-validator1.log` … `monitor-validator6.log`, `provider-validator6.log`
+- `provider-validator1-subnet-b.log` … `provider-validator6-subnet-b.log`
 - `monitor-user1.log`, `provider-user1.log`, `monitor-user2.log`, `provider-user2.log`
 - `relayer-subnet-a-validator1.log` … `relayer-subnet-a-validator4.log` (started by `spin_up_subnet_a_from_container.sh`)
 - `relayer-subnet-b-validator1.log` … `relayer-subnet-b-validator4.log` (started by `spin_up_subnet_b_from_container.sh`)
@@ -150,12 +181,14 @@ Subnet creation (set `WHITELIST` first, e.g. from quickstart output):
 ```bash
 docker exec -e WHITELIST=$WHITELIST bitcoin-ipc ipc-cli \
   --config-path ~/.ipc/validator1/config.toml subnet create \
-  --parent /b4 --min-validators 4 --bottomup-check-period 60 \
-  btc --min-validator-stake 100000000 --min-cross-msg-fee 10 \
-  --validator-whitelist $WHITELIST
+  --parent /b4 --min-validators 4 --bottomup-check-period 10 \
+  btc --min-validator-stake 100000000 --power-unit-exponent 7 --min-cross-msg-fee 10 \
+  --validator-whitelist $WHITELIST \
+  --epoch-length 30 --min-timeout 1 --max-timeout 2000 --min-deposit 330 \
+  --kill-vote-period 36 --kill-delay-period 5
 ```
 
-Other commands (balance, etc.): use the same `ipc-cli --config-path ~/.ipc/validatorN/config.toml` (or `userN`) inside the container.
+Other commands (balance, etc.): use the same `ipc-cli --config-path ~/.ipc/validatorN/config.toml` (or `userN`) inside the container; for subnet B, `~/.ipc/validatorN/subnet-b.config.toml` (see "Unilateral exit and EOTS keys").
 
 
 ## Troubleshooting
