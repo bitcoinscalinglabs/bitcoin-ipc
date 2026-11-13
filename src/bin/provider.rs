@@ -67,24 +67,12 @@ async fn main() -> std::io::Result<()> {
 
     // Load validator secret key
     let validator = load_validator()?;
-    let eots_signer = match load_secret_key("EOTS_SK_PATH", "EOTS")? {
-        Some(sk) => {
-            let Some(seed) = load_hex32("EOTS_SEED_PATH", "EOTS nonce seed")? else {
-                error!("EOTS_SEED_PATH is empty: an EOTS key needs the seed of its nonces");
-                return Err(std::io::Error::other("EOTS_SEED_PATH is empty"));
-            };
-            let signer = provider::eots_signer::EotsSigner::load(
-                sk,
-                bitcoin_ipc::eots::EotsSeed::from_bytes(seed),
-                &PathBuf::from(std::env::var("EOTS_SK_PATH").expect("set above")),
-            )
-            .map_err(|e| std::io::Error::other(format!("EOTS sign record: {e}")))?;
-            let signer = Arc::new(std::sync::Mutex::new(signer));
-            build_nonce_trees(db.clone(), signer.clone());
-            Some(signer)
+    let eots_keys = eots_keys()?.map(Arc::new);
+    if let Some(keys) = &eots_keys {
+        for signer in keys.signers() {
+            build_nonce_trees(db.clone(), signer);
         }
-        None => None,
-    };
+    }
 
     // Start up the actix-web server
 
@@ -95,7 +83,7 @@ async fn main() -> std::io::Result<()> {
         btc_rpc,
         btc_watchonly_rpc,
         validator,
-        eots_signer,
+        eots_keys,
     });
 
     provider::Server::new(token, port, server_data)
@@ -182,33 +170,54 @@ fn load_secret_key(
 
 /// The 32 bytes in the hex file named by `var`, `None` when `var` is unset or empty.
 fn load_hex32(var: &str, what: &str) -> Result<Option<[u8; 32]>, std::io::Error> {
-    let path = match std::env::var(var) {
-        Ok(path) if !path.is_empty() => PathBuf::from(path),
-        _ => {
-            warn!("{var} is empty: no {what} loaded");
-            return Ok(None);
-        }
+    let Some(path) = env_path(var) else {
+        warn!("{var} is empty: no {what} loaded");
+        return Ok(None);
     };
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        error!("Couldn't read {what} from {}: {}", path.display(), e);
-        std::io::Error::other(format!("Couldn't read {what}: {}", e))
-    })?;
-    let text = text.trim();
-    let text = text.strip_prefix("0x").unwrap_or(text);
-    let bytes = hex::decode(text).map_err(|e| {
-        error!("Invalid hex encoding in {what} file: {}", e);
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid hex encoding in {what} file: {}", e),
-        )
-    })?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        error!("Invalid {what}: not 32 bytes");
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid {what}: not 32 bytes"),
-        )
+    let bytes = provider::eots_signer::read_hex32(&path).map_err(|e| {
+        error!("Couldn't read {what}: {e}");
+        std::io::Error::other(format!("Couldn't read {what}: {e}"))
     })?;
     info!("Loaded {what} from {}.", path.display());
     Ok(Some(bytes))
+}
+
+/// The EOTS keys: the key of `EOTS_SK_PATH` and `EOTS_SEED_PATH`, if set, and one per subnet in
+/// the directory of the validator key file, where a join-ue generates them. `None` without a
+/// validator key file and a configured key.
+fn eots_keys() -> Result<Option<provider::eots_keys::EotsKeys>, std::io::Error> {
+    let configured = match (env_path("EOTS_SK_PATH"), env_path("EOTS_SEED_PATH")) {
+        (Some(key), Some(seed)) => Some(provider::eots_signer::EotsKeyFiles { key, seed }),
+        (Some(_), None) => {
+            error!("EOTS_SEED_PATH is empty: an EOTS key needs the seed of its nonces");
+            return Err(std::io::Error::other("EOTS_SEED_PATH is empty"));
+        }
+        (None, _) => None,
+    };
+    let key_file =
+        env_path("VALIDATOR_SK_PATH").or_else(|| configured.as_ref().map(|f| f.key.clone()));
+    let Some(key_file) = key_file else {
+        warn!("VALIDATOR_SK_PATH and EOTS_SK_PATH are empty: no EOTS key");
+        return Ok(None);
+    };
+    let dir = provider::eots_keys::key_dir(&key_file);
+    let keys =
+        provider::eots_keys::EotsKeys::load(dir.clone(), configured.as_ref()).map_err(|e| {
+            error!("EOTS keys: {e}");
+            std::io::Error::other(format!("EOTS keys: {e}"))
+        })?;
+    info!(
+        "EOTS keys: {} held, a join-ue generates the key of a new subnet in {}",
+        keys.signers().len(),
+        dir.display()
+    );
+    Ok(Some(keys))
+}
+
+/// The path in the environment variable `var`, `None` when unset or empty.
+fn env_path(var: &str) -> Option<PathBuf> {
+    env::var(var)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }

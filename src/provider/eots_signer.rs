@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
 use heed::types::{SerdeBincode, Str};
 use heed::{Database, Env, EnvOpenOptions};
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -95,6 +95,97 @@ pub enum EotsSignerError {
     RootsFile(String),
     #[error("the build of a nonce subtree failed")]
     SubtreeBuild,
+    #[error("key file {path}: {reason}")]
+    KeyFile { path: PathBuf, reason: String },
+}
+
+/// The files of the EOTS key and its nonce seed, each a 32-byte secret as 64 hex characters.
+#[derive(Clone, Debug)]
+pub struct EotsKeyFiles {
+    pub key: PathBuf,
+    pub seed: PathBuf,
+}
+
+impl EotsKeyFiles {
+    /// `eots.<txid20>.sk` and `eots.<txid20>.seed` of `subnet_id` in `dir`, the directory of
+    /// the validator key file.
+    pub fn of_subnet(dir: &Path, subnet_id: SubnetId) -> Self {
+        Self {
+            key: super::eots_keys::subnet_file(dir, subnet_id, "sk"),
+            seed: super::eots_keys::subnet_file(dir, subnet_id, "seed"),
+        }
+    }
+
+    /// The signer of the EOTS key held in the files, `None` when the key file does not exist.
+    /// A key file without its seed file is an error.
+    pub fn load(&self) -> Result<Option<EotsSigner>, EotsSignerError> {
+        if !self.key.exists() {
+            return Ok(None);
+        }
+        let key = read_hex32(&self.key)?;
+        let seed = read_hex32(&self.seed)?;
+        self.signer(key, seed).map(Some)
+    }
+
+    /// The signer of the EOTS key held in the files, generating the key and its nonce seed when
+    /// neither file exists. The seed file is written first, so a key file never exists without
+    /// it: a seed file alone, left by an interrupted generation, gets its key. An existing file
+    /// is never replaced.
+    pub fn load_or_create(&self) -> Result<EotsSigner, EotsSignerError> {
+        if self.key.exists() {
+            return self.load()?.ok_or_else(|| EotsSignerError::KeyFile {
+                path: self.key.clone(),
+                reason: "the file disappeared".to_string(),
+            });
+        }
+        let mut rng = rand::thread_rng();
+        let seed = if self.seed.exists() {
+            read_hex32(&self.seed)?
+        } else {
+            let seed = *EotsSeed::new(&mut rng).as_bytes();
+            write_secret_hex32(&self.seed, &seed)?;
+            seed
+        };
+        let key = SecretKey::new(&mut rng).secret_bytes();
+        write_secret_hex32(&self.key, &key)?;
+        self.signer(key, seed)
+    }
+
+    fn signer(&self, key: [u8; 32], seed: [u8; 32]) -> Result<EotsSigner, EotsSignerError> {
+        let secret_key = SecretKey::from_slice(&key).map_err(|e| EotsSignerError::KeyFile {
+            path: self.key.clone(),
+            reason: e.to_string(),
+        })?;
+        EotsSigner::load(secret_key, EotsSeed::from_bytes(seed), &self.key)
+    }
+}
+
+/// The 32 bytes of a hex file, with or without `0x`.
+pub fn read_hex32(path: &Path) -> Result<[u8; 32], EotsSignerError> {
+    let key_file = |reason: String| EotsSignerError::KeyFile {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| key_file(e.to_string()))?;
+    let text = text.trim();
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    let bytes = hex::decode(text).map_err(|e| key_file(format!("invalid hex: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| key_file("not 32 bytes".to_string()))
+}
+
+/// Writes a 32-byte secret as 64 hex characters to `path`, complete and on disk before it
+/// appears there, readable by its owner only.
+fn write_secret_hex32(path: &Path, bytes: &[u8; 32]) -> Result<(), EotsSignerError> {
+    super::eots_keys::write_durably(path, format!("{}\n", hex::encode(bytes)).as_bytes()).map_err(
+        |e| EotsSignerError::KeyFile {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        },
+    )?;
+    info!("Generated {}", path.display());
+    Ok(())
 }
 
 impl EotsSigner {
@@ -445,6 +536,7 @@ impl Trees {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     use super::*;
@@ -463,6 +555,80 @@ mod tests {
         // Vote records are keyed by SubnetId's string form, which depends on this process-global.
         crate::eth_utils::set_fvm_network();
         EotsSigner::load(secret_key(), seed(), &dir.join("eots.sk")).unwrap()
+    }
+
+    #[test]
+    fn key_files_are_generated_once_and_never_replaced() {
+        crate::eth_utils::set_fvm_network();
+        let dir = tempfile::tempdir().unwrap();
+        let files =
+            EotsKeyFiles::of_subnet(&dir.path().join("keys"), SubnetId::from_txid20(&[7u8; 20]));
+        let txid20 = hex::encode([7u8; 20]);
+        assert_eq!(files.key, dir.path().join(format!("keys/eots.{txid20}.sk")));
+        assert_eq!(
+            files.seed,
+            dir.path().join(format!("keys/eots.{txid20}.seed"))
+        );
+        assert!(files.load().unwrap().is_none(), "no key file, no signer");
+
+        let created = files.load_or_create().unwrap();
+        for path in [&files.key, &files.seed] {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert_eq!(text.trim().len(), 64, "{}", path.display());
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            read_hex32(&files.key).unwrap(),
+            created.secret_key().secret_bytes()
+        );
+        assert_eq!(read_hex32(&files.seed).unwrap(), *created.seed().as_bytes());
+        drop(created);
+
+        // One vote database opens once per process: each signer is dropped before the next.
+        let loaded = files.load().unwrap().expect("the key file exists");
+        let (pk_eots, seed) = (loaded.pk_eots(), loaded.seed());
+        drop(loaded);
+        let again = files.load_or_create().unwrap();
+        assert_eq!(again.pk_eots(), pk_eots);
+        assert_eq!(again.seed(), seed);
+        drop(again);
+
+        // A seed file without its key file, left by an interrupted generation, gets its key
+        // and keeps the seed. A key file without its seed file is an error, never a new seed.
+        let (key_before, seed_before) = (
+            read_hex32(&files.key).unwrap(),
+            read_hex32(&files.seed).unwrap(),
+        );
+        std::fs::remove_file(&files.key).unwrap();
+        let seed_only = files.load_or_create().unwrap();
+        assert_eq!(*seed_only.seed().as_bytes(), seed_before);
+        assert_ne!(seed_only.secret_key().secret_bytes(), key_before);
+        drop(seed_only);
+        std::fs::remove_file(&files.seed).unwrap();
+        assert!(files.load().is_err(), "a key file without its seed file");
+        assert!(files.load_or_create().is_err());
+        assert_eq!(read_hex32(&files.seed).is_ok(), false, "no new seed");
+    }
+
+    #[test]
+    fn hex_files_accept_a_0x_prefix_and_refuse_other_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eots.sk");
+        std::fs::write(&path, format!("0x{}\n", hex::encode([7u8; 32]))).unwrap();
+        assert_eq!(read_hex32(&path).unwrap(), [7u8; 32]);
+        std::fs::write(&path, hex::encode([7u8; 31])).unwrap();
+        assert!(read_hex32(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("not 32 bytes"));
+        std::fs::write(&path, "zz").unwrap();
+        assert!(read_hex32(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid hex"));
     }
 
     #[test]

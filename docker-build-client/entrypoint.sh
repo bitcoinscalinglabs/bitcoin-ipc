@@ -79,21 +79,15 @@ SNAPSHOT_LENGTH=$SNAPSHOT_LENGTH
 MONITOR_SYNC_BATCH_SIZE=$MONITOR_SYNC_BATCH_SIZE
 RUST_LOG=$RUST_LOG
 EOF
-# Optional validator key: the provider signs unstake with it. Without it, the provider
-# still serves queries, join and stake.
-VALIDATOR_SK=/root/.ipc/validator.sk
-if [ -f "$VALIDATOR_SK" ]; then
-  echo "VALIDATOR_SK_PATH=$VALIDATOR_SK" >> /etc/bsl/stack.env
-  echo "==> provider signs with $VALIDATOR_SK"
-fi
-
 # ipc-cli operates on the subnet "as viewed by the parent", so the config entry is
 # the parent id (e.g. /b4), not the full child subnet id; commands pass --subnet.
+PARENT_ID="${SUBNET_ID%/*}"
+[ -n "$PARENT_ID" ] || PARENT_ID="$SUBNET_ID"
 cat > /root/.ipc/config.toml <<EOF
 keystore_path = "~/.ipc"
 
 [[subnets]]
-id = "${SUBNET_ID%/*}"
+id = "$PARENT_ID"
 
 [subnets.config]
 network_type = "btc"
@@ -120,6 +114,26 @@ EOF
 }
 append_fevm_subnet "$SUBNET_ID"  "$URL"
 append_fevm_subnet "$SUBNET_ID2" "$URL2"
+
+# The validator key: a btc key of the ipc-cli wallet, created when the file is missing, exported
+# for the provider, which signs join-ue, stake and unstake with it. The EOTS key and nonce seed
+# of each subnet are generated next to it by the join-ue to the subnet.
+VALIDATOR_SK=/root/.ipc/validator.sk
+if [ ! -s "$VALIDATOR_SK" ]; then
+  VALIDATOR_ADDR=$(ipc-cli wallet new --wallet-type btc | sed -n 's/^Created IPC wallet with address: //p')
+  ipc-cli wallet export --wallet-type btc --address "$VALIDATOR_ADDR" --hex > "$VALIDATOR_SK"
+fi
+echo "VALIDATOR_SK_PATH=$VALIDATOR_SK" >> /etc/bsl/stack.env
+# The wallet address of the validator key, for `join-ue --from`.
+VALIDATOR_ADDR=""
+for addr in $(ipc-cli wallet list --wallet-type btc 2>/dev/null | sed -n 's/^Address: //p'); do
+  if [ "$(ipc-cli wallet export --wallet-type btc --address "$addr" --hex)" = \
+       "$(tr -d '[:space:]' < "$VALIDATOR_SK" | sed 's/^0x//')" ]; then
+    VALIDATOR_ADDR=$addr
+    break
+  fi
+done
+echo "==> validator address: ${VALIDATOR_ADDR:-not in the ipc-cli wallet}"
 
 echo "==> starting monitor"
 monitor --env /etc/bsl/stack.env &

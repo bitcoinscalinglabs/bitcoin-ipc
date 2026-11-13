@@ -17,15 +17,15 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::eots::{signature_from_bytes, signature_to_bytes, EotsNonceCommitment, Signature64};
-use crate::slash::{PostedSlashSignatures, SlashSignatureEntry};
 use crate::bitcoin_utils::get_fee_rate;
 use crate::bitcoin_utils::{self, submit_to_mempool, tagged_sha256, verify_schnorr_bytes};
 use crate::db;
+use crate::eots::{signature_from_bytes, signature_to_bytes, EotsNonceCommitment, Signature64};
 use crate::eth_utils::eth_addr_from_x_only_pubkey;
 use crate::eth_utils::ETH_ADDR_LEN;
 use crate::multisig;
 use crate::multisig::create_subnet_multisig_address;
+use crate::slash::{PostedSlashSignatures, SlashSignatureEntry};
 use crate::wallet;
 use crate::NETWORK;
 
@@ -344,7 +344,10 @@ impl IpcValidate for IpcCreateSubnetMsg {
             return Err(field("power_unit_exponent", "Must be at most 15"));
         }
         if self.min_validator_stake < self.power_unit() {
-            return Err(field("min_validator_stake", "Must be at least one power unit"));
+            return Err(field(
+                "min_validator_stake",
+                "Must be at least one power unit",
+            ));
         }
         if self.min_validators == 0 {
             return Err(field("min_validators", "Must be greater than 0"));
@@ -365,7 +368,10 @@ impl IpcValidate for IpcCreateSubnetMsg {
             return Err(field("bottomup_check_period", "Must be greater than 0"));
         }
         if self.active_validators_limit < self.min_validators {
-            return Err(field("active_validators_limit", "Must be at least min_validators"));
+            return Err(field(
+                "active_validators_limit",
+                "Must be at least min_validators",
+            ));
         }
         if usize::from(self.active_validators_limit) > MAX_WHITELIST_SIZE {
             return Err(field("active_validators_limit", "Must be at most 350"));
@@ -386,7 +392,10 @@ impl IpcValidate for IpcCreateSubnetMsg {
             return Err(field("max_timeout", "Must be at least min_timeout"));
         }
         if self.min_deposit < P2TR_DUST_LIMIT {
-            return Err(field("min_deposit", "Must be at least the 330 sat dust limit"));
+            return Err(field(
+                "min_deposit",
+                "Must be at least the 330 sat dust limit",
+            ));
         }
         if self.kill_vote_period == 0 {
             return Err(field("kill_vote_period", "Must be greater than 0"));
@@ -536,7 +545,10 @@ impl IpcCreateSubnetMsg {
         Amount::from_sat(10u64.pow(u32::from(self.power_unit_exponent)))
     }
 
-    pub fn power_of(&self, collateral: &Amount) -> Result<multisig::Power, multisig::MultisigError> {
+    pub fn power_of(
+        &self,
+        collateral: &Amount,
+    ) -> Result<multisig::Power, multisig::MultisigError> {
         multisig::collateral_to_power(collateral, &self.min_validator_stake, &self.power_unit())
     }
 
@@ -960,11 +972,7 @@ impl IpcJoinUeMsg {
     }
 
     fn unsigned_bytes_of(committed: &[u8], nonce_commitment_signature: &Signature64) -> Vec<u8> {
-        [
-            committed,
-            &signature_to_bytes(nonce_commitment_signature),
-        ]
-        .concat()
+        [committed, &signature_to_bytes(nonce_commitment_signature)].concat()
     }
 
     fn unsigned_bytes(&self) -> Vec<u8> {
@@ -1055,13 +1063,14 @@ impl IpcJoinUeMsg {
         })
     }
 
-    /// Submits the commit and reveal transactions, the collateral naming the first configuration
-    /// of `context`. Returns the reveal txid.
-    pub fn submit_to_bitcoin(
+    /// Builds the commit and reveal transactions with the wallet, the collateral naming the
+    /// first configuration of `context`, and checks them against the monitor's rules at the
+    /// next Bitcoin block height. Nothing is sent.
+    pub fn build_transactions(
         &self,
         rpc: &bitcoincore_rpc::Client,
         context: &crate::collateral::JoinContext,
-    ) -> Result<Txid, IpcLibError> {
+    ) -> Result<(Transaction, Transaction), IpcLibError> {
         use bitcoincore_rpc::RpcApi;
 
         let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -1081,7 +1090,7 @@ impl IpcJoinUeMsg {
         };
         let return_address = wallet::get_new_address(rpc)?;
 
-        info!("Submitting join-ue msg to bitcoin. Data={:?}", self);
+        info!("Building the join-ue transactions. Data={:?}", self);
 
         let (commit_tx, reveal_tx) = bitcoin_utils::create_commit_reveal_txs(
             rpc,
@@ -1097,20 +1106,12 @@ impl IpcJoinUeMsg {
             .map_err(bitcoin_utils::BitcoinUtilsError::from)?
             + 1;
         crate::collateral::check_join_ue(&secp, &reveal_tx, 0, &commit_tx, next_height, context)?;
-
-        let reveal_txid = reveal_tx.compute_txid();
         debug!(
             "Join-ue commit_txid={} reveal_txid={}",
             commit_tx.compute_txid(),
-            reveal_txid
+            reveal_tx.compute_txid()
         );
-
-        submit_to_mempool(rpc, vec![commit_tx, reveal_tx])?;
-        info!(
-            "Submitted join-ue msg for subnet_id={} join_txid={}",
-            self.join.subnet_id, reveal_txid
-        );
-        Ok(reveal_txid)
+        Ok((commit_tx, reveal_tx))
     }
 }
 
@@ -1324,14 +1325,22 @@ impl IpcPrefundSubnetMsg {
         rpc: &bitcoincore_rpc::Client,
         multisig_address: &bitcoin::Address,
     ) -> Result<Txid, IpcLibError> {
+        let prefund_tx = self.build_transaction(rpc, multisig_address)?;
+        self.submit_transaction(rpc, prefund_tx)
+    }
+
+    /// Builds, funds and signs the prefund transaction with the wallet, without sending it.
+    pub fn build_transaction(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        multisig_address: &bitcoin::Address,
+    ) -> Result<Transaction, IpcLibError> {
         info!(
-            "Submitting pre-fund subnet msg to bitcoin. Multisig address = {}. Amount={}",
+            "Building pre-fund subnet msg for bitcoin. Multisig address = {}. Amount={}",
             multisig_address, self.amount
         );
 
         let release_address = wallet::get_new_address(rpc)?;
-
-        // Construct, fund and sign the prefund transaction
 
         let fee_rate = get_fee_rate(rpc, None, None);
         let prefund_tx = self.to_tx(fee_rate, multisig_address, &release_address)?;
@@ -1340,9 +1349,15 @@ impl IpcPrefundSubnetMsg {
         trace!("Prefund funded TX: {prefund_tx:?}");
         let prefund_tx = crate::wallet::sign_tx(rpc, prefund_tx)?;
         trace!("Prefund signed TX: {prefund_tx:?}");
+        Ok(prefund_tx)
+    }
 
-        // Submit the prefund transaction to the mempool
-
+    /// Sends a prefund transaction of `build_transaction` to the mempool, returning its txid.
+    pub fn submit_transaction(
+        &self,
+        rpc: &bitcoincore_rpc::Client,
+        prefund_tx: Transaction,
+    ) -> Result<Txid, IpcLibError> {
         let prefund_txid = prefund_tx.compute_txid();
         match submit_to_mempool(rpc, vec![prefund_tx]) {
             Ok(_) => {
@@ -5290,10 +5305,7 @@ pub enum IpcMessage {
     StakeCollateral(IpcStakeCollateralMsg),
     UnstakeCollateral(IpcUnstakeCollateralMsg),
     KillSubnet(IpcKillSubnetMsg),
-    JoinUe {
-        input: usize,
-        msg: IpcJoinUeMsg,
-    },
+    JoinUe { input: usize, msg: IpcJoinUeMsg },
 }
 
 impl IpcMessage {

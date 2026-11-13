@@ -1,3 +1,4 @@
+pub mod eots_keys;
 pub mod eots_signer;
 pub mod rpc;
 mod server;

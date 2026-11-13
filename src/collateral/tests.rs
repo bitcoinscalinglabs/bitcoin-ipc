@@ -2137,7 +2137,9 @@ fn chain_join_ue_and_exit() {
         &eots_key_of(&keypair.x_only_public_key().0),
         test_commitment(),
     );
-    let reveal_txid = msg.submit_to_bitcoin(rpc, &context()).unwrap();
+    let (commit, reveal) = msg.build_transactions(rpc, &context()).unwrap();
+    let reveal_txid = reveal.compute_txid();
+    crate::bitcoin_utils::submit_to_mempool(rpc, vec![commit, reveal]).unwrap();
     rpc.generate_to_address(1, &mine_to).unwrap();
     let join_height = rpc.get_block_count().unwrap();
     assert_eq!(join_height, tip + 1);
