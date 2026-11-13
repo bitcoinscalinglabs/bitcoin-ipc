@@ -13,7 +13,7 @@ The image is built from [`docker-build-client/`](../../docker-build-client/). It
 - Docker.
 - A full node of the chosen network (mainnet, testnet or regtest) that serves any transaction by its txid (Bitcoin Core: `txindex=1`), whose RPC the container reaches.
 - A funded wallet on that node, named by `FUND_WALLET`. It pays the fees, and for a validator also the collateral. The client loads the wallet but does not create it.
-- For a validator: a validator key in the client ([validator key](#validator-key)).
+- For a validator: nothing more; the client creates the validator key ([validator key](#validator-key)).
 
 ## Configuration
 
@@ -87,24 +87,23 @@ curl -s -X POST http://127.0.0.1:3030/api \
 
 ## Validator key
 
-A validator creates its validator key in the client and gives it to the provider, which signs the validator's join and checkpoints with it.
+The client creates the validator key in its key volume when it first starts, and prints its address:
 
 ```bash
-docker exec bsl-client ipc-cli wallet new --wallet-type btc
+docker logs bsl-client 2>&1 | grep 'validator address'
 ```
 
-Output: `Created IPC wallet with address: <validator-address>`.
+The line reads `==> validator address: 0x…`. `XonlyPubKey` is the validator public key, the key that goes into a subnet's whitelist:
 
 ```bash
 docker exec bsl-client ipc-cli wallet list --wallet-type btc | grep -v 'Secret key'
 ```
 
-`XonlyPubKey` is the validator public key, the key that goes into a subnet's whitelist.
+## Join a subnet
 
 ```bash
-docker exec bsl-client ipc-cli wallet export --wallet-type btc --address <validator-address> --hex --output /root/.ipc/validator.sk
-docker restart bsl-client
-docker logs bsl-client 2>&1 | grep 'provider signs with'
+docker exec bsl-client ipc-cli subnet join-ue --from <validator-address> --subnet <subnet-id> --collateral <sats> --ip <ip:port> --backup-address <address> --epochs <n>
+docker exec bsl-client ipc-cli subnet unstake-ue --subnet <subnet-id>
 ```
 
-The last command prints `==> provider signs with /root/.ipc/validator.sk`. The key stays in the volume `bsl-client-keys`.
+Each subnet can be joined once per client; a second join of the same subnet is refused before any transaction is sent. `unstake-ue` pays the matured collateral, minus the fee, to the backup address.
