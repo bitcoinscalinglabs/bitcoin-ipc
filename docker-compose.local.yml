@@ -50,6 +50,13 @@ services:
       - EMISSION_CHAIN_FEATURES=${EMISSION_CHAIN_FEATURES:-false}
       - ACTIVATION_HEIGHT=${ACTIVATION_HEIGHT:-}
       - SNAPSHOT_LENGTH=${SNAPSHOT_LENGTH:-}
+      # Fendermint RocksDB write buffers and write-ahead log cap, passed on when set
+      # (ipc/fendermint/app/config/default.toml [db]).
+      - FM_DB__WRITE_BUFFER_SIZE
+      - FM_DB__MAX_WRITE_BUFFER_NUMBER
+      - FM_DB__MAX_WRITE_BUFFER_SIZE_TO_MAINTAIN
+      - FM_DB__DB_WRITE_BUFFER_SIZE
+      - FM_DB__MAX_TOTAL_WAL_SIZE
       # Unilateral exit (join-ue) is on from this Bitcoin block height; the subnet bootstrap scripts need it
       - UE_ACTIVATION_HEIGHT=${UE_ACTIVATION_HEIGHT:-1}
       # IPC addresses and whitelist (default values, can be overridden from host)

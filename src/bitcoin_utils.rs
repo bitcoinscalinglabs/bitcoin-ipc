@@ -633,13 +633,17 @@ pub fn commit_transaction<E>(
 /// transaction `reveal`, by a transaction before `reveal` in `block_txs` (the transactions of its
 /// Bitcoin block, at `block_height`), or by a transaction in the Bitcoin blocks from the commit
 /// transaction's up to the one before `reveal`'s. Only when the commit transaction is in an
-/// earlier Bitcoin block, `commit_height` gives the height of its Bitcoin block and `block_at` the
-/// transactions of the Bitcoin block at a height.
+/// earlier Bitcoin block, `unspent_at` gives the height of a Bitcoin chain tip at which `outpoint`
+/// is unspent, if it is: from a tip at `block_height` or above, `outpoint` was unspent before
+/// `reveal` and no earlier Bitcoin block is read. Otherwise `commit_height` gives the height of the
+/// commit transaction's Bitcoin block and `block_at` the transactions of the Bitcoin block at a
+/// height.
 pub fn spent_before_reveal<E>(
     outpoint: &OutPoint,
     reveal: &Transaction,
     block_height: u64,
     block_txs: &[Transaction],
+    unspent_at: impl FnOnce(&OutPoint) -> Result<Option<u64>, E>,
     commit_height: impl FnOnce(&Txid) -> Result<u64, E>,
     mut block_at: impl FnMut(u64) -> Result<Vec<Transaction>, E>,
 ) -> Result<bool, E> {
@@ -659,7 +663,7 @@ pub fn spent_before_reveal<E>(
         }
         commit_in_block |= txid == outpoint.txid;
     }
-    if commit_in_block {
+    if commit_in_block || unspent_at(outpoint)?.is_some_and(|tip| tip >= block_height) {
         return Ok(false);
     }
     for height in commit_height(&outpoint.txid)?..block_height {
@@ -1158,6 +1162,7 @@ mod tests {
             ),
         ];
         for (case, reveal, block_txs, chain, spent, heights) in cases {
+            let mut tip_asked = false;
             let mut commit_asked = None;
             let mut asked = vec![];
             let result = spent_before_reveal(
@@ -1165,6 +1170,10 @@ mod tests {
                 reveal,
                 10,
                 &block_txs,
+                |_| {
+                    tip_asked = true;
+                    Ok(None)
+                },
                 |txid| {
                     commit_asked = Some(*txid);
                     Ok::<_, &str>(7)
@@ -1180,8 +1189,43 @@ mod tests {
             );
             assert_eq!(result, Ok(spent), "{case}");
             assert_eq!(asked, heights, "{case}");
+            assert_eq!(tip_asked, !heights.is_empty(), "{case}");
             let commit_lookup = (!heights.is_empty()).then(|| commit.compute_txid());
             assert_eq!(commit_asked, commit_lookup, "{case}");
+        }
+    }
+
+    #[test]
+    fn spent_before_reveal_reads_no_bitcoin_block_when_unspent_at_the_tip() {
+        let (commit, reveal, _, _) = collateral_spends();
+        let outpoint = OutPoint::new(commit.compute_txid(), 1);
+        let block_txs = [reveal.clone()];
+        // The reveal transaction is at height 10: (height of the tip at which the output is
+        // unspent, whether Bitcoin blocks are read).
+        for (tip, read) in [
+            (Some(10), false),
+            (Some(12), false),
+            (Some(9), true),
+            (None, true),
+        ] {
+            let mut asked = vec![];
+            let result = spent_before_reveal(
+                &outpoint,
+                &reveal,
+                10,
+                &block_txs,
+                |asked_outpoint| {
+                    assert_eq!(*asked_outpoint, outpoint);
+                    Ok::<_, &str>(tip)
+                },
+                |_| Ok(7),
+                |height| {
+                    asked.push(height);
+                    Ok(vec![])
+                },
+            );
+            assert_eq!(result, Ok(false), "{tip:?}");
+            assert_eq!(!asked.is_empty(), read, "{tip:?}");
         }
     }
 
@@ -1196,6 +1240,19 @@ mod tests {
                 &reveal,
                 10,
                 &block_txs,
+                |_| Err("no tip"),
+                |_| Ok(7),
+                |_| Ok(vec![])
+            ),
+            Err("no tip")
+        );
+        assert_eq!(
+            spent_before_reveal(
+                &outpoint,
+                &reveal,
+                10,
+                &block_txs,
+                |_| Ok(None),
                 |_| Err("no commit"),
                 |_| Ok(vec![])
             ),
@@ -1207,6 +1264,7 @@ mod tests {
                 &reveal,
                 10,
                 &block_txs,
+                |_| Ok(None),
                 |_| Ok(7),
                 |height| {
                     if height == 8 {

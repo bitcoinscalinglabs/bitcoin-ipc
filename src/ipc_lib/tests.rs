@@ -425,8 +425,8 @@ fn the_batches_the_checkpoint_pays_are_credited_to_its_own_record() {
     assert_eq!(credited(&db, &a), vec![30_000, 40_000]);
     assert_eq!(credited(&db, &b), vec![50_000]);
 
-    // The same reveal processed again changes nothing
-    process_batch(&db, &reveal, 0).unwrap();
+    // The same reveal processed again finds no saved checkpoint transaction and changes nothing
+    rejected(process_batch(&db, &reveal, 0), "not found in database");
     assert_eq!(credited(&db, &a), vec![30_000, 40_000]);
 }
 
@@ -511,7 +511,10 @@ fn a_second_batch_transfer_for_the_same_checkpoint_is_rejected() {
     let tx = checkpoint_tx(&msg, &source);
     record_checkpoint(&db, &msg, &tx);
     let reveal = reveal_of(&msg, &tx);
+    assert!(db.get_transaction(&tx.compute_txid()).unwrap().is_some());
     process_batch(&db, &reveal, 0).unwrap();
+    // Applying the batch deletes the saved checkpoint transaction
+    assert!(db.get_transaction(&tx.compute_txid()).unwrap().is_none());
 
     // The same data in another reveal of the same commitment output
     let mut again = reveal.clone();
@@ -520,11 +523,21 @@ fn a_second_batch_transfer_for_the_same_checkpoint_is_rejected() {
         script_pubkey: bitcoin::ScriptBuf::new_op_return([1]),
     });
     assert_ne!(again.compute_txid(), reveal.compute_txid());
-    rejected(
-        process_batch(&db, &again, 0),
-        "already has the batch transfer",
-    );
+    rejected(process_batch(&db, &again, 0), "not found in database");
     assert_eq!(credited(&db, &a), vec![1_000]);
+}
+
+#[test]
+fn only_a_checkpoint_transaction_with_batch_data_has_a_commitment_output() {
+    set_test_fvm_network();
+    let source = test_utils::generate_subnet(3);
+    let a = test_utils::generate_subnet(2);
+    let without = checkpoint_msg(&source, 1, vec![], vec![]);
+    let with = checkpoint_msg(&source, 2, vec![], vec![transfer(&a, 1_000)]);
+    let has_commitment_output =
+        |msg| IpcCheckpointSubnetMsg::has_commitment_output(&checkpoint_tx(msg, &source)).unwrap();
+    assert!(!has_commitment_output(&without));
+    assert!(has_commitment_output(&with));
 }
 
 #[test]

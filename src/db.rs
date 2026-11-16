@@ -83,11 +83,19 @@ fn subnet_genesis_info_key(subnet_id: SubnetId) -> String {
 }
 
 fn rootnet_msgs_prefix(subnet_id: SubnetId) -> String {
-    format!("{ROOTNET_MSGS_KEY}:{}", subnet_id)
+    format!("{ROOTNET_MSGS_KEY}:{}:", subnet_id)
 }
 
-fn rootnet_msgs_key(subnet_id: SubnetId, nonce: u64) -> String {
-    format!("{ROOTNET_MSGS_KEY}:{}:{}", subnet_id, nonce)
+fn rootnet_msgs_height_prefix(subnet_id: SubnetId, block_height: u64) -> String {
+    format!("{}{:020}:", rootnet_msgs_prefix(subnet_id), block_height)
+}
+
+fn rootnet_msgs_key(subnet_id: SubnetId, block_height: u64, nonce: u64) -> String {
+    format!(
+        "{}{:020}",
+        rootnet_msgs_height_prefix(subnet_id, block_height),
+        nonce
+    )
 }
 
 fn checkpoints_key(subnet_id: SubnetId, number: u64) -> String {
@@ -107,11 +115,88 @@ fn epoch_committee_key(subnet_id: SubnetId, epoch: u64) -> String {
 }
 
 fn stake_changes_prefix(subnet_id: SubnetId) -> String {
-    format!("{STAKE_CHANGES_KEY}:{}", subnet_id)
+    format!("{STAKE_CHANGES_KEY}:{}:", subnet_id)
 }
 
-fn stake_change_key(subnet_id: SubnetId, configuration_number: u64) -> String {
-    format!("{STAKE_CHANGES_KEY}:{}:{}", subnet_id, configuration_number)
+fn stake_changes_height_prefix(subnet_id: SubnetId, block_height: u64) -> String {
+    format!("{}{:020}:", stake_changes_prefix(subnet_id), block_height)
+}
+
+fn stake_change_key(subnet_id: SubnetId, block_height: u64, configuration_number: u64) -> String {
+    format!(
+        "{}{:020}",
+        stake_changes_height_prefix(subnet_id, block_height),
+        configuration_number
+    )
+}
+
+// Rootnet messages and configuration updates are keyed by Bitcoin height, then number. Numbers
+// grow with the height, so key order is number order.
+
+/// The number that ends a key of a rootnet message or a configuration update.
+fn number_in_key(key: &str) -> Result<u64, DbError> {
+    key.rsplit(':')
+        .next()
+        .and_then(|number| number.parse().ok())
+        .ok_or_else(|| DbError::TypeConversionError(format!("No number at the end of key {key}")))
+}
+
+/// The last key under `prefix`, without decoding its value.
+fn last_key<DC>(
+    db: &HeedDatabase<Str, DC>,
+    txn: &RoTxn,
+    prefix: &str,
+) -> Result<Option<String>, DbError> {
+    Ok(db
+        .remap_data_type::<DecodeIgnore>()
+        .rev_prefix_iter(txn, prefix)?
+        .next()
+        .transpose()?
+        .map(|(key, ())| key.to_owned()))
+}
+
+/// The key under `prefix` that ends with `number`, searched back from the last key.
+fn numbered_key<DC>(
+    db: &HeedDatabase<Str, DC>,
+    txn: &RoTxn,
+    prefix: &str,
+    number: u64,
+) -> Result<Option<String>, DbError> {
+    for entry in db
+        .remap_data_type::<DecodeIgnore>()
+        .rev_prefix_iter(txn, prefix)?
+    {
+        let (key, ()) = entry?;
+        let found = number_in_key(key)?;
+        if found <= number {
+            return Ok((found == number).then(|| key.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Refuses `key`, numbered `number`, unless it is the next key under `prefix`: numbered one after
+/// the last key (`first` under an empty prefix), at a Bitcoin height not below the last key's.
+fn check_next_key<DC>(
+    db: &HeedDatabase<Str, DC>,
+    txn: &RoTxn,
+    prefix: &str,
+    key: &str,
+    number: u64,
+    first: u64,
+) -> Result<(), DbError> {
+    let last = last_key(db, txn, prefix)?;
+    let next = match &last {
+        Some(last) => number_in_key(last)? + 1,
+        None => first,
+    };
+    if number != next || last.is_some_and(|last| key <= last.as_str()) {
+        return Err(DbError::KeyModificationError(
+            key.to_string(),
+            format!("the next number is {next}, at a Bitcoin height not below the last one"),
+        ));
+    }
+    Ok(())
 }
 
 fn kill_requests_prefix(subnet_id: SubnetId) -> String {
@@ -791,6 +876,14 @@ impl RootnetMessage {
             RootnetMessage::ErcRegistration { nonce, .. } => *nonce,
         }
     }
+
+    pub fn block_height(&self) -> u64 {
+        match self {
+            RootnetMessage::FundSubnet { block_height, .. } => *block_height,
+            RootnetMessage::ErcTransfer { block_height, .. } => *block_height,
+            RootnetMessage::ErcRegistration { block_height, .. } => *block_height,
+        }
+    }
 }
 
 // Staking
@@ -1328,7 +1421,9 @@ pub trait DatabaseCore {
         txn: &RoTxn,
         txid: &Txid,
     ) -> Result<Option<bitcoin::Transaction>, DbError>;
+    /// Saves `tx` without its witnesses, which leave its txid unchanged.
     fn save_transaction(&self, txn: &mut RwTxn, tx: &bitcoin::Transaction) -> Result<(), DbError>;
+    fn delete_transaction(&self, txn: &mut RwTxn, txid: &Txid) -> Result<(), DbError>;
 
     // Committees
     fn get_committee(
@@ -1824,29 +1919,13 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<RootnetMessage>, DbError> {
-        let prefix = rootnet_msgs_prefix(subnet_id);
+        let prefix = rootnet_msgs_height_prefix(subnet_id, block_height);
         let txn = self.env.read_txn()?;
 
         let msgs_iter = self.rootnet_msgs_db.prefix_iter(&txn, &prefix)?;
 
         let msgs = msgs_iter
             .map(|res| res.map(|(_, msg)| msg))
-            .filter_map(|res| match res {
-                Ok(msg) => {
-                    let height = match &msg {
-                        RootnetMessage::FundSubnet { block_height, .. } => *block_height,
-                        RootnetMessage::ErcTransfer { block_height, .. } => *block_height,
-                        RootnetMessage::ErcRegistration { block_height, .. } => *block_height,
-                    };
-                    // Only include messages within the specified height range
-                    if height == block_height {
-                        Some(Ok(msg))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(Err(e)),
-            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(msgs)
@@ -1857,17 +1936,9 @@ impl DatabaseCore for HeedDb {
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<Option<u64>, DbError> {
-        let prefix = rootnet_msgs_prefix(subnet_id);
-        let msgs_iter = self.rootnet_msgs_db.prefix_iter(txn, &prefix)?;
-        let count: u64 = msgs_iter.count().try_into().map_err(|_| {
-            DbError::TypeConversionError("max rootnet messages reached".to_string())
-        })?;
-
-        if count == 0 {
-            return Ok(None);
-        }
-
-        Ok(Some(count - 1))
+        last_key(&self.rootnet_msgs_db, txn, &rootnet_msgs_prefix(subnet_id))?
+            .map(|key| number_in_key(&key))
+            .transpose()
     }
 
     fn get_next_rootnet_msg_nonce(&self, subnet_id: SubnetId) -> Result<u64, DbError> {
@@ -1904,10 +1975,12 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         nonce: u64,
     ) -> Result<Option<RootnetMessage>, DbError> {
-        let key = rootnet_msgs_key(subnet_id, nonce);
         let txn = self.env.read_txn()?;
-        let msg = self.rootnet_msgs_db.get(&txn, &key)?;
-        Ok(msg)
+        let prefix = rootnet_msgs_prefix(subnet_id);
+        match numbered_key(&self.rootnet_msgs_db, &txn, &prefix, nonce)? {
+            Some(key) => Ok(self.rootnet_msgs_db.get(&txn, &key)?),
+            None => Ok(None),
+        }
     }
 
     fn add_rootnet_msg(
@@ -1916,7 +1989,9 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         msg: RootnetMessage,
     ) -> Result<(), DbError> {
-        let key = rootnet_msgs_key(subnet_id, msg.nonce());
+        let key = rootnet_msgs_key(subnet_id, msg.block_height(), msg.nonce());
+        let prefix = rootnet_msgs_prefix(subnet_id);
+        check_next_key(&self.rootnet_msgs_db, txn, &prefix, &key, msg.nonce(), 0)?;
         trace!("Add rootnet msg: {msg:#?}");
         self.rootnet_msgs_db.put(txn, &key, &msg)?;
         Ok(())
@@ -1985,9 +2060,18 @@ impl DatabaseCore for HeedDb {
         let txid = tx.compute_txid();
         let key = transaction_key(&txid);
 
-        let tx_bytes = bitcoin::consensus::serialize(tx);
+        let mut tx = tx.clone();
+        tx.input
+            .iter_mut()
+            .for_each(|input| input.witness = bitcoin::Witness::new());
+        let tx_bytes = bitcoin::consensus::serialize(&tx);
         self.transactions_db.put(txn, &key, &tx_bytes)?;
 
+        Ok(())
+    }
+
+    fn delete_transaction(&self, txn: &mut RwTxn, txid: &Txid) -> Result<(), DbError> {
+        self.transactions_db.delete(txn, &transaction_key(txid))?;
         Ok(())
     }
 
@@ -2077,9 +2161,11 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         configuration_number: u64,
     ) -> Result<Option<StakeChangeRequest>, DbError> {
-        let key = stake_change_key(subnet_id, configuration_number);
-        let change = self.stake_changes_db.get(txn, &key)?;
-        Ok(change)
+        let prefix = stake_changes_prefix(subnet_id);
+        match numbered_key(&self.stake_changes_db, txn, &prefix, configuration_number)? {
+            Some(key) => Ok(self.stake_changes_db.get(txn, &key)?),
+            None => Ok(None),
+        }
     }
 
     fn get_all_stake_changes(
@@ -2113,21 +2199,17 @@ impl DatabaseCore for HeedDb {
         let prefix = stake_changes_prefix(subnet_id);
         let txn = self.env.read_txn()?;
 
-        let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
+        // Confirmation goes in number order: the unconfirmed changes are the last ones.
+        let changes_iter = self.stake_changes_db.rev_prefix_iter(&txn, &prefix)?;
 
-        let changes = changes_iter
+        let mut changes = changes_iter
             .map(|res| res.map(|(_, change)| change))
-            .filter_map(|res| match res {
-                Ok(change) => {
-                    if change.checkpoint_block_height.is_none() {
-                        Some(Ok(change))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(Err(e)),
+            .take_while(|res| {
+                res.as_ref()
+                    .map_or(true, |change| change.checkpoint_block_height.is_none())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        changes.reverse();
 
         Ok(changes)
     }
@@ -2139,23 +2221,13 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         block_height: u64,
     ) -> Result<Vec<StakeChangeRequest>, DbError> {
-        let prefix = stake_changes_prefix(subnet_id);
+        let prefix = stake_changes_height_prefix(subnet_id, block_height);
         let txn = self.env.read_txn()?;
 
         let changes_iter = self.stake_changes_db.prefix_iter(&txn, &prefix)?;
 
         let changes = changes_iter
             .map(|res| res.map(|(_, change)| change))
-            .filter_map(|res| match res {
-                Ok(change) => {
-                    if change.block_height == block_height {
-                        Some(Ok(change))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(Err(e)),
-            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(changes)
@@ -2174,18 +2246,15 @@ impl DatabaseCore for HeedDb {
         txn: &RoTxn,
         subnet_id: SubnetId,
     ) -> Result<u64, DbError> {
-        let prefix = stake_changes_prefix(subnet_id);
-        let changes_iter = self.stake_changes_db.prefix_iter(txn, &prefix)?;
-        let count: u64 = changes_iter
-            .count()
-            .try_into()
-            .map_err(|_| DbError::TypeConversionError("max stake changes reached".to_string()))?;
-
-        if count == 0 {
-            return Ok(GENESIS_COMMITTEE_CONF_NUM);
+        let last = last_key(
+            &self.stake_changes_db,
+            txn,
+            &stake_changes_prefix(subnet_id),
+        )?;
+        match last {
+            Some(key) => number_in_key(&key),
+            None => Ok(GENESIS_COMMITTEE_CONF_NUM),
         }
-
-        Ok(count)
     }
 
     fn get_next_stake_change_configuration_number(
@@ -2211,7 +2280,11 @@ impl DatabaseCore for HeedDb {
         subnet_id: SubnetId,
         stake_change: StakeChangeRequest,
     ) -> Result<(), DbError> {
-        let key = stake_change_key(subnet_id, stake_change.configuration_number);
+        let number = stake_change.configuration_number;
+        let key = stake_change_key(subnet_id, stake_change.block_height, number);
+        let prefix = stake_changes_prefix(subnet_id);
+        let first = GENESIS_COMMITTEE_CONF_NUM + 1;
+        check_next_key(&self.stake_changes_db, txn, &prefix, &key, number, first)?;
         trace!("Add stake change: {stake_change:#?}");
         self.stake_changes_db.put(txn, &key, &stake_change)?;
         Ok(())
@@ -2225,42 +2298,28 @@ impl DatabaseCore for HeedDb {
         confirmed_block_height: u64,
         confirmed_block_hash: BlockHash,
     ) -> Result<(Option<StakeChangeRequest>, Vec<StakeChangeRequest>), DbError> {
-        // Get all stake changes for the subnet
-        let stake_changes = self.get_all_stake_changes_txn(txn, subnet_id)?;
-
-        // Filter unconfirmed stake changes that are up to the specified configuration number
-        let mut last_confirmed: Option<StakeChangeRequest> = None;
-        let mut confirmed_changes = Vec::new();
-
-        for mut change in stake_changes {
-            // Only process changes that:
-            // 1. Are not yet confirmed (checkpoint_block_height is None)
-            // 2. Have a configuration number <= max_configuration_number
-            if change.checkpoint_block_height.is_none()
-                && change.configuration_number <= max_configuration_number
-            {
-                // Set the confirmation details
-                change.checkpoint_block_height = Some(confirmed_block_height);
-                change.checkpoint_block_hash = Some(confirmed_block_hash);
-
-                // Update in the database
-                let key = stake_change_key(subnet_id, change.configuration_number);
-                self.stake_changes_db.put(txn, &key, &change)?;
-
-                // Update the last confirmed change if this one has a higher configuration number
-                if last_confirmed
-                    .as_ref()
-                    .is_none_or(|last| change.configuration_number > last.configuration_number)
-                {
-                    last_confirmed = Some(change.clone());
-                }
-
-                // Add to the list of confirmed changes
-                confirmed_changes.push(change);
+        // Confirmation goes in number order: the unconfirmed changes are the last ones.
+        let prefix = stake_changes_prefix(subnet_id);
+        let mut unconfirmed = Vec::new();
+        for entry in self.stake_changes_db.rev_prefix_iter(txn, &prefix)? {
+            let (key, change) = entry?;
+            if change.checkpoint_block_height.is_some() {
+                break;
+            }
+            if change.configuration_number <= max_configuration_number {
+                unconfirmed.push((key.to_owned(), change));
             }
         }
 
-        Ok((last_confirmed, confirmed_changes))
+        let mut confirmed_changes = Vec::with_capacity(unconfirmed.len());
+        for (key, mut change) in unconfirmed.into_iter().rev() {
+            change.checkpoint_block_height = Some(confirmed_block_height);
+            change.checkpoint_block_hash = Some(confirmed_block_hash);
+            self.stake_changes_db.put(txn, &key, &change)?;
+            confirmed_changes.push(change);
+        }
+
+        Ok((confirmed_changes.last().cloned(), confirmed_changes))
     }
 
     fn add_kill_request(

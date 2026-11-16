@@ -1997,6 +1997,31 @@ pub(crate) struct CheckpointOutputs {
 }
 
 impl CheckpointOutputs {
+    /// The indices in a checkpoint transaction of `output_count` outputs with these counts from
+    /// its OP_RETURN data. Without transfer batches, the output count tells whether there is a
+    /// commitment output. Only a kill checkpoint with unstakes has no change: they take its
+    /// remainder.
+    fn parsed(
+        output_count: usize,
+        withdrawals: usize,
+        batches: usize,
+        unstakes: usize,
+        kill: bool,
+    ) -> Self {
+        let without_commitment = CheckpointOutputs {
+            withdrawals,
+            has_commitment: false,
+            batches,
+            unstakes,
+        };
+        let has_change = !(kill && unstakes > 0);
+        CheckpointOutputs {
+            has_commitment: batches > 0
+                || output_count > without_commitment.change() + usize::from(has_change),
+            ..without_commitment
+        }
+    }
+
     pub(crate) fn withdrawal(&self, i: usize) -> usize {
         1 + i
     }
@@ -2144,6 +2169,23 @@ impl IpcCheckpointSubnetMsg {
         let killed = op_return_data[Self::FLAGS_OFFSET] & Self::FLAG_KILL != 0;
 
         Ok((withdrawal_count, transfer_count, unstake_count, killed))
+    }
+
+    /// Whether the checkpoint transaction `tx` has a commitment output.
+    pub fn has_commitment_output(tx: &bitcoin::Transaction) -> Result<bool, IpcLibError> {
+        let metadata_tx_out = tx.output.first().ok_or_else(|| {
+            IpcLibError::MsgParseError(IPC_CHECKPOINT_TAG, "No outputs".to_string())
+        })?;
+        let (withdrawals, batches, unstakes, kill) =
+            Self::extract_markers_from_metadata_tx_out(metadata_tx_out)?;
+        let outputs = CheckpointOutputs::parsed(
+            tx.output.len(),
+            withdrawals.into(),
+            batches.into(),
+            unstakes.into(),
+            kill,
+        );
+        Ok(outputs.has_commitment)
     }
 
     pub(crate) fn checkpoint_outputs(&self) -> CheckpointOutputs {
@@ -2710,20 +2752,13 @@ impl IpcCheckpointSubnetMsg {
         let kill_checkpoint = flags & Self::FLAG_KILL != 0;
         let rotation_checkpoint = flags & Self::FLAG_ROTATION != 0;
 
-        // Without transfer batches, the output count tells whether there is a commitment output.
-        // Only a kill checkpoint with unstakes has no change: they take its remainder.
-        let without_commitment = CheckpointOutputs {
-            withdrawals: withdrawals_count,
-            has_commitment: false,
-            batches: batch_transfers_count,
-            unstakes: unstakes_count,
-        };
-        let has_change = !(kill_checkpoint && unstakes_count > 0);
-        let outputs = CheckpointOutputs {
-            has_commitment: batch_transfers_count > 0
-                || tx.output.len() > without_commitment.change() + usize::from(has_change),
-            ..without_commitment
-        };
+        let outputs = CheckpointOutputs::parsed(
+            tx.output.len(),
+            withdrawals_count,
+            batch_transfers_count,
+            unstakes_count,
+            kill_checkpoint,
+        );
         let expected_outputs = outputs.change();
 
         if tx.output.len() < expected_outputs {
@@ -3399,8 +3434,9 @@ impl IpcBatchTransferMsg {
         })
     }
 
-    /// Applies the batch to its checkpoint and returns the updated checkpoint record. A batch
-    /// already applied is a no-op.
+    /// Applies the batch to its checkpoint and returns the updated checkpoint record. Applying it
+    /// deletes the saved checkpoint transaction, so a later batch for the same checkpoint is not
+    /// found.
     pub fn process<D: db::DatabaseCore>(
         &mut self,
         db: &D,
@@ -3609,6 +3645,8 @@ impl IpcBatchTransferMsg {
             &checkpoint,
             checkpoint.checkpoint_number,
         )?;
+        // The checkpoint transaction is kept only for its batch-transfer transaction.
+        db.delete_transaction(&mut wtxn, &self.checkpoint_txid)?;
 
         // Process each transfer and create rootnet messages for destination subnets
         for transfer in &self.transfers {

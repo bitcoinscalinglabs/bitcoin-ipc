@@ -1136,6 +1136,36 @@ async fn finalize_checkpoint_psbt_with_a_malformed_signature_below_the_threshold
     assert!(wallet.0.lock().unwrap().submitted.is_empty());
 }
 
+/// A checkpoint transaction whose sending stalls at the node leaves a read-only method answering
+/// on this single-threaded runtime.
+#[tokio::test]
+async fn a_stalled_checkpoint_transaction_leaves_a_read_only_method_answering() {
+    let (_dir, wallet, data, mut params, posted) = checkpoint_to_finalize(&[1, 2, 3]).await;
+    params.signatures = posted;
+    let gate = Arc::new(Gate::default());
+    wallet.0.lock().unwrap().gate = Some(gate.clone());
+    let finalizing = tokio::spawn(finalize_checkpoint_psbt(
+        Data::new(data.clone()),
+        Params(params),
+    ));
+    while !gate.stalled() {
+        tokio::task::yield_now().await;
+    }
+    assert!(get_confirmed_block_height(Data::new(data.clone()))
+        .await
+        .is_ok());
+    assert!(
+        gate.held(),
+        "answered while the checkpoint transaction waited"
+    );
+    gate.open();
+    finalizing
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("finalize failed: {}", serde_json::to_string(&e).unwrap()));
+    assert_eq!(wallet.0.lock().unwrap().submitted.len(), 1);
+}
+
 #[tokio::test]
 async fn checkpoint_carrying_slash_pre_signatures_without_them_is_rejected() {
     let f = EpochZeroFixture::new([9000; 4]).await;
@@ -2608,17 +2638,14 @@ async fn the_lagging_monitor_check_uses_the_tip_read_after_the_join_guard() {
     assert_eq!(submitted(&wallet), 4);
 }
 
-#[tokio::test]
-async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
-    let (dir, db) = database().await;
-    let (joined, joining) = (subnet(74), subnet(73));
-    create(&db, joined);
-    create(&db, joining);
-    let wallet = WalletRpc::default();
-    let data = Arc::new(provider_with_keys(db, dir.path(), &wallet, None));
-
-    // The join to `joined` is accepted: its EOTS key signs the subnet's votes
-    let txid = join(&data, joined, (7, 50)).unwrap();
+/// Joins `id` from a wallet that has sent nothing before and processes the join as accepted
+/// after three other joins: the subnet starts and the new EOTS key signs its votes.
+fn accepted_join(
+    data: &ServerData,
+    wallet: &WalletRpc,
+    id: SubnetId,
+) -> crate::collateral::CheckedJoinUe {
+    let txid = join(data, id, (7, 50)).unwrap();
     let reveal = wallet.0.lock().unwrap().submitted[1].clone();
     let [(_, IpcMessage::JoinUe { msg, .. })] = &IpcMessage::from_reveal_inputs(&reveal)[..] else {
         panic!("the reveal carries one join-ue message");
@@ -2636,7 +2663,7 @@ async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
         process_join_ue(
             &*data.db,
             &mut txn,
-            &checked(joined, owner, 30 + owner, owner),
+            &checked(id, owner, 30 + owner, owner),
             Txid::from_byte_array([owner; 32]),
             98,
             BlockHash::from_byte_array([98; 32]),
@@ -2653,6 +2680,18 @@ async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
     )
     .unwrap();
     txn.commit().unwrap();
+    accepted
+}
+
+#[tokio::test]
+async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
+    let (dir, db) = database().await;
+    let (joined, joining) = (subnet(74), subnet(73));
+    create(&db, joined);
+    create(&db, joining);
+    let wallet = WalletRpc::default();
+    let data = Arc::new(provider_with_keys(db, dir.path(), &wallet, None));
+    let accepted = accepted_join(&data, &wallet, joined);
 
     // A join to `joining` stalls at the node while sending, on this single-threaded runtime
     let gate = Arc::new(Gate::default());
@@ -2683,7 +2722,7 @@ async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
     .await
     .unwrap_or_else(|e| panic!("{}", serde_json::to_string(&e).unwrap()));
     assert_eq!(vote.height, 10);
-    assert_eq!(vote.pk_eots, msg.pk_eots.to_string());
+    assert_eq!(vote.pk_eots, accepted.msg.pk_eots.to_string());
     assert_eq!(
         get_confirmed_block_height(Data::new(data.clone()))
             .await
@@ -2695,6 +2734,65 @@ async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
     gate.open();
     assert!(stalled.await.unwrap().is_ok());
     assert_eq!(submitted(&wallet), 4);
+}
+
+/// `signeotsvote` waiting for the EOTS key, which another signing holds, leaves a read-only
+/// method answering on this single-threaded runtime; the EOTS vote is stored when it is returned.
+#[tokio::test]
+async fn signeotsvote_waiting_for_the_eots_key_leaves_a_read_only_method_answering() {
+    let (dir, db) = database().await;
+    let id = subnet(74);
+    create(&db, id);
+    let wallet = WalletRpc::default();
+    let data = Arc::new(provider_with_keys(db, dir.path(), &wallet, None));
+    accepted_join(&data, &wallet, id);
+    let signer = eots_signer_of(&data, id)
+        .ok()
+        .flatten()
+        .expect("the EOTS key of the subnet");
+
+    let gate = Arc::new(Gate::default());
+    let holder = std::thread::spawn({
+        let (signer, gate) = (signer.clone(), gate.clone());
+        move || {
+            let _held = signer.lock().unwrap();
+            gate.wait();
+        }
+    });
+    while !gate.stalled() {
+        tokio::task::yield_now().await;
+    }
+    let signing = tokio::spawn(sign_eots_vote(
+        Data::new(data.clone()),
+        Params(SignEotsVoteParams {
+            subnet_id: id,
+            height: 10,
+            block_hash: hex::encode([0x1a; 32]),
+        }),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        get_confirmed_block_height(Data::new(data.clone()))
+            .await
+            .ok(),
+        Some(100)
+    );
+    assert!(gate.held(), "answered while the EOTS key was held");
+    assert!(
+        !signing.is_finished(),
+        "the EOTS vote waits for the EOTS key"
+    );
+    gate.open();
+    holder.join().unwrap();
+    let vote = signing
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("{}", serde_json::to_string(&e).unwrap()));
+    let stored = signer.lock().unwrap().signed(id, 10).unwrap();
+    assert_eq!(
+        stored.map(|stored| EotsVoteJson::from(&stored).signature),
+        Some(vote.signature)
+    );
 }
 
 #[tokio::test]

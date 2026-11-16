@@ -133,6 +133,13 @@ echo "Subnet created in block number ${BLOCK_NUM} (hash: ${BLOCK_HASH})"
 SUBNET_CREATED_AT=$(date -u +"%Y-%m-%d %H:%M:%SZ")
 SUBNET_CREATED_HEIGHT="$BLOCK_NUM"
 
+# miner_hold / miner_resume: pause and continue the devnet miner (scripts/miner.sh, same container). With no new
+# Bitcoin block the monitor, which polls the node every 2 s, reaches the node's tip, and a join is not refused while
+# it waits for the monitor to catch up with the node.
+miner_hold() { pkill -STOP -f 'scripts/miner\.sh' || true; }
+miner_resume() { pkill -CONT -f 'scripts/miner\.sh' || true; }
+trap miner_resume EXIT
+
 # 3. Join the subnet with 4 validators using fixed collateral amounts and per-validator bearer token/port
 join_ue() {
     local name=$1
@@ -162,7 +169,24 @@ join_ue() {
 JSON
 )
     echo "Calling joinsubnet (join-ue) for ${name}..."
-    rpc_post_raw_or_die "joinsubnet (${name})" "$api_url" "$bearer" "$payload" | jq
+    # With the miner paused, sent again every 0.5 s, up to 60 s, while the provider refuses it because it waits for
+    # the monitor to catch up with the node (refused before any transaction); any other error fails at once
+    local out rc deadline=$((SECONDS + 60))
+    miner_hold
+    while :; do
+      rc=0; out=$(rpc_post_raw_or_die "joinsubnet (${name})" "$api_url" "$bearer" "$payload" 2>&1) || rc=$?
+      if [ "$rc" -ne 0 ] && grep -qF 'join-ue waits until it has caught up with the node' <<< "$out" \
+        && [ "$SECONDS" -lt "$deadline" ]; then
+        sleep 0.5; continue
+      fi
+      break
+    done
+    miner_resume
+    if [ "$rc" -ne 0 ]; then
+      echo "$out" >&2
+      exit 1
+    fi
+    echo "$out" | jq
 }
 
 join_ue validator1 "$VAL1_API_URL" "$VAL1_BEARER_TOKEN" "$COLLATERAL1" "66.222.44.55:8080" "5f0dfed3a527ac740c7d4a594cd3aa1059a936187399fc49e3fc6ea6ae177268"

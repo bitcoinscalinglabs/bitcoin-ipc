@@ -482,11 +482,34 @@ capture_node_logs() {
 }
 track_node_logs() { OUTAGE_LOG_NODE="$1"; OUTAGE_LOG_SINCE="$2"; OUTAGE_LOG_LABEL="$3"; }
 
+# miner_hold / miner_resume: pause and continue the devnet miner (scripts/miner.sh, same container). With no new
+# Bitcoin block the monitor, which polls the node every 2 s, reaches the node's tip, and a join is not refused while
+# it waits for the monitor to catch up with the node.
+miner_hold() { pkill -STOP -f 'scripts/miner\.sh' || true; }
+miner_resume() { pkill -CONT -f 'scripts/miner\.sh' || true; }
+
+# join_ue_retrying <join-ue command...>: runs the command with the miner paused, and again every 0.5 s, up to 60 s,
+# while its output says the provider waits for the monitor to catch up with the node (refused before any
+# transaction); resumes the miner, prints the last output and returns the last exit code
+join_ue_retrying() {
+  local out rc deadline=$((SECONDS + 60))
+  miner_hold
+  while :; do
+    rc=0; out=$("$@" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ] && grep -qF 'join-ue waits until it has caught up with the node' <<< "$out" \
+      && [ "$SECONDS" -lt "$deadline" ]; then
+      sleep 0.5; continue
+    fi
+    miner_resume
+    printf '%s\n' "$out"; return "$rc"
+  done
+}
+
 # join_ue <n> <epochs>: validator n joins with join-ue; records its backup address and txids
 join_ue() {
   local n="$1" epochs="$2" out
   BACKUP[$n]=$(new_btc_address)
-  if ! out=$(cli "$n" subnet join-ue --from "$(evm "$n")" --subnet "$SUBNET" --collateral "$COLLATERAL" \
+  if ! out=$(join_ue_retrying cli "$n" subnet join-ue --from "$(evm "$n")" --subnet "$SUBNET" --collateral "$COLLATERAL" \
     --ip "${IP_PREFIX}$((n - 1))" --backup-address "${BACKUP[$n]}" --epochs "$epochs" 2>&1); then
     echo "$out"; fail "join-ue of validator$n"
   fi
@@ -1055,9 +1078,14 @@ step_spent_commitment_queries() {
 step_rejoin() {
   say "9. validator 5 cannot join again after the rotation: a key joins a subnet once"
   local cfg_before; cfg_before=$(config_number)
-  expect_fail "second join-ue of validator5 refused by the provider" cli 5 subnet join-ue --from "$(evm 5)" \
+  local rc=0
+  join_ue_retrying cli 5 subnet join-ue --from "$(evm 5)" \
     --subnet "$SUBNET" --collateral "$COLLATERAL" --ip "${IP_PREFIX}4" --backup-address "${BACKUP[5]}" \
-    --epochs "$EPOCHS_V5"
+    --epochs "$EPOCHS_V5" > "$LOGS/rejoin-validator5.log" 2>&1 || rc=$?
+  cat "$LOGS/rejoin-validator5.log"
+  check "second join-ue of validator5 refused by the provider" test "$rc" -ne 0
+  check "the refusal rejects a validator key that already joined" \
+    grep -iE 'already joined|already registered in subnet|joins.*once|joined.*before|registered.*before|earlier.*join' "$LOGS/rejoin-validator5.log"
   wait_blocks 1
   check "committee still of 4" [ "$(committee_size)" -eq 4 ]
   check "no waiting committee" [ "$(waiting_size)" -eq 0 ]
@@ -1148,7 +1176,7 @@ PY
   CHECKPOINT_TIMEOUT=$((3 * EPOCH_LENGTH)) wait_for "subnet B's monitor has set H_0" 0 subnet_b_active
   before=$(provider_reply 1 geteotskeys "{\"subnet_id\":\"$PAIR_B\"}" b | jq -ceS '.result | sort_by(.pubkey)')
   backup=$(new_btc_address)
-  timeout 30 ipc-cli --config-path /root/.ipc/validator1/config.toml \
+  join_ue_retrying timeout 30 ipc-cli --config-path /root/.ipc/validator1/config.toml \
     subnet join-ue --from "$(evm 1)" --subnet "$PAIR_B" --collateral "$COLLATERAL" \
     --ip "${IP_PREFIX}0" --backup-address "$backup" --epochs "$EPOCHS_BOOTSTRAP" \
     > "$LOGS/spec-subnet-b-join-via-3030.log" 2>&1 || rc=$?
@@ -1739,6 +1767,7 @@ finish_step() {
   case "$status" in 130|143) interrupted="$status" ;; esac
   trap - EXIT ERR
   set +e
+  miner_resume
   if grep -q '^FAIL' "$STEP_CHECKS"; then status=1; fi
   if ! restore_outage_components "$status"; then
     printf 'FAIL\tinterrupted component restoration failed\n' >> "$STEP_CHECKS"

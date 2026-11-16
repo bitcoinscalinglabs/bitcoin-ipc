@@ -98,6 +98,19 @@ pub struct EotsVote {
     pub proof: Vec<[u8; 32]>,
 }
 
+impl EotsVote {
+    /// The encoding of the EOTS vote: the postcard tuple of its fields.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("an EOTS vote encodes")
+    }
+
+    /// Decodes bytes that are exactly the encoding of an EOTS vote.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let vote: Self = postcard::from_bytes(bytes).ok()?;
+        (vote.to_bytes() == bytes).then_some(vote)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EotsError {
     #[error("height {0} is outside the committed range")]
@@ -968,6 +981,15 @@ mod tests {
         expected.extend_from_slice(&[5; 32]);
         expected.extend_from_slice(&[6; 32]);
         assert_eq!(bytes, expected);
+        assert_eq!(vote.to_bytes(), expected);
+        assert_eq!(EotsVote::from_bytes(&expected), Some(vote));
+        let mut longer = expected.clone();
+        longer.push(0);
+        assert_eq!(EotsVote::from_bytes(&longer), None);
+        // The start 1 as a two-byte varint.
+        let mut padded = expected;
+        padded.splice(130..131, [0x81, 0x00]);
+        assert_eq!(EotsVote::from_bytes(&padded), None);
     }
 
     fn range_commitment(start: u64, count: u32) -> EotsNonceCommitment {

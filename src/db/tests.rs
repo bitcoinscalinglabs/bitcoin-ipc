@@ -365,6 +365,162 @@ fn test_rootnet_message_nonce_many_messages() {
 }
 
 #[test]
+fn test_rootnet_messages_in_nonce_order_and_refused_out_of_order() {
+    let db = create_test_db();
+    let subnet_id = generate_subnet_id();
+    let msg = |nonce, block_height| create_test_rootnet_message(subnet_id, nonce, block_height);
+    let nonces = |msgs: Vec<RootnetMessage>| msgs.iter().map(|m| m.nonce()).collect::<Vec<_>>();
+
+    // Nonces 0 to 9 at Bitcoin height 100, 10 and 11 at 101
+    let mut wtxn = db.write_txn().unwrap();
+    for nonce in 0..12 {
+        let block_height = if nonce < 10 { 100 } else { 101 };
+        db.add_rootnet_msg(&mut wtxn, subnet_id, msg(nonce, block_height))
+            .unwrap();
+    }
+    // Neither a nonce other than the next one, nor a lower Bitcoin height
+    for (nonce, block_height) in [(11, 101), (13, 101), (12, 100)] {
+        let result = db.add_rootnet_msg(&mut wtxn, subnet_id, msg(nonce, block_height));
+        assert!(result.is_err(), "{nonce} at {block_height}");
+    }
+    wtxn.commit().unwrap();
+
+    let all = db.get_all_rootnet_msgs(subnet_id).unwrap();
+    assert_eq!(nonces(all), (0..12).collect::<Vec<_>>());
+    let at_101 = db.get_rootnet_msgs_by_height(subnet_id, 101).unwrap();
+    assert_eq!(nonces(at_101), vec![10, 11]);
+    assert!(db
+        .get_rootnet_msgs_by_height(subnet_id, 102)
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.get_next_rootnet_msg_nonce(subnet_id).unwrap(), 12);
+    let tenth = db.get_rootnet_msg(subnet_id, 10).unwrap();
+    assert_eq!(tenth.map(|m| m.nonce()), Some(10));
+    assert!(db.get_rootnet_msg(subnet_id, 12).unwrap().is_none());
+}
+
+#[test]
+fn test_stake_changes_by_height_number_and_confirmation() {
+    let db = create_test_db();
+    let subnet_id = generate_subnet_id();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+    let validator_xpk = XOnlyPublicKey::from_keypair(&secret_key.keypair(&secp)).0;
+    let validator = SubnetValidator {
+        pubkey: validator_xpk,
+        subnet_address: create_rand_eth_addr(),
+        power: 10,
+        collateral: Amount::from_sat(1_000_000),
+        backup_address: Address::from_str("bcrt1qpufku8sca56kmxylyd2233mfmnr9eyc4wdsdmd").unwrap(),
+        ip: "127.0.0.1:8000".parse().unwrap(),
+        join_txid: create_rand_txid(),
+    };
+    let committee = vec![validator].to_committee(&subnet_id, 0);
+    let change = |configuration_number: u64, block_height: u64| StakeChangeRequest {
+        change: StakingChange::Deposit {
+            amount: Amount::from_sat(1_000),
+        },
+        validator_xpk,
+        validator_subnet_address: create_rand_eth_addr(),
+        configuration_number,
+        committee_after_change: committee.clone(),
+        block_height,
+        block_hash: BlockHash::all_zeros(),
+        checkpoint_block_height: None,
+        checkpoint_block_hash: None,
+        txid: Txid::all_zeros(),
+    };
+    let numbers = |changes: Vec<StakeChangeRequest>| {
+        changes
+            .iter()
+            .map(|c| c.configuration_number)
+            .collect::<Vec<_>>()
+    };
+
+    // Change numbers 1 to 10 at Bitcoin height 100, 11 and 12 at 101
+    let mut wtxn = db.write_txn().unwrap();
+    for number in 1..=12 {
+        let block_height = if number <= 10 { 100 } else { 101 };
+        db.add_stake_change(&mut wtxn, subnet_id, change(number, block_height))
+            .unwrap();
+    }
+    // Neither a number other than the next one, nor a lower Bitcoin height
+    for (number, block_height) in [(12, 101), (14, 101), (13, 100)] {
+        let result = db.add_stake_change(&mut wtxn, subnet_id, change(number, block_height));
+        assert!(result.is_err(), "{number} at {block_height}");
+    }
+    wtxn.commit().unwrap();
+
+    let next = db
+        .get_next_stake_change_configuration_number(subnet_id)
+        .unwrap();
+    assert_eq!(next, 13);
+    let all = db.get_all_stake_changes(subnet_id).unwrap();
+    assert_eq!(numbers(all), (1..=12).collect::<Vec<_>>());
+    let at_101 = db.get_stake_changes_by_height(subnet_id, 101).unwrap();
+    assert_eq!(numbers(at_101), vec![11, 12]);
+    let tenth = db.get_stake_change(subnet_id, 10).unwrap();
+    assert_eq!(tenth.map(|c| c.configuration_number), Some(10));
+    assert!(db.get_stake_change(subnet_id, 13).unwrap().is_none());
+
+    // Confirming up to 10, then up to 5 (all confirmed already), then up to 12
+    for (max, last, confirmed, unconfirmed) in [
+        (10, Some(10), (1..=10).collect::<Vec<_>>(), vec![11, 12]),
+        (5, None, vec![], vec![11, 12]),
+        (12, Some(12), vec![11, 12], vec![]),
+    ] {
+        let mut wtxn = db.write_txn().unwrap();
+        let (last_confirmed, changes) = db
+            .confirm_stake_changes(&mut wtxn, subnet_id, max, 200, BlockHash::all_zeros())
+            .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(
+            last_confirmed.map(|c| c.configuration_number),
+            last,
+            "{max}"
+        );
+        assert!(changes
+            .iter()
+            .all(|c| c.checkpoint_block_height == Some(200)));
+        assert_eq!(numbers(changes), confirmed, "{max}");
+        let pending = db.get_unconfirmed_stake_changes(subnet_id).unwrap();
+        assert_eq!(numbers(pending), unconfirmed, "{max}");
+    }
+}
+
+#[test]
+fn test_saved_transaction_keeps_its_txid_without_witnesses() {
+    let db = create_test_db();
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: OutPoint::new(create_rand_txid(), 0),
+            witness: bitcoin::Witness::from_slice(&[[7u8; 64]]),
+            ..Default::default()
+        }],
+        output: vec![bitcoin::TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    };
+    let txid = tx.compute_txid();
+
+    let mut wtxn = db.write_txn().unwrap();
+    db.save_transaction(&mut wtxn, &tx).unwrap();
+    wtxn.commit().unwrap();
+    let saved = db.get_transaction(&txid).unwrap().unwrap();
+    assert_eq!(saved.compute_txid(), txid);
+    assert!(saved.input[0].witness.is_empty());
+    assert_eq!(saved.output, tx.output);
+
+    let mut wtxn = db.write_txn().unwrap();
+    db.delete_transaction(&mut wtxn, &txid).unwrap();
+    wtxn.commit().unwrap();
+    assert!(db.get_transaction(&txid).unwrap().is_none());
+}
+
+#[test]
 fn test_subnet_committee_join_validator() {
     // Setup: Create a subnet ID and initial committee
     let subnet_id = generate_subnet_id();

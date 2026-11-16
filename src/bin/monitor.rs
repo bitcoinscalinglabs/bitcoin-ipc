@@ -824,9 +824,8 @@ where
                 msg.validate()?;
                 let checkpoint = msg.save_to_db(&self.db, txn, block_height, block_hash, txid)?;
 
-                // Save the checkpoint tx to db
-                // we need it available for any batch transfer messages
-                {
+                // Saved for the batch-transfer transaction, which spends the commitment output
+                if ipc_lib::IpcCheckpointSubnetMsg::has_commitment_output(tx)? {
                     let mut wtxn = self.db.nested_write_txn(txn)?;
                     self.db.save_transaction(&mut wtxn, tx)?;
                     wtxn.commit().map_err(db::DbError::from)?;
@@ -915,6 +914,17 @@ where
                     tx,
                     block_height,
                     &block.txdata,
+                    // Unspent at the Bitcoin chain tip, unconfirmed transactions not counted.
+                    |outpoint| -> Result<Option<u64>, bitcoincore_rpc::Error> {
+                        self.rpc
+                            .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))?
+                            .map(|out| {
+                                self.rpc
+                                    .get_block_header_info(&out.bestblock)
+                                    .map(|tip| tip.height as u64)
+                            })
+                            .transpose()
+                    },
                     |txid| -> Result<u64, bitcoincore_rpc::Error> {
                         let hash = self
                             .rpc

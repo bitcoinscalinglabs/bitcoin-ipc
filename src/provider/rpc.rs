@@ -334,6 +334,18 @@ fn node_tip(data: &ServerData) -> Result<u64, JsonRpcError> {
         .map_err(|e| RpcError::InternalError(e.to_string()).into())
 }
 
+/// Runs `work` on a blocking thread, so that the RPC worker that awaits it answers other
+/// requests meanwhile.
+async fn run_blocking<R: Send + 'static>(
+    data: &Arc<ServerData>,
+    work: impl FnOnce(&ServerData) -> Result<R, JsonRpcError> + Send + 'static,
+) -> Result<R, JsonRpcError> {
+    let data = Arc::clone(data);
+    tokio::task::spawn_blocking(move || work(&data))
+        .await
+        .map_err(|e| RpcError::InternalError(e.to_string()))?
+}
+
 /// The number of heights the EOTS nonce commitment of a `join-ue` covers by default.
 pub const DEFAULT_EOTS_NONCE_COUNT: u32 = 100_000;
 
@@ -350,21 +362,17 @@ pub async fn get_block_hash(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetBlockHashParams>,
 ) -> Result<String, JsonRpcError> {
-    let client = data.btc_rpc.as_ref();
-
-    match client.get_block_hash(params.height) {
-        Ok(block_hash) => Ok(block_hash.to_string()),
-        Err(e) => Err(JsonRpcError::internal(e)),
-    }
+    run_blocking(&data, move |data| {
+        match data.btc_rpc.get_block_hash(params.height) {
+            Ok(block_hash) => Ok(block_hash.to_string()),
+            Err(e) => Err(JsonRpcError::internal(e)),
+        }
+    })
+    .await
 }
 
 pub async fn get_block_count(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
-    let client = data.btc_rpc.as_ref();
-
-    match client.get_block_count() {
-        Ok(block_count) => Ok(block_count),
-        Err(e) => Err(RpcError::InternalError(e.to_string()).into()),
-    }
+    run_blocking(&data, node_tip).await
 }
 
 pub async fn get_confirmed_block_height(data: Data<Arc<ServerData>>) -> Result<u64, JsonRpcError> {
@@ -396,9 +404,11 @@ pub async fn create_subnet(
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
-    let subnet_id = msg
-        .submit_to_bitcoin(&data.btc_rpc)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let subnet_id = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     // Return the response
     Ok(CreateSubnetResponse { subnet_id })
@@ -471,7 +481,8 @@ pub async fn join_subnet(
     info!("joinsubnet: {:?} epochs={:?}", msg, epochs);
 
     if epochs.is_some() {
-        check_ue_active(collateral::ue_activation_height(), node_tip(&data)?).map_err(|m| {
+        let tip = run_blocking(&data, node_tip).await?;
+        check_ue_active(collateral::ue_activation_height(), tip).map_err(|m| {
             error!("joinsubnet (join-ue) rejected: {m}");
             JsonRpcError::from(RpcError::InvalidParams(m))
         })?;
@@ -535,11 +546,13 @@ pub async fn join_subnet(
     }
 
     // TODO this check should be done in the Db
-    let multisig_address = &genesis_info.multisig_address();
+    let multisig_address = genesis_info.multisig_address();
 
-    let join_txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, multisig_address)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let join_txid = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     Ok(JoinSubnetResponse { join_txid })
 }
@@ -554,9 +567,9 @@ async fn spawn_join_subnet_ue(
     nonce_range: (u64, u32),
     initial_balance: Option<InitialBalance>,
 ) -> Result<bitcoin::Txid, JsonRpcError> {
-    tokio::task::spawn_blocking(move || {
+    run_blocking(&data, move |data| {
         join_subnet_ue(
-            &data,
+            data,
             &genesis_info,
             join,
             epochs,
@@ -565,7 +578,6 @@ async fn spawn_join_subnet_ue(
         )
     })
     .await
-    .map_err(|e| RpcError::InternalError(format!("join-ue: {e}")))?
 }
 
 /// The join-ue path of `joinsubnet`. The caller has checked the activation switch. One join at a time: the checks, the choice of the EOTS key, the prefund
@@ -1018,6 +1030,13 @@ pub async fn get_subnet_balance(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetSubnetParams>,
 ) -> Result<GetSubnetBalanceResponse, JsonRpcError> {
+    run_blocking(&data, move |data| get_subnet_balance_blocking(data, params)).await
+}
+
+fn get_subnet_balance_blocking(
+    data: &ServerData,
+    params: GetSubnetParams,
+) -> Result<GetSubnetBalanceResponse, JsonRpcError> {
     info!("getsubnetbalance: {}", params.subnet_id);
 
     let subnet_state = data
@@ -1062,7 +1081,7 @@ pub async fn prefund_subnet(
     Params(msg): Params<IpcPrefundSubnetMsg>,
 ) -> Result<PrefundSubnetResponse, JsonRpcError> {
     info!("prefundsubnet: {}", msg.subnet_id);
-    let prefund_txid = submit_prefund(&data, &msg)?;
+    let prefund_txid = run_blocking(&data, move |data| submit_prefund(data, &msg)).await?;
     Ok(PrefundSubnetResponse { prefund_txid })
 }
 
@@ -1155,9 +1174,11 @@ pub async fn fund_subnet(
         genesis_info.multisig_address()
     };
 
-    let fund_txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let fund_txid = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     Ok(FundSubnetResponse { fund_txid })
 }
@@ -1350,6 +1371,16 @@ pub async fn gen_multisig_spend_psbt(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GenMultisigSpendPsbtParams>,
 ) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
+    run_blocking(&data, move |data| {
+        gen_multisig_spend_psbt_blocking(data, params)
+    })
+    .await
+}
+
+fn gen_multisig_spend_psbt_blocking(
+    data: &ServerData,
+    params: GenMultisigSpendPsbtParams,
+) -> Result<GenMultisigSpendPsbtResponse, JsonRpcError> {
     info!("gen_multisig_spend_psbt: {:?}", params);
 
     let (_, validator_sk) = match data.validator {
@@ -1458,7 +1489,17 @@ pub struct GenCheckpointPsbtResponse {
 
 pub async fn gen_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
-    Params(mut params): Params<serde_json::Value>,
+    Params(params): Params<serde_json::Value>,
+) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
+    run_blocking(&data, move |data| {
+        gen_checkpoint_psbt_blocking(data, params)
+    })
+    .await
+}
+
+fn gen_checkpoint_psbt_blocking(
+    data: &ServerData,
+    mut params: serde_json::Value,
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
     // The slash pre-signatures that the checkpoint carries, as posted on the subnet
     let carried = params
@@ -1565,7 +1606,7 @@ pub async fn gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
-    let plan = plan_checkpoint(&data, &genesis_info, &subnet, &mut msg)?;
+    let plan = plan_checkpoint(data, &genesis_info, &subnet, &mut msg)?;
     let unspent = &plan.unspent;
     let mut exhaust_unspent = plan.sweep;
 
@@ -1731,7 +1772,18 @@ pub async fn gen_checkpoint_psbt(
 #[cfg(feature = "dev")]
 pub async fn dev_gen_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
-    Params(mut msg): Params<IpcCheckpointSubnetMsg>,
+    Params(msg): Params<IpcCheckpointSubnetMsg>,
+) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
+    run_blocking(&data, move |data| {
+        dev_gen_checkpoint_psbt_blocking(data, msg)
+    })
+    .await
+}
+
+#[cfg(feature = "dev")]
+fn dev_gen_checkpoint_psbt_blocking(
+    data: &ServerData,
+    mut msg: IpcCheckpointSubnetMsg,
 ) -> Result<GenCheckpointPsbtResponse, JsonRpcError> {
     info!("dev_gen_checkpoint_psbt (no balance check): {:?}", msg);
 
@@ -1805,7 +1857,7 @@ pub async fn dev_gen_checkpoint_psbt(
 
     let fee_rate = bitcoin_utils::get_fee_rate(&data.btc_watchonly_rpc, None, None);
 
-    let plan = plan_checkpoint(&data, &genesis_info, &subnet, &mut msg)?;
+    let plan = plan_checkpoint(data, &genesis_info, &subnet, &mut msg)?;
 
     // balance check intentionally omitted
 
@@ -1972,6 +2024,16 @@ pub struct FinalizeCheckpointPsbtResponse {
 pub async fn finalize_checkpoint_psbt(
     data: Data<Arc<ServerData>>,
     Params(params): Params<FinalizeCheckpointPsbtParams>,
+) -> Result<FinalizeCheckpointPsbtResponse, JsonRpcError> {
+    run_blocking(&data, move |data| {
+        finalize_checkpoint_psbt_blocking(data, params)
+    })
+    .await
+}
+
+fn finalize_checkpoint_psbt_blocking(
+    data: &ServerData,
+    params: FinalizeCheckpointPsbtParams,
 ) -> Result<FinalizeCheckpointPsbtResponse, JsonRpcError> {
     info!("finalize_checkpoint_psbt for subnet {}", params.subnet_id);
 
@@ -2148,9 +2210,11 @@ pub async fn stake_collateral(
 
     let multisig_address = subnet_state.multisig_address();
 
-    let txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, &multisig_address)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let txid = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc, &multisig_address)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     Ok(StakeCollateralResponse { txid })
 }
@@ -2241,9 +2305,11 @@ pub async fn unstake_collateral(
 
     let multisig_address = subnet_state.multisig_address();
 
-    let txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let txid = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     Ok(UnstakeCollateralResponse { txid })
 }
@@ -2263,6 +2329,13 @@ pub struct UnstakeUeResponse {
 pub async fn unstake_ue(
     data: Data<Arc<ServerData>>,
     Params(params): Params<GetSubnetParams>,
+) -> Result<UnstakeUeResponse, JsonRpcError> {
+    run_blocking(&data, move |data| unstake_ue_blocking(data, params)).await
+}
+
+fn unstake_ue_blocking(
+    data: &ServerData,
+    params: GetSubnetParams,
 ) -> Result<UnstakeUeResponse, JsonRpcError> {
     info!("unstakeue: {}", params.subnet_id);
 
@@ -2485,9 +2558,11 @@ pub async fn kill_subnet(
 
     let multisig_address = subnet_state.multisig_address();
 
-    let txid = msg
-        .submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let txid = run_blocking(&data, move |data| {
+        msg.submit_to_bitcoin(&data.btc_rpc, &multisig_address, validator_sk)
+            .map_err(|e| JsonRpcError::internal(e.to_string()))
+    })
+    .await?;
 
     Ok(KillSubnetResponse { txid })
 }
@@ -2544,6 +2619,14 @@ pub struct DevKillSubnetParams {
 pub async fn dev_kill_subnet(
     data: Data<Arc<ServerData>>,
     Params(params): Params<DevKillSubnetParams>,
+) -> Result<Vec<KillSubnetResponse>, JsonRpcError> {
+    run_blocking(&data, move |data| dev_kill_subnet_blocking(data, params)).await
+}
+
+#[cfg(feature = "dev")]
+fn dev_kill_subnet_blocking(
+    data: &ServerData,
+    params: DevKillSubnetParams,
 ) -> Result<Vec<KillSubnetResponse>, JsonRpcError> {
     use std::str::FromStr;
 
@@ -2910,7 +2993,14 @@ pub async fn sign_eots_vote(
     data: Data<Arc<ServerData>>,
     Params(params): Params<SignEotsVoteParams>,
 ) -> Result<EotsVoteJson, JsonRpcError> {
-    let Some(signer) = eots_signer_of(&data, params.subnet_id)? else {
+    run_blocking(&data, move |data| sign_eots_vote_blocking(data, params)).await
+}
+
+fn sign_eots_vote_blocking(
+    data: &ServerData,
+    params: SignEotsVoteParams,
+) -> Result<EotsVoteJson, JsonRpcError> {
+    let Some(signer) = eots_signer_of(data, params.subnet_id)? else {
         return Err(RpcError::InternalError(format!(
             "No EOTS key of subnet {}: a join-ue generates it",
             params.subnet_id

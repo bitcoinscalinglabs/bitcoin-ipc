@@ -1,6 +1,6 @@
 //! Dumps the signed EOTS votes of a recorded state as JSON.
 use bitcoin_ipc::eots::EotsVote;
-use heed::types::{SerdeBincode, Str};
+use heed::types::{Bytes, Str};
 use heed::{Database, EnvFlags, EnvOpenOptions};
 
 #[test]
@@ -16,13 +16,14 @@ fn dump_sign_record() {
             .unwrap()
     };
     let txn = env.read_txn().unwrap();
-    let votes: Database<Str, SerdeBincode<EotsVote>> = env
+    let votes: Database<Str, Bytes> = env
         .open_database(&txn, Some("votes"))
         .unwrap()
         .expect("votes database");
     let mut records = Vec::new();
     for item in votes.iter(&txn).unwrap() {
         let (key, vote) = item.unwrap();
+        let vote = EotsVote::from_bytes(vote).expect("an encoded EOTS vote");
         let (subnet, height) = key.rsplit_once(':').expect("subnet:height database key");
         assert_eq!(
             height.parse::<u64>().unwrap(),

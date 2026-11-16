@@ -62,7 +62,7 @@ The chain records finality in its subnet blocks, because the execution of subnet
 
 The proposer of a subnet block includes in its proposal one consensus message (`EotsFinality`), not a transaction, with:
 
-- The EOTS votes it holds that reach the threshold for the subnet blocks of its chain above the subnet final height, in height order, each height once, up to the subnet block's size limit, if they pass the checks below.
+- For the subnet blocks of its chain above the subnet final height, in height order, each height once, up to the subnet block's size limit: the fewest EOTS votes it holds for the subnet block at that height that pass the checks below and whose powers reach the threshold. It takes them in descending order of power, EOTS votes of equal power in ascending order of `pk_eots`, until their powers reach the threshold.
 - For every `pk_eots` for which it holds [evidence](#double-votes) and no earlier subnet block carries any, one evidence.
 
 Every node checks the proposal and rejects it if a check fails:

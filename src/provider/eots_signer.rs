@@ -1,6 +1,7 @@
 //! The validator's EOTS signer: one vote per subnet height, the votes above the latest
 //! checkpointed height kept in a database next to the key file.
 
+use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -10,8 +11,8 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
-use heed::types::{SerdeBincode, Str};
-use heed::{Database, Env, EnvOpenOptions};
+use heed::types::Str;
+use heed::{BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -29,6 +30,25 @@ const VOTES_DB: &str = "votes";
 /// The database key of a vote, ordered by height within a subnet.
 fn vote_key(subnet_id: SubnetId, height: u64) -> String {
     format!("{subnet_id}:{height:020}")
+}
+
+/// A vote in the database: its encoding as an EOTS vote.
+enum VoteCodec {}
+
+impl<'a> BytesEncode<'a> for VoteCodec {
+    type EItem = EotsVote;
+
+    fn bytes_encode(vote: &'a EotsVote) -> Result<Cow<'a, [u8]>, BoxedError> {
+        Ok(Cow::Owned(vote.to_bytes()))
+    }
+}
+
+impl<'a> BytesDecode<'a> for VoteCodec {
+    type DItem = EotsVote;
+
+    fn bytes_decode(bytes: &'a [u8]) -> Result<EotsVote, BoxedError> {
+        EotsVote::from_bytes(bytes).ok_or_else(|| "not an encoded EOTS vote".into())
+    }
 }
 
 /// The keys of one subnet between two heights, as the standard ranges cannot bound `str` keys.
@@ -60,7 +80,7 @@ pub struct EotsSigner {
     seed: EotsSeed,
     pk_eots: XOnlyPublicKey,
     env: Env,
-    votes: Database<Str, SerdeBincode<EotsVote>>,
+    votes: Database<Str, VoteCodec>,
     trees: Trees,
 }
 

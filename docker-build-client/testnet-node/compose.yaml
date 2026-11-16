@@ -109,6 +109,12 @@ services:
       FM_LOG_DIR: /data/validator/fendermint/data/logs
       FM_SNAPSHOTS_DIR: /data/validator/fendermint/snapshots
       FM_SNAPSHOTS__ENABLED: "true"
+      FM_DB__WRITE_BUFFER_SIZE: "33554432"
+      FM_DB__MAX_WRITE_BUFFER_NUMBER: "2"
+      FM_DB__MAX_WRITE_BUFFER_SIZE_TO_MAINTAIN: "33554432"
+      FM_DB__DB_WRITE_BUFFER_SIZE: "268435456"
+      FM_DB__MAX_TOTAL_WAL_SIZE: "268435456"
+      FM_DB__STATE_HIST_SIZE: "600000"
       FM_IPC__SUBNET_ID: ${NODE_SUBNET_ID:?}
       FM_IPC__TOPDOWN__CHAIN_HEAD_DELAY: "0"
       FM_IPC__TOPDOWN__PARENT_HTTP_ENDPOINT: http://bsl-client:3030/api
