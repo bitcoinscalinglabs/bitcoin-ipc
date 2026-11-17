@@ -26,11 +26,11 @@ ipc-cli subnet create --parent <prefix> --min-validators <n> --bottomup-check-pe
 ### Join
 
 ```
-ipc-cli subnet join-ue [--from <address>] --subnet <id> --collateral <sats> [--initial-balance <sats>] --ip <ip:port> --backup-address <address> --epochs <n>
+ipc-cli subnet join-ue [--from <address>] --subnet <id> --collateral <sats> --ip <ip:port> --backup-address <address> --epochs <n>
 ```
 
-- Parameters: `--from` is the validator's EVM key, whose x-only key is `pk` and must be the provider's validator key. `--ip` is the validator's network address. `--backup-address` is the Bitcoin L1 address to which the exit transaction pays the collateral. `--epochs` is the number of epochs for which the collateral UTXO seats the validator.
-- Action: submits a [join transaction](transactions/join.md) that names the current configuration, with the timeout `T` set from `--epochs`. The provider runs one join at a time. It refuses the join, without any transaction, while its monitor has not processed the Bitcoin chain up to the node's tip, when its validator key joined the subnet before, or when the join transaction it last sent to the subnet awaits the monitor ([creating the transaction](transactions/join.md#creating-the-transaction)). Otherwise, a provider that holds no [EOTS key](slashing.md#eots-key-and-eots-nonce-commitments) for the subnet generates one and its nonce seed, and keeps both for the subnet's EOTS votes. With `--initial-balance` above 0, it then submits a prefund transaction of that amount to the address of `--from` before the join transaction, and the command logs `pre-funding address with <sats>`. The provider records the prefund transaction before sending it and keeps it until a join to the subnet is accepted: a `join-ue` that fails after recording it reports its txid and that the join is incomplete, and a later `join-ue` to the subnet, with or without `--initial-balance`, sends the join transaction alone and names the recorded prefund transaction. A prefund transaction that never reached Bitcoin is sent with [`pre-fund`](#prefund-the-genesis-balance).
+- Parameters: `--from` is the validator's EVM key, whose x-only key is `pk` and must be the provider's validator key. `--ip` is the validator's network address. `--backup-address` is the Bitcoin L1 address to which the exit transaction pays the collateral. `--epochs` is the number of epochs for which the collateral UTXO seats the validator, from `min_timeout` to `max_timeout`.
+- Action: submits a [join transaction](transactions/join.md) that names the current configuration, with the timeout `T` set from `--epochs`. The provider does not wait for its monitor. It refuses the join, without any transaction, when a check of [creating the transaction](transactions/join.md#creating-the-transaction) fails, for example when its validator key or its EOTS key joined before or when the total power would exceed its maximum. Otherwise, a provider that holds no [EOTS key](slashing.md#eots-key-and-eots-nonce-commitments) for the subnet generates one and its nonce seed, and keeps both for the subnet's EOTS votes.
 - Returns: `join-ue transaction submitted at height: <n>`.
 
 ### Stake
@@ -97,16 +97,6 @@ ipc-cli cross-msg fee-top-up --subnet <id> btc <sats>
 
 - Action: submits a fee top-up transaction ([deposit](transactions/deposit.md)) (command **unimplemented**).
 - Returns: `fee top-up submitted at height: <n>`.
-
-### Prefund the genesis balance
-
-```
-ipc-cli cross-msg pre-fund --subnet <id> btc [--to <address>] <sats>
-```
-
-- Parameters: `--to` is the EVM address that receives the genesis balance.
-- Action: submits a [prefund transaction](transactions/prefund.md).
-- Returns: logs `address pre-funded successfully`.
 
 ### Run the checkpoint relayer
 

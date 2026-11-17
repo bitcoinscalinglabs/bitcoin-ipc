@@ -623,15 +623,7 @@ where
         // Process outputs
 
         // TODO make a general way to find messages in outputs or from entire tx
-        if let Ok(prefund_msg) = ipc_lib::IpcPrefundSubnetMsg::from_tx(tx) {
-            let ipc_message = IpcMessage::PrefundSubnet(prefund_msg);
-
-            match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
-            {
-                Ok(_) => {}
-                Err(e) => self.handle_ipc_msg_error(txid, e)?,
-            }
-        } else if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
+        if let Ok(fund_msg) = ipc_lib::IpcFundSubnetMsg::from_tx(tx) {
             let ipc_message = IpcMessage::FundSubnet(fund_msg);
 
             match self.process_ipc_msg(txn, block_height, block_hash, block, tx, txid, ipc_message)
@@ -700,7 +692,6 @@ where
             IpcTag::from_payload(&bitcoin_utils::concatenate_op_push_data(witness).ok()?)
         };
         match output_tag.or_else(witness_tag)? {
-            IpcTag::PrefundSubnet => ipc_lib::IpcPrefundSubnetMsg::from_tx(tx).err(),
             IpcTag::FundSubnet => ipc_lib::IpcFundSubnetMsg::from_tx(tx).err(),
             IpcTag::CheckpointSubnet => {
                 ipc_lib::IpcCheckpointSubnetMsg::from_checkpoint_tx(&self.db, txn, tx).err()
@@ -792,17 +783,6 @@ where
                 info!(
                     "Processed JoinSubnet for Subnet ID: {} Validator XPK: {} Collateral: {}",
                     join_subnet_msg.subnet_id, join_subnet_msg.pubkey, join_subnet_msg.collateral
-                );
-                Ok(())
-            }
-
-            IpcMessage::PrefundSubnet(msg) => {
-                debug!("Found IPC message: {:?}", msg);
-                msg.validate()?;
-                msg.save_to_db(&self.db, txn, block_height, txid)?;
-                info!(
-                    "Processed PrefundSubnet for Subnet ID: {} Address: {}",
-                    msg.subnet_id, msg.address
                 );
                 Ok(())
             }
@@ -1378,21 +1358,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skips_malformed_prefund_subnet() {
-        let (mut monitor, dir) = test_monitor().await;
-        assert_skipped(
-            &mut monitor,
-            &dir,
-            vec![
-                op_return_tx(&tagged("IPCPFD", 10)),
-                op_return_tx(&tagged("IPCPFD", 40)),
-                op_return_tx(&tagged("IPCZZZ", 40)),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_skips_malformed_fund_subnet() {
         let (mut monitor, dir) = test_monitor().await;
         assert_skipped(
@@ -1505,16 +1470,16 @@ mod tests {
     async fn test_warns_on_unparsable_ipc_payload() {
         warnings();
         let (mut monitor, _dir) = test_monitor().await;
-        let mut non_minimal_push = op_return_tx(b"IPCPFD");
-        // OP_RETURN OP_PUSHDATA1 0x06 "IPCPFD"
+        let mut non_minimal_push = op_return_tx(b"IPCFND");
+        // OP_RETURN OP_PUSHDATA1 0x06 "IPCFND"
         non_minimal_push.output[0].script_pubkey =
-            bitcoin::ScriptBuf::from_bytes([&[0x6a, 0x4c, 0x06][..], b"IPCPFD"].concat());
+            bitcoin::ScriptBuf::from_bytes([&[0x6a, 0x4c, 0x06][..], b"IPCFND"].concat());
         let tagged = vec![
             reveal_tx(
                 &[b"IPCCRT".as_slice(), &[0xff; 3]].concat(),
                 vec![payment(10_000)],
             ),
-            op_return_tx(&[b"IPCPFD".as_slice(), &[0xff; 3]].concat()),
+            op_return_tx(&[b"IPCFND".as_slice(), &[0xff; 3]].concat()),
             reveal_tx(
                 &[b"IPCTFR".as_slice(), &[0xff; 3]].concat(),
                 vec![payment(10_000)],

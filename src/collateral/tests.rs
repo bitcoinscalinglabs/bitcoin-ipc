@@ -1096,7 +1096,6 @@ fn subnet_with_whitelist(
         bootstrapped: false,
         genesis_block_height: None,
         genesis_validators: Vec::new(),
-        genesis_balance_entries: Vec::new(),
     };
     let mut wtxn = db.write_txn().unwrap();
     db.save_subnet_genesis_info(&mut wtxn, subnet_id, &genesis)

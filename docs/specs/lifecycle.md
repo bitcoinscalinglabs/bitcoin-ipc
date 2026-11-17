@@ -81,9 +81,9 @@ The creator submits the [create transaction](transactions/create-subnet.md). The
 
 `C_wlist` holds the keys of `whitelist`, each with power 1. Any member counts towards its threshold to spend `MS(C_wlist)`, whether or not it joined. `C_wlist` exists so that the genesis collateral UTXOs name a concrete configuration and their slash pre-signatures can be collected on a running subnet in epoch 0.
 
-### Joins and prefunds before bootstrap
+### Joins before bootstrap
 
-From creation until bootstrap, every validator with a whitelisted key may submit a [join transaction](transactions/join.md), whose collateral UTXO names `C_wlist`. Validators may also submit [prefund transactions](transactions/prefund.md), which pay `MS(C_wlist)` and give an EVM address a genesis balance on the subnet. Every member of `C_wlist` has a subnet account from genesis.
+From creation until bootstrap, every validator with a whitelisted key may submit a [join transaction](transactions/join.md), whose collateral UTXO names `C_wlist`. Every member of `C_wlist` has a subnet account from genesis.
 
 ### Computing configuration C_gen
 
@@ -203,7 +203,7 @@ If that checkpoint belongs to epoch `e`, the subnet stays fully operational up t
 
 | Status | From the Bitcoin L1 block | Meaning |
 |---|---|---|
-| created | that includes the create transaction | joins and prefunds |
+| created | that includes the create transaction | joins |
 | bootstrapped | that includes the join transaction that completes `C_gen` (height `H_boot`) | [epoch 0](#epoch-0), no join transaction |
 | active | at `H_0`, after its transactions (activation) | all operations, with `C_1`, `C_2`, … |
 | to be killed | that includes the checkpoint that records an accepted kill proposal | operations continue until the kill checkpoint |
@@ -213,7 +213,7 @@ If that checkpoint belongs to epoch `e`, the subnet stays fully operational up t
 
 Per subnet, with the code's names in parentheses:
 
-- **Genesis info** (`SubnetGenesisInfo`), from creation on: subnet id, parameters, `C_wlist`, the accepted join transactions before bootstrap, `H_boot` (`genesis_block_height`), and the genesis balance entries (address, amount, prefund txid, height).
+- **Genesis info** (`SubnetGenesisInfo`), from creation on: subnet id, parameters, `C_wlist`, the accepted join transactions before bootstrap, and `H_boot` (`genesis_block_height`).
 - **Subnet state** (`SubnetState`), from bootstrap on (before it, a lookup returns "not found" and the genesis info answers): the current epoch, the epoch of the latest rotation checkpoint, the configuration it adopted (`committee`, `C_gen` before the first) and its last change number, the last checkpoint number, the fee reserve (**unimplemented**), the status, `H_0`, and the checkpoint number at which the subnet was marked to be killed.
 - **Configurations** (`committee::<subnet>:<n>`): the configuration of every epoch.
 - **Configuration updates** (`StakeChangeRequest`): per configuration from `C_1` on, each update with its kind, validator key and subnet address, amount, change number and the Bitcoin block at which the monitor released it.

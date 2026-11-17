@@ -21,7 +21,6 @@ Validators join with their collateral in their own output, exit unilaterally aft
 - [encoding.md](encoding.md): fee rate and dust, subnet ids, postcard encoding, OP_RETURN outputs, commit-reveal pairs, configuration multisigs, the collateral and unbonding scripts, EOTS nonce commitments and EOTS votes.
 - Transactions, in lifecycle order:
   - [create-subnet.md](transactions/create-subnet.md): create a subnet (`IPCCRT`).
-  - [prefund.md](transactions/prefund.md): deposit before bootstrap into the genesis balance (`IPCPFD`).
   - [join.md](transactions/join.md): join with the collateral in the validator's own output (`IPCJUE`).
   - [stake.md](transactions/stake.md): add or renew a collateral UTXO of a validator that has joined (`IPCSUE`).
   - [deposit.md](transactions/deposit.md): deposit and fee top-up (`IPCFND`).

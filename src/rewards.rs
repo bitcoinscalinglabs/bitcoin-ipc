@@ -542,7 +542,6 @@ mod tests {
                 bootstrapped,
                 genesis_block_height,
                 genesis_validators,
-                genesis_balance_entries: Vec::new(),
             }
         }
 

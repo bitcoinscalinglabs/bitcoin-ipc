@@ -7,10 +7,9 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::XOnlyPublicKey;
-use bitcoin::{Transaction, Txid};
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -19,29 +18,11 @@ use crate::ipc_lib::SubnetId;
 
 pub type SharedSigner = Arc<Mutex<EotsSigner>>;
 
-/// The commit and reveal transactions of a join.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinTransactions {
-    pub commit: Transaction,
-    pub reveal: Transaction,
-}
-
-/// The last join of this provider to a subnet, kept in `eots.<txid20>.join` next to the
-/// validator key file: the EOTS key chosen for the subnet, written when it is chosen, the
-/// prefund transaction of the join, written before it is sent and kept until a join to the
-/// subnet is accepted, and the transactions built for the join, written before they are sent.
+/// The configured EOTS key bound to a subnet, kept in `eots.<txid20>.join` next to the validator
+/// key file, written when the first join to the subnet chooses it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRecord {
     pub pk_eots: XOnlyPublicKey,
-    pub prefund: Option<Transaction>,
-    pub transactions: Option<JoinTransactions>,
-}
-
-impl JoinRecord {
-    /// The txid of the reveal transaction, the join txid, once the transactions are built.
-    pub fn txid(&self) -> Option<Txid> {
-        self.transactions.as_ref().map(|t| t.reveal.compute_txid())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,8 +164,6 @@ pub struct EotsKeys {
     configured: Option<SharedSigner>,
     /// The keys generated for a subnet, loaded at start and at the join
     by_subnet: Mutex<BTreeMap<SubnetId, SharedSigner>>,
-    /// Held through a join, from its first check to the sending of its transactions
-    joins: Mutex<()>,
 }
 
 impl EotsKeys {
@@ -217,7 +196,6 @@ impl EotsKeys {
             dir,
             configured,
             by_subnet: Mutex::new(by_subnet),
-            joins: Mutex::new(()),
         })
     }
 
@@ -229,12 +207,6 @@ impl EotsKeys {
             .chain(by_subnet.values())
             .cloned()
             .collect()
-    }
-
-    /// One join at a time: held from the first check of a join to the sending of its
-    /// transactions, so that a second join to the subnet finds the first one recorded.
-    pub fn join_guard(&self) -> MutexGuard<'_, ()> {
-        self.joins.lock().expect("joins lock")
     }
 
     /// The key of `subnet_id`: the key generated for it, else the configured key when the subnet
@@ -295,14 +267,7 @@ impl EotsKeys {
                 Some(_) => return Ok(configured.clone()),
                 None => {
                     let pk_eots = configured.lock().expect("EOTS signer lock").pk_eots();
-                    self.record_join(
-                        subnet_id,
-                        &JoinRecord {
-                            pk_eots,
-                            prefund: None,
-                            transactions: None,
-                        },
-                    )?;
+                    self.record_join(subnet_id, &JoinRecord { pk_eots })?;
                     info!(
                         "EOTS key {pk_eots} of {} joins subnet {subnet_id}",
                         self.dir.display()
@@ -323,7 +288,7 @@ impl EotsKeys {
         Ok(signer)
     }
 
-    /// The record of the last join to `subnet_id`, if any.
+    /// The configured EOTS key bound to `subnet_id`, if any.
     pub fn join_record(&self, subnet_id: SubnetId) -> Result<Option<JoinRecord>, EotsKeysError> {
         let path = subnet_file(&self.dir, subnet_id, "join");
         let text = match std::fs::read_to_string(&path) {
@@ -488,9 +453,6 @@ mod tests {
         );
         let bound = keys.join_record(subnet(1)).unwrap().unwrap();
         assert_eq!(bound.pk_eots, pk_configured);
-        assert_eq!(bound.prefund, None);
-        assert_eq!(bound.transactions, None);
-        assert_eq!(bound.txid(), None);
         assert!(keys.join_record(subnet(2)).unwrap().is_none());
         assert!(keys
             .signer_of(subnet(2), no_accepted_join)
@@ -558,11 +520,7 @@ mod tests {
         );
 
         // A new record replaces the earlier one, through a temporary file
-        let later = JoinRecord {
-            pk_eots: pubkey(40),
-            prefund: None,
-            transactions: None,
-        };
+        let later = JoinRecord { pk_eots: pubkey(40) };
         restarted.record_join(subnet(1), &later).unwrap();
         assert_eq!(restarted.join_record(subnet(1)).unwrap(), Some(later));
         assert!(!subnet_file(dir.path(), subnet(1), "join.tmp").exists());

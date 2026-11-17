@@ -63,7 +63,6 @@ fn genesis() -> SubnetGenesisInfo {
         bootstrapped: true,
         genesis_block_height: Some(99),
         genesis_validators: (1..=4).map(|n| member(n, 100_000)).collect(),
-        genesis_balance_entries: vec![],
     }
 }
 

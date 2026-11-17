@@ -694,26 +694,6 @@ impl SubnetState {
     }
 }
 
-/// An entry in the subnet genesis balance
-///
-/// This balance is added to user addresses in genesis, and becomes part of the genesis
-/// circulating supply. Users (including validators) can add genesis balance
-/// via pre-fund messages.
-///
-/// One entry is added per pre-fund message.
-/// There could be multiple entries for a single subnet address.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct GenesisBalanceEntry {
-    /// The subnet address
-    pub subnet_address: alloy_primitives::Address,
-    /// The balance
-    pub amount: bitcoin::Amount,
-    /// The transaction ID of the pre-fund message
-    pub prefund_txid: bitcoin::Txid,
-    /// The block height of the pre-fund message
-    pub block_height: u64,
-}
-
 /// Genesis info for a subnet
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SubnetGenesisInfo {
@@ -734,11 +714,6 @@ pub struct SubnetGenesisInfo {
     pub genesis_block_height: Option<u64>,
     /// The list of validators that boostrapped the subnet
     pub genesis_validators: Vec<SubnetValidator>,
-    /// The initial balance of the subnet at genesis
-    /// Filled with pre-fund messages
-    ///
-    /// use `.genesis_balance()` to get a hashmap
-    pub genesis_balance_entries: Vec<GenesisBalanceEntry>,
 }
 
 impl SubnetGenesisInfo {
@@ -796,42 +771,6 @@ impl SubnetGenesisInfo {
             last_rotation_epoch: 0,
             pending_multisig_changes: Vec::new(),
         }
-    }
-
-    /// Returns the genesis balance for the subnet
-    pub fn genesis_balance(
-        &self,
-    ) -> std::collections::HashMap<alloy_primitives::Address, bitcoin::Amount> {
-        let mut balance = std::collections::HashMap::new();
-        for entry in &self.genesis_balance_entries {
-            balance
-                .entry(entry.subnet_address)
-                .and_modify(|amount| *amount += entry.amount)
-                .or_insert(entry.amount);
-        }
-        balance
-    }
-
-    /// Adds a genesis balance entry to the genesis info
-    pub fn add_genesis_balance_entry(
-        &mut self,
-        subnet_address: alloy_primitives::Address,
-        amount: bitcoin::Amount,
-        prefund_txid: bitcoin::Txid,
-        block_height: u64,
-    ) {
-        self.genesis_balance_entries.push(GenesisBalanceEntry {
-            subnet_address,
-            amount,
-            prefund_txid,
-            block_height,
-        });
-    }
-
-    /// Removes a genesis balance entry from the genesis info, for a given prefund_txid
-    pub fn remove_genesis_balance_entry(&mut self, txid: &bitcoin::Txid) {
-        self.genesis_balance_entries
-            .retain(|entry| &entry.prefund_txid != txid);
     }
 }
 

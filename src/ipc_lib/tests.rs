@@ -683,7 +683,6 @@ fn a_batch_to_a_destination_bootstrapped_by_an_earlier_input_is_not_credited() {
         bootstrapped: false,
         genesis_block_height: None,
         genesis_validators: Vec::new(),
-        genesis_balance_entries: Vec::new(),
     };
     let save_genesis = |db: &db::HeedDb| {
         let mut wtxn = db.write_txn().unwrap();
@@ -1956,7 +1955,6 @@ fn tagged(tag_index: usize, data: &[u8]) -> Vec<u8> {
         IpcTag::JoinUe,
         IpcTag::BatchTransfer,
         IpcTag::CheckpointSubnet,
-        IpcTag::PrefundSubnet,
         IpcTag::FundSubnet,
         IpcTag::StakeCollateral,
         IpcTag::UnstakeCollateral,
@@ -2043,7 +2041,7 @@ proptest! {
     #[test]
     fn from_reveal_input_never_panics_and_is_idempotent(
         data in prop::collection::vec(any::<u8>(), 0..300),
-        tag_index in 0..11usize,
+        tag_index in 0..10usize,
     ) {
         set_fvm_network();
         let data = tagged(tag_index, &data);
@@ -2090,7 +2088,7 @@ proptest! {
     #[test]
     fn op_return_parsers_never_panic(
         payload in prop::collection::vec(any::<u8>(), 0..100),
-        tag_index in 0..11usize,
+        tag_index in 0..10usize,
         extra in prop::collection::vec((1u64..100_000, 0..3usize), 0..3),
     ) {
         set_fvm_network();
@@ -2170,142 +2168,6 @@ proptest! {
             prop_assert_eq!(postcard::to_stdvec(&wire).unwrap(), data[IPC_TAG_LENGTH..].to_vec());
         }
     }
-}
-
-fn create_test_msg() -> IpcPrefundSubnetMsg {
-    let txid =
-        Txid::from_str("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b").unwrap();
-    let subnet_id = SubnetId::from_txid(&txid);
-    let eth_addr =
-        alloy_primitives::Address::from_str("742d35Cc6634C0532925a3b844Bc454e4438f44e").unwrap();
-
-    IpcPrefundSubnetMsg {
-        subnet_id,
-        amount: Amount::from_sat(1000),
-        address: eth_addr,
-    }
-}
-
-fn get_addresses() -> (bitcoin::Address, bitcoin::Address) {
-    let multisig_address = bitcoin::Address::from_str(
-        "bc1pzc5j0fyekrc9p63avup65y8h8rhp7m5ql5tg7590wuhhqdtlkfusng6er8",
-    )
-    .unwrap()
-    .assume_checked();
-    let release_address =
-        bitcoin::Address::from_str("bcrt1qvr3jycfxtrkk8u6hp5caxc25tueek5f90mpnsv")
-            .unwrap()
-            .assume_checked();
-
-    (multisig_address, release_address)
-}
-
-#[test]
-fn test_to_tx_structure() {
-    let msg = create_test_msg();
-    let (multisig_address, release_address) = get_addresses();
-
-    // Generate transaction
-    let tx = msg
-        .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
-        .unwrap();
-
-    // Check basic structure
-    assert_eq!(
-        tx.output.len(),
-        2,
-        "Transaction should have exactly 2 outputs"
-    );
-
-    // First output should be OP_RETURN
-    assert!(
-        tx.output[0].script_pubkey.is_op_return(),
-        "First output should be OP_RETURN"
-    );
-    assert_eq!(
-        tx.output[0].value,
-        Amount::ZERO,
-        "OP_RETURN output should have zero value"
-    );
-
-    // Second output should have the correct value and script
-    assert!(
-        tx.output[1].script_pubkey.is_p2tr(),
-        "Second output should be p2tr"
-    );
-    assert_eq!(
-        tx.output[1].value,
-        Amount::from_sat(1000),
-        "Second output should have correct value"
-    );
-}
-
-#[test]
-fn test_from_tx_valid() {
-    let original_msg = create_test_msg();
-    let (multisig_address, release_address) = get_addresses();
-
-    // Create transaction using to_tx
-    let tx = original_msg
-        .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
-        .unwrap();
-
-    // Parse it back using from_tx
-    let parsed_msg = IpcPrefundSubnetMsg::from_tx(&tx).unwrap();
-
-    // Verify all fields match
-    assert_eq!(parsed_msg.subnet_id, original_msg.subnet_id);
-    assert_eq!(parsed_msg.amount, original_msg.amount);
-    assert_eq!(parsed_msg.address, original_msg.address);
-}
-
-#[test]
-fn test_from_tx_invalid_cases() {
-    let (multisig_address, release_address) = get_addresses();
-
-    // Test case 1: Empty transaction
-    let empty_tx = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![],
-        output: vec![],
-    };
-    assert!(matches!(
-        IpcPrefundSubnetMsg::from_tx(&empty_tx),
-        Err(IpcLibError::MsgParseError(IPC_PREFUND_SUBNET_TAG, _))
-    ));
-
-    // Test case 2: Transaction with only one output
-    let tx = create_test_msg()
-        .to_tx(DEFAULT_BTC_FEE_RATE, &multisig_address, &release_address)
-        .unwrap();
-    let single_output_tx = Transaction {
-        version: tx.version,
-        lock_time: tx.lock_time,
-        input: tx.input.clone(),
-        output: vec![tx.output[0].clone()], // Only the OP_RETURN output
-    };
-    assert!(matches!(
-        IpcPrefundSubnetMsg::from_tx(&single_output_tx),
-        Err(IpcLibError::MsgParseError(IPC_PREFUND_SUBNET_TAG, _))
-    ));
-
-    // Test case 3: Wrong tag in OP_RETURN
-    let mut wrong_tag_tx = tx.clone();
-    let mut wrong_data = Vec::new();
-    // same length as "IPCPFD"
-    let invalid_tag = "IPC123";
-    // sanity check if we change tag length
-    assert_eq!(invalid_tag.len(), IPC_TAG_LENGTH);
-    wrong_data.extend_from_slice(invalid_tag.as_bytes()); // Different tag
-    wrong_data.extend_from_slice(&[0u8; SubnetId::INNER_LEN]); // txid
-    wrong_data.extend_from_slice(&[0u8; 20]); // address
-    let wrong_data: [u8; IpcPrefundSubnetMsg::DATA_LEN] = wrong_data.try_into().unwrap();
-    wrong_tag_tx.output[0].script_pubkey = bitcoin_utils::make_op_return_script(wrong_data);
-    assert!(matches!(
-        IpcPrefundSubnetMsg::from_tx(&wrong_tag_tx),
-        Err(IpcLibError::MsgParseError(IPC_PREFUND_SUBNET_TAG, _))
-    ));
 }
 
 #[test]

@@ -331,7 +331,6 @@ pub fn create(db: &HeedDb, id: SubnetId) {
         bootstrapped: false,
         genesis_block_height: None,
         genesis_validators: vec![],
-        genesis_balance_entries: vec![],
     };
     let mut txn = db.write_txn().unwrap();
     db.save_subnet_genesis_info(&mut txn, id, &genesis).unwrap();

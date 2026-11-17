@@ -22,7 +22,7 @@ Integers in OP_RETURN layouts are little-endian unless the layout says otherwise
 
 ## Fee rate
 
-Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (the create subnet, prefund, join, stake, deposit and fee top-up transactions) may use any fee its wallet chooses (fee top-up transaction **unimplemented**). `r` fixes the values that the protocol computes itself: commitment outputs, the outputs of reveal transactions, configuration multisig spends and the exit transaction. Each provider uses its own estimate for a checkpoint ([checkpoint](transactions/checkpoint.md#creating-the-transaction)).
+Whoever builds a transaction chooses its fee rate `r`, in whole sat/vB, from its Bitcoin L1 node's fee estimate. A transaction paid by a wallet (the create subnet, join, stake, deposit and fee top-up transactions) may use any fee its wallet chooses (fee top-up transaction **unimplemented**). `r` fixes the values that the protocol computes itself: commitment outputs, the outputs of reveal transactions, configuration multisig spends and the exit transaction. Each provider uses its own estimate for a checkpoint ([checkpoint](transactions/checkpoint.md#creating-the-transaction)).
 
 ## Identifiers
 
@@ -81,7 +81,7 @@ The OP_RETURN output of a message is `OP_RETURN` (`0x6a`) followed by one minima
 | Data length (bytes) | Script | Used by |
 |---|---|---|
 | 26 | `6a 1a ‖ data` | fee top-up transaction (**unimplemented**) |
-| 46 | `6a 2e ‖ data` | prefund and deposit transactions |
+| 46 | `6a 2e ‖ data` | deposit transaction |
 | 62 | `6a 3e ‖ data` | stake transaction |
 | 77 | `6a 4c 4d ‖ data` | checkpoint |
 

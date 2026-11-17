@@ -5,7 +5,7 @@ use crate::{
     ipc_lib::{
         self, validate_erc_batch_data, IpcCheckpointSubnetMsg, IpcCreateSubnetMsg,
         IpcFundSubnetMsg, IpcJoinSubnetMsg, IpcJoinUeMsg, IpcKillSubnetMsg, IpcLibError,
-        IpcPrefundSubnetMsg, IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
+        IpcStakeCollateralMsg, IpcUnstakeCollateralMsg, IpcValidate, SubnetId,
     },
     multisig, wallet, BTC_CONFIRMATIONS, NETWORK,
 };
@@ -22,7 +22,7 @@ use thiserror::Error;
 
 #[cfg(feature = "emission_chain")]
 use crate::db::DatabaseRewardExtensions;
-use crate::provider::eots_keys::{EotsKeys, JoinRecord, JoinTransactions, SharedSigner};
+use crate::provider::eots_keys::{EotsKeys, SharedSigner};
 #[cfg(feature = "emission_chain")]
 use crate::rewards::RewardConfig;
 
@@ -114,218 +114,6 @@ fn eots_signer_of(
     };
     keys.signer_of(subnet_id, accepted_subnet_of(&data.db))
         .map_err(|e| RpcError::InternalError(format!("EOTS key: {e}")).into())
-}
-
-/// The JSON-RPC error code of Bitcoin Core for a transaction it does not know.
-const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
-
-/// Where the node has a transaction this provider sent.
-enum TransactionState {
-    InMempool,
-    /// In the Bitcoin block of this height
-    InBlock(u64),
-    /// Known to the wallet, unconfirmed and out of the mempool
-    Dropped,
-    /// Unknown to the wallet
-    Unknown,
-}
-
-fn transaction_state(
-    data: &ServerData,
-    txid: bitcoin::Txid,
-    what: &str,
-) -> Result<TransactionState, JsonRpcError> {
-    let unknown = |e: &bitcoincore_rpc::Error| {
-        matches!(
-            e,
-            bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(rpc))
-                if rpc.code == RPC_INVALID_ADDRESS_OR_KEY
-        )
-    };
-    let bitcoin_error = |which: &str, e: bitcoincore_rpc::Error| {
-        JsonRpcError::from(RpcError::InternalError(format!(
-            "{which} of the {what} {txid}: {e}"
-        )))
-    };
-    match data
-        .btc_rpc
-        .call::<serde_json::Value>("getmempoolentry", &[json!(txid)])
-    {
-        Ok(_) => return Ok(TransactionState::InMempool),
-        Err(e) if unknown(&e) => {}
-        Err(e) => return Err(bitcoin_error("mempool entry", e)),
-    }
-    let tx = match data
-        .btc_rpc
-        .call::<serde_json::Value>("gettransaction", &[json!(txid)])
-    {
-        Ok(tx) => tx,
-        Err(e) if unknown(&e) => return Ok(TransactionState::Unknown),
-        Err(e) => return Err(bitcoin_error("wallet record", e)),
-    };
-    let confirmations = tx["confirmations"].as_i64().unwrap_or(0);
-    Ok(match tx["blockheight"].as_u64() {
-        Some(height) if confirmations > 0 => TransactionState::InBlock(height),
-        _ => TransactionState::Dropped,
-    })
-}
-
-/// Refuses a join while the monitor has not processed the Bitcoin chain up to the node's tip,
-/// less the confirmations it waits for: until then the accepted joins and EOTS keys it checks
-/// are incomplete.
-fn refuse_lagging_monitor(data: &ServerData, tip: u64) -> Result<(), JsonRpcError> {
-    let confirmed = tip.saturating_sub(BTC_CONFIRMATIONS);
-    let processed = data
-        .db
-        .get_last_processed_block()
-        .map_err(RpcError::DbError)?;
-    if processed < confirmed {
-        let m = format!(
-            "the monitor has processed Bitcoin block {processed} of {confirmed}: join-ue waits until it has caught up with the node"
-        );
-        error!("joinsubnet (join-ue) refused: {m}");
-        return Err(RpcError::InvalidParams(m).into());
-    }
-    Ok(())
-}
-
-/// Where an output stands at the node.
-enum OutputState {
-    Unspent,
-    /// Spent by a transaction in the mempool
-    SpentInMempool,
-    /// Spent by a transaction in a Bitcoin block
-    SpentInBlock,
-}
-
-/// The state of `outpoint`, an output of a transaction in the mempool (`in_mempool`) or in a
-/// Bitcoin block.
-fn output_state(
-    data: &ServerData,
-    outpoint: bitcoin::OutPoint,
-    in_mempool: bool,
-) -> Result<OutputState, JsonRpcError> {
-    let unspent = |with_mempool: bool| {
-        data.btc_rpc
-            .get_tx_out(&outpoint.txid, outpoint.vout, Some(with_mempool))
-            .map(|out| out.is_some())
-            .map_err(|e| RpcError::InternalError(format!("output {outpoint}: {e}")))
-    };
-    if unspent(true)? {
-        return Ok(OutputState::Unspent);
-    }
-    if in_mempool || unspent(false)? {
-        return Ok(OutputState::SpentInMempool);
-    }
-    Ok(OutputState::SpentInBlock)
-}
-
-/// The Bitcoin block above `processed`, up to `tip`, that holds the transaction spending
-/// `outpoint`, `None` when the monitor has processed that block.
-fn unprocessed_spend(
-    data: &ServerData,
-    outpoint: bitcoin::OutPoint,
-    processed: u64,
-    tip: u64,
-) -> Result<Option<u64>, JsonRpcError> {
-    for height in processed + 1..=tip {
-        let block = data
-            .btc_rpc
-            .get_block_hash(height)
-            .and_then(|hash| data.btc_rpc.get_block(&hash))
-            .map_err(|e| RpcError::InternalError(format!("Bitcoin block {height}: {e}")))?;
-        if block
-            .txdata
-            .iter()
-            .any(|tx| tx.input.iter().any(|i| i.previous_output == outpoint))
-        {
-            return Ok(Some(height));
-        }
-    }
-    Ok(None)
-}
-
-/// Refuses a join to `subnet_id` while the join transaction last sent to it awaits the monitor:
-/// in the mempool, or in a Bitcoin block the monitor has not processed. A reveal transaction
-/// that did not reach the node while its commit transaction did is sent again, unless another
-/// transaction spent its input: the join is refused until the monitor has processed that spend,
-/// then a new pair may be sent. A join transaction that was dropped, never sent, or processed
-/// without being accepted, lets the next join through.
-fn refuse_pending_join(
-    data: &ServerData,
-    keys: &EotsKeys,
-    subnet_id: SubnetId,
-    tip: u64,
-) -> Result<(), JsonRpcError> {
-    let Some(transactions) = keys
-        .join_record(subnet_id)
-        .map_err(|e| RpcError::InternalError(format!("EOTS key: {e}")))?
-        .and_then(|record| record.transactions)
-    else {
-        return Ok(());
-    };
-    let txid = transactions.reveal.compute_txid();
-    let pending = |how: String| -> JsonRpcError {
-        let m = format!(
-            "the join transaction {txid} of this validator for subnet {subnet_id} is {how}: a key joins a subnet once"
-        );
-        error!("joinsubnet (join-ue) refused: {m}");
-        RpcError::InvalidParams(m).into()
-    };
-    let processed = data
-        .db
-        .get_last_processed_block()
-        .map_err(RpcError::DbError)?;
-    match transaction_state(data, txid, "join transaction sent before")? {
-        TransactionState::InMempool => Err(pending("unconfirmed, in the mempool".to_string())),
-        TransactionState::InBlock(height) if height > processed => Err(pending(format!(
-            "in Bitcoin block {height}, which the monitor has not processed (last processed {processed})"
-        ))),
-        TransactionState::InBlock(_) => Ok(()),
-        TransactionState::Dropped | TransactionState::Unknown => {
-            let commit_txid = transactions.commit.compute_txid();
-            let commit_state = transaction_state(data, commit_txid, "commit transaction of the join")?;
-            let in_mempool = match commit_state {
-                TransactionState::InMempool => true,
-                TransactionState::InBlock(_) => false,
-                TransactionState::Dropped | TransactionState::Unknown => {
-                    warn!("the join transaction {txid} sent to subnet {subnet_id} before did not reach the node");
-                    return Ok(());
-                }
-            };
-            let outpoint = bitcoin::OutPoint::new(commit_txid, 0);
-            match output_state(data, outpoint, in_mempool)? {
-                OutputState::Unspent => {
-                    warn!("the commit transaction {commit_txid} of the join to subnet {subnet_id} reached the node without its reveal transaction {txid}: sending it again");
-                    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![transactions.reveal])
-                        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-                    Err(pending("sent again, unconfirmed".to_string()))
-                }
-                OutputState::SpentInMempool => Err(pending(format!(
-                    "replaced by another transaction spending {outpoint} in the mempool, which awaits the monitor"
-                ))),
-                OutputState::SpentInBlock => match unprocessed_spend(data, outpoint, processed, tip)? {
-                    Some(height) => Err(pending(format!(
-                        "replaced by another transaction spending {outpoint} in Bitcoin block {height}, which the monitor has not processed (last processed {processed})"
-                    ))),
-                    None => {
-                        warn!("the input {outpoint} of the join transaction {txid} sent to subnet {subnet_id} before was spent by another transaction, which the monitor has processed without accepting a join of this validator: a new pair is sent");
-                        Ok(())
-                    }
-                },
-            }
-        }
-    }
-}
-
-/// Refuses a join if Bitcoin blocks arrived since `tip` that the monitor has not processed:
-/// read before the first broadcast, as the preparation of a join can span Bitcoin blocks.
-fn refuse_lagging_monitor_since(data: &ServerData, tip: u64) -> Result<(), JsonRpcError> {
-    let now = node_tip(data)?;
-    if now > tip {
-        refuse_lagging_monitor(data, now)?;
-    }
-    Ok(())
 }
 
 fn node_tip(data: &ServerData) -> Result<u64, JsonRpcError> {
@@ -434,18 +222,6 @@ pub struct JoinSubnetRequest {
     /// The number of heights it covers (default `DEFAULT_EOTS_NONCE_COUNT`)
     #[serde(default)]
     pub eots_nonce_count: Option<u32>,
-    /// With it, the `join-ue` submits this prefund transaction after its checks, before its own
-    /// transactions
-    #[serde(default)]
-    pub initial_balance: Option<InitialBalance>,
-}
-
-/// A genesis balance a `join-ue` prefunds: `--initial-balance`, to the address of `--from`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitialBalance {
-    #[serde(with = "bitcoin::amount::serde::as_sat")]
-    pub amount: bitcoin::Amount,
-    pub address: alloy_primitives::Address,
 }
 
 impl From<JoinSubnetRequest> for IpcJoinSubnetMsg {
@@ -465,14 +241,13 @@ pub struct JoinSubnetResponse {
     join_txid: bitcoin::Txid,
 }
 
-/// The join-ue path runs on a blocking thread: it holds the join guard through Bitcoin RPC calls
-/// and file writes, and the RPC workers keep answering the other methods meanwhile.
+/// The join-ue path runs on a blocking thread: it makes Bitcoin RPC calls and file writes, and the
+/// RPC workers keep answering the other methods meanwhile.
 pub async fn join_subnet(
     data: Data<Arc<ServerData>>,
-    Params(mut req): Params<JoinSubnetRequest>,
+    Params(req): Params<JoinSubnetRequest>,
 ) -> Result<JoinSubnetResponse, JsonRpcError> {
     let epochs = req.epochs;
-    let initial_balance = req.initial_balance.take();
     let nonce_range = (
         req.eots_nonce_start.unwrap_or(1),
         req.eots_nonce_count.unwrap_or(DEFAULT_EOTS_NONCE_COUNT),
@@ -505,45 +280,30 @@ pub async fn join_subnet(
             msg.subnet_id
         )))?;
 
-    let subnet_state = data.db.get_subnet_state(msg.subnet_id).map_err(|e| {
-        error!("Error getting subnet info from Db: {}", e);
-        RpcError::DbError(e)
-    })?;
-
-    msg.validate_for_subnet(&genesis_info, &subnet_state)
-        .map_err(|e| {
-            error!("Error validating join msg for subnet info: {}", e);
-            RpcError::InvalidParams(e.to_string())
-        })?;
-    if let Some(state) = &subnet_state {
-        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
-        epochs::next_multisig_members(&*data.db, &txn, &genesis_info, state)
-            .and_then(|members| Ok(msg.validate_for_members(state, &members)?))
-            .map_err(|e| {
-                error!("Error validating join msg for subnet info: {}", e);
-                RpcError::InvalidParams(e.to_string())
-            })?;
-    }
-
     if let Some(epochs) = epochs {
         let server: Arc<ServerData> = Arc::clone(&data);
-        let join_txid = spawn_join_subnet_ue(
-            server,
-            genesis_info,
-            msg,
-            epochs,
-            nonce_range,
-            initial_balance,
-        )
-        .await?;
+        let join_txid =
+            spawn_join_subnet_ue(server, genesis_info, msg, epochs, nonce_range).await?;
         return Ok(JoinSubnetResponse { join_txid });
     }
-    if initial_balance.is_some() {
-        return Err(RpcError::InvalidParams(
-            "initial_balance needs epochs: only a join-ue prefunds with its join".to_string(),
-        )
-        .into());
-    }
+    check_subnet(&data, &genesis_info, &msg)
+        .and_then(|()| {
+            let Some(state) = data
+                .db
+                .get_subnet_state(msg.subnet_id)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+            let txn = data.db.read_txn().map_err(|e| e.to_string())?;
+            epochs::next_multisig_members(&*data.db, &txn, &genesis_info, &state)
+                .and_then(|members| Ok(msg.validate_for_members(&state, &members)?))
+                .map_err(|e| e.to_string())
+        })
+        .map_err(|e| {
+            error!("Error validating join msg for subnet info: {}", e);
+            RpcError::InvalidParams(e)
+        })?;
 
     // TODO this check should be done in the Db
     let multisig_address = genesis_info.multisig_address();
@@ -565,36 +325,23 @@ async fn spawn_join_subnet_ue(
     join: IpcJoinSubnetMsg,
     epochs: u32,
     nonce_range: (u64, u32),
-    initial_balance: Option<InitialBalance>,
 ) -> Result<bitcoin::Txid, JsonRpcError> {
     run_blocking(&data, move |data| {
-        join_subnet_ue(
-            data,
-            &genesis_info,
-            join,
-            epochs,
-            nonce_range,
-            initial_balance,
-        )
+        join_subnet_ue(data, &genesis_info, join, epochs, nonce_range)
     })
     .await
 }
 
-/// The join-ue path of `joinsubnet`. The caller has checked the activation switch. One join at a time: the checks, the choice of the EOTS key, the prefund
-/// transaction, the join record and the sending of the transactions run under the keys' join
-/// guard, against the node's tip read once the guard is held.
+/// The join-ue path of `joinsubnet`; the caller has checked the activation switch and the
+/// message. The checks below run in order against the subnet as the monitor has processed it and
+/// the node's tip.
 fn join_subnet_ue(
     data: &ServerData,
     genesis_info: &db::SubnetGenesisInfo,
     join: IpcJoinSubnetMsg,
     epochs: u32,
     nonce_range: (u64, u32),
-    initial_balance: Option<InitialBalance>,
 ) -> Result<bitcoin::Txid, JsonRpcError> {
-    let invalid = |m: String| -> JsonRpcError {
-        error!("joinsubnet (join-ue) rejected: {m}");
-        RpcError::InvalidParams(m).into()
-    };
     let Some((validator_xpk, validator_sk)) = data.validator else {
         return Err(RpcError::InternalError("No validator keypair configured.".to_string()).into());
     };
@@ -603,195 +350,219 @@ fn join_subnet_ue(
             RpcError::InternalError("No EOTS key: no validator key file".to_string()).into(),
         );
     };
-    let _one_join = keys.join_guard();
     let tip = node_tip(data)?;
-    if join.pubkey != validator_xpk {
-        return Err(invalid(format!(
-            "join-ue signs with this provider's validator key {validator_xpk}, not {}",
-            join.pubkey
-        )));
-    }
-    let params = &genesis_info.create_subnet_msg;
-    if epochs < params.min_timeout || epochs > params.max_timeout {
-        return Err(invalid(format!(
-            "epochs must be between min_timeout {} and max_timeout {}, got {epochs}",
-            params.min_timeout, params.max_timeout
-        )));
-    }
-    refuse_lagging_monitor(data, tip)?;
+    check_validator_key(&join, validator_xpk)
+        .map_err(refuse("set --from to the address of that key"))?;
+    refuse_accepted_join(data, &join)?;
+    check_subnet(data, genesis_info, &join).map_err(refuse_join)?;
+    let context = join_context(data, join.subnet_id)?;
+    let timeout = join_timeout(genesis_info, &context, epochs, tip)?;
+    check_total_power(data, genesis_info, &join, tip)
+        .map_err(refuse("join with a smaller --collateral"))?;
+    let msg = signed_join(data, keys, join, timeout, nonce_range, &validator_sk)?;
+    check_eots_key_unused(data, &msg)
+        .map_err(refuse("configure another EOTS key with EOTS_SK_PATH"))?;
 
-    let context = {
-        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
-        collateral::refuse_earlier_join(&*data.db, &txn, join.subnet_id, &join.pubkey, None)
-            .map_err(|e| invalid(e.to_string()))?;
-        collateral::join_context(&*data.db, &txn, join.subnet_id)
-            .map_err(|e| invalid(e.to_string()))?
-    };
-    refuse_pending_join(data, keys, join.subnet_id, tip)?;
-
-    // Before activation the origin is the last processed Bitcoin block
-    let origin = match context.h_0 {
-        Some(h_0) => h_0,
-        None => data
-            .db
-            .get_last_processed_block()
-            .map_err(|e| RpcError::DbError(e))?,
-    };
-    let timeout =
-        u32::try_from(params.cutoff_height(origin, context.epoch + u64::from(epochs) + 3))
-            .ok()
-            .filter(|t| *t < collateral::LOCKTIME_THRESHOLD)
-            .ok_or_else(|| invalid("the timeout is not a block height".to_string()))?;
-    context.check_timeout(timeout, tip + 1).map_err(invalid)?;
-
-    let secp = bitcoin::secp256k1::Secp256k1::new();
     let (start, count) = nonce_range;
-    if start < 1 || count < 1 {
-        return Err(invalid(format!(
-            "the EOTS nonce range needs start >= 1 and count >= 1, got start {start} count {count}"
+    info!(
+        "joinsubnet (join-ue): timeout {timeout} for {epochs} epochs from epoch {} (tip {tip}), EOTS key {} nonces {start}..{}",
+        context.epoch,
+        msg.pk_eots,
+        u128::from(start) + u128::from(count)
+    );
+    send_join(data, &msg, &context)
+}
+
+/// Logs and returns the refusal of a join-ue: `m` says what is wrong and what the validator can do.
+fn refuse_join(m: String) -> JsonRpcError {
+    error!("joinsubnet (join-ue) refused: {m}");
+    RpcError::InvalidParams(m).into()
+}
+
+/// The refusal of a join-ue for a failed check, with what the validator can do.
+fn refuse(advice: &'static str) -> impl FnOnce(String) -> JsonRpcError {
+    move |reason| refuse_join(format!("{reason}: {advice}"))
+}
+
+fn eots_key_error(e: crate::provider::eots_keys::EotsKeysError) -> JsonRpcError {
+    RpcError::InternalError(format!("EOTS key: {e}")).into()
+}
+
+/// The join carries this provider's validator key, the only key it signs with.
+fn check_validator_key(
+    join: &IpcJoinSubnetMsg,
+    validator_xpk: bitcoin::XOnlyPublicKey,
+) -> Result<(), String> {
+    if join.pubkey == validator_xpk {
+        return Ok(());
+    }
+    Err(format!(
+        "join-ue signs with this provider's validator key {validator_xpk}, not {}",
+        join.pubkey
+    ))
+}
+
+/// No accepted join of the subnet carries the validator key: the monitor rejects a second join of
+/// a key to a subnet (rule 2.7).
+fn refuse_accepted_join(data: &ServerData, join: &IpcJoinSubnetMsg) -> Result<(), JsonRpcError> {
+    let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+    collateral::refuse_earlier_join(&*data.db, &txn, join.subnet_id, &join.pubkey, None).map_err(
+        |e| {
+            refuse_join(format!(
+                "{e}: the validator is in the subnet and needs no second join"
+            ))
+        },
+    )
+}
+
+/// The epoch, `H_0` and configurations of the subnet, as the monitor has processed them.
+fn join_context(
+    data: &ServerData,
+    subnet_id: SubnetId,
+) -> Result<collateral::JoinContext, JsonRpcError> {
+    let txn = data.db.read_txn().map_err(RpcError::DbError)?;
+    collateral::join_context(&*data.db, &txn, subnet_id)
+        .map_err(|e| RpcError::InternalError(format!("subnet {subnet_id}: {e}")).into())
+}
+
+/// The timeout `T` for `epochs` epochs from the current one, `min_timeout ≤ epochs ≤ max_timeout`,
+/// which the monitor accepts at the next Bitcoin block height (rule 2.6). Before activation the latest final Bitcoin block takes
+/// the place of `H_0`.
+fn join_timeout(
+    genesis_info: &db::SubnetGenesisInfo,
+    context: &collateral::JoinContext,
+    epochs: u32,
+    tip: u64,
+) -> Result<u32, JsonRpcError> {
+    if epochs < context.min_timeout || epochs > context.max_timeout {
+        return Err(refuse_join(format!(
+            "--epochs {epochs} is not between min_timeout {} and max_timeout {}",
+            context.min_timeout, context.max_timeout
         )));
     }
-    let eots_key = |e: crate::provider::eots_keys::EotsKeysError| {
-        JsonRpcError::from(RpcError::InternalError(format!("EOTS key: {e}")))
-    };
+    let origin = context
+        .h_0
+        .unwrap_or_else(|| tip.saturating_sub(BTC_CONFIRMATIONS));
+    let end = genesis_info
+        .create_subnet_msg
+        .cutoff_height(origin, context.epoch + u64::from(epochs) + 3);
+    let timeout = u32::try_from(end)
+        .ok()
+        .filter(|t| *t < collateral::LOCKTIME_THRESHOLD)
+        .ok_or_else(|| {
+            refuse_join(format!(
+                "the timeout {end} for {epochs} epochs is not a Bitcoin block height: choose fewer --epochs"
+            ))
+        })?;
+    context
+        .check_timeout(timeout, tip + 1)
+        .map_err(|e| refuse_join(format!("{e}: change --epochs")))?;
+    Ok(timeout)
+}
+
+/// The subnet takes a join of the key: it exists, before bootstrap the key is in the whitelist,
+/// after activation it is active or to be killed, and the collateral is at least
+/// `min_validator_stake` (rule 3).
+fn check_subnet(
+    data: &ServerData,
+    genesis_info: &db::SubnetGenesisInfo,
+    join: &IpcJoinSubnetMsg,
+) -> Result<(), String> {
+    let state = data
+        .db
+        .get_subnet_state(join.subnet_id)
+        .map_err(|e| e.to_string())?;
+    join.validate_for_subnet(genesis_info, &state)
+        .map_err(|e| e.to_string())
+}
+
+/// With the collateral of `join`, the total power stays `≤ MAX_TOTAL_POWER`: the monitor rejects
+/// a join above it (rule 3).
+fn check_total_power(
+    data: &ServerData,
+    genesis_info: &db::SubnetGenesisInfo,
+    join: &IpcJoinSubnetMsg,
+    tip: u64,
+) -> Result<(), String> {
+    let txn = data.db.read_txn().map_err(|e| e.to_string())?;
+    let state = data
+        .db
+        .get_subnet_state_txn(&txn, join.subnet_id)
+        .map_err(|e| e.to_string())?;
+    collateral::refuse_excess_power(
+        &*data.db,
+        &txn,
+        genesis_info,
+        state.as_ref(),
+        tip + 1,
+        None,
+        join.collateral,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The join-ue message of `join`, signed with the validator key and the subnet's EOTS key, which
+/// the first join to the subnet generates, with the EOTS nonce commitment of `nonce_range`.
+fn signed_join(
+    data: &ServerData,
+    keys: &EotsKeys,
+    join: IpcJoinSubnetMsg,
+    timeout: u32,
+    (start, count): (u64, u32),
+    validator_sk: &bitcoin::secp256k1::SecretKey,
+) -> Result<IpcJoinUeMsg, JsonRpcError> {
     let eots_signer = keys
         .signer_for_join(join.subnet_id, accepted_subnet_of(&data.db))
-        .map_err(eots_key)?;
+        .map_err(eots_key_error)?;
     let (eots_sk, eots_seed) = {
         let signer = eots_signer.lock().expect("EOTS signer lock");
         (signer.secret_key(), signer.seed())
     };
     let (commitment, roots) = eots::commit_nonces(&eots_seed, &join.subnet_id, start, count)
-        .map_err(|e| invalid(e.to_string()))?;
+        .map_err(|e| refuse_join(format!("{e}: change eots_nonce_count")))?;
     eots_signer
         .lock()
         .expect("EOTS signer lock")
         .keep_subtree_roots(join.subnet_id, &commitment, roots)
         .map_err(|e| RpcError::InternalError(format!("EOTS subtree roots: {e}")))?;
-    let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, &validator_sk, &eots_sk, commitment);
-    msg.validate().map_err(|e| invalid(e.to_string()))?;
-    {
-        let txn = data.db.read_txn().map_err(RpcError::DbError)?;
-        collateral::refuse_earlier_eots_key(
-            &*data.db,
-            &txn,
-            msg.join.subnet_id,
-            &msg.join.pubkey,
-            &msg.pk_eots,
-            None,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
-    }
-
-    info!(
-        "joinsubnet (join-ue): timeout {timeout} for {epochs} epochs from epoch {} (origin {origin}, tip {tip}), EOTS key {} nonces {start}..{}",
-        context.epoch,
-        msg.pk_eots,
-        u128::from(start) + u128::from(count)
-    );
-    let subnet_id = msg.join.subnet_id;
-    // A join that fails after its prefund transaction was recorded names it: no later join-ue to
-    // the subnet sends a second one.
-    let incomplete = |prefund_txid: bitcoin::Txid, e: String| -> JsonRpcError {
-        RpcError::InternalError(format!(
-            "{e}; the join to subnet {subnet_id} is incomplete after recording its prefund transaction {prefund_txid}: join-ue again sends the join transaction alone, and `ipc-cli cross-msg pre-fund` sends a prefund transaction that never reached Bitcoin"
-        ))
-        .into()
-    };
-    let recorded = keys
-        .join_record(subnet_id)
-        .map_err(eots_key)?
-        .and_then(|record| record.prefund);
-    let mut sent_prefund = false;
-    let prefund = match (recorded, initial_balance) {
-        (Some(prefund), balance) => {
-            let prefund_txid = prefund.compute_txid();
-            if balance.is_some() {
-                warn!("joinsubnet (join-ue): the join to subnet {subnet_id} recorded the prefund transaction {prefund_txid} before: no second one is sent");
-            } else {
-                info!("joinsubnet (join-ue): the join to subnet {subnet_id} recorded the prefund transaction {prefund_txid} before");
-            }
-            Some(prefund)
-        }
-        (None, Some(balance)) => {
-            let prefund_tx = prefund_transaction(
-                data,
-                &IpcPrefundSubnetMsg {
-                    subnet_id,
-                    amount: balance.amount,
-                    address: balance.address,
-                },
-            )?;
-            let prefund_txid = prefund_tx.compute_txid();
-            refuse_lagging_monitor_since(data, tip)?;
-            keys.record_join(
-                subnet_id,
-                &JoinRecord {
-                    pk_eots: msg.pk_eots,
-                    prefund: Some(prefund_tx.clone()),
-                    transactions: None,
-                },
-            )
-            .map_err(|e| {
-                // A failed write may have left the record: then it is final
-                let recorded =
-                    keys.join_record(subnet_id).ok().flatten().is_some_and(|r| {
-                        r.prefund.is_some_and(|p| p.compute_txid() == prefund_txid)
-                    });
-                if recorded {
-                    incomplete(prefund_txid, format!("EOTS key: {e}"))
-                } else {
-                    eots_key(e)
-                }
-            })?;
-            bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![prefund_tx.clone()])
-                .map_err(|e| incomplete(prefund_txid, e.to_string()))?;
-            info!("joinsubnet (join-ue): prefund transaction {prefund_txid}");
-            sent_prefund = true;
-            Some(prefund_tx)
-        }
-        (None, None) => None,
-    };
-    let pair = || -> Result<bitcoin::Txid, JsonRpcError> {
-        let (commit, reveal) = msg
-            .build_transactions(&data.btc_rpc, &context)
-            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-        if !sent_prefund {
-            refuse_lagging_monitor_since(data, tip)?;
-        }
-        let txid = reveal.compute_txid();
-        keys.record_join(
-            subnet_id,
-            &JoinRecord {
-                pk_eots: msg.pk_eots,
-                prefund: prefund.clone(),
-                transactions: Some(JoinTransactions {
-                    commit: commit.clone(),
-                    reveal: reveal.clone(),
-                }),
-            },
-        )
-        .map_err(eots_key)?;
-        bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![commit, reveal])
-            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
-        Ok(txid)
-    };
-    let txid = pair().map_err(|e| match &prefund {
-        Some(prefund) => incomplete(prefund.compute_txid(), error_text(&e)),
-        None => e,
-    })?;
-    info!("Submitted join-ue msg for subnet_id={subnet_id} join_txid={txid}");
-    Ok(txid)
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let msg = IpcJoinUeMsg::new_signed(&secp, join, timeout, validator_sk, &eots_sk, commitment);
+    msg.validate()
+        .map_err(|e| refuse_join(format!("the join-ue message is invalid: {e}")))?;
+    Ok(msg)
 }
 
-/// The message and details of a JSON-RPC error, as one line.
-fn error_text(e: &JsonRpcError) -> String {
-    let value = serde_json::to_value(e).unwrap_or_default();
-    match (value["message"].as_str(), value["data"].as_str()) {
-        (Some(message), Some(details)) => format!("{message}: {details}"),
-        (Some(message), None) => message.to_string(),
-        _ => "join-ue failed".to_string(),
-    }
+/// No accepted join of any subnet carries the EOTS key: the monitor rejects a join with an EOTS
+/// key accepted before (rule 2.7).
+fn check_eots_key_unused(data: &ServerData, msg: &IpcJoinUeMsg) -> Result<(), String> {
+    let txn = data.db.read_txn().map_err(|e| e.to_string())?;
+    collateral::refuse_earlier_eots_key(
+        &*data.db,
+        &txn,
+        msg.join.subnet_id,
+        &msg.join.pubkey,
+        &msg.pk_eots,
+        None,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Sends the commit and reveal transactions, built with the wallet, checked against the monitor's
+/// rules at the next Bitcoin block height and by the node's mempool.
+fn send_join(
+    data: &ServerData,
+    msg: &IpcJoinUeMsg,
+    context: &collateral::JoinContext,
+) -> Result<bitcoin::Txid, JsonRpcError> {
+    let subnet_id = msg.join.subnet_id;
+    let (commit, reveal) = msg
+        .build_transactions(&data.btc_rpc, context)
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    let txid = reveal.compute_txid();
+    bitcoin_utils::submit_to_mempool(&data.btc_rpc, vec![commit, reveal])
+        .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+    info!("Submitted join-ue msg for subnet_id={subnet_id} join_txid={txid}");
+    Ok(txid)
 }
 
 /// Refuses `join-ue` and `unstakeue` while `UE_ACTIVATION_HEIGHT` is unset or above the tip.
@@ -1072,64 +843,6 @@ fn get_subnet_balance_blocking(
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PrefundSubnetResponse {
-    prefund_txid: bitcoin::Txid,
-}
-
-pub async fn prefund_subnet(
-    data: Data<Arc<ServerData>>,
-    Params(msg): Params<IpcPrefundSubnetMsg>,
-) -> Result<PrefundSubnetResponse, JsonRpcError> {
-    info!("prefundsubnet: {}", msg.subnet_id);
-    let prefund_txid = run_blocking(&data, move |data| submit_prefund(data, &msg)).await?;
-    Ok(PrefundSubnetResponse { prefund_txid })
-}
-
-/// Checks and submits a prefund transaction, returning its txid.
-fn submit_prefund(
-    data: &ServerData,
-    msg: &IpcPrefundSubnetMsg,
-) -> Result<bitcoin::Txid, JsonRpcError> {
-    let prefund_tx = prefund_transaction(data, msg)?;
-    msg.submit_transaction(&data.btc_rpc, prefund_tx)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))
-}
-
-/// Checks a prefund message and builds its transaction with the wallet, without sending it.
-fn prefund_transaction(
-    data: &ServerData,
-    msg: &IpcPrefundSubnetMsg,
-) -> Result<bitcoin::Transaction, JsonRpcError> {
-    if let Err(err) = msg.validate() {
-        error!("Invalid prefund message={msg:?}: {err}");
-        return Err(RpcError::InvalidParams(err.to_string()).into());
-    }
-
-    let genesis_info = data
-        .db
-        .get_subnet_genesis_info(msg.subnet_id)
-        .map_err(|e| {
-            error!("Error getting subnet info from Db: {}", e);
-            RpcError::DbError(e)
-        })?
-        .ok_or(RpcError::InvalidParams(format!(
-            "Subnet {} not found.",
-            msg.subnet_id
-        )))?;
-
-    msg.validate_for_genesis_info(&genesis_info).map_err(|e| {
-        error!("Error validating prefund msg for subnet info: {}", e);
-        RpcError::InvalidParams(e.to_string())
-    })?;
-
-    // TODO this check should be done in the Db
-    let multisig_address = genesis_info.multisig_address();
-
-    msg.build_transaction(&data.btc_rpc, &multisig_address)
-        .map_err(|e| JsonRpcError::internal(e.to_string()))
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct FundSubnetResponse {
     fund_txid: bitcoin::Txid,
 }
@@ -1141,7 +854,7 @@ pub async fn fund_subnet(
     info!("fundsubnet: {}", msg.subnet_id);
 
     if let Err(err) = msg.validate() {
-        error!("Invalid prefund message={msg:?}: {err}");
+        error!("Invalid fund message={msg:?}: {err}");
         return Err(RpcError::InvalidParams(err.to_string()).into());
     }
 
@@ -3246,7 +2959,6 @@ pub fn make_rpc_server(server_data: Arc<ServerData>) -> RpcServer {
         .with_method("getsubnet", get_subnet)
         .with_method("getsubnetbalance", get_subnet_balance)
         .with_method("getgenesisinfo", get_genesis_info)
-        .with_method("prefundsubnet", prefund_subnet)
         .with_method("fundsubnet", fund_subnet)
         .with_method("killsubnet", kill_subnet)
         // rootnet messages

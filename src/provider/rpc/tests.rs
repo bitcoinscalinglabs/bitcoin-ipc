@@ -256,7 +256,6 @@ fn carried_entries_keep_complete_valid_ones_only() {
         bootstrapped: false,
         genesis_block_height: None,
         genesis_validators: vec![],
-        genesis_balance_entries: vec![],
     };
     let record = UeCollateral {
         subnet_id,
@@ -573,7 +572,6 @@ fn genesis(subnet_id: SubnetId, whitelist: Vec<bitcoin::XOnlyPublicKey>) -> db::
         bootstrapped: true,
         genesis_block_height: Some(1),
         genesis_validators: vec![],
-        genesis_balance_entries: vec![],
     }
 }
 
@@ -630,25 +628,27 @@ fn epoch_1_with_c_1_equal_to_c_gen_sweeps_the_whitelist_multisig() {
 #[derive(Default)]
 struct WalletState {
     funds: Vec<ListUnspentResultEntry>,
-    /// In the mempool unless mined, dropped or forgotten
+    /// In the mempool
     submitted: Vec<bitcoin::Transaction>,
-    /// By Bitcoin block height
-    mined: std::collections::BTreeMap<Txid, u64>,
-    /// Out of the mempool, unconfirmed
-    dropped: std::collections::BTreeSet<Txid>,
-    /// Unknown to the wallet
-    forgotten: std::collections::BTreeSet<Txid>,
     tip: u64,
-    /// The outcome of the next `sendrawtransaction` calls, in order; `None` sends normally
-    send_failures: std::collections::VecDeque<Option<SendFailure>>,
-    /// Outputs spent by other transactions: in the mempool (`None`) or in a Bitcoin block
-    spent: std::collections::BTreeMap<OutPoint, Option<u64>>,
-    /// The transactions of others in Bitcoin blocks, by height
-    blocks: std::collections::BTreeMap<u64, Vec<bitcoin::Transaction>>,
+    /// The next `sendrawtransaction` is refused by the node
+    fail_next_send: bool,
     /// The next `sendrawtransaction` waits at this gate
     gate: Option<Arc<Gate>>,
-    /// The tip after the next `fundrawtransaction`: a Bitcoin block arrives while a pair is built
-    tip_after_funding: Option<u64>,
+}
+
+impl WalletState {
+    /// A submitted transaction spends `outpoint`
+    fn spent(&self, outpoint: &OutPoint) -> bool {
+        self.submitted
+            .iter()
+            .any(|tx| tx.input.iter().any(|i| i.previous_output == *outpoint))
+    }
+}
+
+/// The wallet's own outputs, by index.
+fn wallet_output(vout: u32) -> OutPoint {
+    OutPoint::new(Txid::from_byte_array([0xfd; 32]), vout)
 }
 
 /// A wait in the wallet, released by the test or after 10 seconds.
@@ -693,33 +693,10 @@ impl Gate {
     }
 }
 
-fn block_hash_at(height: u64) -> BlockHash {
-    let mut bytes = [0xb1; 32];
-    bytes[..8].copy_from_slice(&height.to_le_bytes());
-    BlockHash::from_byte_array(bytes)
-}
-
-#[derive(Clone, Copy)]
-enum SendFailure {
-    /// The node has the transaction, the response is lost
-    Lost,
-    /// The node refuses the transaction
-    Refused,
-}
-
 fn send_error() -> jsonrpc::error::RpcError {
     jsonrpc::error::RpcError {
         code: -25,
         message: "connection lost".to_string(),
-        data: None,
-    }
-}
-
-/// Bitcoin Core's error for a transaction it does not know
-fn unknown_transaction() -> jsonrpc::error::RpcError {
-    jsonrpc::error::RpcError {
-        code: -5,
-        message: "No such mempool or wallet transaction".to_string(),
         data: None,
     }
 }
@@ -764,8 +741,8 @@ impl jsonrpc::client::Transport for WalletRpc {
                 .unwrap()
             }
             "fundrawtransaction" => {
-                // Wallet templates have no inputs and use legacy serialization. Decode
-                // their fields separately, then provide a synthetic wallet input.
+                // Wallet templates use legacy serialization. Decode their fields separately,
+                // then add the first wallet output that is neither spent nor an input already.
                 use bitcoin::consensus::Decodable;
                 let bytes = hex::decode(args[0].as_str().unwrap()).unwrap();
                 let mut cursor = bitcoin::io::Cursor::new(bytes);
@@ -775,9 +752,16 @@ impl jsonrpc::client::Transport for WalletRpc {
                     output: Decodable::consensus_decode(&mut cursor).unwrap(),
                     lock_time: Decodable::consensus_decode(&mut cursor).unwrap(),
                 };
-                assert!(tx.input.is_empty());
+                let state = self.0.lock().unwrap();
+                let previous_output = (0..)
+                    .map(wallet_output)
+                    .find(|outpoint| {
+                        !state.spent(outpoint)
+                            && tx.input.iter().all(|i| i.previous_output != *outpoint)
+                    })
+                    .unwrap();
                 tx.input.push(bitcoin::TxIn {
-                    previous_output: OutPoint::new(Txid::from_byte_array([0xfd; 32]), 0),
+                    previous_output,
                     ..Default::default()
                 });
                 serde_json::json!({
@@ -786,63 +770,7 @@ impl jsonrpc::client::Transport for WalletRpc {
                     "changepos": -1
                 })
             }
-            "signrawtransactionwithwallet" => {
-                let mut state = self.0.lock().unwrap();
-                if let Some(tip) = state.tip_after_funding.take() {
-                    state.tip = tip;
-                }
-                serde_json::json!({"hex": args[0], "complete": true})
-            }
-            "gettxout" => {
-                let txid: Txid = serde_json::from_value(args[0].clone()).unwrap();
-                let vout = args[1].as_u64().unwrap() as u32;
-                let with_mempool = args.get(2).and_then(|v| v.as_bool()).unwrap_or(true);
-                let state = self.0.lock().unwrap();
-                let outpoint = OutPoint::new(txid, vout);
-                let output = serde_json::json!({
-                    "bestblock": block_hash_at(state.tip),
-                    "confirmations": 1,
-                    "value": 0.001,
-                    "scriptPubKey": {"asm": "1", "hex": "51", "type": "nonstandard"},
-                    "coinbase": false,
-                });
-                let unspent = match state.spent.get(&outpoint) {
-                    Some(None) => !with_mempool,
-                    Some(Some(_)) => false,
-                    None => {
-                        let own = state.submitted.iter().any(|tx| tx.compute_txid() == txid);
-                        let mined = state.mined.contains_key(&txid);
-                        let in_mempool = own
-                            && !mined
-                            && !state.dropped.contains(&txid)
-                            && !state.forgotten.contains(&txid);
-                        !own || mined || (in_mempool && with_mempool)
-                    }
-                };
-                if unspent {
-                    output
-                } else {
-                    serde_json::Value::Null
-                }
-            }
-            "getblockhash" => serde_json::json!(block_hash_at(args[0].as_u64().unwrap())),
-            "getblock" => {
-                let hash: BlockHash = serde_json::from_value(args[0].clone()).unwrap();
-                let height = u64::from_le_bytes(hash.to_byte_array()[..8].try_into().unwrap());
-                let state = self.0.lock().unwrap();
-                let block = bitcoin::Block {
-                    header: bitcoin::block::Header {
-                        version: bitcoin::block::Version::ONE,
-                        prev_blockhash: BlockHash::all_zeros(),
-                        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-                        time: 0,
-                        bits: bitcoin::CompactTarget::from_consensus(0),
-                        nonce: 0,
-                    },
-                    txdata: state.blocks.get(&height).cloned().unwrap_or_default(),
-                };
-                serde_json::json!(bitcoin::consensus::encode::serialize_hex(&block))
-            }
+            "signrawtransactionwithwallet" => serde_json::json!({"hex": args[0], "complete": true}),
             "testmempoolaccept" => {
                 let hexes: Vec<String> = serde_json::from_value(args[0].clone()).unwrap();
                 serde_json::json!(hexes
@@ -865,11 +793,7 @@ impl jsonrpc::client::Transport for WalletRpc {
                     gate.wait();
                 }
                 let mut state = self.0.lock().unwrap();
-                let failure = state.send_failures.pop_front().flatten();
-                if !matches!(failure, Some(SendFailure::Refused)) {
-                    state.submitted.push(tx);
-                }
-                if failure.is_some() {
+                if std::mem::take(&mut state.fail_next_send) {
                     return Ok(jsonrpc::Response {
                         result: None,
                         error: Some(send_error()),
@@ -877,46 +801,8 @@ impl jsonrpc::client::Transport for WalletRpc {
                         jsonrpc: Some("2.0".into()),
                     });
                 }
+                state.submitted.push(tx);
                 serde_json::json!(txid)
-            }
-            "getmempoolentry" => {
-                let txid: Txid = serde_json::from_value(args[0].clone()).unwrap();
-                let state = self.0.lock().unwrap();
-                let in_mempool = state.submitted.iter().any(|tx| tx.compute_txid() == txid)
-                    && !state.mined.contains_key(&txid)
-                    && !state.dropped.contains(&txid)
-                    && !state.forgotten.contains(&txid);
-                if !in_mempool {
-                    return Ok(jsonrpc::Response {
-                        result: None,
-                        error: Some(unknown_transaction()),
-                        id: request.id,
-                        jsonrpc: Some("2.0".into()),
-                    });
-                }
-                serde_json::json!({"vsize": 200})
-            }
-            "gettransaction" => {
-                let txid: Txid = serde_json::from_value(args[0].clone()).unwrap();
-                let state = self.0.lock().unwrap();
-                if !state.submitted.iter().any(|tx| tx.compute_txid() == txid)
-                    || state.forgotten.contains(&txid)
-                {
-                    return Ok(jsonrpc::Response {
-                        result: None,
-                        error: Some(unknown_transaction()),
-                        id: request.id,
-                        jsonrpc: Some("2.0".into()),
-                    });
-                }
-                match state.mined.get(&txid) {
-                    Some(height) => serde_json::json!({
-                        "txid": txid,
-                        "confirmations": 1,
-                        "blockheight": height,
-                    }),
-                    None => serde_json::json!({"txid": txid, "confirmations": 0}),
-                }
             }
             method => panic!("unexpected Bitcoin RPC method: {method}"),
         };
@@ -1867,35 +1753,8 @@ fn pk_eots_of(
 
 fn join(data: &ServerData, id: SubnetId, nonces: (u64, u32)) -> Result<bitcoin::Txid, String> {
     let genesis = data.db.get_subnet_genesis_info(id).unwrap().unwrap();
-    join_subnet_ue(
-        data,
-        &genesis,
-        checked(id, 1, 22, 1).msg.join,
-        2,
-        nonces,
-        None,
-    )
-    .map_err(|e| serde_json::to_string(&e).unwrap())
-}
-
-fn join_record(data: &ServerData, id: SubnetId) -> JoinRecord {
-    data.eots_keys
-        .as_ref()
-        .unwrap()
-        .join_record(id)
-        .unwrap()
-        .unwrap()
-}
-
-fn submitted_txids(wallet: &WalletRpc) -> Vec<Txid> {
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .submitted
-        .iter()
-        .map(|tx| tx.compute_txid())
-        .collect()
+    join_subnet_ue(data, &genesis, checked(id, 1, 22, 1).msg.join, 2, nonces)
+        .map_err(|e| serde_json::to_string(&e).unwrap())
 }
 
 fn submitted(wallet: &WalletRpc) -> usize {
@@ -1963,16 +1822,7 @@ async fn join_ue_generates_an_eots_key_and_seed_per_subnet() {
         let signer = signer.lock().unwrap();
         assert_eq!(signer.pk_eots(), pk);
         assert_eq!(signer.key_path(), files_of(id).key);
-        assert_eq!(
-            keys.join_record(id).unwrap().unwrap().pk_eots,
-            pk,
-            "the join sent is recorded"
-        );
     }
-    assert_eq!(
-        keys.join_record(first).unwrap().unwrap().txid(),
-        Some(first_txid)
-    );
     assert!(keys.signer_of(subnet(95), no_join).unwrap().is_none());
 
     // The vote databases stay open in `data`: the restart loads a copy of the files
@@ -1999,58 +1849,6 @@ async fn join_ue_generates_an_eots_key_and_seed_per_subnet() {
             .unwrap();
         assert_eq!(vote.pk_eots, pk.serialize());
     }
-}
-
-#[tokio::test]
-async fn join_ue_is_refused_while_an_earlier_join_awaits_the_monitor() {
-    let (dir, db) = database().await;
-    let id = subnet(92);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let keys = data.eots_keys.as_ref().unwrap();
-
-    let txid = join(&data, id, (7, 50)).unwrap();
-    let (pk_eots, _) = pk_eots_of(&wallet, txid);
-    assert_eq!(submitted(&wallet), 2, "commit and reveal");
-    let files_before = key_files_in(dir.path());
-
-    // In the mempool
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(refused.contains("unconfirmed, in the mempool"), "{refused}");
-    assert!(refused.contains(&txid.to_string()), "{refused}");
-    assert_eq!(submitted(&wallet), 2, "no transaction");
-
-    // In a Bitcoin block the monitor has not processed
-    wallet.0.lock().unwrap().mined.insert(txid, 103);
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(refused.contains("in Bitcoin block 103"), "{refused}");
-    assert!(refused.contains("last processed 100"), "{refused}");
-    assert_eq!(submitted(&wallet), 2);
-    assert_eq!(key_files_in(dir.path()), files_before, "no new key");
-    assert_eq!(keys.join_record(id).unwrap().unwrap().txid(), Some(txid));
-
-    // Processed by the monitor without being accepted: the join is sent again with the same key
-    wallet.0.lock().unwrap().mined.insert(txid, 99);
-    let retry = join(&data, id, (7, 50)).unwrap();
-    assert_ne!(retry, txid);
-    assert_eq!(submitted(&wallet), 4);
-    assert_eq!(pk_eots_of(&wallet, retry).0, pk_eots);
-    assert_eq!(key_files_in(dir.path()), files_before);
-    assert_eq!(keys.join_record(id).unwrap().unwrap().txid(), Some(retry));
-
-    // The pair dropped from the mempool: sent again
-    let commit = wallet.0.lock().unwrap().submitted[2].compute_txid();
-    wallet.0.lock().unwrap().dropped.extend([commit, retry]);
-    let dropped = join(&data, id, (7, 50)).unwrap();
-    assert_eq!(submitted(&wallet), 6);
-    assert_eq!(pk_eots_of(&wallet, dropped).0, pk_eots);
-
-    // The pair unknown to the wallet: sent again
-    let commit = wallet.0.lock().unwrap().submitted[4].compute_txid();
-    wallet.0.lock().unwrap().forgotten.extend([commit, dropped]);
-    assert!(join(&data, id, (7, 50)).is_ok());
-    assert_eq!(submitted(&wallet), 8);
 }
 
 #[tokio::test]
@@ -2143,24 +1941,6 @@ async fn a_configured_eots_key_joins_and_votes_as_before() {
         .is_none());
 }
 
-/// A join to `id` with `initial_balance`, through the handler's join-ue path.
-fn join_with_balance(
-    data: &ServerData,
-    id: SubnetId,
-    initial_balance: Option<InitialBalance>,
-) -> Result<bitcoin::Txid, String> {
-    let genesis = data.db.get_subnet_genesis_info(id).unwrap().unwrap();
-    join_subnet_ue(
-        data,
-        &genesis,
-        checked(id, 1, 22, 1).msg.join,
-        2,
-        (7, 50),
-        initial_balance,
-    )
-    .map_err(|e| serde_json::to_string(&e).unwrap())
-}
-
 fn set_processed(data: &ServerData, height: u64) {
     let mut txn = data.db.write_txn().unwrap();
     data.db.set_last_processed_block(&mut txn, height).unwrap();
@@ -2196,26 +1976,8 @@ fn join_both(
 }
 
 #[tokio::test]
-async fn joins_at_the_same_time_send_one_pair_per_subnet_and_never_share_a_key() {
-    let (dir, db) = database().await;
-    let id = subnet(89);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = Arc::new(provider_with_keys(db, dir.path(), &wallet, None));
-
-    // To one subnet: one join is sent, the other finds it unconfirmed
-    let results = join_both(&data, id, id);
-    let sent: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
-    let refused: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
-    assert_eq!(sent.len(), 1, "{results:?}");
-    assert!(
-        refused[0].contains("unconfirmed, in the mempool"),
-        "{refused:?}"
-    );
-    assert_eq!(submitted(&wallet), 2, "one commit and one reveal");
-    drop(data);
-
-    // To two subnets with an unused configured key: one join carries it, the other a new key
+async fn joins_at_the_same_time_to_two_subnets_never_share_a_key() {
+    // With an unused configured key: one join carries it, the other a new key
     let (dir, db) = database().await;
     let (first, second) = (subnet(88), subnet(87));
     create(&db, first);
@@ -2253,12 +2015,7 @@ async fn the_configured_key_stays_with_the_subnet_it_was_chosen_for_after_a_fail
     let pk_configured = keys.signers()[0].lock().unwrap().pk_eots();
 
     // The node refuses the commit transaction of the first join
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .push_back(Some(SendFailure::Refused));
+    wallet.0.lock().unwrap().fail_next_send = true;
     let failed = join(&data, first, (7, 50)).unwrap_err();
     assert!(failed.contains("connection lost"), "{failed}");
     assert_eq!(submitted(&wallet), 0);
@@ -2273,368 +2030,6 @@ async fn the_configured_key_stays_with_the_subnet_it_was_chosen_for_after_a_fail
     assert_ne!(pk_second, pk_configured);
     let (pk_first, _) = pk_eots_of(&wallet, join(&data, first, (7, 50)).unwrap());
     assert_eq!(pk_first, pk_configured);
-    assert_eq!(submitted(&wallet), 4);
-}
-
-#[tokio::test]
-async fn a_join_that_may_have_reached_bitcoin_is_known_across_a_restart() {
-    let (dir, db) = database().await;
-    let id = subnet(84);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let keys = data.eots_keys.as_ref().unwrap();
-
-    // The join record cannot be written: nothing is sent
-    let blocked = crate::provider::eots_keys::subnet_file(dir.path(), id, "join.tmp");
-    std::fs::create_dir(&blocked).unwrap();
-    let failed = join(&data, id, (7, 50)).unwrap_err();
-    std::fs::remove_dir(&blocked).unwrap();
-    assert!(failed.contains("join record"), "{failed}");
-    assert_eq!(submitted(&wallet), 0, "no transaction without its record");
-
-    // The response to the reveal transaction is lost: the join is recorded and refused later
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .extend([None, Some(SendFailure::Lost)]);
-    let lost = join(&data, id, (7, 50)).unwrap_err();
-    assert!(lost.contains("connection lost"), "{lost}");
-    assert_eq!(submitted(&wallet), 2, "both reached the node");
-    let txid = wallet.0.lock().unwrap().submitted[1].compute_txid();
-    assert_eq!(keys.join_record(id).unwrap().unwrap().txid(), Some(txid));
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(refused.contains("unconfirmed, in the mempool"), "{refused}");
-    assert!(refused.contains(&txid.to_string()), "{refused}");
-    assert_eq!(submitted(&wallet), 2);
-
-    // After a restart as well (one vote database opens once per process: the keys are dropped)
-    let ServerData { db, eots_keys, .. } = data;
-    drop(eots_keys);
-    let db = Arc::try_unwrap(db).ok().unwrap();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(refused.contains("unconfirmed, in the mempool"), "{refused}");
-    assert_eq!(submitted(&wallet), 2);
-
-    // The pair dropped: the next join is sent, and its reveal transaction is refused by the node
-    let commit = wallet.0.lock().unwrap().submitted[0].compute_txid();
-    wallet.0.lock().unwrap().dropped.extend([commit, txid]);
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .extend([None, Some(SendFailure::Refused)]);
-    assert!(join(&data, id, (7, 50)).is_err());
-    assert_eq!(submitted(&wallet), 3, "the commit transaction alone");
-    // The next join sends the recorded reveal transaction again and is refused
-    let again = join(&data, id, (7, 50)).unwrap_err();
-    assert!(again.contains("sent again, unconfirmed"), "{again}");
-    assert_eq!(submitted(&wallet), 4);
-    let reveal = wallet.0.lock().unwrap().submitted[3].clone();
-    assert_eq!(
-        reveal.input[0].previous_output.txid,
-        wallet.0.lock().unwrap().submitted[2].compute_txid(),
-        "the reveal of the recorded pair"
-    );
-    assert_eq!(
-        data.eots_keys
-            .as_ref()
-            .unwrap()
-            .join_record(id)
-            .unwrap()
-            .unwrap()
-            .txid(),
-        Some(reveal.compute_txid())
-    );
-}
-
-#[tokio::test]
-async fn join_ue_is_refused_while_the_monitor_has_not_caught_up() {
-    let (dir, db) = database().await;
-    let id = subnet(83);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-
-    set_processed(&data, 99);
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(
-        refused.contains("has processed Bitcoin block 99 of 100"),
-        "{refused}"
-    );
-    assert!(refused.contains("caught up"), "{refused}");
-    assert_eq!(submitted(&wallet), 0, "no transaction");
-    assert!(key_files_in(dir.path()).is_empty(), "no new key");
-
-    set_processed(&data, 100);
-    assert!(join(&data, id, (7, 50)).is_ok());
-    assert_eq!(submitted(&wallet), 2);
-}
-
-#[tokio::test]
-async fn a_refused_join_with_an_initial_balance_sends_no_prefund_transaction() {
-    let (dir, db) = database().await;
-    let id = subnet(82);
-    create(&db, id);
-    let accepted = checked(id, 1, 22, 1);
-    let mut txn = db.write_txn().unwrap();
-    process_join_ue(
-        &db,
-        &mut txn,
-        &accepted,
-        Txid::from_byte_array([34; 32]),
-        99,
-        BlockHash::from_byte_array([98; 32]),
-    )
-    .unwrap();
-    txn.commit().unwrap();
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let balance = InitialBalance {
-        amount: Amount::from_sat(5_000),
-        address: alloy_primitives::Address::from([7; 20]),
-    };
-
-    // Joined before: nothing is sent
-    let refused = join_with_balance(&data, id, Some(balance.clone())).unwrap_err();
-    assert!(refused.contains("a key joins a subnet once"), "{refused}");
-    assert_eq!(submitted(&wallet), 0, "no prefund transaction");
-
-    // A join awaiting the monitor: nothing is sent either
-    let open = subnet(81);
-    create(&data.db, open);
-    let txid = join_with_balance(&data, open, Some(balance.clone())).unwrap();
-    assert_eq!(submitted(&wallet), 3, "prefund, commit and reveal");
-    let prefund = wallet.0.lock().unwrap().submitted[0].clone();
-    assert!(
-        prefund.output[0].script_pubkey.is_op_return() && prefund.output[1].value.to_sat() == 5_000,
-        "the prefund transaction comes first: {prefund:?}"
-    );
-    assert_eq!(wallet.0.lock().unwrap().submitted[2].compute_txid(), txid);
-    let refused = join_with_balance(&data, open, Some(balance)).unwrap_err();
-    assert!(refused.contains("unconfirmed, in the mempool"), "{refused}");
-    assert_eq!(submitted(&wallet), 3);
-}
-
-#[tokio::test]
-async fn a_prefund_transaction_that_may_have_reached_bitcoin_is_sent_once() {
-    let (dir, db) = database().await;
-    let id = subnet(80);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let balance = InitialBalance {
-        amount: Amount::from_sat(5_000),
-        address: alloy_primitives::Address::from([7; 20]),
-    };
-
-    // The response to the prefund transaction is lost: the error names it and the incomplete join
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .push_back(Some(SendFailure::Lost));
-    let lost = join_with_balance(&data, id, Some(balance.clone())).unwrap_err();
-    assert_eq!(
-        submitted(&wallet),
-        1,
-        "the prefund transaction reached the node"
-    );
-    let prefund = submitted_txids(&wallet)[0];
-    assert!(lost.contains(&prefund.to_string()), "{lost}");
-    assert!(lost.contains("incomplete"), "{lost}");
-    let record = join_record(&data, id);
-    assert_eq!(record.prefund.map(|tx| tx.compute_txid()), Some(prefund));
-    assert_eq!(record.transactions, None);
-
-    // The retry, with the same initial balance, sends the pair alone and keeps the record
-    let txid = join_with_balance(&data, id, Some(balance.clone())).unwrap();
-    assert_eq!(
-        submitted_txids(&wallet).len(),
-        3,
-        "prefund, commit and reveal"
-    );
-    assert_eq!(submitted_txids(&wallet)[2], txid);
-    let record = join_record(&data, id);
-    assert_eq!(
-        record.prefund.as_ref().map(|tx| tx.compute_txid()),
-        Some(prefund)
-    );
-    assert_eq!(record.txid(), Some(txid));
-
-    // The pair dropped and the prefund transaction mined: a join without an initial balance sends
-    // the pair alone
-    let commit = submitted_txids(&wallet)[1];
-    {
-        let mut state = wallet.0.lock().unwrap();
-        state.dropped.extend([commit, txid]);
-        state.mined.insert(prefund, 100);
-    }
-    let again = join(&data, id, (7, 50)).unwrap();
-    assert_eq!(submitted_txids(&wallet).len(), 5);
-    assert_eq!(submitted_txids(&wallet)[4], again);
-    assert!(
-        submitted_txids(&wallet)[3..].iter().all(|t| *t != prefund),
-        "no second prefund transaction"
-    );
-
-    // A prefund transaction recorded but refused by the node is never sent again, whatever
-    // happened to it: a failed retry names it, the next one sends the pair alone
-    let other = subnet(79);
-    create(&data.db, other);
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .push_back(Some(SendFailure::Refused));
-    let refused = join_with_balance(&data, other, Some(balance.clone())).unwrap_err();
-    assert!(refused.contains("incomplete"), "{refused}");
-    assert_eq!(submitted(&wallet), 5, "nothing reached the node");
-    let recorded = join_record(&data, other).prefund.unwrap().compute_txid();
-    assert!(refused.contains(&recorded.to_string()), "{refused}");
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .push_back(Some(SendFailure::Refused));
-    let failed = join_with_balance(&data, other, Some(balance.clone())).unwrap_err();
-    assert!(failed.contains(&recorded.to_string()), "{failed}");
-    assert!(failed.contains("incomplete"), "{failed}");
-    assert_eq!(submitted(&wallet), 5, "the commit transaction was refused");
-    let more = InitialBalance {
-        amount: Amount::from_sat(6_000),
-        ..balance
-    };
-    let txid = join_with_balance(&data, other, Some(more)).unwrap();
-    assert_eq!(submitted_txids(&wallet).len(), 7, "the pair alone");
-    assert_eq!(submitted_txids(&wallet)[6], txid);
-    assert!(
-        submitted_txids(&wallet).iter().all(|t| *t != recorded),
-        "the recorded prefund transaction is never sent"
-    );
-    let record = join_record(&data, other);
-    assert_eq!(
-        record.prefund.as_ref().map(|tx| tx.compute_txid()),
-        Some(recorded)
-    );
-    assert_eq!(record.txid(), Some(txid));
-}
-
-#[tokio::test]
-async fn a_spent_reveal_input_lets_a_new_pair_through_once_the_monitor_processed_the_spend() {
-    let (dir, db) = database().await;
-    let id = subnet(77);
-    create(&db, id);
-    let wallet = WalletRpc::default();
-    let data = provider_with_keys(db, dir.path(), &wallet, None);
-
-    let txid = join(&data, id, (7, 50)).unwrap();
-    let (pk_eots, _) = pk_eots_of(&wallet, txid);
-    let commit = submitted_txids(&wallet)[0];
-    let outpoint = OutPoint::new(commit, 0);
-    // The commit transaction is mined, the reveal transaction is out of the mempool
-    {
-        let mut state = wallet.0.lock().unwrap();
-        state.mined.insert(commit, 99);
-        state.dropped.insert(txid);
-    }
-
-    // Its input spent by another transaction in the mempool: refused, nothing sent
-    wallet.0.lock().unwrap().spent.insert(outpoint, None);
-    let refused = join(&data, id, (7, 50)).unwrap_err();
-    assert!(refused.contains("another transaction"), "{refused}");
-    assert!(refused.contains("in the mempool"), "{refused}");
-    assert_eq!(
-        submitted(&wallet),
-        2,
-        "the reveal transaction is not sent again"
-    );
-
-    // Spent in a Bitcoin block the monitor has processed: a new pair with the subnet's key
-    wallet.0.lock().unwrap().spent.insert(outpoint, Some(100));
-    let retry = join(&data, id, (7, 50)).unwrap();
-    assert_eq!(submitted(&wallet), 4);
-    assert_ne!(retry, txid);
-    assert_eq!(pk_eots_of(&wallet, retry).0, pk_eots);
-    assert_eq!(join_record(&data, id).txid(), Some(retry));
-
-    // The Bitcoin block of a spend the monitor has not processed is found
-    let spender = bitcoin::Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![bitcoin::TxIn {
-            previous_output: outpoint,
-            ..Default::default()
-        }],
-        output: vec![],
-    };
-    {
-        let mut state = wallet.0.lock().unwrap();
-        state.blocks.insert(101, vec![spender]);
-        state.tip = 102;
-    }
-    let spend = |processed| {
-        unprocessed_spend(&data, outpoint, processed, 102)
-            .ok()
-            .unwrap()
-    };
-    assert_eq!(spend(100), Some(101));
-    assert_eq!(spend(101), None);
-    assert_eq!(spend(102), None);
-}
-
-#[tokio::test]
-async fn the_lagging_monitor_check_uses_the_tip_read_after_the_join_guard() {
-    let (dir, db) = database().await;
-    let (first, second) = (subnet(76), subnet(75));
-    create(&db, first);
-    create(&db, second);
-    let wallet = WalletRpc::default();
-    let data = Arc::new(provider_with_keys(db, dir.path(), &wallet, None));
-
-    // A join waits at the node while sending; a Bitcoin block arrives; a second join waits for it
-    let gate = Arc::new(Gate::default());
-    wallet.0.lock().unwrap().gate = Some(gate.clone());
-    let stalled = {
-        let data = data.clone();
-        std::thread::spawn(move || join(&data, first, (7, 50)))
-    };
-    while !gate.stalled() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    wallet.0.lock().unwrap().tip = 101;
-    let waiting = {
-        let data = data.clone();
-        std::thread::spawn(move || join(&data, second, (7, 50)))
-    };
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    gate.open();
-    assert!(stalled.join().unwrap().is_ok());
-    let refused = waiting.join().unwrap().unwrap_err();
-    assert!(
-        refused.contains("has processed Bitcoin block 100 of 101"),
-        "{refused}"
-    );
-    assert_eq!(submitted(&wallet), 2, "the first pair alone");
-
-    // A Bitcoin block arrives while the pair is built: refused before the first broadcast
-    set_processed(&data, 101);
-    wallet.0.lock().unwrap().tip_after_funding = Some(102);
-    let refused = join(&data, second, (7, 50)).unwrap_err();
-    assert!(
-        refused.contains("has processed Bitcoin block 101 of 102"),
-        "{refused}"
-    );
-    assert_eq!(submitted(&wallet), 2);
-    set_processed(&data, 102);
-    assert!(join(&data, second, (7, 50)).is_ok());
     assert_eq!(submitted(&wallet), 4);
 }
 
@@ -2703,7 +2098,6 @@ async fn a_stalled_join_leaves_signeotsvote_and_a_read_only_method_answering() {
         checked(joining, 1, 22, 1).msg.join,
         2,
         (7, 50),
-        None,
     ));
     while !gate.stalled() {
         tokio::task::yield_now().await;
@@ -2795,55 +2189,154 @@ async fn signeotsvote_waiting_for_the_eots_key_leaves_a_read_only_method_answeri
     );
 }
 
+fn refusal(e: JsonRpcError) -> String {
+    serde_json::to_string(&e).unwrap()
+}
+
 #[tokio::test]
-async fn a_failed_sync_of_the_join_record_sends_nothing() {
-    use crate::provider::eots_keys::sync_faults::{self, SyncStep};
+async fn join_ue_checks_the_validator_key_the_epochs_and_the_nonce_range() {
     let (dir, db) = database().await;
-    let id = subnet(72);
+    let id = subnet(60);
+    create(&db, id);
+    // With epochs of one Bitcoin block, the timeout of --epochs 3 is allowed at the next height
+    let mut genesis = db.get_subnet_genesis_info(id).unwrap().unwrap();
+    genesis.create_subnet_msg.epoch_length = 1;
+    genesis.create_subnet_msg.max_timeout = 2;
+    let mut txn = db.write_txn().unwrap();
+    db.save_subnet_genesis_info(&mut txn, id, &genesis).unwrap();
+    txn.commit().unwrap();
+    let wallet = WalletRpc::default();
+    let data = provider_with_keys(db, dir.path(), &wallet, None);
+    let request = |join: IpcJoinSubnetMsg, epochs, nonces| {
+        refusal(join_subnet_ue(&data, &genesis, join, epochs, nonces).unwrap_err())
+    };
+    let join = || checked(id, 1, 22, 1).msg.join;
+
+    let mut other_key = join();
+    other_key.pubkey = pubkey(2);
+    let refused = request(other_key, 2, (7, 50));
+    assert!(refused.contains(&pubkey(2).to_string()), "{refused}");
+
+    // min_timeout 1, max_timeout 2
+    for epochs in [0, 3] {
+        let refused = request(join(), epochs, (7, 50));
+        assert!(refused.contains("max_timeout 2"), "{refused}");
+    }
+
+    for nonces in [(0, 1), (1, 0)] {
+        let refused = request(join(), 2, nonces);
+        assert!(
+            refused.contains("eots_nonce_count") || refused.contains("start >= 1"),
+            "{refused}"
+        );
+    }
+    assert_eq!(submitted(&wallet), 0);
+}
+
+#[tokio::test]
+async fn a_lagging_monitor_does_not_refuse_a_join() {
+    let (dir, db) = database().await;
+    let id = subnet(61);
     create(&db, id);
     let wallet = WalletRpc::default();
     let data = provider_with_keys(db, dir.path(), &wallet, None);
-    let balance = InitialBalance {
-        amount: Amount::from_sat(5_000),
-        address: alloy_primitives::Address::from([7; 20]),
+    set_processed(&data, 60);
+
+    let txid = join(&data, id, (7, 50)).unwrap();
+    assert_eq!(submitted(&wallet), 2, "commit and reveal");
+    // Before activation the timeout counts from the node's latest final Bitcoin block
+    let reveal = wallet.0.lock().unwrap().submitted[1].clone();
+    assert_eq!(reveal.compute_txid(), txid);
+    let [(_, IpcMessage::JoinUe { msg, .. })] = &IpcMessage::from_reveal_inputs(&reveal)[..] else {
+        panic!("the reveal carries one join-ue message");
     };
-    // The subnet's key exists, from a join whose commit transaction the node refused
-    wallet
-        .0
-        .lock()
-        .unwrap()
-        .send_failures
-        .push_back(Some(SendFailure::Refused));
-    assert!(join(&data, id, (7, 50)).is_err());
-    assert_eq!(submitted(&wallet), 0);
-    let files = key_files_in(dir.path());
-    assert_eq!(files.len(), 2);
+    assert_eq!(
+        u64::from(msg.timeout),
+        100 - BTC_CONFIRMATIONS + (2 + 3) * 10
+    );
+}
 
-    // The file sync of the record fails: no prefund transaction, no pair
-    sync_faults::fail(dir.path(), SyncStep::File);
-    let failed = join_with_balance(&data, id, Some(balance.clone())).unwrap_err();
-    sync_faults::clear(dir.path());
-    assert!(failed.contains("join record"), "{failed}");
-    assert!(failed.contains("File sync failed"), "{failed}");
-    assert_eq!(submitted(&wallet), 0);
+#[tokio::test]
+async fn join_ue_is_refused_when_the_key_is_not_in_the_whitelist() {
+    let (dir, db) = database().await;
+    let id = subnet(62);
+    create(&db, id);
+    let wallet = WalletRpc::default();
+    let data = provider_with_keys(db, dir.path(), &wallet, None);
+    let mut genesis = data.db.get_subnet_genesis_info(id).unwrap().unwrap();
+    let join_msg = checked(id, 1, 22, 1).msg.join;
+    genesis
+        .create_subnet_msg
+        .whitelist
+        .retain(|key| *key != join_msg.pubkey);
 
-    // The directory sync fails: the same, but the record is on disk, so the prefund transaction
-    // is recorded and the error names it
-    sync_faults::fail(dir.path(), SyncStep::Directory);
-    let failed = join_with_balance(&data, id, Some(balance.clone())).unwrap_err();
-    assert!(failed.contains("Directory sync failed"), "{failed}");
-    assert!(failed.contains("incomplete"), "{failed}");
-    let recorded = join_record(&data, id).prefund.unwrap().compute_txid();
-    assert!(failed.contains(&recorded.to_string()), "{failed}");
+    let refused = refusal(join_subnet_ue(&data, &genesis, join_msg, 2, (7, 50)).unwrap_err());
+    assert!(refused.contains("not whitelisted"), "{refused}");
     assert_eq!(submitted(&wallet), 0);
-    let failed = join(&data, id, (7, 50)).unwrap_err();
-    sync_faults::clear(dir.path());
-    assert!(failed.contains("join record"), "{failed}");
-    assert_eq!(submitted(&wallet), 0);
-    assert_eq!(key_files_in(dir.path()), files);
+}
 
-    // Synced, the join goes through: the pair alone, the recorded prefund transaction is never sent
-    assert!(join_with_balance(&data, id, Some(balance)).is_ok());
-    assert_eq!(submitted(&wallet), 2);
-    assert!(submitted_txids(&wallet).iter().all(|t| *t != recorded));
+#[tokio::test]
+async fn join_ue_is_refused_when_the_timeout_is_not_a_bitcoin_block_height() {
+    let (dir, db) = database().await;
+    let id = subnet(63);
+    create(&db, id);
+    let wallet = WalletRpc::default();
+    let data = provider_with_keys(db, dir.path(), &wallet, None);
+    wallet.0.lock().unwrap().tip = u64::from(collateral::LOCKTIME_THRESHOLD) - 10;
+
+    let refused = join(&data, id, (7, 50)).unwrap_err();
+    assert!(refused.contains("choose fewer --epochs"), "{refused}");
+    assert_eq!(submitted(&wallet), 0);
+}
+
+#[tokio::test]
+async fn join_ue_is_refused_with_a_collateral_above_the_maximum_power() {
+    let (dir, db) = database().await;
+    let id = subnet(64);
+    create(&db, id);
+    let wallet = WalletRpc::default();
+    let data = provider_with_keys(db, dir.path(), &wallet, None);
+    let genesis = data.db.get_subnet_genesis_info(id).unwrap().unwrap();
+    let mut join_msg = checked(id, 1, 22, 1).msg.join;
+    let unit = genesis.create_subnet_msg.power_unit().to_sat();
+    let above = u64::from(crate::multisig::MAX_TOTAL_POWER) + 1;
+    join_msg.collateral = Amount::from_sat(above * unit);
+
+    let refused = refusal(join_subnet_ue(&data, &genesis, join_msg, 2, (7, 50)).unwrap_err());
+    assert!(refused.contains("collateral too high"), "{refused}");
+    assert!(refused.contains("smaller --collateral"), "{refused}");
+    assert_eq!(submitted(&wallet), 0);
+    assert!(key_files_in(dir.path()).is_empty(), "no EOTS key");
+}
+
+#[tokio::test]
+async fn join_ue_is_refused_when_an_accepted_join_carries_its_eots_key() {
+    let (dir, db) = database().await;
+    let id = subnet(65);
+    create(&db, id);
+    // Validator 2 joined the subnet with the EOTS key configured for validator 1
+    let mut txn = db.write_txn().unwrap();
+    process_join_ue(
+        &db,
+        &mut txn,
+        &checked(id, 2, 23, 5),
+        Txid::from_byte_array([36; 32]),
+        99,
+        BlockHash::from_byte_array([99; 32]),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    let configured = crate::provider::eots_signer::EotsKeyFiles {
+        key: dir.path().join("configured").join("eots.sk"),
+        seed: dir.path().join("configured").join("eots.seed"),
+    };
+    std::fs::create_dir_all(dir.path().join("configured")).unwrap();
+    std::fs::write(&configured.key, hex::encode(secret(23).secret_bytes())).unwrap();
+    std::fs::write(&configured.seed, hex::encode([0x5e; 32])).unwrap();
+    let wallet = WalletRpc::default();
+    let data = provider_with_keys(db, dir.path(), &wallet, Some(&configured));
+
+    let refused = join(&data, id, (7, 50)).unwrap_err();
+    assert!(refused.contains("EOTS_SK_PATH"), "{refused}");
+    assert_eq!(submitted(&wallet), 0);
 }

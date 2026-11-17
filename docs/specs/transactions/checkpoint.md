@@ -68,7 +68,7 @@ Output 0 is an [OP_RETURN output](../encoding.md#op_return-output) whose data is
 
 ## Fund UTXOs
 
-The fund UTXOs of a configuration are the outputs locked under its multisig that the monitor accepted: prefund transactions (for `C_wlist`), deposit and fee top-up transactions, credited incoming transfers, the change of the previous checkpoint, and output 0 of a processed batch-transfer transaction.
+The fund UTXOs of a configuration are the outputs locked under its multisig that the monitor accepted: deposit and fee top-up transactions, credited incoming transfers, the change of the previous checkpoint, and output 0 of a processed batch-transfer transaction.
 
 **Delayed arrivals.** The subnet accepts delayed arrivals for half an epoch (the `K/2` window **unimplemented**: the code accepts the multisig of the previous configuration instead). A deposit transaction, fee top-up transaction or incoming transfer that pays the multisig of the current configuration is a fund UTXO. One that pays the multisig of an earlier configuration `C_e` (`e ≥ 1`) or `C_wlist` is a fund UTXO if its Bitcoin block height is at most `H_e + K/2`, where `H_e` is the cutoff that ends epoch `e` (`H_0` for `C_wlist`) and `e` is the latest epoch whose configuration has that multisig. The next checkpoint spends it into the current configuration.
 
@@ -76,7 +76,7 @@ The fund UTXOs of a configuration are the outputs locked under its multisig that
 
 ## Checkpoints of epoch 0
 
-The checkpoints before the rotation checkpoint of epoch 1 are regular checkpoints of `C_wlist` ([epoch 0](../lifecycle.md#epoch-0)). The validators of `C_wlist` sign them. They spend fund UTXOs of `C_wlist`: prefund, deposit and fee top-up transactions (fee top-up **unimplemented**) and the previous change. They pay their change to `MS(C_wlist)`, carry `last_change_number` 0 and no rotation flag, and refresh and exit no collateral UTXO.
+The checkpoints before the rotation checkpoint of epoch 1 are regular checkpoints of `C_wlist` ([epoch 0](../lifecycle.md#epoch-0)). The validators of `C_wlist` sign them. They spend fund UTXOs of `C_wlist`: deposit and fee top-up transactions (fee top-up **unimplemented**) and the previous change. They pay their change to `MS(C_wlist)`, carry `last_change_number` 0 and no rotation flag, and refresh and exit no collateral UTXO.
 
 ## The kill checkpoint
 
