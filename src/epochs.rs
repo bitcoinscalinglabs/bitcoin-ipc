@@ -29,7 +29,11 @@ pub struct CutoffOutcome {
 
 /// Logs a configuration that may not be able to make progress.
 pub fn warn_if_small(subnet_id: SubnetId, epoch: u64, members: usize) {
-    if members < MIN_CONFIGURATION_SIZE {
+    if members == 0 {
+        warn!(
+            "Subnet {subnet_id}: the configuration of epoch {epoch} is empty and may not be able to make progress"
+        );
+    } else if members < MIN_CONFIGURATION_SIZE {
         warn!(
             "Subnet {subnet_id}: the configuration of epoch {epoch} has {members} members, fewer than {MIN_CONFIGURATION_SIZE}, and may not be able to make progress"
         );
@@ -391,7 +395,7 @@ fn process_cutoff<D: DatabaseCore>(
 
     let base = state.latest_committee().clone();
     let boundary = params.cutoff_height(h_0, epoch + 2);
-    let mut target = compute_configuration(
+    let target = compute_configuration(
         db,
         txn,
         genesis_info,
@@ -399,16 +403,6 @@ fn process_cutoff<D: DatabaseCore>(
         &state.pending_multisig_changes,
         boundary,
     )?;
-    // With no qualifying validator the configuration stays and the pending changes wait for the
-    // next cutoff
-    let qualifies = !target.is_empty();
-    if !qualifies {
-        warn!(
-            "Subnet {subnet_id}: no validator qualifies for epoch {epoch}, C_{epoch} stays C_{}",
-            epoch - 1
-        );
-        target = base.validators.clone();
-    }
     warn_if_small(subnet_id, epoch, target.len());
 
     let first_number = db.get_next_stake_change_configuration_number_txn(txn, subnet_id)?;
@@ -435,9 +429,7 @@ fn process_cutoff<D: DatabaseCore>(
     };
 
     state.epoch = epoch;
-    if qualifies {
-        state.pending_multisig_changes.clear();
-    }
+    state.pending_multisig_changes.clear();
     if changed {
         state.waiting_committee = Some(committee.clone());
     }

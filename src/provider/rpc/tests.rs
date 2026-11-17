@@ -1372,8 +1372,8 @@ async fn checkpoint_epochs_across_periods_and_epoch_lengths() {
 }
 
 #[tokio::test]
-async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_gen() {
-    let f = EpochZeroFixture::new([135; 4]).await;
+async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_to_c_1() {
+    let f = EpochZeroFixture::new([200; 4]).await;
     let first = f.message(&[1, 2, 3, 4]);
     let (tx, reveal) = f.transactions(&first);
     f.accept(&first, &tx, 110);
@@ -1385,17 +1385,8 @@ async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_
     assert_eq!(state.h_0, Some(111));
     assert_eq!(state.epoch, 1);
     assert_eq!(state.last_rotation_epoch, 0);
-    let g = f.db.get_subnet_genesis_info(id).unwrap().unwrap();
-    let c_gen = g.to_subnet().committee;
     let c_one = state.latest_committee().clone();
-    assert_eq!(
-        c_one.validator_weighted_keys(),
-        c_gen.validator_weighted_keys()
-    );
-    assert_eq!(c_one.threshold, c_gen.threshold);
-    assert_eq!(c_one.multisig_address, c_gen.multisig_address);
-    assert_eq!(c_one.configuration_number, 0);
-    assert!(f.db.get_all_stake_changes(id).unwrap().is_empty());
+    assert_eq!(c_one.validators.len(), 4);
     let whitelist = f.signer().address;
     let destination = c_one.address_checked();
     assert_ne!(whitelist, destination);
@@ -1405,6 +1396,7 @@ async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_
     let mut request = f.message(&[]);
     request.checkpoint_height = 60;
     request.change_address = None;
+    request.next_committee_configuration_number = c_one.configuration_number;
     let (_dir, data) = provider(f, &wallet);
 
     fund_subnet(
@@ -1456,7 +1448,10 @@ async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_
         IpcCheckpointSubnetMsg::from_checkpoint_tx(&*data.db, &data.db.read_txn().unwrap(), tx)
             .unwrap();
     assert!(msg.is_rotation_checkpoint);
-    assert_eq!(msg.next_committee_configuration_number, 0);
+    assert_eq!(
+        msg.next_committee_configuration_number,
+        c_one.configuration_number
+    );
     let mut txn = data.db.write_txn().unwrap();
     let cp = msg
         .save_to_db(
@@ -1478,7 +1473,6 @@ async fn epoch_one_sweeps_whitelist_funds_and_routes_deposits_when_c_1_equals_c_
             .last_rotation_epoch,
         1
     );
-    assert!(data.db.get_all_stake_changes(id).unwrap().is_empty());
 }
 
 #[tokio::test]

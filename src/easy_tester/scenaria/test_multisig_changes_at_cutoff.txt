@@ -1,4 +1,4 @@
-# A multisig stake or unstake in the cutoff block H_1 is in C_2, one in H_1 + 1 or H_1 + 2 is in C_3, and C_e is C_{e-1} when every member unstakes its whole collateral.
+# A multisig stake or unstake in the cutoff block H_1 is in C_2, one in H_1 + 1 or H_1 + 2 is in C_3, and C_e is empty when every member unstakes its whole collateral.
 
 setup
 
@@ -96,14 +96,12 @@ expect result.pending_multisig_changes = 4
 # the rotation checkpoint of epoch 3
 checkpoint subnet2
 
-# at the cutoff at 140 = H_3 no validator qualifies: C_4 is C_3
+# at the cutoff at 140 = H_3 no validator qualifies: C_4 is empty
 block 141
 read subnet_state subnet2
 expect result.epoch = 4
+expect result.pending_multisig_changes = 0
 read validators subnet2
-expect result.count = 4
-expect result.names = validator1,validator2,validator3,validator4
-expect result.validator1.collateral = 100_000_000
-expect result.validator4.collateral = 100_000_000
-read withdrawals subnet2
 expect result.count = 0
+read withdrawals subnet2
+expect result.count = 4

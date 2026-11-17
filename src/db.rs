@@ -502,11 +502,9 @@ impl SubnetCommittee {
         // Remove the validator from the committee
         self.validators.remove_validator(pubkey)?;
 
-        // Update the configuration's threshold and multisig address, unless it is empty
-        if !self.validators.is_empty() {
-            self.threshold = self.validators.threshold();
-            self.multisig_address = self.validators.multisig_address(subnet_id);
-        }
+        // Update the configuration's threshold and multisig address
+        self.threshold = self.validators.threshold();
+        self.multisig_address = self.validators.multisig_address(subnet_id);
 
         Ok(())
     }
@@ -585,7 +583,7 @@ pub struct SubnetState {
     /// The epoch of the last processed rotation checkpoint, below `epoch` while one is awaited
     pub last_rotation_epoch: u64,
     /// The multisig joins, stakes and unstakes accepted since the cutoff `H_e`, applied in `C_{e+2}`
-    /// at the cutoff `H_{e+1}`, or kept for the next cutoff when no validator qualifies there
+    /// at the cutoff `H_{e+1}`
     pub pending_multisig_changes: Vec<PendingMultisigChange>,
 }
 

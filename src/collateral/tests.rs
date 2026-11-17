@@ -930,7 +930,7 @@ fn two_join_ue_in_one_reveal_of_the_same_subnet() {
     assert!(!is_ue_validator(&db, &db.read_txn().unwrap(), subnet_id, join_txid, &other).unwrap());
 
     // Once slashable, key 0 leaves at the cutoff whose boundary reaches T, with the value
-    // `C_gen` gave it; key 1 stays, and stays past its own timeout as the only member
+    // `C_gen` gave it; key 1 leaves at the next cutoff, which leaves the configuration empty
     activate(&db, subnet_id, BLOCK);
     for pk in &pks {
         make_slashable(&db, subnet_id, join_txid, pk, BLOCK + 1);
@@ -940,10 +940,13 @@ fn two_join_ue_in_one_reveal_of_the_same_subnet() {
     assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], UNIT)]);
     let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
     assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
-    assert!(cutoff(&db, h_87 + 10)[0].new_committee.is_none());
+    assert!(cutoff(&db, h_87 + 10)[0].new_committee.is_some());
     let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-    assert_eq!(state.latest_committee().pubkeys(), vec![pks[1]]);
-    assert_eq!(withdrawals(&db, subnet_id), vec![(pks[0], UNIT)]);
+    assert!(state.latest_committee().pubkeys().is_empty());
+    assert_eq!(
+        withdrawals(&db, subnet_id),
+        vec![(pks[0], UNIT), (pks[1], COLLATERAL)]
+    );
 }
 
 #[test]
@@ -996,8 +999,7 @@ fn two_join_ue_in_one_reveal_of_different_subnets() {
         assert_eq!(state.latest_committee().validators.len(), 1);
     }
 
-    // Past its timeout the key stays in each subnet, each handled by the same cutoff: a
-    // configuration needs a key
+    // Past its timeout the key leaves each subnet, each handled by the same cutoff
     for subnet_id in [subnet_a, subnet_b] {
         activate(&db, subnet_id, BLOCK);
         make_slashable(&db, subnet_id, join_txid, &pk, BLOCK + 1);
@@ -1012,8 +1014,8 @@ fn two_join_ue_in_one_reveal_of_different_subnets() {
     );
     for subnet_id in [subnet_a, subnet_b] {
         let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-        assert_eq!(state.latest_committee().pubkeys(), vec![pk]);
-        assert!(withdrawals(&db, subnet_id).is_empty());
+        assert!(state.latest_committee().pubkeys().is_empty());
+        assert_eq!(withdrawals(&db, subnet_id), vec![(pk, UNIT)]);
     }
 }
 
@@ -1515,11 +1517,11 @@ fn cutoffs_drop_the_collaterals_that_mature_within_three_epochs() {
     assert!(cutoff(&db, h_86 + 20)[0].new_committee.is_none());
     assert_eq!(withdrawals(&db, subnet_id).len(), 2);
 
-    // The only member stays past its timeout: a configuration needs a key
-    assert!(cutoff(&db, BLOCK + 137 * 10)[0].new_committee.is_none());
+    // A later cutoff drops the last member and the configuration is empty
+    assert!(cutoff(&db, BLOCK + 137 * 10)[0].new_committee.is_some());
     let state = db.get_subnet_state(subnet_id).unwrap().unwrap();
-    assert_eq!(state.latest_committee().pubkeys(), vec![pks[2]]);
-    assert_eq!(withdrawals(&db, subnet_id).len(), 2);
+    assert!(state.latest_committee().pubkeys().is_empty());
+    assert_eq!(withdrawals(&db, subnet_id).len(), 3);
 }
 
 #[test]

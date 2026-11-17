@@ -108,7 +108,7 @@ Activation ends epoch 0, when the monitor sets `H_0`. The subnet becomes *active
 
 ### Computing configuration C_1
 
-The monitor computes `C_1` at `H_0` as at any cutoff ([C_e](#computing-configuration-c_e-for-e--2)). `C_1` holds the members of `C_gen` whose join collateral UTXO is unspent and [slashable](slashing.md#slashable-outputs) at `H_0`, with a timeout `T > H_0 + 3K`. A member's power is that of the total value of its join collateral UTXO and of its stake collateral UTXOs of epoch 0 that meet the same conditions. `C_1` may be smaller than `C_gen` and than `boot_validators`. If no member of `C_gen` qualifies, `C_1` is `C_gen`. If `C_1` has fewer than `MIN_CONFIGURATION_SIZE` members, the subnet may not make progress.
+The monitor computes `C_1` at `H_0`. `C_1` holds the members of `C_gen` whose join collateral UTXO is unspent and [slashable](slashing.md#slashable-outputs) at `H_0`, with a timeout `T > H_0 + 3K`. A member's power is that of the total value of its join collateral UTXO and of its stake collateral UTXOs of epoch 0 that meet the same conditions. `C_1` may be smaller than `C_gen` and than `boot_validators`, or empty. If `C_1` has fewer than `MIN_CONFIGURATION_SIZE` members, the subnet may not make progress.
 
 ### After activation
 
@@ -128,7 +128,7 @@ When the monitor processes the cutoff block `H_{e−1}`, it computes `C_e`: ever
 2. has a timeout `T > H_{e+2}`, and
 3. is slashable by the slash pre-signatures of checkpoints that the monitor has processed.
 
-Each such validator has the power of the total value of those collateral UTXOs. If no validator qualifies, `C_e` is `C_{e−1}`. If `C_e` has fewer than `MIN_CONFIGURATION_SIZE` members, the subnet may not make progress.
+Each such validator has the power of the total value of those collateral UTXOs. `C_e` may be empty. If `C_e` has fewer than `MIN_CONFIGURATION_SIZE` members, the subnet may not make progress.
 
 From the cutoff on, `C_e` is the current configuration: new deposit and join transactions name it. The subnet's validator set becomes `C_e` once the subnet [applies its configuration updates](#applying-configuration-updates-in-the-subnet). `C_{e−1}` then finalizes no further subnet block.
 
@@ -195,9 +195,9 @@ A collateral UTXO with timeout `T` seats its owner in `C_e` only if `T > H_{e+2}
 
 ### The end of a subnet
 
-A subnet ends when its validators kill it (kill procedure **unimplemented**). A member of the validator set submits a kill proposal on the subnet, which counts as its vote, and the other members vote. At most one proposal is open at a time, and a validator votes at most once per proposal. The subnet accepts the proposal if the current powers of its voters reach the threshold of their configuration within `kill_vote_period` subnet blocks. An expired proposal closes, and a new one may follow. The next checkpoint records the acceptance with the flag bit `0x02` ([OP_RETURN data](transactions/checkpoint.md#op_return-data)), and the monitor marks the subnet *to be killed*.
+A subnet ends when its validators kill it (kill procedure **unimplemented**). A member of the validator set submits a kill proposal on the subnet, which counts as its vote, and the other members vote. At most one proposal is open at a time, and a validator votes at most once per proposal. The subnet accepts the proposal if the current powers of its voters reach the threshold of their configuration within `kill_vote_period` subnet blocks. An expired proposal closes, and a new one may follow. The next checkpoint records the acceptance with the flag bit `0x02` ([OP_RETURN data](transactions/checkpoint.md#op_return-data)), and the monitor marks the subnet *to be killed*. From then on, every other subnet rejects transfers to it ([batch-transfer transaction](transactions/batch-transfer.md#creating-the-transaction)).
 
-If that checkpoint belongs to epoch `e`, the subnet stays fully operational up to the end of epoch `e + kill_delay_period`, so that users withdraw their funds. The rotation checkpoint of epoch `e + kill_delay_period + 1` is the [kill checkpoint](transactions/checkpoint.md#the-kill-checkpoint): it exits the collateral UTXOs whose owners signed a cooperative exit and burns the rest of the subnet's funds. When the monitor processes it, it marks the subnet *killed*. From then on it accepts no checkpoint, join or stake transaction, computes no configuration, and every other subnet rejects transfers to it. It still processes the kill checkpoint's batch-transfer transaction. The exit and slash transactions stay open on Bitcoin L1.
+If that checkpoint belongs to epoch `e`, the subnet stays fully operational up to the end of epoch `e + kill_delay_period`, so that users withdraw their funds. The rotation checkpoint of epoch `e + kill_delay_period + 1` is the [kill checkpoint](transactions/checkpoint.md#the-kill-checkpoint): it exits the collateral UTXOs whose owners signed a cooperative exit and burns the rest of the subnet's funds. When the monitor processes it, it marks the subnet *killed*. From then on it accepts no checkpoint, join or stake transaction, and computes no configuration. It still processes the kill checkpoint's batch-transfer transaction. The exit and slash transactions stay open on Bitcoin L1.
 
 ## Subnet status
 

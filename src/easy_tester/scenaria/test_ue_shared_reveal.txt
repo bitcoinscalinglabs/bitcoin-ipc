@@ -110,9 +110,9 @@ expect result.names = validator4
 read withdrawals subnet1
 expect result.count = 5
 
-# validator4 is the only member at the cutoff 374 (boundary 404): kept
+# validator4 is the only member at the cutoff 374 (boundary 404): dropped, and the configuration is empty
 block 375
 read validators subnet1
-expect result.names = validator4
+expect result.count = 0
 read withdrawals subnet1
-expect result.count = 5
+expect result.count = 6

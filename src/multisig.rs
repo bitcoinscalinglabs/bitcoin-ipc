@@ -58,12 +58,6 @@ pub fn create_multisig_script(
     public_keys: &[WeightedKey],
     threshold: Power,
 ) -> Result<ScriptBuf, MultisigError> {
-    // Check if enough weight is available
-    let total_weight: Power = public_keys.iter().map(|(_, weight)| weight).sum();
-    if total_weight < threshold {
-        return Err(MultisigError::InsufficientTotalPower);
-    }
-
     // Public keys need to be sorted for consistent scriptPubKey
     let sorted_public_keys = sort_committee_keys(public_keys);
 
@@ -942,9 +936,6 @@ pub fn finalize_spend_psbt_from_sigs(
 pub enum MultisigError {
     #[error("insufficient public keys provided")]
     InsufficientPublicKeys,
-
-    #[error("insufficient total validator power provided")]
-    InsufficientTotalPower,
 
     #[error("insufficient collateral provided")]
     InsufficientCollateral,

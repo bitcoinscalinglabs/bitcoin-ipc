@@ -171,22 +171,22 @@ expect result.names = validator5
 read withdrawals subnet1
 expect result.count = 4
 
-# validator5 is the only member left: it stays past its timeout (cutoff 376, boundary 406)
-block 377
-read validators subnet1
-expect result.names = validator5
-read withdrawals subnet1
-expect result.count = 4
-read ue_collaterals subnet1
-expect result.validator5.spent = false
-
 # a key that left cannot join again: a key joins a subnet once
-block 381
+block 371
 join-ue subnet1 validator1 100_000 700
 
-block 383
+block 373
 read validators subnet1
 expect result.names = validator5
 read ue_collaterals subnet1
 expect result.count = 5
 expect result.validator1.count = 1
+
+# validator5 is the only member left: the cutoff 376 (boundary 406) drops it and the configuration is empty
+block 377
+read validators subnet1
+expect result.count = 0
+read withdrawals subnet1
+expect result.count = 5
+read ue_collaterals subnet1
+expect result.validator5.spent = false

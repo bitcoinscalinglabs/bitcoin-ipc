@@ -456,7 +456,7 @@ async fn a_bootstrapped_subnet_has_no_cutoffs_until_h_zero_is_known() {
 }
 
 #[tokio::test]
-async fn an_empty_candidate_set_retains_the_previous_configuration() {
+async fn no_qualifying_validator_gives_an_empty_configuration() {
     let f = Fixture::new().await;
     for n in 1..=4 {
         f.collateral(n, 140, true, false);
@@ -464,9 +464,10 @@ async fn an_empty_candidate_set_retains_the_previous_configuration() {
     f.cutoff(110);
     let state = f.state();
     assert_eq!(state.epoch, 2);
-    assert_eq!(state.latest_committee().configuration_number, 4);
-    assert_eq!(state.latest_committee().validators.len(), 4);
-    assert!(f.changes().is_empty());
+    assert_eq!(state.latest_committee().configuration_number, 8);
+    assert!(state.latest_committee().validators.is_empty());
+    assert_eq!(state.latest_committee().threshold, 1);
+    assert_eq!(f.changes().len(), 4);
 }
 
 #[tokio::test]
@@ -932,7 +933,7 @@ async fn activation_changes_follow_the_genesis_unit_values_and_begin_at_one() {
 }
 
 #[tokio::test]
-async fn activation_with_no_qualifying_collateral_keeps_genesis_power() {
+async fn activation_with_no_qualifying_collateral_gives_an_empty_c_1() {
     let f = EpochZeroFixture::new([135; 4]).await;
     let msg = f.message(&[1, 2, 3, 4]);
     let (tx, reveal) = f.transactions(&msg);
@@ -941,9 +942,8 @@ async fn activation_with_no_qualifying_collateral_keeps_genesis_power() {
     f.cutoff(111);
     let state = f.state();
     assert!(state.is_activated());
-    assert_eq!(state.committee.validators.len(), 4);
-    assert!(state.committee.validators.iter().all(|v| v.power == 1));
-    assert!(f.db.get_all_stake_changes(f.id).unwrap().is_empty());
+    assert!(state.latest_committee().validators.is_empty());
+    assert_eq!(f.db.get_all_stake_changes(f.id).unwrap().len(), 4);
 }
 
 #[tokio::test]

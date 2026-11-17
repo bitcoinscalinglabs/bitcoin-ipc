@@ -92,24 +92,6 @@ fn test_create_multisig_address_multiple_keys() {
     assert_eq!(address.address_type(), Some(AddressType::P2tr));
 }
 
-#[test]
-fn test_create_multisig_address_insufficient_keys() {
-    let secp = Secp256k1::new();
-    let public_keys = generate_equal_weighted_keys(1);
-    let threshold = 2; // More signatures required than keys available
-    let network = Network::Bitcoin;
-
-    let result = create_subnet_multisig_address(
-        &secp,
-        &generate_subnet_id(),
-        &public_keys,
-        threshold,
-        network,
-    );
-
-    assert!(matches!(result, Err(MultisigError::InsufficientTotalPower)));
-}
-
 //
 // Test spending
 //
