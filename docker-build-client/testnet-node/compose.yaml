@@ -9,8 +9,9 @@
 # and database carry over.
 name: bsl-node
 
-x-client-image: &client-image ghcr.io/bitcoinscalinglabs/bsl-client:testnet
-x-fendermint-image: &fendermint-image ghcr.io/bitcoinscalinglabs/bsl-fendermint:testnet
+# Both images use the tag BSL_IMAGE_TAG (default testnet); set it in bsl.env, e.g. `dev`.
+x-client-image: &client-image ghcr.io/bitcoinscalinglabs/bsl-client:${BSL_IMAGE_TAG:-testnet}
+x-fendermint-image: &fendermint-image ghcr.io/bitcoinscalinglabs/bsl-fendermint:${BSL_IMAGE_TAG:-testnet}
 # The fendermint image is amd64 only (what the BSL validators run); arm64 hosts emulate it.
 x-fendermint-platform: &fendermint-platform linux/amd64
 x-cometbft-image: &cometbft-image cometbft/cometbft:v0.37.18

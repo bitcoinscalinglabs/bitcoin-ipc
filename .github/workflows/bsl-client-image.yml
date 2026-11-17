@@ -1,16 +1,17 @@
 # Builds the public BSL client image and pushes it to GHCR.
 #
-# ipc-cli is built from the ipc repo's `bitcoin` branch. Its Rust bindings are generated from
+# ipc-cli is built from the ipc repo's `bitcoin` branch (`main` here) or `bitcoin-dev`
+# (`dev` here); the image tag follows: `testnet` or `dev`. Its Rust bindings are generated from
 # the compiled Solidity ABIs, so the `contracts` job compiles them once (Foundry +
 # pnpm) and shares contracts/out as an artifact. The `build` matrix then builds
 # docker-build-client/Dockerfile on
 # native runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm), each pushing
-# its arch by digest; the `merge` job assembles the :testnet manifest list.
+# its arch by digest; the `merge` job assembles the manifest list.
 name: bsl-client image
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -23,16 +24,20 @@ concurrency:
 
 env:
   REGISTRY_IMAGE: ghcr.io/bitcoinscalinglabs/bsl-client
+  # `dev` builds from the ipc `bitcoin-dev` branch and publishes :dev; every other
+  # branch (`main`) builds from `bitcoin` and publishes :testnet.
+  IPC_REF: ${{ github.ref_name == 'dev' && 'bitcoin-dev' || 'bitcoin' }}
+  IMAGE_TAG: ${{ github.ref_name == 'dev' && 'dev' || 'testnet' }}
 
 jobs:
   contracts:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout ipc (BSL bitcoin branch, with submodules)
+      - name: Checkout ipc (BSL branch, with submodules)
         uses: actions/checkout@v7
         with:
           repository: bitcoinscalinglabs/ipc
-          ref: bitcoin
+          ref: ${{ env.IPC_REF }}
           path: ipc
           submodules: recursive
 
@@ -89,11 +94,11 @@ jobs:
         with:
           path: bitcoin-ipc
 
-      - name: Checkout ipc (BSL bitcoin branch)
+      - name: Checkout ipc (BSL branch)
         uses: actions/checkout@v7
         with:
           repository: bitcoinscalinglabs/ipc
-          ref: bitcoin
+          ref: ${{ env.IPC_REF }}
           path: ipc
 
       - name: Restore contract ABIs
@@ -173,8 +178,8 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create -t "${REGISTRY_IMAGE}:testnet" \
+          docker buildx imagetools create -t "${REGISTRY_IMAGE}:${IMAGE_TAG}" \
             $(printf "${REGISTRY_IMAGE}@sha256:%s " *)
 
       - name: Inspect
-        run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:testnet"
+        run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${IMAGE_TAG}"
