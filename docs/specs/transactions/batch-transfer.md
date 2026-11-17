@@ -25,6 +25,8 @@ Map entries are in ascending order of `txid20`. All fields are present, empty or
 
 ## Creating the transaction
 
+A subnet accepts a transfer, native or ERC20, only if its destination is active in the Bitcoin L1 state of the subnet's [parent finality](../lifecycle.md#applying-configuration-updates-in-the-subnet). A transfer to any other destination (unknown, in epoch 0, to be killed or killed) fails on the source subnet and moves nothing. So no checkpoint carries a transfer to a killed subnet, while the source subnet creates checkpoints: a destination stays to be killed for `kill_delay_period` epochs, and the monitor still credits it ([verifying the transaction](#verifying-the-transaction)) (**unimplemented**: the source subnet accepts any destination, and a provider cannot build a checkpoint that carries a transfer to an unknown subnet).
+
 Every provider builds it with its checkpoint, from the same data, after checking the ERC20 records against the ERC20 rules below in its monitor's state. It needs no signature.
 
 ## Verifying the transaction
