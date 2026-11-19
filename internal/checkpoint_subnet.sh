@@ -125,7 +125,7 @@ if echo "$SIGN_RESPONSE" | jq -e '.error' > /dev/null; then
 fi
 
 # Extract the signatures
-SIGNATURES=$(echo "$SIGN_RESPONSE" | jq '.result.signatures')
+SIGNATURES=$(echo "$SIGN_RESPONSE" | jq '[.result.signatures[][1]]')
 
 if [ "$SIGNATURES" == "null" ] || [ -z "$SIGNATURES" ]; then
   echo "Error: No signatures returned"

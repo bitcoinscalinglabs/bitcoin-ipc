@@ -1,0 +1,61 @@
+# An EOTS identity cannot be reused across subnets.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 4
+whitelist validator1 validator2 validator3 validator4
+subnet_b
+min 4
+whitelist validator1 validator2 validator3 validator4
+
+scenario
+block 102
+create subnet_a
+create subnet_b
+
+block 103
+join-ue subnet_a validator1 100000 1000
+join-ue subnet_b validator2 100000 1000
+
+block 104
+read subnet_genesis subnet_a
+expect result.bootstrapped = false
+expect result.genesis_validators = 1
+read subnet_genesis subnet_b
+expect result.bootstrapped = false
+expect result.genesis_validators = 1
+
+# Each validator's EOTS key was accepted by the other subnet in the preceding block.
+join-ue subnet_b validator1 200000 1100
+join-ue subnet_a validator2 200000 1100
+
+block 105
+read ue_collaterals subnet_a
+expect result.count = 1
+expect result.validator1.count = 1
+expect result.validator1.value = 100000
+read ue_collaterals subnet_b
+expect result.count = 1
+expect result.validator2.count = 1
+expect result.validator2.value = 100000
+read subnet_genesis subnet_a
+expect result.genesis_validators = 1
+read subnet_genesis subnet_b
+expect result.genesis_validators = 1
+
+# A fresh identity joins after the rejected joins.
+join-ue subnet_a validator3 100000 1200
+
+block 106
+read subnet_genesis subnet_a
+expect result.genesis_validators = 2
+expect result.bootstrapped = false
+read ue_collaterals subnet_a
+expect result.count = 2
+expect result.validator3.count = 1
+read ue_collaterals subnet_b
+expect result.count = 1

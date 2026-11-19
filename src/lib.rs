@@ -1,12 +1,16 @@
 use bitcoin::{FeeRate, Network};
 
 pub mod bitcoin_utils;
+pub mod collateral;
 pub mod db;
+pub mod eots;
+pub mod epochs;
 pub mod eth_utils;
 pub mod ipc_lib;
 pub mod easy_tester;
 pub mod multisig;
 pub mod provider;
+pub mod slash;
 
 pub mod rewards;
 

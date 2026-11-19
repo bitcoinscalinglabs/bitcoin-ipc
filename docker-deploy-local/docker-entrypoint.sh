@@ -111,6 +111,23 @@ for id in $ids; do
     provider_ids+=("$id")
 done
 
+# Second provider per validator for subnet B, with its own EOTS key and seed (kept across restarts); `subnet-b.config.toml` reaches it.
+for n in 1 2 3 4 5 6; do
+    dir="/root/.ipc/validator${n}"
+    id="validator${n}-subnet-b"
+    [ -f "${dir}/eots-subnet-b.sk" ] || openssl rand -hex 32 > "${dir}/eots-subnet-b.sk"
+    [ -f "${dir}/eots-subnet-b.seed" ] || openssl rand -hex 32 > "${dir}/eots-subnet-b.seed"
+    sed -e "s|^PROVIDER_PORT=.*|PROVIDER_PORT=$((3129 + n))|" \
+        -e "s|^EOTS_SK_PATH=.*|EOTS_SK_PATH=${dir}/eots-subnet-b.sk|" \
+        -e "s|^EOTS_SEED_PATH=.*|EOTS_SEED_PATH=${dir}/eots-subnet-b.seed|" \
+        "${dir}/.env" > "${dir}/subnet-b.env"
+    subnet_b_config.sh "$n"
+    echo "Starting provider for ${id}..."
+    provider --env "${dir}/subnet-b.env" >> "/root/.ipc/logs/provider-${id}.log" 2>&1 &
+    provider_pids+=($!)
+    provider_ids+=("$id")
+done
+
 # Wait 2s, then check providers
 sleep 2
 

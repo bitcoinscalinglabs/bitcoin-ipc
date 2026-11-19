@@ -95,14 +95,21 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 TesterConfig::Db {
                     activation_height,
                     snapshot_length,
+                    ue_activation_height,
                 } => {
-                    let mut tester =
-                        DbTester::new(parsed.setup, activation_height, snapshot_length).await?;
+                    let mut tester = DbTester::new(
+                        parsed.setup,
+                        activation_height,
+                        snapshot_length,
+                        ue_activation_height,
+                    )
+                    .await?;
                     run_scenario(&mut tester, scenario, 1)?;
                 }
                 TesterConfig::Monitor {
                     activation_height,
                     snapshot_length,
+                    ue_activation_height,
                     monitor_log_level,
                     provider_log_level,
                 } => {
@@ -110,6 +117,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                         parsed.setup,
                         activation_height,
                         snapshot_length,
+                        ue_activation_height,
                         monitor_log_level,
                         provider_log_level,
                     )
@@ -148,47 +156,92 @@ fn run_scenario<T: Tester>(
                 }
                 working_height = height;
             }
-            ScenarioCommand::Create { subnet_name } => {
-                tester.exec_create_subnet(working_height, &subnet_name).map_err(annotate)?;
+            ScenarioCommand::Create { subnet_name, shape } => {
+                tester
+                    .exec_create_subnet(working_height, &subnet_name, shape)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::Join {
                 subnet_name,
                 validator_name,
                 collateral_sats,
+                raw,
             } => {
                 tester.exec_join_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     collateral_sats,
+                    raw,
                 ).map_err(annotate)?;
+            }
+            ScenarioCommand::JoinUe {
+                subnet_name,
+                joins,
+                shape,
+            } => {
+                tester
+                    .exec_join_ue(working_height, &subnet_name, &joins, shape)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::Stake {
                 subnet_name,
                 validator_name,
                 amount_sats,
+                raw,
             } => {
                 tester.exec_stake_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     amount_sats,
+                    raw,
                 ).map_err(annotate)?;
             }
             ScenarioCommand::Unstake {
                 subnet_name,
                 validator_name,
                 amount_sats,
+                raw,
             } => {
                 tester.exec_unstake_subnet(
                     working_height,
                     &subnet_name,
                     &validator_name,
                     amount_sats,
+                    raw,
                 ).map_err(annotate)?;
             }
-            ScenarioCommand::Checkpoint { subnet_name } => {
-                tester.exec_checkpoint_subnet(working_height, &subnet_name).map_err(annotate)?;
+            ScenarioCommand::UnstakeUe {
+                subnet_name,
+                validator_name,
+            } => {
+                tester
+                    .exec_unstake_ue(working_height, &subnet_name, &validator_name)
+                    .map_err(annotate)?;
+            }
+            ScenarioCommand::Presign {
+                subnet_name,
+                owner,
+                signers,
+                bad,
+            } => {
+                tester
+                    .exec_presign(
+                        working_height,
+                        &subnet_name,
+                        bitcoin_ipc::easy_tester::model::PresignSpec {
+                            owner,
+                            signers,
+                            bad,
+                        },
+                    )
+                    .map_err(annotate)?;
+            }
+            ScenarioCommand::Checkpoint { subnets, shape } => {
+                tester
+                    .exec_checkpoint(working_height, &subnets, shape)
+                    .map_err(annotate)?;
             }
             ScenarioCommand::RegisterToken {
                 subnet_name,

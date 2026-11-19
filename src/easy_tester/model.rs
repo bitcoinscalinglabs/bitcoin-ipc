@@ -5,13 +5,15 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::{ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
+use crate::{easy_tester::reveal::RevealShape, ipc_lib::IpcCreateSubnetMsg, SubnetId, NETWORK};
 
 #[derive(Debug, Clone)]
 pub struct ValidatorSpec {
     pub name: String,
     pub secret_key: SecretKey,
     pub pubkey: XOnlyPublicKey,
+    pub eots_secret_key: SecretKey,
+    pub eots_seed: crate::eots::EotsSeed,
     pub default_ip: SocketAddr,
     pub default_backup_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
 }
@@ -22,6 +24,8 @@ pub struct SubnetSpec {
     pub min_validators: u16,
     pub whitelist_names: Vec<String>,
     pub whitelist_pubkeys: Vec<XOnlyPublicKey>,
+    /// `K`, the epoch length in Bitcoin blocks
+    pub epoch_length: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -45,10 +49,13 @@ pub enum TesterConfig {
     Db {
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        /// Unilateral exit is on from this height; `None` = off
+        ue_activation_height: Option<u64>,
     },
     Monitor {
         activation_height: Option<u64>,
         snapshot_length: Option<u64>,
+        ue_activation_height: Option<u64>,
         monitor_log_level: Option<String>,
         provider_log_level: Option<String>,
     },
@@ -98,6 +105,26 @@ pub enum OutputDb {
     TokenBalance,
     /// FendermintTester only: `read token_metadata <subnet> <token_name>`
     TokenMetadata,
+    /// `read validators <subnet> [current]`: the latest (or the current) configuration
+    Validators,
+    /// `read ue_collaterals <subnet>`: the unilateral-exit collateral records
+    UeCollaterals,
+    /// `read withdrawals <subnet>`: the Withdraw stake changes not yet in a checkpoint
+    Withdrawals,
+    /// `read subnet_state <subnet>`: activation, epoch and `H_0`
+    SubnetState,
+}
+
+/// One join of a `join-ue` line: the collateral matures at `timeout`. `subnet_name` is set
+/// when the join targets another subnet than the line's (`<subnet>:<validator>`).
+/// `collateral_spent`: a transaction spends the collateral UTXO before the reveal transaction
+#[derive(Debug, Clone)]
+pub struct JoinUeSpec {
+    pub subnet_name: Option<String>,
+    pub validator_name: String,
+    pub collateral_sats: u64,
+    pub timeout: u64,
+    pub collateral_spent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,24 +134,51 @@ pub enum ScenarioCommand {
     },
     Create {
         subnet_name: String,
+        shape: RevealShape,
     },
+    /// `raw`: the transaction is hand-built and submitted without the provider
     Join {
         subnet_name: String,
         validator_name: String,
         collateral_sats: u64,
+        raw: bool,
     },
+    /// Join under the unilateral-exit script; several joins go in one reveal, in order
+    JoinUe {
+        subnet_name: String,
+        joins: Vec<JoinUeSpec>,
+        shape: RevealShape,
+    },
+    /// `raw`: the transaction is hand-built and submitted without the provider
     Stake {
         subnet_name: String,
         validator_name: String,
         amount_sats: u64,
+        raw: bool,
     },
     Unstake {
         subnet_name: String,
         validator_name: String,
         amount_sats: u64,
+        raw: bool,
     },
-    Checkpoint {
+    /// Spend the validator's matured unilateral-exit collaterals to its backup address
+    UnstakeUe {
         subnet_name: String,
+        validator_name: String,
+    },
+    /// Slash pre-signatures of `owner`'s latest collateral by `signers`, carried by the next
+    /// checkpoint of the subnet; `bad` corrupts the first signature
+    Presign {
+        subnet_name: String,
+        owner: String,
+        signers: Vec<String>,
+        bad: bool,
+    },
+    /// One checkpoint per subnet; their batch transfers go in one reveal, in `shape`
+    Checkpoint {
+        subnets: Vec<String>,
+        shape: RevealShape,
     },
     /// Register an ERC20 token on a subnet (queues ETR for next checkpoint).
     /// `issuer` is only set for FendermintTester scenarios.
@@ -274,9 +328,102 @@ pub fn generate_validator(name: &str, ordinal: usize) -> ValidatorSpec {
         name: name.to_string(),
         secret_key: sk,
         pubkey: xonly_pubkey,
+        eots_secret_key: SecretKey::new(&mut rand::thread_rng()),
+        eots_seed: crate::eots::EotsSeed::new(&mut rand::thread_rng()),
         default_ip: ip,
         default_backup_address: backup,
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PresignSpec {
+    pub owner: String,
+    pub signers: Vec<String>,
+    pub bad: bool,
+}
+
+/// The slash pre-signature entries of queued `presign` lines, for the next checkpoint: each
+/// signs the owner's latest recorded collateral in `subnet_id` with the signers' keys.
+pub fn build_slash_entries<D: crate::db::DatabaseCore>(
+    db: &D,
+    subnet_id: SubnetId,
+    specs: &[PresignSpec],
+    validators: &HashMap<String, ValidatorSpec>,
+) -> Result<Vec<crate::slash::SlashSignatureEntry>, crate::easy_tester::EasyTesterError> {
+    use crate::easy_tester::EasyTesterError;
+    let secp = Secp256k1::new();
+    let txn = db
+        .read_txn()
+        .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?;
+    let mut entries: Vec<crate::slash::SlashSignatureEntry> = Vec::new();
+    for spec in specs {
+        let owner = validators
+            .get(&spec.owner)
+            .ok_or_else(|| EasyTesterError::runtime(format!("unknown validator '{}'", spec.owner)))?;
+        let record = db
+            .get_ue_collaterals_txn(&txn, subnet_id)
+            .map_err(|e| EasyTesterError::runtime(format!("db read failed: {e}")))?
+            .into_iter()
+            .filter(|r| r.pubkey == owner.pubkey)
+            .max_by_key(|r| r.timeout)
+            .ok_or_else(|| {
+                EasyTesterError::runtime(format!("'{}' has no join-ue collateral", spec.owner))
+            })?;
+        let script = crate::collateral::collateral_script_of(db, &txn, &record)
+            .map_err(|e| EasyTesterError::runtime(format!("collateral script: {e}")))?;
+        let mut signatures = Vec::new();
+        for signer_name in &spec.signers {
+            let signer = validators.get(signer_name).ok_or_else(|| {
+                EasyTesterError::runtime(format!("unknown validator '{signer_name}'"))
+            })?;
+            let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &signer.secret_key);
+            let (index, mut signature) =
+                crate::slash::sign_slash(&secp, &script, record.outpoint, record.value, &keypair)
+                    .map_err(|e| EasyTesterError::runtime(format!("presign: {e}")))?;
+            if spec.bad && signatures.is_empty() {
+                signature[1][0] ^= 1;
+            }
+            signatures.push((index, signature));
+        }
+        signatures.sort_by_key(|(index, _)| *index);
+        match entries.iter_mut().find(|e| e.outpoint() == record.outpoint) {
+            Some(entry) => {
+                entry.signatures.extend(signatures);
+                entry.signatures.sort_by_key(|(index, _)| *index);
+            }
+            None => entries.push(crate::slash::SlashSignatureEntry::new(record.outpoint, signatures)),
+        }
+    }
+    entries.sort_by_key(|e| (e.txid, e.vout));
+    Ok(entries)
+}
+
+/// The number of heights a tester's EOTS nonce commitment covers, from height 1.
+pub const TEST_EOTS_NONCE_COUNT: u32 = 1_000;
+
+/// A signed `join-ue` message of `validator` with its EOTS nonce commitment for heights
+/// `1..=TEST_EOTS_NONCE_COUNT`.
+pub fn join_ue_msg(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    join: crate::ipc_lib::IpcJoinSubnetMsg,
+    timeout: u32,
+    validator: &ValidatorSpec,
+) -> crate::ipc_lib::IpcJoinUeMsg {
+    let (commitment, _) = crate::eots::commit_nonces(
+        &validator.eots_seed,
+        &join.subnet_id,
+        1,
+        TEST_EOTS_NONCE_COUNT,
+    )
+    .expect("heights 1..=TEST_EOTS_NONCE_COUNT are a valid EOTS nonce range");
+    crate::ipc_lib::IpcJoinUeMsg::new_signed(
+        secp,
+        join,
+        timeout,
+        &validator.secret_key,
+        &validator.eots_secret_key,
+        commitment,
+    )
 }
 
 pub fn build_create_subnet_msg(subnet: &SubnetSpec) -> IpcCreateSubnetMsg {
@@ -285,11 +432,18 @@ pub fn build_create_subnet_msg(subnet: &SubnetSpec) -> IpcCreateSubnetMsg {
 
     IpcCreateSubnetMsg {
         min_validator_stake: Amount::from_sat(100_000),
+        power_unit_exponent: 4,
         min_validators,
         bottomup_check_period: 1,
         active_validators_limit,
         min_cross_msg_fee: Amount::from_sat(1),
         whitelist: subnet.whitelist_pubkeys.clone(),
+        epoch_length: subnet.epoch_length,
+        min_timeout: 1,
+        max_timeout: 1000,
+        min_deposit: Amount::from_sat(330),
+        kill_vote_period: 36,
+        kill_delay_period: 5,
     }
 }
 

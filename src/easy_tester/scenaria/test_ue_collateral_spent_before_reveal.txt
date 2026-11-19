@@ -1,0 +1,31 @@
+# A join whose collateral UTXO is spent before its reveal transaction is refused (join rule 2.5).
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+# The commit transaction and a transaction spending its collateral UTXO go into block 110, the
+# reveal transaction into block 111
+block 110
+join-ue subnet1 validator1 100_000 400 @collateral-spent
+
+# A join in the reveal transaction's block whose collateral UTXO is unspent
+block 111
+join-ue subnet1 validator2 100_000 400
+
+block 113
+read ue_collaterals subnet1
+expect result.count = 1
+expect result.validator2.count = 1

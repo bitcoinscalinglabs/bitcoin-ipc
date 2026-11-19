@@ -1,0 +1,86 @@
+# Every epoch has a rotation checkpoint, also when the configuration does not change.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 2
+whitelist validator1 validator2 validator3 validator4
+epoch_length 10
+
+scenario
+block 102
+create subnet_a
+block 103
+join-ue subnet_a validator1 100000 2000 validator2 120000 2000
+block 104
+# The db tester's deposit is a no-op; it is recorded in its own Bitcoin block.
+deposit subnet_a validator1 1000000
+presign subnet_a validator1 by validator1 validator2
+presign subnet_a validator2 by validator1 validator2
+block 105
+checkpoint subnet_a
+block 106
+read subnet_state subnet_a
+expect result.activated = true
+expect result.epoch = 1
+expect result.h_0 = 105
+expect result.last_rotation_epoch = 0
+checkpoint subnet_a
+block 107
+read subnet_state subnet_a
+expect result.last_rotation_epoch = 1
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+expect result.validator1.collateral = 100000
+expect result.validator2.collateral = 120000
+# H_1=115: create and include epoch 2's rotation before H_2.
+block 116
+read subnet_state subnet_a
+expect result.epoch = 2
+expect result.last_rotation_epoch = 1
+checkpoint subnet_a
+block 117
+read subnet_state subnet_a
+expect result.epoch = 2
+expect result.last_rotation_epoch = 2
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+expect result.names = validator1,validator2
+read withdrawals subnet_a
+expect result.count = 0
+# H_2=125: the same configuration still gets epoch 3's rotation.
+block 126
+read subnet_state subnet_a
+expect result.epoch = 3
+expect result.last_rotation_epoch = 2
+checkpoint subnet_a
+block 127
+read subnet_state subnet_a
+expect result.epoch = 3
+expect result.last_rotation_epoch = 3
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.waiting = false
+# H_3=135: epoch 4's rotation is made in epoch 4, without backfilling skipped epochs.
+block 136
+read subnet_state subnet_a
+expect result.epoch = 4
+expect result.last_rotation_epoch = 3
+checkpoint subnet_a
+block 137
+read subnet_state subnet_a
+expect result.epoch = 4
+expect result.last_rotation_epoch = 4
+expect result.committee_number = 2
+read validators subnet_a current
+expect result.names = validator1,validator2
+expect result.waiting = false
+expect result.validator1.collateral = 100000
+expect result.validator2.collateral = 120000
+read withdrawals subnet_a
+expect result.count = 0

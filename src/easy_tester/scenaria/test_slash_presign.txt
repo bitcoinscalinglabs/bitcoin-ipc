@@ -1,0 +1,131 @@
+# A collateral is slashable once a checkpoint's batch transfer carries pre-signatures that reach the threshold of its named configuration.
+
+setup
+
+validator1
+validator2
+validator3
+validator4
+validator5
+validator6
+
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 105
+create subnet1
+
+block 110
+join-ue subnet1 validator1 100_000 400
+join-ue subnet1 validator2 100_000 400
+join-ue subnet1 validator3 100_000 400
+join-ue subnet1 validator4 100_000 400
+
+block 112
+read validators subnet1
+expect result.count = 4
+read ue_collaterals subnet1
+expect result.count = 4
+expect result.slashable_count = 0
+deposit subnet1 validator1 500_000_000
+
+# Two unit-power signatures do not reach the whitelist's threshold of three: the collateral
+# stays unslashable, so no C_gen collateral is slashable and H_0 is not set
+block 114
+presign subnet1 validator2 by validator1 validator2
+checkpoint subnet1
+
+block 116
+read ue_collaterals subnet1
+expect result.slashable_count = 0
+expect result.validator2.slashable = false
+read subnet_state subnet1
+expect result.activated = false
+expect result.h_0 = none
+# one entry per genesis collateral with signatures reaching the threshold: H_0 = 116
+presign subnet1 validator1 by validator1 validator2 validator3 validator4
+presign subnet1 validator2 by validator1 validator2 validator3
+presign subnet1 validator3 by validator1 validator2 validator3
+presign subnet1 validator4 by validator1 validator2 validator3
+checkpoint subnet1
+
+block 117
+read ue_collaterals subnet1
+expect result.slashable_count = 4
+read subnet_state subnet1
+expect result.activated = true
+expect result.epoch = 1
+expect result.h_0 = 116
+expect result.last_rotation_epoch = 0
+read validators subnet1 current
+expect result.count = 4
+expect result.validator1.collateral = 10_000
+# after activation a join names C_1 and waits for its pre-signatures; validator6 never gets them
+join-ue subnet1 validator5 100_000 420
+join-ue subnet1 validator6 100_000 420
+
+block 118
+read ue_collaterals subnet1
+expect result.count = 6
+expect result.validator5.slashable = false
+expect result.validator6.slashable = false
+read validators subnet1
+expect result.count = 4
+# the rotation checkpoint of epoch 1 applies C_1
+checkpoint subnet1
+
+block 119
+read subnet_state subnet1
+expect result.last_rotation_epoch = 1
+read validators subnet1 current
+expect result.count = 4
+expect result.validator1.collateral = 100_000
+expect result.waiting = false
+# a corrupted signature fails the whole batch transfer, the valid entry with it
+presign subnet1 validator5 by validator1 validator2 validator3 bad
+presign subnet1 validator6 by validator1 validator2 validator3
+checkpoint subnet1
+
+block 120
+read ue_collaterals subnet1
+expect result.slashable_count = 4
+expect result.validator5.slashable = false
+expect result.validator6.slashable = false
+# Three members reach the threshold for the later join.
+presign subnet1 validator5 by validator1 validator2 validator3
+checkpoint subnet1
+
+block 121
+read ue_collaterals subnet1
+expect result.slashable_count = 5
+expect result.validator5.slashable = true
+read validators subnet1
+expect result.count = 4
+expect result.waiting = false
+
+# the cutoff at 126 computes C_2 from the slashable collaterals: validators 1 to 5, not validator6
+block 127
+read ue_collaterals subnet1
+expect result.validator6.slashable = false
+read validators subnet1
+expect result.names = validator1,validator2,validator3,validator4,validator5
+expect result.waiting = true
+expect result.validator5.collateral = 100_000
+read validators subnet1 current
+expect result.count = 4
+# the rotation checkpoint of epoch 2 applies C_2
+checkpoint subnet1
+
+block 128
+read validators subnet1 current
+expect result.names = validator1,validator2,validator3,validator4,validator5
+# a later entry for a slashable output changes nothing
+presign subnet1 validator1 by validator1 validator2 validator3 validator4
+checkpoint subnet1
+
+block 129
+read ue_collaterals subnet1
+expect result.slashable_count = 5

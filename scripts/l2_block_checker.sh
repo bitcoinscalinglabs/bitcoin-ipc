@@ -9,7 +9,7 @@ if [ -z "$1" ]; then
 fi
 
 PORT=$1
-CHECKPOINT_PERIOD=${2:-60}
+CHECKPOINT_PERIOD=${2:-10}
 
 echo "PORT: $PORT"
 

@@ -1,0 +1,68 @@
+# A join is admitted in the epoch that a cutoff ends, and the cutoff then sees the quorums of that Bitcoin block.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet_a
+min 2
+whitelist validator1 validator2 validator3 validator4
+epoch_length 10
+
+scenario
+block 102
+create subnet_a
+block 103
+join-ue subnet_a validator1 100000 2000 validator2 120000 2000
+block 104
+# The db tester's deposit is a no-op; it is recorded in its own Bitcoin block.
+deposit subnet_a validator1 1000000
+presign subnet_a validator1 by validator1 validator2
+presign subnet_a validator2 by validator1 validator2
+block 105
+checkpoint subnet_a
+block 106
+read subnet_state subnet_a
+expect result.activated = true
+expect result.epoch = 1
+# The next checkpoint rotates to C_1; the checkpoint carrying the pre-signatures was regular.
+checkpoint subnet_a
+block 107
+read subnet_state subnet_a
+expect result.last_rotation_epoch = 1
+block 114
+join-ue subnet_a validator3 130000 2000
+block 115
+# H_1=115. Validator4's T=155 is in E_T=5, allowed for e=1, rejected if the cutoff runs too early as e=2.
+join-ue subnet_a validator4 140000 155
+presign subnet_a validator3 by validator1 validator2
+checkpoint subnet_a
+block 116
+read ue_collaterals subnet_a
+expect result.count = 4
+expect result.validator4.timeout = 155
+expect result.validator4.slashable = false
+read subnet_state subnet_a
+expect result.epoch = 2
+expect result.last_rotation_epoch = 1
+read validators subnet_a
+expect result.names = validator1,validator2,validator3
+expect result.waiting = true
+read validators subnet_a current
+expect result.names = validator1,validator2
+presign subnet_a validator4 by validator1 validator2
+checkpoint subnet_a
+block 117
+read validators subnet_a current
+expect result.names = validator1,validator2,validator3
+read ue_collaterals subnet_a
+expect result.validator4.slashable = true
+block 126
+# C_3's boundary is H_5=155: validator4 is now slashable but no longer eligible, and never withdraws value it never seated.
+read subnet_state subnet_a
+expect result.epoch = 3
+read validators subnet_a
+expect result.names = validator1,validator2,validator3
+read withdrawals subnet_a
+expect result.count = 0

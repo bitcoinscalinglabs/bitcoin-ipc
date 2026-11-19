@@ -1,0 +1,127 @@
+# A batch transfer is read from any input of a reveal that spends a checkpoint's commitment output.
+
+setup
+validator1
+validator2
+validator3
+validator4
+subnet1
+whitelist validator1 validator2 validator3 validator4
+min 4
+subnet2
+whitelist validator1 validator2 validator3 validator4
+min 4
+subnet3
+whitelist validator1 validator2 validator3 validator4
+min 4
+
+scenario
+
+block 102
+create subnet1
+create subnet2
+create subnet3
+
+block 103
+join subnet1 validator1 100_000_000
+join subnet1 validator2 100_000_000
+join subnet1 validator3 100_000_000
+join subnet1 validator4 100_000_000
+join subnet2 validator1 100_000_000
+join subnet2 validator2 100_000_000
+join subnet2 validator3 100_000_000
+join subnet2 validator4 100_000_000
+
+block 104
+join subnet3 validator1 100_000_000
+join subnet3 validator2 100_000_000
+join subnet3 validator3 100_000_000
+join subnet3 validator4 100_000_000
+
+# The first checkpoints of subnet2 and subnet3 activate them: a subnet receives transfers
+# from its activation on
+block 105
+checkpoint subnet2
+checkpoint subnet3
+
+# As built: the registration fans out to subnet2 and subnet3
+block 110
+register_token subnet1 TokenA TKA 1_000_000
+checkpoint subnet1
+
+block 111
+read rootnet_msgs subnet2
+expect result.count = 1
+expect result.0.kind = erc_registration
+read rootnet_msgs subnet3
+expect result.count = 1
+
+# An input that carries no message before the data input
+erc_transfer subnet1 subnet2 TokenA 100
+checkpoint subnet1 @input-before
+
+block 112
+read rootnet_msgs subnet2
+expect result.count = 2
+expect result.1.kind = erc_transfer
+read token_balance subnet2 TokenA
+expect result.balance = 100
+
+# Inputs before and after
+erc_transfer subnet1 subnet2 TokenA 200
+checkpoint subnet1 @inputs-around
+
+block 113
+read rootnet_msgs subnet2
+expect result.count = 3
+read token_balance subnet2 TokenA
+expect result.balance = 300
+
+# Other outputs
+erc_transfer subnet1 subnet3 TokenA 50
+checkpoint subnet1 @other-output
+
+block 114
+read rootnet_msgs subnet3
+expect result.count = 2
+read token_balance subnet3 TokenA
+expect result.balance = 50
+
+# Two checkpoints' batches in one reveal
+register_token subnet2 TokenB TKB 5_000
+erc_transfer subnet1 subnet3 TokenA 25
+checkpoint subnet1 subnet2
+
+block 115
+read rootnet_msgs subnet3
+expect result.count = 4
+read rootnet_msgs subnet1
+expect result.count = 1
+expect result.0.kind = erc_registration
+read token_balance subnet3 TokenA
+expect result.balance = 75
+
+# Two batches in one reveal, inputs reversed, with an input before them
+erc_transfer subnet1 subnet3 TokenA 10
+erc_transfer subnet2 subnet3 TokenB 500
+checkpoint subnet1 subnet2 @reversed
+
+block 116
+read rootnet_msgs subnet3
+expect result.count = 6
+read token_balance subnet3 TokenA
+expect result.balance = 85
+read token_balance subnet3 TokenB
+expect result.balance = 500
+
+erc_transfer subnet1 subnet3 TokenA 10
+erc_transfer subnet2 subnet3 TokenB 100
+checkpoint subnet1 subnet2 @input-before
+
+block 117
+read rootnet_msgs subnet3
+expect result.count = 8
+read token_balance subnet3 TokenA
+expect result.balance = 95
+read token_balance subnet3 TokenB
+expect result.balance = 600

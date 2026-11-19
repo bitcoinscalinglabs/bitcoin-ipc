@@ -10,7 +10,8 @@ set -euo pipefail
 #   /workspace/bitcoin-ipc/scripts/spin_up_subnet_a_from_container.sh <subnet_id> [validator5|validator6]
 #
 # With <subnet_id> only: starts validators 1-4 for Subnet A.
-# With <subnet_id> validator5: adds validator 5 (requires CometBftID, ResolverAddress from prior run).
+# With <subnet_id> validator5: adds validator 5 (requires CometBftID, ResolverAddress from prior run,
+# and the nodes of validators 2-4 running).
 # With <subnet_id> validator6: adds validator 6 (requires CometBftID, ResolverAddress from prior run). Not supported yet.
 
 cleanup() {
@@ -21,6 +22,8 @@ cleanup() {
 }
 
 trap cleanup SIGINT SIGTERM
+
+source "$(dirname "${BASH_SOURCE[0]}")/spin_up_peers.sh"
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <subnet_id> [validator5|validator6]" >&2
@@ -130,11 +133,14 @@ BEARER_TOKEN_3="validator3_auth_token"
 BEARER_TOKEN_4="validator4_auth_token"
 BEARER_TOKEN_5="validator5_auth_token"
 
-API_URL_1="http://host.docker.internal:${PORT_1}/api"
-API_URL_2="http://host.docker.internal:${PORT_2}/api"
-API_URL_3="http://host.docker.internal:${PORT_3}/api"
-API_URL_4="http://host.docker.internal:${PORT_4}/api"
-API_URL_5="http://host.docker.internal:${PORT_5}/api"
+# Address at which containers reach services published on the host: host.docker.internal on
+# Docker Desktop, the host's interface address under rootless Docker (HOST_ADDR=10.0.0.4).
+HOST_ADDR="${HOST_ADDR:-host.docker.internal}"
+API_URL_1="http://${HOST_ADDR}:${PORT_1}/api"
+API_URL_2="http://${HOST_ADDR}:${PORT_2}/api"
+API_URL_3="http://${HOST_ADDR}:${PORT_3}/api"
+API_URL_4="http://${HOST_ADDR}:${PORT_4}/api"
+API_URL_5="http://${HOST_ADDR}:${PORT_5}/api"
 
 # Validator 5 fendermint ports (Subnet A: 27056, 27057, 8945, 27055)
 CMT_P2P_5="27056"
@@ -142,7 +148,15 @@ CMT_RPC_5="27057"
 ETHAPI_5="8945"
 RESOLVER_5="27055"
 
+NODE_NAME_SUFFIX=""
+CARGO_MAKE=(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" --env HOME="$HOST_HOME_DIR")
+
 if [ "$ADD_VALIDATOR" = "validator5" ]; then
+    add_peer 1 26655 "$CometBftID" "$ResolverAddress"
+    add_node_peer 2 26755
+    add_node_peer 3 26855
+    add_node_peer 4 26955
+
     echo "Starting validator 5..."
     cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
         --env NODE_NAME="validator-5" \
@@ -153,8 +167,8 @@ if [ "$ADD_VALIDATOR" = "validator5" ]; then
         --env CMT_RPC_HOST_PORT="$CMT_RPC_5" \
         --env ETHAPI_HOST_PORT="$ETHAPI_5" \
         --env RESOLVER_HOST_PORT="$RESOLVER_5" \
-        --env BOOTSTRAPS="${CometBftID}@validator-1-cometbft:26656" \
-        --env RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${ResolverAddress}" \
+        --env PERSISTENT_PEERS="$COMETBFT_PEERS" \
+        --env RESOLVER_BOOTSTRAPS="$RESOLVER_PEERS" \
         --env PARENT_ENDPOINT="$API_URL_5" \
         --env PARENT_AUTH_TOKEN="$BEARER_TOKEN_5" \
         --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
@@ -162,6 +176,9 @@ if [ "$ADD_VALIDATOR" = "validator5" ]; then
         --env FM_PULL_SKIP=1 \
         child-validator
     echo "Validator 5 started!"
+
+    add_node_peer 5 "$RESOLVER_5"
+    write_full_peer_lists 1 2 3 4
     exit 0
 fi
 
@@ -170,6 +187,7 @@ echo "Starting validator 1..."
 VALIDATOR1_OUTPUT=""
 if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" \
     --env NODE_NAME="validator-1" \
+    --env PERSISTENT_PEERS="" \
     --env SUBNET_ID="$SUBNET_ID" \
     --env HOME="$HOST_HOME_DIR" \
     --env PRIVATE_KEY_PATH="/root/.ipc/validator1/validator.sk" \
@@ -191,12 +209,14 @@ if ! VALIDATOR1_OUTPUT=$(cargo-make make --makefile "$FENDERMINT_MAKEFILE_PATH" 
 fi
 
 # Extract bootstrap information
-COMETBFT_ID=$(echo "$VALIDATOR1_OUTPUT" | grep "CometBFT node ID:" -A 1 | tail -n 1 | tr -d ' ' | xargs)
-RESOLVER_ADDR=$(echo "$VALIDATOR1_OUTPUT" | grep -o '/ip4/0.0.0.0/tcp/[0-9]*/p2p/[a-zA-Z0-9]*' | cut -d'/' -f7 | xargs)
+COMETBFT_ID=$(cometbft_node_id 1)
+RESOLVER_ADDR=$(resolver_node_id 1)
 
 echo "Bootstrap information:"
 echo "CometBFT ID: $COMETBFT_ID"
 echo "Resolver Address: $RESOLVER_ADDR"
+
+add_peer 1 26655 "$COMETBFT_ID" "$RESOLVER_ADDR"
 
 # Function to run additional validators
 run_validator() {
@@ -219,8 +239,8 @@ run_validator() {
         --env CMT_RPC_HOST_PORT="$rpc_port" \
         --env ETHAPI_HOST_PORT="$eth_port" \
         --env RESOLVER_HOST_PORT="$resolver_port" \
-        --env BOOTSTRAPS="${COMETBFT_ID}@validator-1-cometbft:26656" \
-        --env RESOLVER_BOOTSTRAPS="/dns/validator-1-fendermint/tcp/26655/p2p/${RESOLVER_ADDR}" \
+        --env PERSISTENT_PEERS="$COMETBFT_PEERS" \
+        --env RESOLVER_BOOTSTRAPS="$RESOLVER_PEERS" \
         --env PARENT_ENDPOINT="$api_url" \
         --env PARENT_AUTH_TOKEN="$bearer_token" \
         --env TOPDOWN_CHAIN_HEAD_DELAY=0 \
@@ -257,7 +277,9 @@ do
         echo "Aborting." >&2
         exit 1
     fi
+    add_node_peer "$validator_num" "$5"
 done
+write_full_peer_lists 1 2 3 4
 
 echo "All validators have been started for subnet $SUBNET_ID!"
 
@@ -266,7 +288,7 @@ echo "All validators have been started for subnet $SUBNET_ID!"
 mkdir -p /root/.ipc/logs
 echo "Starting relayers for validators 1-4..."
 for n in 1 2 3 4; do
-    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" > "/root/.ipc/logs/relayer-subnet-a-validator${n}.log" 2>&1 &
+    RUST_LOG=debug nohup ipc-cli --config-path "/root/.ipc/validator${n}/config.toml" checkpoint relayer --subnet "$SUBNET_ID" --checkpoint-interval-sec 5 > "/root/.ipc/logs/relayer-subnet-a-validator${n}.log" 2>&1 &
     echo "  Relayer for validator${n} started (log: /root/.ipc/logs/relayer-subnet-a-validator${n}.log)"
 done
 
